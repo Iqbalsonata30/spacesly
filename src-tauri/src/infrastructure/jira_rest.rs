@@ -175,7 +175,7 @@ pub fn fetch_board_issues_paginated(
 
         let page: IssuePage = match send(auth, request) {
             Ok(page) => page,
-            Err(error) if !issues.is_empty() => return Ok(issues),
+            Err(_error) if !issues.is_empty() => return Ok(issues),
             Err(error) => return Err(error),
         };
         issues.extend(page.issues.into_iter().map(|issue| JiraIssue {

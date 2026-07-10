@@ -59,7 +59,7 @@ pub struct Column {
 #[serde(rename_all = "snake_case")]
 pub enum ColumnIntent {
     Backlog,
-    Ready,
+    Queued,
     InProgress,
     Review,
     Done,

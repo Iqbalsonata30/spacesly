@@ -1,10 +1,14 @@
 <script lang="ts">
   type AgentRunStatus = "idle" | "running" | "completed" | "blocked";
+  type AgentOutputStatus = "complete" | "blocked" | "working" | "unknown";
   type AgentOutputView = {
-    status: "complete" | "blocked" | "working" | "unknown";
+    status: AgentOutputStatus;
+    label: string;
     summary: string;
+    outcome: string;
     evidence: string[];
-    details: string[];
+    changes: string[];
+    nextSteps: string[];
   };
 
   let { output, runStatus } = $props<{
@@ -15,19 +19,26 @@
   let view = $derived(parseAgentOutput(output, runStatus));
 
   function parseAgentOutput(value: string, statusValue: AgentRunStatus): AgentOutputView {
-    const text = value.trim();
-    if (!text || text === "Waiting for Agent output..." || text === "Agent is processing the task context...") {
+    const text = stripAnsi(value).trim();
+    const waiting = !text || text === "Waiting for Agent output..." || text === "Agent is processing the task context...";
+
+    if (waiting) {
+      const status = statusValue === "blocked" ? "blocked" : statusValue === "completed" ? "complete" : "working";
       return {
-        status: statusValue === "blocked" ? "blocked" : statusValue === "completed" ? "complete" : "working",
+        status,
+        label: statusLabel(status),
         summary: text || "Waiting for Agent output...",
+        outcome: status === "working" ? "The Agent is still preparing or executing this task." : "No structured result is available yet.",
         evidence: [],
-        details: [],
+        changes: [],
+        nextSteps: status === "working" ? ["Wait for the Agent to return evidence or a blocker."] : [],
       };
     }
 
     const sections = labelledSections(text);
+    const fallbackLines = cleanOutputLines(text.split(/\n+/));
     const explicitStatus = sections.STATUS?.join(" ").toLowerCase() ?? "";
-    const parsedStatus = explicitStatus.includes("complete")
+    const status = explicitStatus.includes("complete")
       ? "complete"
       : explicitStatus.includes("blocked")
         ? "blocked"
@@ -36,14 +47,26 @@
           : statusValue === "blocked"
             ? "blocked"
             : "unknown";
-    const fallbackLines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+
+    const summary = cleanSentence(sections.SUMMARY?.join(" ") || fallbackLines[0] || "No summary returned.");
+    const evidence = cleanOutputLines(sections.EVIDENCE ?? []).slice(0, 6);
+    const detailLines = cleanOutputLines(sections.DETAILS ?? fallbackLines.slice(1));
+    const changes = detailLines.filter(isChangeLine).slice(0, 5);
+    const nextSteps = nextStepLines(status, detailLines, evidence);
 
     return {
-      status: parsedStatus,
-      summary: sections.SUMMARY?.join(" ") || fallbackLines[0] || "No summary returned.",
-      evidence: cleanOutputLines(sections.EVIDENCE ?? []),
-      details: cleanOutputLines(sections.DETAILS ?? fallbackLines.slice(1)),
+      status,
+      label: statusLabel(status),
+      summary,
+      outcome: outcomeText(status, summary),
+      evidence,
+      changes: changes.length > 0 ? changes : detailLines.slice(0, 4),
+      nextSteps,
     };
+  }
+
+  function stripAnsi(value: string): string {
+    return value.replace(/\x1b\[[0-9;]*m/g, "");
   }
 
   function labelledSections(value: string): Record<string, string[]> {
@@ -59,9 +82,7 @@
         continue;
       }
 
-      if (activeKey && line.trim()) {
-        sections[activeKey].push(line.trim());
-      }
+      if (activeKey && line.trim()) sections[activeKey].push(line.trim());
     }
 
     return sections;
@@ -70,25 +91,74 @@
   function cleanOutputLines(lines: string[]): string[] {
     return lines
       .flatMap((line) => line.split("\n"))
-      .map((line) => line.trim().replace(/^[-*]\s*/, ""))
+      .map((line) => cleanSentence(line.replace(/^[-*•]\s*/, "")))
       .filter(Boolean)
-      .slice(0, 8);
+      .filter((line) => !/^(STATUS|SUMMARY|EVIDENCE|DETAILS):?$/i.test(line))
+      .slice(0, 12);
+  }
+
+  function cleanSentence(value: string): string {
+    return value
+      .replace(/^STATUS:\s*/i, "")
+      .replace(/^SUMMARY:\s*/i, "")
+      .replace(/^EVIDENCE:\s*/i, "")
+      .replace(/^DETAILS:\s*/i, "")
+      .replace(/`{3}/g, "")
+      .trim();
+  }
+
+  function isChangeLine(value: string): boolean {
+    return /(changed|updated|created|deleted|patched|deployed|rebuilt|transitioned|commented|verified|committed|pushed|file|jira|bamboo|ocp|pod|deployment)/i.test(value);
+  }
+
+  function nextStepLines(status: AgentOutputStatus, details: string[], evidence: string[]): string[] {
+    if (status === "complete") return ["Review the evidence, then keep or sync the completed Jira state."];
+    if (status === "working") return ["Wait for the Agent to return evidence or a blocker."];
+
+    const blockers = [...details, ...evidence].filter((line) => /(need|needs|blocked|approve|approval|missing|failed|cannot|can't|uncommitted|unpushed|permission)/i.test(line));
+    return blockers.length > 0
+      ? blockers.slice(0, 3)
+      : ["Add an operator note or approval in the Agent console, then continue the Agent on this card."];
+  }
+
+  function statusLabel(status: AgentOutputStatus): string {
+    if (status === "complete") return "Completed";
+    if (status === "blocked") return "Needs attention";
+    if (status === "working") return "Working";
+    return "Review needed";
+  }
+
+  function outcomeText(status: AgentOutputStatus, summary: string): string {
+    if (status === "complete") return "The Agent reported the task complete with evidence.";
+    if (status === "blocked") return "The Agent stopped before marking the task Done.";
+    if (status === "working") return "The Agent is still running.";
+    return summary;
   }
 </script>
 
-<div class="agent-output-card">
-  <div class={`agent-output-status ${view.status}`}>
-    <span></span>
-    <strong>{view.status}</strong>
-  </div>
+<article class={`agent-output-card ${view.status}`} aria-label="Agent result">
+  <header class="agent-output-hero">
+    <div class="agent-output-mark"><span></span></div>
+    <div>
+      <p>{view.label}</p>
+      <h3>{view.summary}</h3>
+      <strong>{view.outcome}</strong>
+    </div>
+  </header>
 
-  <section class="agent-output-section summary">
-    <p>Summary</p>
-    <strong>{view.summary}</strong>
-  </section>
+  {#if view.nextSteps.length > 0}
+    <section class="agent-output-panel next">
+      <p>{view.status === "blocked" ? "What needs attention" : "Next"}</p>
+      <ul>
+        {#each view.nextSteps as line}
+          <li>{line}</li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
 
   {#if view.evidence.length > 0}
-    <section class="agent-output-section">
+    <section class="agent-output-panel evidence">
       <p>Evidence</p>
       <ul>
         {#each view.evidence as line}
@@ -98,22 +168,17 @@
     </section>
   {/if}
 
-  {#if view.details.length > 0}
-    <section class="agent-output-section">
-      <p>Details</p>
+  {#if view.changes.length > 0}
+    <section class="agent-output-panel changes">
+      <p>What happened</p>
       <ul>
-        {#each view.details as line}
+        {#each view.changes as line}
           <li>{line}</li>
         {/each}
       </ul>
     </section>
   {/if}
-
-  <details class="agent-output-raw">
-    <summary>Raw output</summary>
-    <pre>{output}</pre>
-  </details>
-</div>
+</article>
 
 <style>
   .agent-output-card {
@@ -125,62 +190,57 @@
     padding: 10px;
   }
 
-  .agent-output-status {
-    display: inline-flex;
-    width: fit-content;
-    align-items: center;
-    gap: 8px;
-    border: 1px solid #34313d;
-    border-radius: 999px;
-    padding: 6px 10px;
-    background: #1a1920;
-    color: #aaa1c3;
-  }
-
-  .agent-output-status span {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: currentColor;
-  }
-
-  .agent-output-status strong {
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-  }
-
-  .agent-output-status.complete {
-    border-color: rgba(185, 214, 170, 0.34);
-    color: #b9d6aa;
-  }
-
-  .agent-output-status.blocked {
-    border-color: rgba(240, 176, 170, 0.34);
-    color: #f0b0aa;
-  }
-
-  .agent-output-status.working {
-    border-color: rgba(184, 214, 228, 0.3);
-    color: #b8d6e4;
-  }
-
-  .agent-output-section {
-    display: grid;
-    gap: 6px;
+  .agent-output-hero,
+  .agent-output-panel {
     border: 1px solid #24222b;
-    border-radius: 10px;
-    padding: 10px;
+    border-radius: 12px;
     background: #15141b;
   }
 
-  .agent-output-section.summary {
-    border-color: rgba(184, 214, 228, 0.18);
-    background: linear-gradient(135deg, rgba(37, 42, 49, 0.58), #15141b);
+  .agent-output-hero {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 10px;
+    padding: 12px;
+    background: linear-gradient(135deg, rgba(37, 42, 49, 0.72), #15141b);
   }
 
-  .agent-output-section p {
+  .agent-output-mark {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border-radius: 999px;
+    background: rgba(184, 214, 228, 0.1);
+    color: #b8d6e4;
+  }
+
+  .agent-output-mark span {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 5px rgba(184, 214, 228, 0.08);
+  }
+
+  .agent-output-card.complete .agent-output-mark {
+    background: rgba(185, 214, 170, 0.12);
+    color: #b9d6aa;
+  }
+
+  .agent-output-card.blocked .agent-output-mark {
+    background: rgba(240, 176, 170, 0.12);
+    color: #f0b0aa;
+  }
+
+  .agent-output-hero div:last-child {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  .agent-output-hero p,
+  .agent-output-panel p {
     margin: 0;
     color: #8f88a8;
     font-size: 11px;
@@ -189,65 +249,72 @@
     text-transform: uppercase;
   }
 
-  .agent-output-section strong {
+  .agent-output-hero h3 {
+    margin: 0;
     color: #f1edf5;
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 15px;
+    line-height: 1.35;
   }
 
-  .agent-output-section ul {
+  .agent-output-hero strong {
+    color: #aaa1c3;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+
+  .agent-output-panel {
     display: grid;
-    gap: 6px;
+    gap: 8px;
+    padding: 11px 12px;
+  }
+
+  .agent-output-panel.next {
+    border-color: rgba(240, 176, 170, 0.24);
+    background: rgba(55, 30, 32, 0.42);
+  }
+
+  .agent-output-card.complete .agent-output-panel.next {
+    border-color: rgba(185, 214, 170, 0.18);
+    background: rgba(43, 56, 38, 0.32);
+  }
+
+  .agent-output-panel.evidence {
+    border-color: rgba(184, 214, 228, 0.18);
+  }
+
+  ul {
+    display: grid;
+    gap: 7px;
     margin: 0;
     padding: 0;
     list-style: none;
   }
 
-  .agent-output-section li {
+  li {
     position: relative;
-    padding-left: 16px;
-    color: #c9c1d6;
+    padding-left: 18px;
+    color: #cfc8dc;
     font-size: 12px;
     line-height: 1.45;
   }
 
-  .agent-output-section li::before {
+  li::before {
     position: absolute;
     top: 0.62em;
     left: 2px;
-    width: 5px;
-    height: 5px;
+    width: 6px;
+    height: 6px;
     border-radius: 999px;
     background: #b8d6e4;
     content: "";
   }
 
-  .agent-output-raw {
-    border: 1px solid #24222b;
-    border-radius: 10px;
-    background: #0e0e14;
+  .agent-output-panel.next li::before {
+    background: #f0b0aa;
   }
 
-  .agent-output-raw summary {
-    cursor: pointer;
-    padding: 9px 10px;
-    color: #8f88a8;
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-  }
-
-  .agent-output-raw pre {
-    max-height: 220px;
-    margin: 0;
-    overflow: auto;
-    border-top: 1px solid #24222b;
-    padding: 10px;
-    color: #b9b2c8;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    line-height: 1.45;
-    white-space: pre-wrap;
+  .agent-output-card.complete .agent-output-panel.next li::before {
+    background: #b9d6aa;
   }
 </style>

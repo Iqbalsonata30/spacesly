@@ -1,4 +1,5 @@
 import { aiProviders, defaultModelForProvider, providerById } from "$lib/aiModels";
+import { normalizeOpencodeModel } from "$lib/opencodeModels";
 
 export interface McpServerSettings {
   id: string;
@@ -216,7 +217,7 @@ function normalizeSettings(value: unknown): AppSettings {
       modelIds: aiModelIds,
       apiKeys: aiApiKeys,
       opencodeCommand: stringOrFallback(candidate.aiWorker?.opencodeCommand, fallback.aiWorker.opencodeCommand),
-      opencodeModel: stringOrFallback(candidate.aiWorker?.opencodeModel, fallback.aiWorker.opencodeModel),
+      opencodeModel: normalizeOpencodeModel(candidate.aiWorker?.opencodeModel, fallback.aiWorker.opencodeModel),
       opencodeWorkdir: String(candidate.aiWorker?.opencodeWorkdir ?? fallback.aiWorker.opencodeWorkdir),
       opencodeAutoApprove: candidate.aiWorker?.opencodeAutoApprove === true,
       agentRules: String(candidate.aiWorker?.agentRules ?? fallback.aiWorker.agentRules),

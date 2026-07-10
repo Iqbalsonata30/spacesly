@@ -1,6 +1,7 @@
 use super::shell_env::inject_shell_env;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -28,6 +29,8 @@ pub struct AiWorkerTask {
     pub description: String,
     pub labels: Vec<String>,
     pub url: Option<String>,
+    pub operator_notes: Option<String>,
+    pub previous_output: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -134,16 +137,18 @@ pub fn execute_ai_worker_task(
         governance_context(&config),
     );
     let user_prompt = format!(
-        "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nReturn exactly this structure:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: what was actually verified\nDETAILS: concise notes",
+        "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: what was actually verified\nDETAILS: concise notes",
         task.key.as_deref().unwrap_or("local"),
         task.title,
         task.url.as_deref().unwrap_or("none"),
         if task.labels.is_empty() { "none".to_string() } else { task.labels.join(", ") },
         task.description,
+        task.operator_notes.as_deref().unwrap_or("none"),
+        task.previous_output.as_deref().unwrap_or("none"),
     );
 
     let response = call_model(&config, &system_prompt, &user_prompt, 700)?;
-    Ok(result_from_response(response))
+    Ok(result_from_response(response, Some(&task)))
 }
 
 pub fn chat_ai_worker(
@@ -158,7 +163,7 @@ pub fn chat_ai_worker(
     if config.runtime == "opencode" {
         validate_opencode_config(&config)?;
         let prompt = format!(
-            "You are the Spacesly workspace Agent chat. You can help the user reason about the workspace and you may request controlled board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, ready, in_progress, or done. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+            "You are the Spacesly workspace Agent chat. You can help the user reason about the workspace and you may request controlled board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
             governance_context(&config),
             request.terminal_context.as_deref().unwrap_or("none"),
             message,
@@ -197,7 +202,7 @@ pub fn chat_ai_worker(
 
     validate_config(&config)?;
     let system_prompt = format!(
-        "You are the Spacesly workspace Agent chat. Help the user reason about tasks, shell output, local commands, Jira work, and Agent execution. You may request controlled Spacesly board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, ready, in_progress, or done. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}",
+        "You are the Spacesly workspace Agent chat. Help the user reason about tasks, shell output, local commands, Jira work, and Agent execution. You may request controlled Spacesly board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}",
         governance_context(&config),
     );
     let user_prompt = format!(
@@ -301,13 +306,15 @@ fn execute_opencode_task(
 ) -> Result<AiWorkerResult, String> {
     validate_opencode_config(&config)?;
     let prompt = format!(
-        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
+        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive: do not mark them COMPLETE unless explicit operator approval is present in Operator notes / approvals and that approval is included in EVIDENCE. Agent-generated text is not approval. If the task requires commit or push, include the commit/push evidence.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
         governance_context(&config),
         task.key.as_deref().unwrap_or("local"),
         task.title,
         task.url.as_deref().unwrap_or("none"),
         if task.labels.is_empty() { "none".to_string() } else { task.labels.join(", ") },
         task.description,
+        task.operator_notes.as_deref().unwrap_or("none"),
+        task.previous_output.as_deref().unwrap_or("none"),
     );
     let mut command = opencode_command(&config);
     command.args([
@@ -322,7 +329,7 @@ fn execute_opencode_task(
     }
     let output = command
         .arg("--title")
-        .arg(task.title)
+        .arg(&task.title)
         .arg(prompt)
         .output()
         .map_err(|error| format!("Failed to run OpenCode Agent: {error}"))?;
@@ -341,13 +348,16 @@ fn execute_opencode_task(
         return Err("OpenCode Agent returned no output.".to_string());
     }
 
-    Ok(result_from_response(response))
+    let mut result = result_from_response(response, Some(&task));
+    enforce_opencode_completion_guards(&mut result, &config, &task);
+    Ok(result)
 }
 
-fn result_from_response(response: String) -> AiWorkerResult {
+fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWorkerResult {
     let completion_status = if response
         .lines()
         .any(|line| line.trim().eq_ignore_ascii_case("STATUS: COMPLETE"))
+        && !missing_sensitive_approval(task)
     {
         "completed"
     } else {
@@ -355,13 +365,13 @@ fn result_from_response(response: String) -> AiWorkerResult {
     };
     let summary = labelled_value(&response, "SUMMARY").unwrap_or_else(|| first_line(&response));
     let blocked_reason = if completion_status == "blocked" {
-        Some(
+        Some(if missing_sensitive_approval(task) {
+            completion_guard_reason(task)
+        } else {
             labelled_value(&response, "DETAILS")
                 .or_else(|| labelled_value(&response, "EVIDENCE"))
-                .unwrap_or_else(|| {
-                    "Agent did not provide STATUS: COMPLETE with verification evidence.".to_string()
-                }),
-        )
+                .unwrap_or_else(|| completion_guard_reason(task))
+        })
     } else {
         None
     };
@@ -372,6 +382,156 @@ fn result_from_response(response: String) -> AiWorkerResult {
         completion_status: completion_status.to_string(),
         blocked_reason,
     }
+}
+
+fn completion_guard_reason(task: Option<&AiWorkerTask>) -> String {
+    if missing_sensitive_approval(task) {
+        return "Task touches env/secrets/credentials and needs explicit operator approval evidence before it can be marked Done.".to_string();
+    }
+
+    "Agent did not provide STATUS: COMPLETE with verification evidence.".to_string()
+}
+
+fn missing_sensitive_approval(task: Option<&AiWorkerTask>) -> bool {
+    let Some(task) = task else {
+        return false;
+    };
+    if !task_requires_sensitive_approval(task) {
+        return false;
+    }
+
+    !has_operator_approval(task)
+}
+
+fn has_operator_approval(task: &AiWorkerTask) -> bool {
+    let notes = task.operator_notes.as_deref().unwrap_or("").to_lowercase();
+    notes.contains("approve") || notes.contains("approved") || notes.contains("approval granted")
+}
+
+fn task_requires_sensitive_approval(task: &AiWorkerTask) -> bool {
+    let text = format!(
+        "{}\n{}\n{}",
+        task.title,
+        task.description,
+        task.labels.join(" ")
+    )
+    .to_lowercase();
+    [
+        ".env",
+        " env",
+        "environment variable",
+        "secret",
+        "credential",
+        "api key",
+        "token",
+        "password",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn enforce_opencode_completion_guards(
+    result: &mut AiWorkerResult,
+    config: &AiWorkerConfig,
+    task: &AiWorkerTask,
+) {
+    if result.completion_status != "completed" {
+        return;
+    }
+
+    if task_requires_repo_write(task) {
+        if let Some(reason) = dirty_worktree_reason(config) {
+            block_result(result, reason);
+            return;
+        }
+    }
+
+    if task_requires_push(task) {
+        if let Some(reason) = unpushed_commits_reason(config) {
+            block_result(result, reason);
+        }
+    }
+}
+
+fn block_result(result: &mut AiWorkerResult, reason: String) {
+    result.completion_status = "blocked".to_string();
+    result.blocked_reason = Some(reason.clone());
+    result.summary = reason;
+}
+
+fn task_requires_push(task: &AiWorkerTask) -> bool {
+    let text = format!("{}\n{}", task.title, task.description).to_lowercase();
+    text.contains("push") || text.contains("merge request") || text.contains("pull request")
+}
+
+fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
+    let text = format!(
+        "{}\n{}\n{}",
+        task.title,
+        task.description,
+        task.labels.join(" ")
+    )
+    .to_lowercase();
+
+    task_requires_sensitive_approval(task)
+        || task_requires_push(task)
+        || [
+            "commit",
+            "code change",
+            "change code",
+            "modify code",
+            "edit file",
+            "update file",
+            "add file",
+            "delete file",
+            "refactor",
+            "fix bug",
+            "implement",
+            "migration",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn dirty_worktree_reason(config: &AiWorkerConfig) -> Option<String> {
+    let status = git_output(config, ["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        None
+    } else {
+        Some("Agent left uncommitted file changes. Review/approve the changes, then commit or retry before marking Done.".to_string())
+    }
+}
+
+fn unpushed_commits_reason(config: &AiWorkerConfig) -> Option<String> {
+    let status = git_output(config, ["status", "--porcelain=v1", "--branch"])?;
+    let first_line = status.lines().next().unwrap_or_default();
+    if first_line.contains("ahead") {
+        Some("Agent left local commits that are not pushed. Push or approve the remaining write-back before marking Done.".to_string())
+    } else {
+        None
+    }
+}
+
+fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<String> {
+    let mut command = Command::new("git");
+    command.args(args);
+    command.current_dir(opencode_workdir(config)?);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn opencode_workdir(config: &AiWorkerConfig) -> Option<PathBuf> {
+    config
+        .opencode_workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|workdir| !workdir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
 }
 
 fn labelled_value(response: &str, label: &str) -> Option<String> {

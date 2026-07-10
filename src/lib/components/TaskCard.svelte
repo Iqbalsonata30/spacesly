@@ -37,18 +37,19 @@
     onDragEnd: () => void;
   }>();
 
-  const descriptionCache = new Map<string, DescriptionPart[]>();
+  let cachedDescriptionText = "";
+  let cachedDescriptionParts: DescriptionPart[] = [];
   let description = $derived(descriptionParts(card.description));
 
   function descriptionParts(value: string): DescriptionPart[] {
-    const cached = descriptionCache.get(value);
-    if (cached) return cached;
+    if (cachedDescriptionText === value) return cachedDescriptionParts;
 
     const parts = value
       .split(/(https?:\/\/\S+)/g)
       .filter(Boolean)
       .map((part) => ({ text: part, url: part.startsWith("http") ? part : undefined }));
-    descriptionCache.set(value, parts);
+    cachedDescriptionText = value;
+    cachedDescriptionParts = parts;
     return parts;
   }
 
@@ -99,7 +100,7 @@
   {/if}
   {#if showActions}
     <div class="actions">
-      <span>{isBlocked ? "Blocked" : "○ Ready"}</span>
+      <span>{isBlocked ? "Blocked" : "○ Queue"}</span>
       <span
         class="start"
         class:retry={isBlocked}

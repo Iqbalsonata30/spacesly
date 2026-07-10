@@ -83,12 +83,14 @@ fn intent_for_status(status: &str) -> ColumnIntent {
 
     if normalized.contains("progress") || normalized.contains("doing") {
         ColumnIntent::InProgress
+    } else if normalized.contains("queued") || normalized.contains("queue") {
+        ColumnIntent::Queued
     } else if normalized.contains("review") || normalized.contains("qa") {
-        ColumnIntent::Ready
+        ColumnIntent::Queued
     } else if normalized.contains("done") || normalized.contains("closed") {
         ColumnIntent::Done
     } else if normalized.contains("ready") {
-        ColumnIntent::Ready
+        ColumnIntent::Queued
     } else {
         ColumnIntent::Backlog
     }
@@ -98,7 +100,7 @@ fn intent_matches(left: &ColumnIntent, right: &ColumnIntent) -> bool {
     matches!(
         (left, right),
         (ColumnIntent::Backlog, ColumnIntent::Backlog)
-            | (ColumnIntent::Ready, ColumnIntent::Ready)
+            | (ColumnIntent::Queued, ColumnIntent::Queued)
             | (ColumnIntent::InProgress, ColumnIntent::InProgress)
             | (ColumnIntent::Review, ColumnIntent::Review)
             | (ColumnIntent::Done, ColumnIntent::Done)
@@ -138,9 +140,9 @@ fn seeded_workspace() -> Workspace {
                         }],
                     },
                     Column {
-                        id: ColumnId("column-ready".to_string()),
-                        name: "Ready".to_string(),
-                        intent: ColumnIntent::Ready,
+                        id: ColumnId("column-queued".to_string()),
+                        name: "Queued".to_string(),
+                        intent: ColumnIntent::Queued,
                         cards: vec![],
                     },
                     Column {

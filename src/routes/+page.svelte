@@ -40,6 +40,7 @@
     type AppSettings,
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
+  import { opencodeModelOptions } from "$lib/opencodeModels";
   import { loadCachedWorkspace, saveCachedWorkspace } from "$lib/workspaceCache";
 
   const initialSettings = loadSettings();
@@ -49,6 +50,9 @@
   const MAX_AGENT_TERMINAL_LINES = 80;
   const MAX_WORKSPACE_CHAT_MESSAGES = 80;
   const MAX_AGENT_OUTPUT_CHARS = 32_000;
+  const DEFAULT_DONE_VISIBLE_LIMIT = 20;
+  const SYNC_RETAIN_MISSING_CARD_MS = 3 * 24 * 60 * 60 * 1_000;
+  const UI_STATE_WRITE_DELAY_MS = 200;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
   const UI_STATE_KEY = "spacesly.ui.v1";
 
@@ -74,7 +78,7 @@
 
   type WorkspaceChatAction =
     | { type: "create_task"; title: string; description?: string }
-    | { type: "move_card"; card_id?: string; ticket?: string; title?: string; target: "todo" | "ready" | "in_progress" | "done" }
+    | { type: "move_card"; card_id?: string; ticket?: string; title?: string; target: "todo" | "queued" | "in_progress" | "done" }
     | { type: "start_agent"; card_id?: string; ticket?: string; title?: string }
     | { type: "select_card"; card_id?: string; ticket?: string; title?: string }
     | { type: "delete_card"; card_id?: string; ticket?: string; title?: string }
@@ -104,6 +108,7 @@
     workspaceMode: "board" | "term";
     workspaceShellWorkdir: string;
     workspaceChatMessages: WorkspaceChatMessage[];
+    doneVisibleLimit: number | "all";
   };
 
   const defaultLayoutPrefs: LayoutPrefs = {
@@ -131,6 +136,13 @@
     message: string;
   };
 
+  type McpConnectionState = {
+    status: "connected" | "disconnected";
+    testedAt: number;
+    message: string;
+    toolCount: number;
+  };
+
   type AgentRunSession = {
     cardId: string;
     title: string;
@@ -148,6 +160,19 @@
     state: "pending" | "active" | "done" | "blocked";
   };
 
+  type BoardDisplayColumn = BoardProjection["columns"][number] & {
+    totalCardCount: number;
+    hiddenDoneCardCount: number;
+  };
+
+  type BoardIndex = {
+    cards: CardProjection[];
+    cardById: Map<string, CardProjection>;
+    columnById: Map<string, BoardProjection["columns"][number]>;
+    columnByIntent: Map<ColumnIntent, BoardProjection["columns"][number]>;
+    cardColumnIntentById: Map<string, ColumnIntent>;
+  };
+
   let workspace = $state<WorkspaceProjection | null>(cachedWorkspace?.workspace ?? null);
   let cacheSavedAt = $state<number | null>(cachedWorkspace?.savedAt ?? null);
   let error = $state<string | null>(null);
@@ -161,6 +186,7 @@
   let connectionMessage = $state<string | null>(null);
   let workerStatus = $state<AiWorkerStatus | null>(null);
   let agentConnectionStates = $state<Record<string, AgentConnectionState>>(loadAgentConnectionStates());
+  let mcpConnectionStates = $state<Record<string, McpConnectionState>>({});
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(
     cachedWorkspace
       ? { tone: "info", message: "Loaded saved cards instantly. Sync Jira only when you need fresh updates." }
@@ -173,6 +199,7 @@
   let settings = $state<AppSettings>(initialSettings);
   let selectedServerId = $state(initialSettings.jira.serverId);
   let workspaceMode = $state<"board" | "term">(initialUiState.workspaceMode);
+  let doneVisibleLimit = $state<number | "all">(initialUiState.doneVisibleLimit);
   let now = $state(new Date());
   let selectedCardId = $state<string | null>(null);
   let draggedCardId = $state<string | null>(null);
@@ -196,11 +223,14 @@
   let workspaceTerminalResizeObserver: ResizeObserver | null = null;
   let workspaceTerminalOpened = $state(false);
   const workspaceTerminalId = "main-workspace-terminal";
-  let workspaceChatInput = $state("");
+  let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
+  let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
+  let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRunning = $state(false);
   let workspaceChatMessages = $state<WorkspaceChatMessage[]>(initialUiState.workspaceChatMessages);
   let layoutPrefs = $state<LayoutPrefs>(loadLayoutPrefs());
   let layoutResizeDrag: LayoutResizeDrag | null = null;
+  let uiStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(() => {
     const timer = window.setInterval(() => {
@@ -229,6 +259,7 @@
   });
 
   onDestroy(() => {
+    flushUiState();
     workspaceTerminalResizeObserver?.disconnect();
     workspaceTerminal?.dispose();
   });
@@ -236,23 +267,42 @@
   let activeBoard = $derived<BoardProjection | null>(
     workspace?.projects[0]?.boards[0] ?? null,
   );
-  let activeCards = $derived<CardProjection[]>(
-    activeBoard?.columns.flatMap((column) => column.cards) ?? [],
+  let displayColumns = $derived<BoardDisplayColumn[]>(
+    activeBoard?.columns.map((column) => {
+      const cards = visibleCardsForColumn(column);
+      return {
+        ...column,
+        cards,
+        totalCardCount: column.cards.length,
+        hiddenDoneCardCount: Math.max(0, column.cards.length - cards.length),
+      };
+    }) ?? [],
   );
-  let activeCardById = $derived(
-    new Map(activeCards.map((card) => [card.id, card])),
-  );
-  let activeColumnById = $derived(
-    new Map(activeBoard?.columns.map((column) => [column.id, column]) ?? []),
-  );
-  let activeColumnByIntent = $derived(
-    new Map(activeBoard?.columns.map((column) => [column.intent, column]) ?? []),
-  );
-  let cardColumnIntentById = $derived(
-    new Map(
-      activeBoard?.columns.flatMap((column) => column.cards.map((card) => [card.id, column.intent] as const)) ?? [],
-    ),
-  );
+  let boardIndex = $derived.by((): BoardIndex => {
+    const cards: CardProjection[] = [];
+    const cardById = new Map<string, CardProjection>();
+    const columnById = new Map<string, BoardProjection["columns"][number]>();
+    const columnByIntent = new Map<ColumnIntent, BoardProjection["columns"][number]>();
+    const cardColumnIntentById = new Map<string, ColumnIntent>();
+
+    for (const column of activeBoard?.columns ?? []) {
+      columnById.set(column.id, column);
+      columnByIntent.set(column.intent, column);
+
+      for (const card of column.cards) {
+        cards.push(card);
+        cardById.set(card.id, card);
+        cardColumnIntentById.set(card.id, column.intent);
+      }
+    }
+
+    return { cards, cardById, columnById, columnByIntent, cardColumnIntentById };
+  });
+  let activeCards = $derived(boardIndex.cards);
+  let activeCardById = $derived(boardIndex.cardById);
+  let activeColumnById = $derived(boardIndex.columnById);
+  let activeColumnByIntent = $derived(boardIndex.columnByIntent);
+  let cardColumnIntentById = $derived(boardIndex.cardColumnIntentById);
   let selectedCard = $derived<CardProjection | null>(
     selectedCardId ? activeCardById.get(selectedCardId) ?? null : null,
   );
@@ -355,7 +405,7 @@
 
   function loadUiState(): UiState {
     if (typeof localStorage === "undefined") {
-      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages };
+      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages, doneVisibleLimit: DEFAULT_DONE_VISIBLE_LIMIT };
     }
 
     try {
@@ -367,10 +417,17 @@
         workspaceMode: parsed.workspaceMode === "term" ? "term" : "board",
         workspaceShellWorkdir: typeof parsed.workspaceShellWorkdir === "string" ? parsed.workspaceShellWorkdir : "",
         workspaceChatMessages: messages.length > 0 ? messages : defaultWorkspaceChatMessages,
+        doneVisibleLimit: normalizeDoneVisibleLimit(parsed.doneVisibleLimit),
       };
     } catch {
-      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages };
+      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages, doneVisibleLimit: DEFAULT_DONE_VISIBLE_LIMIT };
     }
+  }
+
+  function normalizeDoneVisibleLimit(value: unknown): number | "all" {
+    if (value === "all") return "all";
+    if (value === 10 || value === 20) return value;
+    return DEFAULT_DONE_VISIBLE_LIMIT;
   }
 
   function isWorkspaceChatMessage(value: unknown): value is WorkspaceChatMessage {
@@ -382,14 +439,34 @@
   }
 
   function saveUiState() {
+    if (uiStateSaveTimer) clearTimeout(uiStateSaveTimer);
+    uiStateSaveTimer = setTimeout(() => {
+      uiStateSaveTimer = null;
+      flushUiState();
+    }, UI_STATE_WRITE_DELAY_MS);
+  }
+
+  function flushUiState() {
+    if (typeof localStorage === "undefined") return;
+    if (uiStateSaveTimer) {
+      clearTimeout(uiStateSaveTimer);
+      uiStateSaveTimer = null;
+    }
+
     localStorage.setItem(
       UI_STATE_KEY,
       JSON.stringify({
         workspaceMode,
         workspaceShellWorkdir,
         workspaceChatMessages: workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+        doneVisibleLimit,
       } satisfies UiState),
     );
+  }
+
+  function setDoneVisibleLimit(limit: number | "all") {
+    doneVisibleLimit = limit;
+    saveUiState();
   }
 
   function setWorkspaceMode(mode: "board" | "term") {
@@ -501,6 +578,29 @@
     saveAgentConnectionStates(next);
   }
 
+  function rememberMcpConnection(serverId: string, state: McpConnectionState) {
+    mcpConnectionStates = { ...mcpConnectionStates, [serverId]: state };
+  }
+
+  function mcpConnectionState(serverId: string): McpConnectionState | null {
+    return mcpConnectionStates[serverId] ?? null;
+  }
+
+  function mcpConnectionLabel(serverId: string): string {
+    const state = mcpConnectionState(serverId);
+    if (!state) return "Not tested";
+    return state.status === "connected" ? "Connected" : "Disconnected";
+  }
+
+  function mcpConnectionDetail(serverId: string): string {
+    const state = mcpConnectionState(serverId);
+    if (!state) return "Test connection to verify this MCP.";
+    if (state.status === "connected") {
+      return `${state.toolCount} tool${state.toolCount === 1 ? "" : "s"} · ${relativeTime(state.testedAt)}`;
+    }
+    return state.message;
+  }
+
   function sourceLabel(source: CardSource): string {
     if (source === "local") return "spacesly/local";
     return source.jira.key;
@@ -508,6 +608,94 @@
 
   function ticketLabel(card: CardProjection): string {
     return sourceLabel(card.source);
+  }
+
+  function completedSortValue(card: CardProjection): number {
+    return typeof card.completedAt === "number" ? card.completedAt : 0;
+  }
+
+  function visibleCardsForColumn(column: BoardProjection["columns"][number]): CardProjection[] {
+    if (column.intent !== "done") return column.cards;
+
+    const cards = [...column.cards].sort((left, right) => completedSortValue(right) - completedSortValue(left));
+    return doneVisibleLimit === "all" ? cards : cards.slice(0, doneVisibleLimit);
+  }
+
+  function withCompletionMetadata(card: CardProjection, columnIntent: ColumnIntent): CardProjection {
+    if (columnIntent === "done") return { ...card, completedAt: card.completedAt ?? Date.now(), syncMissingAt: null };
+    if (card.completedAt == null) return card;
+    return { ...card, completedAt: null, syncMissingAt: null };
+  }
+
+  function mergeSyncedWorkspace(projection: WorkspaceProjection): WorkspaceProjection {
+    const nowMs = Date.now();
+    const currentEntries = new Map<string, { card: CardProjection; intent: ColumnIntent }>();
+    const incomingIds = new Set<string>();
+
+    for (const column of activeBoard?.columns ?? []) {
+      for (const card of column.cards) {
+        currentEntries.set(card.id, { card, intent: column.intent });
+      }
+    }
+
+    for (const column of projection.projects[0]?.boards[0]?.columns ?? []) {
+      for (const card of column.cards) {
+        incomingIds.add(card.id);
+      }
+    }
+
+    const retainedCardsByIntent = new Map<ColumnIntent, CardProjection[]>();
+    const retainedIds = new Set<string>();
+
+    const retainCard = (card: CardProjection, intent: ColumnIntent) => {
+      const cards = retainedCardsByIntent.get(intent) ?? [];
+      cards.push(card);
+      retainedCardsByIntent.set(intent, cards);
+      retainedIds.add(card.id);
+    };
+
+    for (const { card, intent } of currentEntries.values()) {
+      if (card.source === "local") {
+        retainCard({ ...card, syncMissingAt: null }, intent);
+        continue;
+      }
+
+      if (intent !== "in_progress" && intent !== "done") continue;
+
+      const missingAt = incomingIds.has(card.id) ? null : card.syncMissingAt ?? nowMs;
+      if (missingAt !== null && nowMs - missingAt > SYNC_RETAIN_MISSING_CARD_MS) continue;
+
+      retainCard({ ...card, syncMissingAt: missingAt }, intent);
+    }
+
+    return {
+      ...projection,
+      projects: projection.projects.map((project) => ({
+        ...project,
+        boards: project.boards.map((board) => ({
+          ...board,
+          columns: board.columns.map((column) => {
+            const retainedForColumn = retainedCardsByIntent.get(column.intent) ?? [];
+            return {
+              ...column,
+              cards: [
+                ...column.cards
+                  .filter((card) => !retainedIds.has(card.id))
+                  .map((card) => {
+                    const current = currentEntries.get(card.id)?.card;
+                    return {
+                      ...card,
+                      completedAt: current?.completedAt ?? card.completedAt ?? null,
+                      syncMissingAt: null,
+                    };
+                  }),
+                ...retainedForColumn,
+              ],
+            };
+          }),
+        })),
+      })),
+    };
   }
 
   function descriptionParts(description: string): Array<{ text: string; url?: string }> {
@@ -644,7 +832,7 @@
 
   function agentActionLabel(card: CardProjection): string {
     if (runningWorkerCardId === card.id || card.execution === "running") return "Running";
-    if (isBlocked(card.execution)) return "↻ Retry Agent";
+    if (isBlocked(card.execution)) return operatorNotesForCard(card.id) ? "↻ Continue Agent" : "↻ Retry Agent";
     return "▷ Start";
   }
 
@@ -815,10 +1003,10 @@
   }
 
   async function sendWorkspaceChat() {
-    const message = workspaceChatInput.trim();
+    const message = workspaceChatTextarea?.value.trim() ?? "";
     if (!message || workspaceChatRunning) return;
 
-    workspaceChatInput = "";
+    if (workspaceChatTextarea) workspaceChatTextarea.value = "";
     appendWorkspaceChat({ role: "user", text: message });
 
     const localActions = fastWorkspaceChatActions(message);
@@ -876,7 +1064,7 @@
       "Cards JSON:",
       JSON.stringify(cards),
       "Allowed board actions: create_task, move_card, start_agent, select_card, delete_card, sync_jira.",
-      "If you want Spacesly to mutate the board, append a final line starting with SPACESLY_ACTIONS: followed by a JSON array of actions. Use card_id when possible. Use target todo/ready/in_progress/done for move_card.",
+      "If you want Spacesly to mutate the board, append a final line starting with SPACESLY_ACTIONS: followed by a JSON array of actions. Use card_id when possible. Use target todo/queued/in_progress/done for move_card.",
     ].join("\n");
   }
 
@@ -932,8 +1120,8 @@
     return typeof value === "string" && value.trim() ? value.trim() : undefined;
   }
 
-  function isBoardTarget(value: string): value is "todo" | "ready" | "in_progress" | "done" {
-    return value === "todo" || value === "ready" || value === "in_progress" || value === "done";
+  function isBoardTarget(value: string): value is "todo" | "queued" | "in_progress" | "done" {
+    return value === "todo" || value === "queued" || value === "in_progress" || value === "done";
   }
 
   function fastWorkspaceChatActions(message: string): WorkspaceChatAction[] {
@@ -945,7 +1133,10 @@
     const createMatch = text.match(/^(?:create|add)(?:\s+a)?\s+task\s*:?\s+(.+)$/i);
     if (createMatch?.[1]) return [{ type: "create_task", title: createMatch[1].trim() }];
 
-    const moveMatch = text.match(/^move\s+(.+?)\s+to\s+(todo|ready|in[\s_-]?progress|done)$/i);
+    const queueMatch = text.match(/^queue\s+(.+)$/i);
+    if (queueMatch?.[1]) return [{ type: "move_card", ...cardReference(queueMatch[1]), target: "queued" }];
+
+    const moveMatch = text.match(/^move\s+(.+?)\s+to\s+(todo|queue|queued|in[\s_-]?progress|done)$/i);
     if (moveMatch?.[1] && moveMatch[2]) {
       return [{ type: "move_card", ...cardReference(moveMatch[1]), target: normalizeBoardTarget(moveMatch[2]) }];
     }
@@ -969,8 +1160,11 @@
     return { title: text };
   }
 
-  function normalizeBoardTarget(value: string): "todo" | "ready" | "in_progress" | "done" {
-    return value.toLowerCase().replace(/[\s-]+/g, "_") === "in_progress" ? "in_progress" : value.toLowerCase() as "todo" | "ready" | "done";
+  function normalizeBoardTarget(value: string): "todo" | "queued" | "in_progress" | "done" {
+    const normalized = value.toLowerCase().replace(/[\s-]+/g, "_");
+    if (normalized === "in_progress") return "in_progress";
+    if (normalized === "queue") return "queued";
+    return normalized as "todo" | "queued" | "done";
   }
 
   async function applyWorkspaceChatActions(actions: WorkspaceChatAction[]): Promise<string> {
@@ -1045,7 +1239,7 @@
     return null;
   }
 
-  function columnIdForChatTarget(target: "todo" | "ready" | "in_progress" | "done"): string | null {
+  function columnIdForChatTarget(target: "todo" | "queued" | "in_progress" | "done"): string | null {
     const intent: ColumnIntent = target === "todo" ? "backlog" : target;
     return activeColumnByIntent.get(intent)?.id ?? null;
   }
@@ -1126,12 +1320,12 @@
     await tick();
 
     try {
-      const projection = applyConfiguredBoardName(await syncJiraWorkspace(config));
+      const projection = mergeSyncedWorkspace(applyConfiguredBoardName(await syncJiraWorkspace(config)));
       workspace = projection;
       cacheSavedAt = Date.now();
       saveCachedWorkspace(projection);
       const syncedCards = projection.projects[0]?.boards[0]?.columns.reduce(
-        (count, column) => count + column.cards.filter((card) => card.source !== "local").length,
+        (count, column) => count + column.cards.reduce((total, card) => total + (card.source !== "local" ? 1 : 0), 0),
         0,
       ) ?? 0;
       appNotice = {
@@ -1170,8 +1364,21 @@
       connectionMessage = status.board_count > 0 || status.issue_count > 0
         ? `Jira connected. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
         : `MCP connected with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
+      rememberMcpConnection(selectedServer.id, {
+        status: "connected",
+        testedAt: Date.now(),
+        message: connectionMessage,
+        toolCount: status.tool_count,
+      });
     } catch (reason) {
-      settingsError = reason instanceof Error ? reason.message : String(reason);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      settingsError = message;
+      rememberMcpConnection(selectedServer.id, {
+        status: "disconnected",
+        testedAt: Date.now(),
+        message,
+        toolCount: 0,
+      });
     } finally {
       testingConnection = false;
     }
@@ -1197,8 +1404,21 @@
       const status = await testMcpServerConnection(serverConfig);
       discoveredTools = status.tools;
       connectionMessage = `Connected. ${status.tool_count} MCP tool${status.tool_count === 1 ? "" : "s"} available.`;
+      rememberMcpConnection(selectedServer.id, {
+        status: "connected",
+        testedAt: Date.now(),
+        message: connectionMessage,
+        toolCount: status.tool_count,
+      });
     } catch (reason) {
-      settingsError = reason instanceof Error ? reason.message : String(reason);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      settingsError = message;
+      rememberMcpConnection(selectedServer.id, {
+        status: "disconnected",
+        testedAt: Date.now(),
+        message,
+        toolCount: 0,
+      });
     } finally {
       testingConnection = false;
     }
@@ -1347,12 +1567,15 @@
   }
 
   function persistSettings() {
-    if (selectedServer?.kind === "jira" && !settings.jira.toolName.trim()) {
+    const nextSettings = settingsWithInstructionDrafts();
+    settings = nextSettings;
+
+    if (selectedServer?.kind === "jira" && !nextSettings.jira.toolName.trim()) {
       settingsError = "Jira tool name is required.";
       return;
     }
 
-    saveSettings(settings);
+    saveSettings(nextSettings);
     settingsOpen = false;
     settingsError = null;
     syncError = null;
@@ -1374,50 +1597,83 @@
     };
   }
 
-  function moveCard(cardId: string, targetColumnId: string) {
+  function settingsWithInstructionDrafts(): AppSettings {
+    const agentRules = agentRulesTextarea?.value;
+    const agentSkills = agentSkillsTextarea?.value;
+
+    if (agentRules === undefined && agentSkills === undefined) return settings;
+
+    return {
+      ...settings,
+      aiWorker: {
+        ...settings.aiWorker,
+        agentRules: agentRules ?? settings.aiWorker.agentRules,
+        agentSkills: agentSkills ?? settings.aiWorker.agentSkills,
+      },
+    };
+  }
+
+  function commitInstructionDrafts() {
+    settings = settingsWithInstructionDrafts();
+  }
+
+  function commitAgentRulesDraft() {
+    if (!agentRulesTextarea) return;
+    settings = {
+      ...settings,
+      aiWorker: { ...settings.aiWorker, agentRules: agentRulesTextarea.value },
+    };
+  }
+
+  function commitAgentSkillsDraft() {
+    if (!agentSkillsTextarea) return;
+    settings = {
+      ...settings,
+      aiWorker: { ...settings.aiWorker, agentSkills: agentSkillsTextarea.value },
+    };
+  }
+
+  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState) {
     if (!workspace) return;
 
-    let movedCard: CardProjection | null = null;
-    const nextWorkspace = {
+    const movedCard = activeCardById.get(cardId);
+    if (!movedCard) return;
+
+    const targetColumn = activeColumnById.get(targetColumnId);
+    if (!targetColumn) return;
+
+    const targetIntent = targetColumn.intent;
+    const cardForTarget = {
+      ...(targetIntent ? withCompletionMetadata(movedCard, targetIntent) : movedCard),
+      ...(execution !== undefined ? { execution } : {}),
+    };
+
+    workspace = {
       ...workspace,
       projects: workspace.projects.map((project) => ({
         ...project,
         boards: project.boards.map((board) => ({
           ...board,
           columns: board.columns.map((column) => {
-            const cards = column.cards.filter((card) => {
-              if (card.id === cardId) {
-                movedCard = card;
-                return false;
-              }
-              return true;
-            });
-
-            return { ...column, cards };
+            const cards = column.cards.filter((card) => card.id !== cardId);
+            return column.id === targetColumnId
+              ? { ...column, cards: [...cards, cardForTarget] }
+              : { ...column, cards };
           }),
-        })),
-      })),
-    };
-
-    if (!movedCard) return;
-
-    workspace = {
-      ...nextWorkspace,
-      projects: nextWorkspace.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) =>
-            column.id === targetColumnId
-              ? { ...column, cards: [...column.cards, movedCard as CardProjection] }
-              : column,
-          ),
         })),
       })),
     };
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace);
     appNotice = { tone: "info", message: "Card moved in Spacesly." };
+  }
+
+  function executionForColumn(columnId: string): ExecutionState | null {
+    const intent = activeColumnById.get(columnId)?.intent;
+    if (intent === "backlog") return "idle";
+    if (intent === "queued") return "queued";
+    if (intent === "in_progress") return "running";
+    return null;
   }
 
   function removeCard(cardId: string): boolean {
@@ -1502,25 +1758,28 @@
     newTaskTitle = "";
     newTaskDescription = "";
     newTaskOpen = false;
-    appNotice = { tone: "success", message: "Task created. Click Start or drag it to Ready when you want the Agent to run it." };
+    appNotice = { tone: "success", message: "Task created. Queue it or click Start when you want the Agent to run it." };
   }
 
-  function beginAgentRun(card: CardProjection) {
+  function beginAgentRun(card: CardProjection, continuation = false) {
+    const previousSession = agentRunSessions[card.id];
     agentConsoleOpen = true;
     agentRunCardId = card.id;
     agentRunTitle = card.title;
     agentRunStatus = "running";
-    agentRunProgress = 5;
-    agentRunOutput = "Waiting for Agent output...";
-    agentRunLogs = [];
-    agentTerminalLines = [
-      {
-        id: `term-${Date.now().toString(36)}`,
-        prompt: "system",
-        text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
-      },
-    ];
-    appendAgentLog("info", "start", `Agent run started for ${ticketLabel(card)}.`);
+    agentRunProgress = continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5;
+    agentRunOutput = continuation && previousSession?.output ? previousSession.output : "Waiting for Agent output...";
+    agentRunLogs = continuation && previousSession ? previousSession.logs : [];
+    agentTerminalLines = continuation && previousSession
+      ? previousSession.terminalLines
+      : [
+          {
+            id: `term-${Date.now().toString(36)}`,
+            prompt: "system",
+            text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+          },
+        ];
+    appendAgentLog("info", continuation ? "continue" : "start", continuation ? `Agent continuation started for ${ticketLabel(card)}.` : `Agent run started for ${ticketLabel(card)}.`);
   }
 
   function activeAgentSession(): AgentRunSession | null {
@@ -1566,7 +1825,7 @@
   }
 
   function hasTerminalState(card: CardProjection): boolean {
-    return card.execution === "running" || (typeof card.execution === "object" && "completed" in card.execution);
+    return card.execution === "running" || typeof card.execution === "object";
   }
 
   function selectCard(card: CardProjection) {
@@ -1623,7 +1882,36 @@
 
     appendTerminalLine("operator", input);
     appendAgentLog("info", "operator", input);
+    if (agentRunStatus === "blocked" && isApprovalText(input)) {
+      appendAgentLog("success", "approval", "Operator approval recorded for this card session. Continue the Agent to finish remaining work.");
+      appNotice = { tone: "info", message: "Approval recorded. Continue the Agent on this card when ready." };
+    }
     agentTerminalInput = "";
+  }
+
+  function isApprovalText(value: string): boolean {
+    const text = value.toLowerCase();
+    return text.includes("approve") || text.includes("approved") || text.includes("approval granted");
+  }
+
+  function operatorNotesForCard(cardId: string): string | null {
+    const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
+    const notes = session?.terminalLines
+      .filter((line) => line.prompt === "operator")
+      .map((line) => line.text.trim())
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    return notes || null;
+  }
+
+  function previousOutputForCard(cardId: string): string | null {
+    const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
+    const output = session?.output?.trim();
+    return output && output !== "Waiting for Agent output..." && output !== "Agent is processing the task context..."
+      ? output
+      : null;
   }
 
   function agentJiraComment(resultSummary: string, resultBody: string): string {
@@ -1644,6 +1932,7 @@
 
   function updateCardExecution(cardId: string, execution: ExecutionState) {
     if (!workspace) return;
+    const completedAt = typeof execution === "object" && "completed" in execution ? Date.now() : null;
 
     workspace = {
       ...workspace,
@@ -1653,7 +1942,7 @@
           ...board,
           columns: board.columns.map((column) => ({
             ...column,
-            cards: column.cards.map((card) => card.id === cardId ? { ...card, execution } : card),
+            cards: column.cards.map((card) => card.id === cardId ? { ...card, execution, completedAt } : card),
           })),
         })),
       })),
@@ -1662,7 +1951,7 @@
     saveCachedWorkspace(workspace);
   }
 
-  function columnIdByIntent(intent: "ready" | "in_progress" | "done"): string | null {
+  function columnIdByIntent(intent: "queued" | "in_progress" | "done"): string | null {
     return activeColumnByIntent.get(intent)?.id ?? null;
   }
 
@@ -1678,14 +1967,14 @@
     const column = activeColumnById.get(columnId);
     if (!column) return null;
 
-    if (column.intent === "ready" || column.intent === "in_progress") return "In Progress";
+    if (column.intent === "in_progress") return "In Progress";
     if (column.intent === "done") return "Done";
     return null;
   }
 
   function shouldStartWorkerForColumn(columnId: string): boolean {
     const column = activeColumnById.get(columnId);
-    return column?.intent === "ready" || column?.intent === "in_progress";
+    return column?.intent === "in_progress";
   }
 
   async function moveCardAndSync(cardId: string, targetColumnId: string) {
@@ -1698,7 +1987,8 @@
     const issueKey = card ? jiraKey(card) : null;
     const targetStatus = jiraTargetStatus(targetColumnId);
 
-    moveCard(cardId, targetColumnId);
+    const localExecution = executionForColumn(targetColumnId);
+    moveCard(cardId, targetColumnId, localExecution ?? undefined);
 
     if (!issueKey || !targetStatus) return;
 
@@ -1735,22 +2025,27 @@
     const inProgressColumnId = columnIdByIntent("in_progress");
     const doneColumnId = columnIdByIntent("done");
     if (!inProgressColumnId || !doneColumnId) return;
+    const existingSession = agentRunSessions[cardId];
+    const isContinuation = existingSession?.status === "blocked";
+    const operatorNotes = operatorNotesForCard(cardId);
+    const previousOutput = previousOutputForCard(cardId);
 
     runningWorkerCardId = cardId;
-    beginAgentRun(card);
+    beginAgentRun(card, isContinuation);
     const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : selectedAiModel.label;
-    appNotice = { tone: "info", message: `Agent started ${ticketLabel(card)} with ${runtimeLabel}.` };
+    appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
 
     try {
       if (cardColumnIntent(cardId) !== "in_progress") {
         appendAgentLog("info", "board", "Moved card to In Progress locally.");
-        moveCard(cardId, inProgressColumnId);
+        moveCard(cardId, inProgressColumnId, "running");
+      } else {
+        updateCardExecution(cardId, "running");
       }
-      updateCardExecution(cardId, "running");
       setAgentProgress(15);
       appendAgentLog("info", "model", config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${selectedAiProvider.label} / ${selectedAiModel.label}.`);
 
-      if (issueKey) {
+      if (issueKey && !isContinuation) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
           appendAgentLog("info", "jira", `Assigning ${issueKey} and moving Jira to In Progress.`);
@@ -1764,6 +2059,10 @@
         appendAgentLog("info", "local", "Local Spacesly task. Jira sync is not required.");
         setAgentProgress(35);
       }
+      if (issueKey && isContinuation) {
+        appendAgentLog("info", "jira", `${issueKey} is already in execution. Skipping duplicate Jira In Progress transition.`);
+        setAgentProgress(35);
+      }
 
       appendAgentLog("info", "agent", "Sending task context to Agent.");
       setAgentRunOutput("Agent is processing the task context...");
@@ -1774,6 +2073,8 @@
         description: card.description,
         labels: card.labels,
         url: card.url,
+        operator_notes: operatorNotes,
+        previous_output: previousOutput,
       });
       appendAgentLog(result.completion_status === "completed" ? "success" : "error", "agent", result.summary);
       setAgentRunOutput(result.raw_response);
@@ -1789,9 +2090,8 @@
         return;
       }
 
-      updateCardExecution(cardId, { completed: { summary: result.summary } });
       appendAgentLog("info", "board", "Stored Agent summary on card and moved card to Done locally.");
-      moveCard(cardId, doneColumnId);
+      moveCard(cardId, doneColumnId, { completed: { summary: result.summary } });
       setAgentProgress(82);
 
       if (issueKey) {
@@ -1916,6 +2216,11 @@
                 >
                   <strong>{server.name || "Unnamed MCP"}</strong>
                   <span>{server.kind.toUpperCase()} · {server.command || "No command configured"}</span>
+                  <small class={`mcp-status ${mcpConnectionState(server.id)?.status ?? "unknown"}`}>
+                    <i></i>
+                    {mcpConnectionLabel(server.id)}
+                  </small>
+                  <em>{mcpConnectionDetail(server.id)}</em>
                 </button>
               {/each}
               <button class="add-server" type="button" onclick={addMcpServer}>＋ Add MCP</button>
@@ -2081,20 +2386,33 @@
                           }}
                         />
                       </label>
-                      <label>
+                    </div>
+                    <div class="opencode-model-picker" aria-label="OpenCode model">
+                      <div class="opencode-model-header">
                         <span>OpenCode model</span>
-                        <input
-                          placeholder="openai/gpt-5.5"
-                          value={settings.aiWorker.opencodeModel}
-                          oninput={(event) => {
-                            settings = {
-                              ...settings,
-                              aiWorker: { ...settings.aiWorker, opencodeModel: event.currentTarget.value },
-                            };
-                            workerStatus = null;
-                          }}
-                        />
-                      </label>
+                        <strong>{settings.aiWorker.opencodeModel}</strong>
+                      </div>
+                      <div class="opencode-model-grid">
+                        {#each opencodeModelOptions as model (model.id)}
+                          <button
+                            class:active={settings.aiWorker.opencodeModel === model.id}
+                            type="button"
+                            onclick={() => {
+                              settings = {
+                                ...settings,
+                                aiWorker: { ...settings.aiWorker, opencodeModel: model.id },
+                              };
+                              workerStatus = null;
+                            }}
+                          >
+                            <span class={`model-badge ${model.badge.toLowerCase()}`}>{model.badge}</span>
+                            <strong>{model.label}</strong>
+                            <small>{model.provider}</small>
+                            <em>{model.description}</em>
+                            <code>{model.id}</code>
+                          </button>
+                        {/each}
+                      </div>
                     </div>
                     <label>
                       <span>Working directory</span>
@@ -2161,17 +2479,13 @@
                     <label class="guidance-editor">
                       <span>Operating rules</span>
                       <textarea
+                        bind:this={agentRulesTextarea}
                         class="agent-instruction-field"
                         rows="10"
                         spellcheck="false"
                         placeholder="Never mark a task done unless it was actually executed and verified.&#10;Do not touch secrets unless explicitly requested.&#10;Block instead of guessing when tools or access are missing."
                         value={settings.aiWorker.agentRules}
-                        oninput={(event) => {
-                          settings = {
-                            ...settings,
-                            aiWorker: { ...settings.aiWorker, agentRules: event.currentTarget.value },
-                          };
-                        }}
+                        onblur={commitAgentRulesDraft}
                       ></textarea>
                     </label>
 
@@ -2208,17 +2522,13 @@
                     <label class="guidance-editor">
                       <span>Reusable skills</span>
                       <textarea
+                        bind:this={agentSkillsTextarea}
                         class="agent-instruction-field"
                         rows="12"
                         spellcheck="false"
                         placeholder="Skill: Bamboo diagnostics&#10;Check latest build status, fetch logs, identify failing job, summarize evidence.&#10;&#10;Skill: OCP troubleshooting&#10;Check pod status, recent events, logs, and resource usage before guessing."
                         value={settings.aiWorker.agentSkills}
-                        oninput={(event) => {
-                          settings = {
-                            ...settings,
-                            aiWorker: { ...settings.aiWorker, agentSkills: event.currentTarget.value },
-                          };
-                        }}
+                        onblur={commitAgentSkillsDraft}
                       ></textarea>
                     </label>
                   </div>
@@ -2633,7 +2943,7 @@
             </div>
           </div>
         <div class="board" style={`--lane-width: ${layoutPrefs.laneWidth}px;`}>
-          {#each activeBoard.columns as column (column.id)}
+          {#each displayColumns as column (column.id)}
             <section
               class="lane"
               class:drop-target={draggedCardId !== null}
@@ -2650,9 +2960,15 @@
                 <div>
                   <span class="caret">⌄</span>
                   <h2>{columnTitle(column.name)}</h2>
-                  <span class="count">{column.cards.length}</span>
+                  <span class="count">{column.intent === "done" && column.hiddenDoneCardCount > 0 ? `${column.cards.length}/${column.totalCardCount}` : column.totalCardCount}</span>
                 </div>
-                {#if column.intent === "done"}<button type="button">•••</button>{/if}
+                {#if column.intent === "done"}
+                  <div class="done-controls" aria-label="Done card visibility">
+                    <button class:active={doneVisibleLimit === 10} type="button" onclick={() => setDoneVisibleLimit(10)}>10</button>
+                    <button class:active={doneVisibleLimit === 20} type="button" onclick={() => setDoneVisibleLimit(20)}>20</button>
+                    <button class:active={doneVisibleLimit === "all"} type="button" onclick={() => setDoneVisibleLimit("all")}>All</button>
+                  </div>
+                {/if}
               </header>
 
               <div class="lane-cards">
@@ -2665,7 +2981,7 @@
                     executionLabel={executionLabel(card.execution)}
                     ticketLabel={ticketLabel(card)}
                     isBlocked={isBlocked(card.execution)}
-                    showActions={column.intent === "backlog" || column.intent === "ready" || isBlocked(card.execution)}
+                    showActions={column.intent === "backlog" || column.intent === "queued" || isBlocked(card.execution)}
                     showDelete={column.intent === "backlog"}
                     minHeight={layoutPrefs.cardMinHeight}
                     onSelect={() => selectCard(card)}
@@ -2680,6 +2996,12 @@
                 {:else}
                   <div class="empty-card">Drop completed work here</div>
                 {/each}
+                {#if column.hiddenDoneCardCount > 0}
+                  <div class="done-hidden-card">
+                    Showing latest {column.cards.length}. {column.hiddenDoneCardCount} older completed card{column.hiddenDoneCardCount === 1 ? "" : "s"} kept in history.
+                    <button type="button" onclick={() => setDoneVisibleLimit("all")}>Show all</button>
+                  </div>
+                {/if}
               </div>
 
               {#if column.intent === "backlog"}
@@ -2954,10 +3276,9 @@
                 }}
               >
                 <textarea
-                  placeholder="Ask about work, or say: create a task, move ABC-123 to ready, start agent on this card, sync Jira..."
-                  value={workspaceChatInput}
+                  bind:this={workspaceChatTextarea}
+                  placeholder="Ask about work, or say: create a task, queue ABC-123, move ABC-123 to in progress, start agent on this card, sync Jira..."
                   disabled={workspaceChatRunning}
-                  oninput={(event) => (workspaceChatInput = event.currentTarget.value)}
                 ></textarea>
                 <button type="submit" disabled={workspaceChatRunning}>{workspaceChatRunning ? "Thinking" : "Send"}</button>
               </form>

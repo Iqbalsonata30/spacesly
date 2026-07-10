@@ -616,6 +616,53 @@
     white-space: nowrap;
   }
 
+  .server-list small,
+  .server-list em {
+    min-width: 0;
+  }
+
+  .server-list small {
+    display: inline-flex;
+    width: fit-content;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid #34313d;
+    border-radius: 999px;
+    padding: 4px 8px;
+    color: #8f88a8;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .server-list small i {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: currentColor;
+  }
+
+  .server-list small.connected {
+    border-color: rgba(131, 173, 112, 0.34);
+    color: #b9d6aa;
+  }
+
+  .server-list small.disconnected {
+    border-color: rgba(240, 176, 170, 0.34);
+    color: #f0b0aa;
+  }
+
+  .server-list em {
+    overflow: hidden;
+    color: #6f687e;
+    font-size: 11px;
+    font-style: normal;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .server-list .add-server {
     margin-top: auto;
     border-color: #52606a;
@@ -957,6 +1004,143 @@
     white-space: nowrap;
   }
 
+  .opencode-model-picker {
+    display: grid;
+    gap: 10px;
+    border: 1px solid rgba(184, 214, 228, 0.16);
+    border-radius: 14px;
+    padding: 12px;
+    background:
+      radial-gradient(circle at top right, rgba(184, 214, 228, 0.08), transparent 34%),
+      rgba(9, 9, 13, 0.42);
+  }
+
+  .opencode-model-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .opencode-model-header span {
+    color: #8f88a8;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .opencode-model-header strong {
+    overflow: hidden;
+    color: #b8d6e4;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .opencode-model-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .opencode-model-grid button {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 5px 10px;
+    align-items: start;
+    border: 1px solid #2d2a35;
+    border-radius: 12px;
+    padding: 12px;
+    background: linear-gradient(180deg, rgba(21, 20, 27, 0.96), rgba(13, 13, 19, 0.96));
+    color: #918aa4;
+    text-align: left;
+  }
+
+  .opencode-model-grid button:hover {
+    border-color: rgba(184, 214, 228, 0.34);
+    background: linear-gradient(180deg, rgba(28, 30, 38, 0.98), rgba(14, 15, 21, 0.98));
+  }
+
+  .opencode-model-grid button.active {
+    border-color: rgba(184, 214, 228, 0.72);
+    background:
+      radial-gradient(circle at top right, rgba(184, 214, 228, 0.16), transparent 38%),
+      linear-gradient(180deg, rgba(37, 42, 49, 0.98), rgba(16, 18, 24, 0.98));
+    box-shadow: 0 0 0 2px rgba(184, 214, 228, 0.08);
+  }
+
+  .opencode-model-grid strong,
+  .opencode-model-grid small,
+  .opencode-model-grid em,
+  .opencode-model-grid code {
+    min-width: 0;
+  }
+
+  .opencode-model-grid strong {
+    color: #f1edf5;
+    font-size: 14px;
+  }
+
+  .opencode-model-grid small {
+    color: #8f88a8;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .opencode-model-grid em {
+    grid-column: 1 / -1;
+    color: #aaa1c3;
+    font-size: 12px;
+    font-style: normal;
+    line-height: 1.4;
+  }
+
+  .opencode-model-grid code {
+    grid-column: 1 / -1;
+    overflow: hidden;
+    color: #756f86;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .model-badge {
+    justify-self: end;
+    border-radius: 999px;
+    padding: 4px 7px;
+    background: rgba(184, 214, 228, 0.1);
+    color: #b8d6e4;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .model-badge.free {
+    background: rgba(131, 173, 112, 0.12);
+    color: #b9d6aa;
+  }
+
+  .model-badge.gpt {
+    background: rgba(184, 214, 228, 0.12);
+    color: #b8d6e4;
+  }
+
+  .model-badge.reasoning {
+    background: rgba(190, 152, 95, 0.12);
+    color: #e1c08a;
+  }
+
+  .model-badge.fast {
+    background: rgba(145, 174, 194, 0.12);
+    color: #c5d6df;
+  }
+
   .jira-section {
     display: grid;
     gap: 14px;
@@ -1216,6 +1400,31 @@
     color: #706980;
   }
 
+  .done-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    border: 1px solid #2b2934;
+    border-radius: 999px;
+    padding: 2px;
+    background: #15141b;
+  }
+
+  .done-controls button {
+    min-width: 28px;
+    height: 24px;
+    border-radius: 999px;
+    padding: 0 7px;
+    color: #79728f;
+    font-size: 11px;
+    font-weight: 900;
+  }
+
+  .done-controls button.active {
+    background: #282631;
+    color: #b8d6e4;
+  }
+
   .lane-cards {
     display: flex;
     min-height: 0;
@@ -1308,6 +1517,30 @@
     border-radius: 8px;
     color: #5f596f;
     font-weight: 800;
+  }
+
+  .done-hidden-card {
+    display: grid;
+    gap: 10px;
+    border: 1px solid #2c2a34;
+    border-radius: 10px;
+    padding: 12px;
+    background: #15141b;
+    color: #817a96;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1.4;
+  }
+
+  .done-hidden-card button {
+    justify-self: start;
+    height: 30px;
+    padding: 0 10px;
+    border-color: #3b4a54;
+    background: #20262d;
+    color: #b8d6e4;
+    font-size: 12px;
+    font-weight: 900;
   }
 
   .lane-footer {
@@ -1417,6 +1650,11 @@
     gap: 12px;
     border-bottom: 1px solid #272530;
     padding: 12px 14px;
+  }
+
+  .agent-console header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 28px;
   }
 
   .console-progress {
@@ -1553,7 +1791,8 @@
 
   .agent-console header div:first-child {
     min-width: 0;
-    flex: 1;
+    max-width: 100%;
+    overflow: hidden;
   }
 
   .agent-console header p,
@@ -1570,9 +1809,11 @@
   }
 
   .agent-console header h3 {
+    display: block;
     overflow: hidden;
     color: #f1edf5;
     font-size: 15px;
+    min-width: 0;
     text-overflow: ellipsis;
     white-space: nowrap;
   }

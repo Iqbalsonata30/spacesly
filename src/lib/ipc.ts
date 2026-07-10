@@ -21,7 +21,7 @@ export interface BoardProjection {
   columns: ColumnProjection[];
 }
 
-export type ColumnIntent = "backlog" | "ready" | "in_progress" | "review" | "done";
+export type ColumnIntent = "backlog" | "queued" | "in_progress" | "review" | "done";
 
 export interface ColumnProjection {
   id: string;
@@ -51,6 +51,8 @@ export interface CardProjection {
   assignee: string | null;
   priority: Priority;
   execution: ExecutionState;
+  completedAt?: number | null;
+  syncMissingAt?: number | null;
 }
 
 export interface RepoInfo {
@@ -197,6 +199,8 @@ export interface AiWorkerTask {
   description: string;
   labels: string[];
   url: string | null;
+  operator_notes?: string | null;
+  previous_output?: string | null;
 }
 
 export interface AiWorkerChatRequest {
