@@ -11,10 +11,12 @@
     executionLabel,
     ticketLabel,
     isBlocked,
+    isQueued,
     showActions,
     showDelete,
     minHeight,
     onSelect,
+    onQueue,
     onStartAgent,
     onDelete,
     onDragStart,
@@ -27,10 +29,12 @@
     executionLabel: string;
     ticketLabel: string;
     isBlocked: boolean;
+    isQueued: boolean;
     showActions: boolean;
     showDelete: boolean;
     minHeight: number;
     onSelect: () => void;
+    onQueue: () => void;
     onStartAgent: () => void;
     onDelete: () => void;
     onDragStart: (event: DragEvent) => void;
@@ -56,6 +60,11 @@
   function startAgent(event: MouseEvent | KeyboardEvent): void {
     event.stopPropagation();
     if (canStartAgent) onStartAgent();
+  }
+
+  function queueTask(event: MouseEvent | KeyboardEvent): void {
+    event.stopPropagation();
+    if (!isBlocked && !isQueued) onQueue();
   }
 
   function deleteCard(event: MouseEvent | KeyboardEvent): void {
@@ -100,7 +109,21 @@
   {/if}
   {#if showActions}
     <div class="actions">
-      <span>{isBlocked ? "Blocked" : "○ Queue"}</span>
+      <span
+        class="queue"
+        class:active={isQueued}
+        class:blocked={isBlocked}
+        aria-disabled={isBlocked || isQueued}
+        role="button"
+        tabindex="0"
+        onclick={queueTask}
+        onkeydown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            queueTask(event);
+          }
+        }}
+      >{isBlocked ? "Blocked" : isQueued ? "Queued" : "Queue"}</span>
       <span
         class="start"
         class:retry={isBlocked}
@@ -115,7 +138,6 @@
           }
         }}
       >{actionLabel}</span>
-      <span class="ghost">⌕</span>
       {#if showDelete}
         <span
           class="delete"
@@ -152,6 +174,12 @@
     font: inherit;
     text-align: left;
     user-select: none;
+    transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, transform 160ms ease;
+  }
+
+  .task-card:hover {
+    border-color: #34313d;
+    background: #1d1b23;
   }
 
   .task-card:active {
@@ -190,8 +218,9 @@
   h3 {
     margin: 0;
     color: #f1edf5;
-    font-size: 21px;
+    font-size: clamp(17px, 1.35vw, 21px);
     line-height: 1.2;
+    overflow-wrap: anywhere;
   }
 
   p {
@@ -247,6 +276,7 @@
 
   .actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-top: 14px;
   }
@@ -254,6 +284,8 @@
   .actions span {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
+    min-width: 0;
     height: 36px;
     padding: 0 14px;
     border: 1px solid #34313d;
@@ -261,6 +293,26 @@
     background: #22212a;
     color: #77718a;
     font-weight: 800;
+    white-space: nowrap;
+    transition: border-color 140ms ease, background 140ms ease, color 140ms ease, opacity 140ms ease;
+  }
+
+  .actions .queue {
+    cursor: pointer;
+  }
+
+  .actions .queue.active {
+    border-color: rgba(149, 176, 130, 0.5);
+    background: rgba(52, 73, 46, 0.42);
+    color: #cce2bd;
+    cursor: default;
+  }
+
+  .actions .queue.blocked {
+    border-color: rgba(240, 176, 170, 0.32);
+    background: rgba(91, 42, 42, 0.22);
+    color: #f0b0aa;
+    cursor: default;
   }
 
   .actions .start {
@@ -281,13 +333,6 @@
     opacity: 0.55;
   }
 
-  .actions .ghost {
-    margin-left: auto;
-    border: 0;
-    background: transparent;
-    color: #5f596f;
-  }
-
   .actions .delete {
     border-color: rgba(240, 176, 170, 0.26);
     background: rgba(91, 42, 42, 0.18);
@@ -295,7 +340,19 @@
     cursor: pointer;
   }
 
-  .actions .ghost + .delete {
-    margin-left: 0;
+  @media (max-width: 520px) {
+    .task-card {
+      padding: 14px;
+    }
+
+    .actions span {
+      flex: 1 1 calc(50% - 4px);
+      padding: 0 10px;
+      font-size: 12px;
+    }
+
+    .actions .delete {
+      flex-basis: 100%;
+    }
   }
 </style>

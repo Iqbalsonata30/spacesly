@@ -7,16 +7,21 @@ export interface CachedWorkspace {
 
 const CACHE_KEY = "spacesly.workspace.cache.v1";
 const CACHE_WRITE_DELAY_MS = 250;
+const LEGACY_SEED_CARD_ID = "local-list-current-directory";
 
 let pendingCache: CachedWorkspace | null = null;
 let cacheWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let cacheWriteIdleId: number | null = null;
+let lastCacheSizeBytes = 0;
+let lastCachePayload = "";
 
 export function loadCachedWorkspace(): CachedWorkspace | null {
   if (typeof localStorage === "undefined") return null;
 
   const raw = localStorage.getItem(CACHE_KEY);
   if (!raw) return null;
+  lastCacheSizeBytes = raw.length;
+  lastCachePayload = raw;
 
   try {
     const parsed = JSON.parse(raw) as CachedWorkspace;
@@ -25,11 +30,16 @@ export function loadCachedWorkspace(): CachedWorkspace | null {
       ...project,
       boards: project.boards.map((board) => ({
         ...board,
-        columns: board.columns.map((column) =>
-          String(column.intent) === "ready"
+        columns: board.columns.map((column) => {
+          const migratedColumn = String(column.intent) === "ready"
             ? { ...column, id: column.id === "column-ready" ? "column-queued" : column.id, name: "Queued", intent: "queued" as const }
-            : column,
-        ),
+            : column;
+
+          return {
+            ...migratedColumn,
+            cards: migratedColumn.cards.filter((card) => card.id !== LEGACY_SEED_CARD_ID),
+          };
+        }),
       })),
     }));
     return parsed;
@@ -69,8 +79,18 @@ export function saveCachedWorkspace(workspace: WorkspaceProjection): void {
 export function flushCachedWorkspace(): void {
   if (typeof localStorage === "undefined" || !pendingCache) return;
 
-  localStorage.setItem(CACHE_KEY, JSON.stringify(pendingCache));
+  const payload = JSON.stringify(pendingCache);
+  if (payload !== lastCachePayload) {
+    localStorage.setItem(CACHE_KEY, payload);
+    lastCachePayload = payload;
+  }
+  lastCacheSizeBytes = payload.length;
   pendingCache = null;
+}
+
+export function cachedWorkspaceSizeBytes(): number {
+  if (typeof localStorage === "undefined") return lastCacheSizeBytes;
+  return localStorage.getItem(CACHE_KEY)?.length ?? lastCacheSizeBytes;
 }
 
 if (typeof window !== "undefined") {

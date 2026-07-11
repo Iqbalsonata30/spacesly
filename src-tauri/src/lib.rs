@@ -9,6 +9,11 @@ use infrastructure::ai_worker::{
     test_ai_worker as test_ai_worker_impl, AiWorkerChatRequest, AiWorkerConfig, AiWorkerResult,
     AiWorkerStatus, AiWorkerTask,
 };
+use infrastructure::files::{
+    list_directory as list_directory_impl, read_file_at_root as read_file_impl,
+    workspace_root_path as workspace_root_path_impl, write_file as write_file_impl, FileEntry,
+    WorkspaceRoot,
+};
 use infrastructure::jira_rest::{add_comment, assign_issue, transition_issue};
 use infrastructure::mcp::{
     fetch_jira_boards, fetch_jira_issues, test_jira_connection, test_mcp_connection, JiraBoard,
@@ -16,8 +21,13 @@ use infrastructure::mcp::{
 };
 use infrastructure::pty::{
     close_all_terminals, open_pty_terminal as open_pty_terminal_impl,
+    pty_current_directory as pty_current_directory_impl,
     resize_pty_terminal as resize_pty_terminal_impl, write_pty_terminal as write_pty_terminal_impl,
     PtyRegistry, PtyState,
+};
+use infrastructure::secrets::{
+    load_app_secrets as load_app_secrets_impl, save_app_secrets as save_app_secrets_impl,
+    AppSecrets,
 };
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
@@ -144,6 +154,72 @@ async fn chat_ai_worker(
 }
 
 #[tauri::command]
+async fn list_directory(
+    workspace_id: String,
+    relative_path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<Vec<FileEntry>, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_directory_impl(&root, workspace_id, relative_path)
+    })
+    .await
+    .map_err(|error| format!("File listing task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn read_file(
+    workspace_id: String,
+    relative_path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<String, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || read_file_impl(&root, workspace_id, relative_path))
+        .await
+        .map_err(|error| format!("File read task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn write_file(
+    workspace_id: String,
+    relative_path: String,
+    content: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<(), String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        write_file_impl(&root, workspace_id, relative_path, content)
+    })
+    .await
+    .map_err(|error| format!("File write task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn workspace_root_path(
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<String, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || workspace_root_path_impl(&root, workspace_id))
+        .await
+        .map_err(|error| format!("Workspace root task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn load_app_secrets() -> Result<AppSecrets, String> {
+    tauri::async_runtime::spawn_blocking(load_app_secrets_impl)
+        .await
+        .map_err(|error| format!("Load secrets task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_app_secrets(secrets: AppSecrets) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_app_secrets_impl(secrets))
+        .await
+        .map_err(|error| format!("Save secrets task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_shell_command_impl(request))
         .await
@@ -156,8 +232,9 @@ fn open_pty_terminal(
     workdir: Option<String>,
     on_data: Channel<Vec<u8>>,
     state: State<'_, PtyState>,
+    workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<(), String> {
-    open_pty_terminal_impl(&state, terminal_id, workdir, on_data)
+    open_pty_terminal_impl(&state, &workspace_root, terminal_id, workdir, on_data)
 }
 
 #[tauri::command]
@@ -180,6 +257,14 @@ fn resize_pty_terminal(
 }
 
 #[tauri::command]
+fn pty_current_directory(
+    terminal_id: String,
+    state: State<'_, PtyState>,
+) -> Result<Option<String>, String> {
+    pty_current_directory_impl(&state, terminal_id)
+}
+
+#[tauri::command]
 async fn complete_shell_input(
     request: ShellCompletionRequest,
 ) -> Result<ShellCompletionResult, String> {
@@ -192,8 +277,11 @@ async fn complete_shell_input(
 pub fn run() {
     let pty_state: PtyState = Arc::new(Mutex::new(PtyRegistry::new()));
     let shutdown_state = pty_state.clone();
+    let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
     tauri::Builder::default()
         .manage(pty_state)
+        .manage(workspace_root)
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_workspace,
@@ -208,11 +296,18 @@ pub fn run() {
             test_ai_worker,
             execute_ai_worker_task,
             chat_ai_worker,
+            list_directory,
+            read_file,
+            write_file,
+            workspace_root_path,
+            load_app_secrets,
+            save_app_secrets,
             run_shell_command,
             complete_shell_input,
             open_pty_terminal,
             write_pty_terminal,
-            resize_pty_terminal
+            resize_pty_terminal,
+            pty_current_directory
         ])
         .on_window_event(move |_window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {

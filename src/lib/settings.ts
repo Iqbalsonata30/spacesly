@@ -130,7 +130,23 @@ export function loadSettings(): AppSettings {
 }
 
 export function saveSettings(settings: AppSettings): void {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settingsWithoutSecrets(settings)));
+}
+
+export function settingsWithoutSecrets(settings: AppSettings): AppSettings {
+  return {
+    ...settings,
+    jira: {
+      ...settings.jira,
+      apiToken: "",
+      personalAccessToken: "",
+      password: "",
+    },
+    aiWorker: {
+      ...settings.aiWorker,
+      apiKeys: {},
+    },
+  };
 }
 
 export function createMcpServer(): McpServerSettings {

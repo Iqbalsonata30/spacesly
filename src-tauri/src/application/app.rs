@@ -125,19 +125,7 @@ fn seeded_workspace() -> Workspace {
                         id: ColumnId("column-backlog".to_string()),
                         name: "Backlog".to_string(),
                         intent: ColumnIntent::Backlog,
-                        cards: vec![Card {
-                            id: CardId("local-list-current-directory".to_string()),
-                            title: "List current directory".to_string(),
-                            source: CardSource::Local,
-                            url: None,
-                            labels: vec!["local".to_string(), "shell".to_string()],
-                            description:
-                                "Run `ls` in the current directory and report the entries found."
-                                    .to_string(),
-                            assignee: None,
-                            priority: Priority::Medium,
-                            execution: ExecutionState::Idle,
-                        }],
+                        cards: vec![],
                     },
                     Column {
                         id: ColumnId("column-queued".to_string()),
@@ -182,8 +170,7 @@ mod tests {
 
         assert_eq!(workspace.name, "Personal command center");
         assert_eq!(board.columns.len(), 4);
-        assert_eq!(board.columns[0].cards[0].title, "List current directory");
-        assert!(board.columns[1..]
+        assert!(board.columns
             .iter()
             .all(|column| column.cards.is_empty()));
     }

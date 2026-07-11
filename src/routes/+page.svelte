@@ -1,10 +1,42 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { Terminal } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import AgentOutput from "$lib/components/AgentOutput.svelte";
   import McpConnectionSettings from "$lib/components/McpConnectionSettings.svelte";
   import TaskCard from "$lib/components/TaskCard.svelte";
+  import { formatEditorText, prettierParserForPath, validateEditorSyntax } from "$lib/editorFormatting";
+  import { directoryBreadcrumbs, displayPath, fileName, normalizeAbsolutePath, parentDirectory } from "$lib/filesFeature";
+  import {
+    agentActivity,
+    agentActionLabel,
+    agentPhaseTimeline,
+    canStartAgent,
+    descriptionParts,
+    executionDetail,
+    isBlocked,
+    mergeSyncedWorkspace,
+    withCompletionMetadata,
+  } from "$lib/boardWorkflow";
+  import {
+    loadUiState,
+    serializeUiState,
+    type UiState,
+    type WorkspaceChatMessage,
+    type WorkspaceMode,
+  } from "$lib/uiState";
+  import {
+    chatTargetLabel,
+    columnTitle,
+    executionLabel,
+    extractWorkspaceActions,
+    fastWorkspaceChatActions,
+    ticketLabel,
+    workspaceAgentContext,
+    stripWorkspaceActions,
+    type WorkspaceChatAction,
+  } from "$lib/workspaceChat";
   import "@xterm/xterm/css/xterm.css";
   import "./page.css";
   import {
@@ -14,20 +46,29 @@
     executeAiWorkerTask,
     getJiraBoards,
     getWorkspace,
+    listDirectory,
+    loadAppSecrets,
     openPtyTerminal,
+    readFile,
     resizePtyTerminal,
+    saveAppSecrets,
+    setWorkspaceRoot,
     syncJiraWorkspace,
     testAiWorker,
     testMcpServerConnection,
     transitionJiraIssue,
+    writeFile,
     writePtyTerminal,
+    workspaceRootPath,
     type AiWorkerConfig,
     type AiWorkerStatus,
+    type AppSecrets,
     type BoardProjection,
     type CardProjection,
     type CardSource,
     type ColumnIntent,
     type ExecutionState,
+    type FileEntry,
     type JiraMcpConfig,
     type JiraBoard,
     type WorkspaceProjection,
@@ -37,11 +78,12 @@
     createMcpServer,
     loadSettings,
     saveSettings,
+    settingsWithoutSecrets,
     type AppSettings,
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
   import { opencodeModelOptions } from "$lib/opencodeModels";
-  import { loadCachedWorkspace, saveCachedWorkspace } from "$lib/workspaceCache";
+  import { cachedWorkspaceSizeBytes, loadCachedWorkspace, saveCachedWorkspace } from "$lib/workspaceCache";
 
   const initialSettings = loadSettings();
   const cachedWorkspace = loadCachedWorkspace();
@@ -51,8 +93,13 @@
   const MAX_WORKSPACE_CHAT_MESSAGES = 80;
   const MAX_AGENT_OUTPUT_CHARS = 32_000;
   const DEFAULT_DONE_VISIBLE_LIMIT = 20;
+  const DEFAULT_LANE_VISIBLE_LIMIT = 40;
+  const LANE_VISIBLE_INCREMENT = 40;
   const SYNC_RETAIN_MISSING_CARD_MS = 3 * 24 * 60 * 60 * 1_000;
+  const LEGACY_SEED_CARD_ID = "local-list-current-directory";
   const UI_STATE_WRITE_DELAY_MS = 200;
+  const NOTICE_AUTO_DISMISS_MS = 3_000;
+  const ERROR_NOTICE_AUTO_DISMISS_MS = 5_000;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
   const UI_STATE_KEY = "spacesly.ui.v1";
 
@@ -69,20 +116,6 @@
     prompt: string;
     text: string;
   };
-
-  type WorkspaceChatMessage = {
-    id: string;
-    role: "user" | "agent" | "system";
-    text: string;
-  };
-
-  type WorkspaceChatAction =
-    | { type: "create_task"; title: string; description?: string }
-    | { type: "move_card"; card_id?: string; ticket?: string; title?: string; target: "todo" | "queued" | "in_progress" | "done" }
-    | { type: "start_agent"; card_id?: string; ticket?: string; title?: string }
-    | { type: "select_card"; card_id?: string; ticket?: string; title?: string }
-    | { type: "delete_card"; card_id?: string; ticket?: string; title?: string }
-    | { type: "sync_jira" };
 
   type LayoutPrefs = {
     laneWidth: number;
@@ -104,11 +137,12 @@
     pointerId: number;
   };
 
-  type UiState = {
-    workspaceMode: "board" | "term";
-    workspaceShellWorkdir: string;
-    workspaceChatMessages: WorkspaceChatMessage[];
-    doneVisibleLimit: number | "all";
+  type OpenEditorFile = {
+    path: string;
+    name: string;
+    content: string;
+    savedContent: string;
+    dirty: boolean;
   };
 
   const defaultLayoutPrefs: LayoutPrefs = {
@@ -125,10 +159,19 @@
     {
       id: "chat-welcome",
       role: "system",
-      text: "Ask the Agent about terminal output or tell it to create, move, open, sync, or start work on board tasks.",
+      text: "Agent Chat is command-first. Press Enter to send, Shift+Enter for multiline. Try: queue ABC-123, start agent on ABC-123, sync Jira, or ask what changed.",
     },
   ];
-  const initialUiState = loadUiState();
+  const initialUiState = (() => {
+    const state = loadUiState(typeof localStorage === "undefined" ? undefined : localStorage, {
+      chatMessages: defaultWorkspaceChatMessages,
+    });
+
+    return {
+      ...state,
+      workspaceChatMessages: state.workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+    };
+  })();
 
   type AgentConnectionState = {
     connected: boolean;
@@ -162,6 +205,7 @@
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;
+    hiddenLaneCardCount: number;
     hiddenDoneCardCount: number;
   };
 
@@ -182,7 +226,7 @@
   let loadingBoards = $state(false);
   let connectingJira = $state(false);
   let testingWorker = $state(false);
-  let runningWorkerCardId = $state<string | null>(null);
+  let runningWorkerCardIds = $state<Record<string, true>>({});
   let connectionMessage = $state<string | null>(null);
   let workerStatus = $state<AiWorkerStatus | null>(null);
   let agentConnectionStates = $state<Record<string, AgentConnectionState>>(loadAgentConnectionStates());
@@ -192,14 +236,17 @@
       ? { tone: "info", message: "Loaded saved cards instantly. Sync Jira only when you need fresh updates." }
       : null,
   );
-  let discoveredTools = $state<string[]>([]);
+  let mcpToolsByServer = $state<Record<string, string[]>>({});
   let settingsOpen = $state(false);
   let settingsTab = $state<"agent" | "rules" | "skills" | "mcp" | "jira" | "theme">("agent");
   let settingsError = $state<string | null>(null);
   let settings = $state<AppSettings>(initialSettings);
+  let secretsHydrated = $state(false);
+  let filesStateHydrated = $state(false);
   let selectedServerId = $state(initialSettings.jira.serverId);
-  let workspaceMode = $state<"board" | "term">(initialUiState.workspaceMode);
+  let workspaceMode = $state<WorkspaceMode>(initialUiState.workspaceMode);
   let doneVisibleLimit = $state<number | "all">(initialUiState.doneVisibleLimit);
+  let laneVisibleLimits = $state<Record<string, number>>({});
   let now = $state(new Date());
   let selectedCardId = $state<string | null>(null);
   let draggedCardId = $state<string | null>(null);
@@ -224,6 +271,8 @@
   let workspaceTerminalOpened = $state(false);
   const workspaceTerminalId = "main-workspace-terminal";
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
+  let workspaceChatEnd: HTMLDivElement | null = $state(null);
+  let editorTextarea: HTMLTextAreaElement | null = $state(null);
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRunning = $state(false);
@@ -231,6 +280,22 @@
   let layoutPrefs = $state<LayoutPrefs>(loadLayoutPrefs());
   let layoutResizeDrag: LayoutResizeDrag | null = null;
   let uiStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let appNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let terminalFrameId: number | null = null;
+  let fileEntries = $state<FileEntry[]>([]);
+  let fileDirectory = $state("");
+  let fileRootLabel = $state("~");
+  let fileLoading = $state(false);
+  let fileError = $state<string | null>(null);
+  let workspaceFilesRoot = $state(initialUiState.workspaceFilesRoot);
+  let workspaceFilesDirectory = $state(initialUiState.workspaceFilesDirectory);
+  let openEditorFiles = $state<OpenEditorFile[]>([]);
+  let activeEditorPath = $state<string | null>(null);
+  let savingFilePath = $state<string | null>(null);
+  let formattingFilePath = $state<string | null>(null);
+  let editorDiagnostic = $state<string | null>(null);
+  let workspaceRoot = $state<string | null>(null);
+  let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(() => {
     const timer = window.setInterval(() => {
@@ -254,11 +319,64 @@
 
   $effect(() => {
     if (workspaceMode === "term" && workspaceTerminalContainer) {
-      void initWorkspaceTerminal();
+      if (workspaceTerminalOpened) {
+        scheduleWorkspaceTerminalActivation();
+      } else {
+        scheduleWorkspaceTerminalInit();
+      }
     }
   });
 
+  $effect(() => {
+    if (workspaceMode === "files" && workspace && fileEntries.length === 0 && !fileLoading) {
+      void refreshFileDirectory(fileDirectory);
+    }
+  });
+
+  $effect(() => {
+    if (!workspace || workspaceRoot) return;
+    workspaceRootPath(workspace.id)
+      .then((path) => {
+        if (workspaceRoot) return;
+        workspaceRoot = normalizeAbsolutePath(path);
+        fileRootLabel = displayPath(path);
+      })
+      .catch(() => {
+        workspaceRoot = null;
+      });
+  });
+
+  $effect(() => {
+    if (!workspace || filesStateHydrated) return;
+    filesStateHydrated = true;
+    void restoreFilesState();
+  });
+
+  $effect(() => {
+    if (secretsHydrated) return;
+    secretsHydrated = true;
+    void hydrateSecrets();
+  });
+
+  $effect(() => {
+    if (appNoticeTimer) {
+      clearTimeout(appNoticeTimer);
+      appNoticeTimer = null;
+    }
+
+    if (!appNotice) return;
+
+    const notice = appNotice;
+    appNoticeTimer = setTimeout(() => {
+      if (appNotice === notice) appNotice = null;
+      appNoticeTimer = null;
+    }, notice.tone === "error" ? ERROR_NOTICE_AUTO_DISMISS_MS : NOTICE_AUTO_DISMISS_MS);
+  });
+
   onDestroy(() => {
+    if (appNoticeTimer) clearTimeout(appNoticeTimer);
+    if (terminalFrameId !== null) window.cancelAnimationFrame(terminalFrameId);
+    if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
     flushUiState();
     workspaceTerminalResizeObserver?.disconnect();
     workspaceTerminal?.dispose();
@@ -274,7 +392,8 @@
         ...column,
         cards,
         totalCardCount: column.cards.length,
-        hiddenDoneCardCount: Math.max(0, column.cards.length - cards.length),
+        hiddenLaneCardCount: column.intent === "done" ? 0 : Math.max(0, column.cards.length - cards.length),
+        hiddenDoneCardCount: column.intent === "done" ? Math.max(0, column.cards.length - cards.length) : 0,
       };
     }) ?? [],
   );
@@ -299,7 +418,11 @@
     return { cards, cardById, columnById, columnByIntent, cardColumnIntentById };
   });
   let activeCards = $derived(boardIndex.cards);
+  let renderedCardCount = $derived(
+    displayColumns.reduce((count, column) => count + column.cards.length, 0),
+  );
   let activeCardById = $derived(boardIndex.cardById);
+  let activeCardIds = $derived(new Set(activeCardById.keys()));
   let activeColumnById = $derived(boardIndex.columnById);
   let activeColumnByIntent = $derived(boardIndex.columnByIntent);
   let cardColumnIntentById = $derived(boardIndex.cardColumnIntentById);
@@ -309,10 +432,24 @@
   let selectedCardAgentSession = $derived<AgentRunSession | null>(
     selectedCardId ? agentRunSessions[selectedCardId] ?? null : null,
   );
+  let activeEditorFile = $derived<OpenEditorFile | null>(
+    activeEditorPath ? openEditorFiles.find((file) => file.path === activeEditorPath) ?? null : null,
+  );
+  let activeEditorDirty = $derived(Boolean(activeEditorFile?.dirty));
+  let fileStatusLabel = $derived(
+    fileLoading
+      ? "Loading files"
+      : fileError
+        ? "File error"
+        : activeEditorFile
+          ? `${activeEditorFile.path}${activeEditorFile.dirty ? " • unsaved" : ""}`
+          : `${fileEntries.length} item${fileEntries.length === 1 ? "" : "s"}`,
+  );
   let selectedServer = $derived(
     settings.mcpServers.find((server) => server.id === selectedServerId) ??
       settings.mcpServers[0],
   );
+  let selectedMcpTools = $derived(selectedServer ? mcpToolsByServer[selectedServer.id] ?? [] : []);
   let currentDate = $derived(
     now.toLocaleDateString(undefined, {
       weekday: "short",
@@ -328,6 +465,8 @@
     }),
   );
   let cacheStatusLabel = $derived(cacheSavedAt ? `Cached ${relativeTime(cacheSavedAt)}` : "No cached board");
+  let boardResourceLabel = $derived(`${renderedCardCount}/${activeCards.length} cards rendered`);
+  let cacheSizeLabel = $derived(cacheSavedAt ? `Cache ${formatBytes(cachedWorkspaceSizeBytes())}` : "Cache empty");
   let syncBudgetLabel = $derived(
     `Fast sync: up to ${settings.jira.pageSize * settings.jira.maxPages} Jira cards (${settings.jira.pageSize}/page × ${settings.jira.maxPages} page${settings.jira.maxPages === 1 ? "" : "s"}).`,
   );
@@ -364,6 +503,7 @@
   let agentActivityDetail = $derived(agentActivityView.detail);
   let agentNextStep = $derived(agentActivityView.next);
   let agentPhases = $derived(agentPhaseTimeline(agentRunStatus, agentRunProgress));
+  let hasAgentConsoleSession = $derived(Boolean(agentRunCardId && agentRunLogs.length > 0));
   let settingsTitle = $derived(
     {
       agent: "Agent",
@@ -374,11 +514,6 @@
       theme: "Theme",
     }[settingsTab],
   );
-
-  function columnTitle(name: string): string {
-    if (name.toLowerCase() === "backlog") return "Todo";
-    return name;
-  }
 
   function relativeTime(timestamp: number): string {
     const elapsedMs = Math.max(0, now.getTime() - timestamp);
@@ -393,6 +528,12 @@
     return `${elapsedDays}d ago`;
   }
 
+  function formatBytes(bytes: number): string {
+    if (bytes < 1_024) return `${bytes} B`;
+    if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+
   function loadLayoutPrefs(): LayoutPrefs {
     if (typeof localStorage === "undefined") return { ...defaultLayoutPrefs };
     try {
@@ -403,47 +544,78 @@
     }
   }
 
-  function loadUiState(): UiState {
-    if (typeof localStorage === "undefined") {
-      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages, doneVisibleLimit: DEFAULT_DONE_VISIBLE_LIMIT };
-    }
-
-    try {
-      const parsed = JSON.parse(localStorage.getItem(UI_STATE_KEY) ?? "{}") as Partial<UiState>;
-      const messages = Array.isArray(parsed.workspaceChatMessages)
-        ? parsed.workspaceChatMessages.filter(isWorkspaceChatMessage).slice(-MAX_WORKSPACE_CHAT_MESSAGES)
-        : defaultWorkspaceChatMessages;
-      return {
-        workspaceMode: parsed.workspaceMode === "term" ? "term" : "board",
-        workspaceShellWorkdir: typeof parsed.workspaceShellWorkdir === "string" ? parsed.workspaceShellWorkdir : "",
-        workspaceChatMessages: messages.length > 0 ? messages : defaultWorkspaceChatMessages,
-        doneVisibleLimit: normalizeDoneVisibleLimit(parsed.doneVisibleLimit),
-      };
-    } catch {
-      return { workspaceMode: "board", workspaceShellWorkdir: "", workspaceChatMessages: defaultWorkspaceChatMessages, doneVisibleLimit: DEFAULT_DONE_VISIBLE_LIMIT };
-    }
-  }
-
-  function normalizeDoneVisibleLimit(value: unknown): number | "all" {
-    if (value === "all") return "all";
-    if (value === 10 || value === 20) return value;
-    return DEFAULT_DONE_VISIBLE_LIMIT;
-  }
-
-  function isWorkspaceChatMessage(value: unknown): value is WorkspaceChatMessage {
-    if (!value || typeof value !== "object") return false;
-    const candidate = value as Partial<WorkspaceChatMessage>;
-    return typeof candidate.id === "string"
-      && (candidate.role === "user" || candidate.role === "agent" || candidate.role === "system")
-      && typeof candidate.text === "string";
-  }
-
   function saveUiState() {
     if (uiStateSaveTimer) clearTimeout(uiStateSaveTimer);
     uiStateSaveTimer = setTimeout(() => {
       uiStateSaveTimer = null;
       flushUiState();
     }, UI_STATE_WRITE_DELAY_MS);
+  }
+
+  function secretsFromSettings(value: AppSettings): AppSecrets {
+    return {
+      jira_api_token: value.jira.apiToken,
+      jira_personal_access_token: value.jira.personalAccessToken,
+      jira_password: value.jira.password,
+      ai_api_keys: value.aiWorker.apiKeys,
+    };
+  }
+
+  function mergeSettingsSecrets(value: AppSettings, secrets: AppSecrets): AppSettings {
+    return {
+      ...value,
+      jira: {
+        ...value.jira,
+        apiToken: secrets.jira_api_token,
+        personalAccessToken: secrets.jira_personal_access_token,
+        password: secrets.jira_password,
+      },
+      aiWorker: {
+        ...value.aiWorker,
+        apiKeys: secrets.ai_api_keys,
+      },
+    };
+  }
+
+  function hasAnySecret(secrets: AppSecrets): boolean {
+    return Boolean(
+      secrets.jira_api_token
+        || secrets.jira_personal_access_token
+        || secrets.jira_password
+        || Object.values(secrets.ai_api_keys).some((value) => value.trim()),
+    );
+  }
+
+  async function hydrateSecrets() {
+    const localSecrets = secretsFromSettings(settings);
+    try {
+      const storedSecrets = await loadAppSecrets();
+      const mergedSecrets = hasAnySecret(localSecrets)
+        ? {
+            jira_api_token: localSecrets.jira_api_token || storedSecrets.jira_api_token,
+            jira_personal_access_token: localSecrets.jira_personal_access_token || storedSecrets.jira_personal_access_token,
+            jira_password: localSecrets.jira_password || storedSecrets.jira_password,
+            ai_api_keys: { ...storedSecrets.ai_api_keys, ...localSecrets.ai_api_keys },
+          }
+        : storedSecrets;
+
+      if (hasAnySecret(localSecrets)) {
+        await saveAppSecrets(mergedSecrets);
+        saveSettings(settingsWithoutSecrets(settings));
+      }
+
+      settings = mergeSettingsSecrets(settingsWithoutSecrets(settings), mergedSecrets);
+    } catch (reason: unknown) {
+      appNotice = {
+        tone: "error",
+        message: `Could not load secure settings: ${reason instanceof Error ? reason.message : String(reason)}`,
+      };
+    }
+  }
+
+  async function persistSettingsAndSecrets(value: AppSettings) {
+    await saveAppSecrets(secretsFromSettings(value));
+    saveSettings(value);
   }
 
   function flushUiState() {
@@ -455,11 +627,14 @@
 
     localStorage.setItem(
       UI_STATE_KEY,
-      JSON.stringify({
+      serializeUiState({
         workspaceMode,
         workspaceShellWorkdir,
         workspaceChatMessages: workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
         doneVisibleLimit,
+        workspaceFilesRoot,
+        workspaceFilesDirectory,
+        workspaceFilesActivePath: activeEditorPath,
       } satisfies UiState),
     );
   }
@@ -469,10 +644,290 @@
     saveUiState();
   }
 
-  function setWorkspaceMode(mode: "board" | "term") {
+  function setWorkspaceMode(mode: WorkspaceMode) {
+    if (workspaceMode === mode) return;
+    captureActiveEditorDraft();
     workspaceMode = mode;
     saveUiState();
-    if (mode === "term") void initWorkspaceTerminal();
+    if (mode === "term") {
+      if (workspaceTerminalOpened) {
+        scheduleWorkspaceTerminalActivation();
+      } else {
+        scheduleWorkspaceTerminalInit();
+      }
+    } else if (mode === "files") {
+      void refreshFileDirectory(fileDirectory);
+    }
+  }
+
+  async function refreshFileDirectory(relativePath = fileDirectory) {
+    if (!workspace || fileLoading) return;
+    fileLoading = true;
+    fileError = null;
+    fileDirectory = relativePath;
+    workspaceFilesDirectory = relativePath;
+    saveUiState();
+    try {
+      fileEntries = await listDirectory(workspace.id, relativePath);
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      fileLoading = false;
+    }
+  }
+
+  async function refreshWorkspaceRootLabel() {
+    if (!workspace) return;
+    const root = await workspaceRootPath(workspace.id);
+    workspaceRoot = normalizeAbsolutePath(root);
+    workspaceFilesRoot = workspaceRoot;
+    fileRootLabel = displayPath(root);
+  }
+
+  async function restoreFilesState() {
+    if (!workspace) return;
+
+    const savedRoot = normalizeAbsolutePath(initialUiState.workspaceFilesRoot);
+    if (savedRoot && savedRoot !== workspaceRoot) {
+      await setWorkspaceRoot(savedRoot);
+      workspaceRoot = savedRoot;
+      workspaceFilesRoot = savedRoot;
+      fileRootLabel = displayPath(savedRoot);
+    }
+
+    const savedDirectory = initialUiState.workspaceFilesDirectory || "";
+    const savedActivePath = initialUiState.workspaceFilesActivePath;
+    const targetDirectory = savedDirectory || (savedActivePath ? parentDirectory(savedActivePath) ?? "" : "");
+
+    if (fileDirectory !== targetDirectory) {
+      await refreshFileDirectory(targetDirectory);
+    }
+
+    if (savedActivePath) {
+      const existingFile = openEditorFiles.find((file) => file.path === savedActivePath);
+      if (existingFile) {
+        activeEditorPath = savedActivePath;
+        saveUiState();
+        return;
+      }
+
+      await openFileEntry({ name: fileName(savedActivePath), path: savedActivePath, is_dir: false, size: 0 });
+    }
+
+    saveUiState();
+  }
+
+  async function openFolderFromDialog() {
+    if (!workspace) return;
+    const selected = await openDialog({ directory: true, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    if (typeof selected !== "string") return;
+
+    await setWorkspaceRoot(selected);
+    fileDirectory = "";
+    workspaceFilesDirectory = "";
+    openEditorFiles = [];
+    activeEditorPath = null;
+    await refreshWorkspaceRootLabel();
+    await refreshFileDirectory("");
+    saveUiState();
+    appNotice = { tone: "success", message: `Opened folder ${fileRootLabel}` };
+  }
+
+  async function openFileFromDialog() {
+    if (!workspace) return;
+    const selected = await openDialog({ directory: false, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    if (typeof selected !== "string") return;
+
+    const normalized = normalizeAbsolutePath(selected);
+    const separator = normalized.lastIndexOf("/");
+    const parent = separator > 0 ? normalized.slice(0, separator) : normalized;
+    const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
+    await setWorkspaceRoot(parent);
+    fileDirectory = "";
+    workspaceFilesDirectory = "";
+    await refreshWorkspaceRootLabel();
+    await refreshFileDirectory("");
+    await openFileEntry({ name, path: name, is_dir: false, size: 0 });
+    saveUiState();
+    appNotice = { tone: "success", message: `Opened ${name}` };
+  }
+
+  function captureActiveEditorDraft() {
+    if (!activeEditorPath || !editorTextarea) return;
+    const value = editorTextarea.value;
+    openEditorFiles = openEditorFiles.map((file) =>
+      file.path === activeEditorPath ? { ...file, content: value, dirty: value !== file.savedContent } : file,
+    );
+  }
+
+  async function openFileEntry(entry: FileEntry) {
+    if (entry.is_dir) {
+      captureActiveEditorDraft();
+      await refreshFileDirectory(entry.path);
+      return;
+    }
+
+    if (!workspace) return;
+    captureActiveEditorDraft();
+    activeEditorPath = entry.path;
+    saveUiState();
+    if (openEditorFiles.some((file) => file.path === entry.path)) {
+      await tick();
+      editorTextarea?.focus();
+      return;
+    }
+
+    fileLoading = true;
+    fileError = null;
+    try {
+      const content = await readFile(workspace.id, entry.path);
+      openEditorFiles = [
+        ...openEditorFiles,
+        { path: entry.path, name: entry.name, content, savedContent: content, dirty: false },
+      ];
+      await tick();
+      editorTextarea?.focus();
+      scheduleEditorDiagnostics();
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+      activeEditorPath = openEditorFiles.at(-1)?.path ?? null;
+    } finally {
+      fileLoading = false;
+    }
+  }
+
+  function selectEditorTab(path: string) {
+    if (activeEditorPath === path) return;
+    captureActiveEditorDraft();
+    activeEditorPath = path;
+    saveUiState();
+    void tick().then(() => {
+      editorTextarea?.focus();
+      scheduleEditorDiagnostics();
+    });
+  }
+
+  function closeEditorTab(path: string) {
+    captureActiveEditorDraft();
+    const index = openEditorFiles.findIndex((file) => file.path === path);
+    openEditorFiles = openEditorFiles.filter((file) => file.path !== path);
+    if (activeEditorPath === path) {
+      activeEditorPath = openEditorFiles[Math.max(0, index - 1)]?.path ?? openEditorFiles[0]?.path ?? null;
+    }
+    saveUiState();
+  }
+
+  function markActiveEditorDirty() {
+    if (!activeEditorPath || !editorTextarea) return;
+    const value = editorTextarea.value;
+    openEditorFiles = openEditorFiles.map((file) =>
+      file.path === activeEditorPath ? { ...file, dirty: value !== file.savedContent } : file,
+    );
+    scheduleEditorDiagnostics();
+  }
+
+  async function saveActiveFile() {
+    if (!workspace || !activeEditorPath || !editorTextarea) return;
+    const content = editorTextarea.value;
+    savingFilePath = activeEditorPath;
+    fileError = null;
+    try {
+      await writeFile(workspace.id, activeEditorPath, content);
+      openEditorFiles = openEditorFiles.map((file) =>
+        file.path === activeEditorPath ? { ...file, content, savedContent: content, dirty: false } : file,
+      );
+      appNotice = { tone: "success", message: `Saved ${activeEditorPath}` };
+      await validateActiveEditorSyntax();
+      void refreshFileDirectory(fileDirectory);
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      savingFilePath = null;
+    }
+  }
+
+  async function formatActiveFile() {
+    if (!activeEditorPath || !editorTextarea) return;
+    const parser = prettierParserForPath(activeEditorPath);
+    if (!parser) {
+      fileError = `No Prettier parser configured for ${activeEditorPath}.`;
+      return;
+    }
+
+    formattingFilePath = activeEditorPath;
+    fileError = null;
+    try {
+      const formatted = await formatEditorText(activeEditorPath, editorTextarea.value);
+      editorTextarea.value = formatted;
+      markActiveEditorDirty();
+      await validateActiveEditorSyntax();
+      appNotice = { tone: "success", message: `Formatted ${activeEditorPath}` };
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      formattingFilePath = null;
+    }
+  }
+
+  function scheduleEditorDiagnostics() {
+    if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
+    editorDiagnosticTimer = setTimeout(() => {
+      editorDiagnosticTimer = null;
+      void validateActiveEditorSyntax();
+    }, 650);
+  }
+
+  async function validateActiveEditorSyntax() {
+    if (!activeEditorPath || !editorTextarea) {
+      editorDiagnostic = null;
+      return;
+    }
+    editorDiagnostic = await validateEditorSyntax(activeEditorPath, editorTextarea.value);
+  }
+
+  function handleEditorKeydown(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      void saveActiveFile();
+    } else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      void formatActiveFile();
+    }
+  }
+
+  function scheduleWorkspaceTerminalInit() {
+    if (terminalFrameId !== null || workspaceTerminalOpened) return;
+
+    terminalFrameId = window.requestAnimationFrame(() => {
+      terminalFrameId = null;
+      void initWorkspaceTerminal();
+    });
+  }
+
+  function scheduleWorkspaceTerminalActivation() {
+    if (terminalFrameId !== null) return;
+
+    terminalFrameId = window.requestAnimationFrame(() => {
+      terminalFrameId = null;
+      if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer) return;
+      workspaceFitAddon.fit();
+      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(() => {});
+      workspaceTerminal.focus();
+    });
+  }
+
+  function openSettings(tab?: typeof settingsTab) {
+    if (tab) settingsTab = tab;
+    settingsOpen = true;
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+  }
+
+  function switchSettingsTab(tab: typeof settingsTab) {
+    if (settingsTab === tab) return;
+    settingsTab = tab;
   }
 
   function normalizeLayoutPrefs(value: Partial<LayoutPrefs>): LayoutPrefs {
@@ -582,6 +1037,10 @@
     mcpConnectionStates = { ...mcpConnectionStates, [serverId]: state };
   }
 
+  function rememberMcpTools(serverId: string, tools: string[]) {
+    mcpToolsByServer = { ...mcpToolsByServer, [serverId]: tools };
+  }
+
   function mcpConnectionState(serverId: string): McpConnectionState | null {
     return mcpConnectionStates[serverId] ?? null;
   }
@@ -601,13 +1060,12 @@
     return state.message;
   }
 
-  function sourceLabel(source: CardSource): string {
-    if (source === "local") return "spacesly/local";
-    return source.jira.key;
-  }
-
-  function ticketLabel(card: CardProjection): string {
-    return sourceLabel(card.source);
+  function dismissAppNotice() {
+    if (appNoticeTimer) {
+      clearTimeout(appNoticeTimer);
+      appNoticeTimer = null;
+    }
+    appNotice = null;
   }
 
   function completedSortValue(card: CardProjection): number {
@@ -615,225 +1073,27 @@
   }
 
   function visibleCardsForColumn(column: BoardProjection["columns"][number]): CardProjection[] {
-    if (column.intent !== "done") return column.cards;
+    if (column.intent !== "done") {
+      const limit = laneVisibleLimits[column.id] ?? DEFAULT_LANE_VISIBLE_LIMIT;
+      return column.cards.slice(0, limit);
+    }
 
     const cards = [...column.cards].sort((left, right) => completedSortValue(right) - completedSortValue(left));
     return doneVisibleLimit === "all" ? cards : cards.slice(0, doneVisibleLimit);
   }
 
-  function withCompletionMetadata(card: CardProjection, columnIntent: ColumnIntent): CardProjection {
-    if (columnIntent === "done") return { ...card, completedAt: card.completedAt ?? Date.now(), syncMissingAt: null };
-    if (card.completedAt == null) return card;
-    return { ...card, completedAt: null, syncMissingAt: null };
-  }
-
-  function mergeSyncedWorkspace(projection: WorkspaceProjection): WorkspaceProjection {
-    const nowMs = Date.now();
-    const currentEntries = new Map<string, { card: CardProjection; intent: ColumnIntent }>();
-    const incomingIds = new Set<string>();
-
-    for (const column of activeBoard?.columns ?? []) {
-      for (const card of column.cards) {
-        currentEntries.set(card.id, { card, intent: column.intent });
-      }
-    }
-
-    for (const column of projection.projects[0]?.boards[0]?.columns ?? []) {
-      for (const card of column.cards) {
-        incomingIds.add(card.id);
-      }
-    }
-
-    const retainedCardsByIntent = new Map<ColumnIntent, CardProjection[]>();
-    const retainedIds = new Set<string>();
-
-    const retainCard = (card: CardProjection, intent: ColumnIntent) => {
-      const cards = retainedCardsByIntent.get(intent) ?? [];
-      cards.push(card);
-      retainedCardsByIntent.set(intent, cards);
-      retainedIds.add(card.id);
-    };
-
-    for (const { card, intent } of currentEntries.values()) {
-      if (card.source === "local") {
-        retainCard({ ...card, syncMissingAt: null }, intent);
-        continue;
-      }
-
-      if (intent !== "in_progress" && intent !== "done") continue;
-
-      const missingAt = incomingIds.has(card.id) ? null : card.syncMissingAt ?? nowMs;
-      if (missingAt !== null && nowMs - missingAt > SYNC_RETAIN_MISSING_CARD_MS) continue;
-
-      retainCard({ ...card, syncMissingAt: missingAt }, intent);
-    }
-
-    return {
-      ...projection,
-      projects: projection.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) => {
-            const retainedForColumn = retainedCardsByIntent.get(column.intent) ?? [];
-            return {
-              ...column,
-              cards: [
-                ...column.cards
-                  .filter((card) => !retainedIds.has(card.id))
-                  .map((card) => {
-                    const current = currentEntries.get(card.id)?.card;
-                    return {
-                      ...card,
-                      completedAt: current?.completedAt ?? card.completedAt ?? null,
-                      syncMissingAt: null,
-                    };
-                  }),
-                ...retainedForColumn,
-              ],
-            };
-          }),
-        })),
-      })),
+  function showMoreLaneCards(column: BoardDisplayColumn) {
+    laneVisibleLimits = {
+      ...laneVisibleLimits,
+      [column.id]: Math.min(column.totalCardCount, (laneVisibleLimits[column.id] ?? DEFAULT_LANE_VISIBLE_LIMIT) + LANE_VISIBLE_INCREMENT),
     };
   }
 
-  function descriptionParts(description: string): Array<{ text: string; url?: string }> {
-    const urlPattern = /https?:\/\/[^\s<>"]+/g;
-    const parts: Array<{ text: string; url?: string }> = [];
-    let lastIndex = 0;
-
-    for (const match of description.matchAll(urlPattern)) {
-      const index = match.index ?? 0;
-      if (index > lastIndex) {
-        parts.push({ text: description.slice(lastIndex, index) });
-      }
-
-      const url = match[0].replace(/[),.;]+$/, "");
-      const trailing = match[0].slice(url.length);
-      parts.push({ text: url, url });
-      if (trailing) parts.push({ text: trailing });
-      lastIndex = index + match[0].length;
-    }
-
-    if (lastIndex < description.length) {
-      parts.push({ text: description.slice(lastIndex) });
-    }
-
-    return parts.length > 0 ? parts : [{ text: description }];
-  }
-
-  function executionLabel(execution: ExecutionState): string {
-    if (typeof execution === "string") return execution.replace("_", " ");
-    if ("blocked" in execution) return "blocked";
-    return "merged";
-  }
-
-  function executionDetail(execution: ExecutionState): string {
-    if (typeof execution === "string") return execution.replace("_", " ");
-    if ("blocked" in execution) return execution.blocked.reason;
-    return execution.completed.summary;
-  }
-
-  function agentActivity(
-    status: AgentRunSession["status"],
-    progress: number,
-    log: AgentRunLog | null,
-  ): { title: string; detail: string; next: string } {
-    if (status === "blocked") {
-      return {
-        title: "Blocked",
-        detail: log?.message ?? "Agent stopped because it needs attention.",
-        next: "Review the blocker, then retry the Agent when ready.",
-      };
-    }
-
-    if (status === "completed") {
-      return {
-        title: "Completed and verified",
-        detail: log?.message ?? "Agent finished the task and stored the result.",
-        next: "Review the result or open the card for details.",
-      };
-    }
-
-    if (progress < 15) {
-      return {
-        title: "Preparing workspace task",
-        detail: log?.message ?? "Opening execution session and reading card context.",
-        next: "Move the card into execution state.",
-      };
-    }
-
-    if (progress < 35) {
-      return {
-        title: "Syncing Jira execution state",
-        detail: log?.message ?? "Assigning the issue and moving Jira to In Progress when available.",
-        next: "Send the task context to the Agent runtime.",
-      };
-    }
-
-    if (progress < 75) {
-      return {
-        title: "Agent is working",
-        detail: log?.message ?? "The selected runtime is processing the task and preparing output.",
-        next: "Wait for completion evidence or a blocker.",
-      };
-    }
-
-    if (progress < 94) {
-      return {
-        title: "Recording result",
-        detail: log?.message ?? "Spacesly is saving the Agent result and preparing Jira write-back.",
-        next: "Post summary/comment and transition Jira if configured.",
-      };
-    }
-
-    return {
-      title: "Finalizing",
-      detail: log?.message ?? "Spacesly is finishing local and Jira state updates.",
-      next: "Mark the run completed after final verification.",
+  function showAllLaneCards(column: BoardDisplayColumn) {
+    laneVisibleLimits = {
+      ...laneVisibleLimits,
+      [column.id]: column.totalCardCount,
     };
-  }
-
-  function agentPhaseTimeline(status: AgentRunSession["status"], progress: number): AgentPhase[] {
-    const phases: Array<Omit<AgentPhase, "state"> & { threshold: number }> = [
-      { key: "prepare", label: "Prepare", threshold: 5 },
-      { key: "jira", label: "Jira", threshold: 25 },
-      { key: "model", label: "Runtime", threshold: 35 },
-      { key: "execute", label: "Execute", threshold: 55 },
-      { key: "writeback", label: "Write-back", threshold: 82 },
-      { key: "done", label: "Done", threshold: 100 },
-    ];
-
-    return phases.map((phase, index) => {
-      const next = phases[index + 1];
-      const active = progress >= phase.threshold && (!next || progress < next.threshold);
-      return {
-        key: phase.key,
-        label: phase.label,
-        state: status === "blocked" && active
-          ? "blocked"
-          : progress >= phase.threshold && (!next || progress >= next.threshold)
-            ? "done"
-            : active
-              ? "active"
-              : "pending",
-      };
-    });
-  }
-
-  function isBlocked(execution: ExecutionState): boolean {
-    return typeof execution === "object" && "blocked" in execution;
-  }
-
-  function canStartAgent(card: CardProjection): boolean {
-    return runningWorkerCardId !== card.id && card.execution !== "running";
-  }
-
-  function agentActionLabel(card: CardProjection): string {
-    if (runningWorkerCardId === card.id || card.execution === "running") return "Running";
-    if (isBlocked(card.execution)) return operatorNotesForCard(card.id) ? "↻ Continue Agent" : "↻ Retry Agent";
-    return "▷ Start";
   }
 
   function buildJiraConfig(): JiraMcpConfig | null {
@@ -843,13 +1103,13 @@
 
     if (!settings.jira.baseUrl.trim() || !credential) {
       syncError = "Open Settings and fill Jira URL plus the selected credential before syncing.";
-      settingsOpen = true;
+      openSettings("jira");
       return null;
     }
 
     if (settings.jira.authMode !== "pat" && !settings.jira.username.trim()) {
       syncError = "Open Settings and fill the Jira email/username required by the selected auth method.";
-      settingsOpen = true;
+      openSettings("jira");
       return null;
     }
 
@@ -889,34 +1149,37 @@
   }
 
   function buildAiWorkerConfig(): AiWorkerConfig | null {
-    if (settings.aiWorker.runtime === "api" && !selectedAiApiKey.trim()) {
-      settingsOpen = true;
-      settingsTab = "agent";
-      appNotice = { tone: "error", message: `Open Settings and fill ${selectedAiProvider.apiKeyLabel}.` };
+    const effectiveSettings = settingsWithInstructionDrafts();
+    const effectiveProvider = providerById(effectiveSettings.aiWorker.providerId);
+    const effectiveModel = modelById(effectiveProvider, effectiveSettings.aiWorker.modelId);
+    const effectiveApiKey = effectiveSettings.aiWorker.apiKeys[effectiveProvider.id] ?? "";
+
+    if (effectiveSettings.aiWorker.runtime === "api" && !effectiveApiKey.trim()) {
+      openSettings("agent");
+      appNotice = { tone: "error", message: `Open Settings and fill ${effectiveProvider.apiKeyLabel}.` };
       return null;
     }
 
-    if (settings.aiWorker.runtime === "opencode" && !settings.aiWorker.opencodeCommand.trim()) {
-      settingsOpen = true;
-      settingsTab = "agent";
+    if (effectiveSettings.aiWorker.runtime === "opencode" && !effectiveSettings.aiWorker.opencodeCommand.trim()) {
+      openSettings("agent");
       appNotice = { tone: "error", message: "Open Settings and fill the OpenCode command." };
       return null;
     }
 
     return {
-      runtime: settings.aiWorker.runtime,
-      provider_name: selectedAiProvider.label,
-      base_url: selectedAiProvider.baseUrl,
-      api_style: selectedAiProvider.apiStyle,
-      api_key: selectedAiApiKey,
-      model: settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.id,
-      opencode_command: settings.aiWorker.opencodeCommand,
-      opencode_model: settings.aiWorker.opencodeModel,
-      opencode_workdir: settings.aiWorker.opencodeWorkdir.trim() || null,
-      opencode_auto_approve: settings.aiWorker.opencodeAutoApprove,
-      agent_rules: settings.aiWorker.agentRules,
-      agent_skills: settings.aiWorker.agentSkills,
-      temperature: settings.aiWorker.temperature,
+      runtime: effectiveSettings.aiWorker.runtime,
+      provider_name: effectiveProvider.label,
+      base_url: effectiveProvider.baseUrl,
+      api_style: effectiveProvider.apiStyle,
+      api_key: effectiveApiKey,
+      model: effectiveSettings.aiWorker.runtime === "opencode" ? effectiveSettings.aiWorker.opencodeModel : effectiveModel.id,
+      opencode_command: effectiveSettings.aiWorker.opencodeCommand,
+      opencode_model: effectiveSettings.aiWorker.opencodeModel,
+      opencode_workdir: effectiveSettings.aiWorker.opencodeWorkdir.trim() || null,
+      opencode_auto_approve: effectiveSettings.aiWorker.opencodeAutoApprove,
+      agent_rules: effectiveSettings.aiWorker.agentRules,
+      agent_skills: effectiveSettings.aiWorker.agentSkills,
+      temperature: effectiveSettings.aiWorker.temperature,
     };
   }
 
@@ -926,6 +1189,24 @@
       { ...message, id: `chat-${Date.now().toString(36)}-${workspaceChatMessages.length}` },
     ], MAX_WORKSPACE_CHAT_MESSAGES);
     saveUiState();
+    scrollWorkspaceChatToLatest();
+  }
+
+  function scrollWorkspaceChatToLatest() {
+    void tick().then(() => {
+      workspaceChatEnd?.scrollIntoView({ block: "end" });
+    });
+  }
+
+  function focusWorkspaceChatInput() {
+    void tick().then(() => workspaceChatTextarea?.focus());
+  }
+
+  function handleWorkspaceChatKeydown(event: KeyboardEvent) {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+
+    event.preventDefault();
+    void sendWorkspaceChat();
   }
 
   function capList<T>(items: T[], maxItems: number): T[] {
@@ -934,10 +1215,6 @@
 
   function capText(value: string, maxChars: number): string {
     return value.length > maxChars ? value.slice(value.length - maxChars) : value;
-  }
-
-  function terminalContext(): string {
-    return "PTY terminal is active. Ask about visible terminal output or paste relevant output into chat when needed.";
   }
 
   async function initWorkspaceTerminal() {
@@ -1008,11 +1285,13 @@
 
     if (workspaceChatTextarea) workspaceChatTextarea.value = "";
     appendWorkspaceChat({ role: "user", text: message });
+    focusWorkspaceChatInput();
 
-    const localActions = fastWorkspaceChatActions(message);
+    const localActions = fastWorkspaceChatActions(message, activeCardIds);
     if (localActions.length > 0) {
       const actionSummary = await applyWorkspaceChatActions(localActions);
       appendWorkspaceChat({ role: "system", text: actionSummary });
+      focusWorkspaceChatInput();
       return;
     }
 
@@ -1024,7 +1303,7 @@
     try {
       const result = await chatAiWorker(config, {
         message,
-        terminal_context: workspaceAgentContext(),
+        terminal_context: workspaceAgentContext(activeBoard),
       });
       const actions = extractWorkspaceActions(result.raw_response);
       appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(result.raw_response) });
@@ -1036,135 +1315,8 @@
       appendWorkspaceChat({ role: "system", text: reason instanceof Error ? reason.message : String(reason) });
     } finally {
       workspaceChatRunning = false;
+      focusWorkspaceChatInput();
     }
-  }
-
-  function workspaceAgentContext(): string {
-    return [terminalContext(), boardContext()].filter(Boolean).join("\n\n");
-  }
-
-  function boardContext(): string {
-    if (!activeBoard) return "Board context: no active board loaded.";
-
-    const cards = activeBoard.columns.flatMap((column) =>
-      column.cards.slice(0, 20).map((card) => ({
-        id: card.id,
-        ticket: ticketLabel(card),
-        title: card.title,
-        column: columnTitle(column.name),
-        intent: column.intent,
-        execution: executionLabel(card.execution),
-        labels: card.labels.slice(0, 4),
-      })),
-    ).slice(0, 80);
-
-    return [
-      `Board context: ${activeBoard.name}`,
-      `Columns: ${activeBoard.columns.map((column) => `${column.intent}:${column.name}`).join(" | ")}`,
-      "Cards JSON:",
-      JSON.stringify(cards),
-      "Allowed board actions: create_task, move_card, start_agent, select_card, delete_card, sync_jira.",
-      "If you want Spacesly to mutate the board, append a final line starting with SPACESLY_ACTIONS: followed by a JSON array of actions. Use card_id when possible. Use target todo/queued/in_progress/done for move_card.",
-    ].join("\n");
-  }
-
-  function extractWorkspaceActions(response: string): WorkspaceChatAction[] {
-    const match = response.match(/SPACESLY_ACTIONS:\s*(\[[\s\S]*\])\s*$/i);
-    if (!match) return [];
-
-    try {
-      const parsed = JSON.parse(match[1]) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.flatMap((entry) => normalizeWorkspaceAction(entry));
-    } catch {
-      return [];
-    }
-  }
-
-  function stripWorkspaceActions(response: string): string {
-    return response.replace(/\n?SPACESLY_ACTIONS:\s*\[[\s\S]*\]\s*$/i, "").trim() || response.trim();
-  }
-
-  function normalizeWorkspaceAction(value: unknown): WorkspaceChatAction[] {
-    if (!value || typeof value !== "object") return [];
-    const action = value as Record<string, unknown>;
-    const type = typeof action.type === "string" ? action.type : "";
-
-    if (type === "create_task" && typeof action.title === "string" && action.title.trim()) {
-      return [{ type, title: action.title.trim(), description: typeof action.description === "string" ? action.description : undefined }];
-    }
-
-    if (type === "move_card" && typeof action.target === "string" && isBoardTarget(action.target)) {
-      return [{
-        type,
-        card_id: stringField(action.card_id),
-        ticket: stringField(action.ticket),
-        title: stringField(action.title),
-        target: action.target,
-      }];
-    }
-
-    if ((type === "start_agent" || type === "select_card")) {
-      return [{ type, card_id: stringField(action.card_id), ticket: stringField(action.ticket), title: stringField(action.title) }];
-    }
-
-    if (type === "delete_card") {
-      return [{ type, card_id: stringField(action.card_id), ticket: stringField(action.ticket), title: stringField(action.title) }];
-    }
-
-    if (type === "sync_jira") return [{ type }];
-    return [];
-  }
-
-  function stringField(value: unknown): string | undefined {
-    return typeof value === "string" && value.trim() ? value.trim() : undefined;
-  }
-
-  function isBoardTarget(value: string): value is "todo" | "queued" | "in_progress" | "done" {
-    return value === "todo" || value === "queued" || value === "in_progress" || value === "done";
-  }
-
-  function fastWorkspaceChatActions(message: string): WorkspaceChatAction[] {
-    const text = message.trim();
-    const lower = text.toLowerCase();
-
-    if (/^(sync|refresh)\s+jira\b/.test(lower)) return [{ type: "sync_jira" }];
-
-    const createMatch = text.match(/^(?:create|add)(?:\s+a)?\s+task\s*:?\s+(.+)$/i);
-    if (createMatch?.[1]) return [{ type: "create_task", title: createMatch[1].trim() }];
-
-    const queueMatch = text.match(/^queue\s+(.+)$/i);
-    if (queueMatch?.[1]) return [{ type: "move_card", ...cardReference(queueMatch[1]), target: "queued" }];
-
-    const moveMatch = text.match(/^move\s+(.+?)\s+to\s+(todo|queue|queued|in[\s_-]?progress|done)$/i);
-    if (moveMatch?.[1] && moveMatch[2]) {
-      return [{ type: "move_card", ...cardReference(moveMatch[1]), target: normalizeBoardTarget(moveMatch[2]) }];
-    }
-
-    const startMatch = text.match(/^start(?:\s+agent)?(?:\s+(?:on|for))?\s+(.+)$/i);
-    if (startMatch?.[1]) return [{ type: "start_agent", ...cardReference(startMatch[1]) }];
-
-    const openMatch = text.match(/^(?:open|show|select)\s+(.+)$/i);
-    if (openMatch?.[1]) return [{ type: "select_card", ...cardReference(openMatch[1]) }];
-
-    const deleteMatch = text.match(/^(?:delete|remove)\s+(.+)$/i);
-    if (deleteMatch?.[1]) return [{ type: "delete_card", ...cardReference(deleteMatch[1]) }];
-
-    return [];
-  }
-
-  function cardReference(value: string): { card_id?: string; ticket?: string; title?: string } {
-    const text = value.trim().replace(/^task\s+/i, "");
-    if (activeCardById.has(text)) return { card_id: text };
-    if (/^[A-Z][A-Z0-9]+-\d+$/i.test(text)) return { ticket: text.toUpperCase() };
-    return { title: text };
-  }
-
-  function normalizeBoardTarget(value: string): "todo" | "queued" | "in_progress" | "done" {
-    const normalized = value.toLowerCase().replace(/[\s-]+/g, "_");
-    if (normalized === "in_progress") return "in_progress";
-    if (normalized === "queue") return "queued";
-    return normalized as "todo" | "queued" | "done";
   }
 
   async function applyWorkspaceChatActions(actions: WorkspaceChatAction[]): Promise<string> {
@@ -1173,13 +1325,13 @@
     for (const action of actions.slice(0, 5)) {
       if (action.type === "create_task") {
         const card = createBoardTask(action.title, action.description ?? "Created by Spacesly Agent chat.");
-        results.push(card ? `Created task "${card.title}".` : `Could not create task "${action.title}".`);
+        results.push(card ? `Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.` : `Could not create task "${action.title}".`);
         continue;
       }
 
       if (action.type === "sync_jira") {
         await syncJira();
-        results.push("Started Jira sync.");
+        results.push("Jira sync requested. Watch the board notice for fetched card count or errors.");
         continue;
       }
 
@@ -1192,7 +1344,7 @@
       if (action.type === "select_card") {
         selectCard(card);
         setWorkspaceMode("board");
-        results.push(`Opened ${ticketLabel(card)}.`);
+        results.push(`Opened ${ticketLabel(card)}: "${card.title}". Current state: ${executionDetail(card.execution)}.`);
         continue;
       }
 
@@ -1204,7 +1356,7 @@
 
       if (action.type === "start_agent") {
         await startWorkerForCard(card.id);
-        results.push(`Started Agent for ${ticketLabel(card)}.`);
+        results.push(`Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`);
         continue;
       }
 
@@ -1215,11 +1367,11 @@
           continue;
         }
         await moveCardAndSync(card.id, columnId);
-        results.push(`Moved ${ticketLabel(card)} to ${action.target}.`);
+        results.push(`Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}. Jira write-back is attempted only for In Progress and Done.`);
       }
     }
 
-    return results.length > 0 ? `Board actions: ${results.join(" ")}` : "No board actions were applied.";
+    return results.length > 0 ? `Command result: ${results.join(" ")}` : "Command result: no board actions were applied.";
   }
 
   function resolveActionCard(action: { card_id?: string; ticket?: string; title?: string }): CardProjection | null {
@@ -1310,7 +1462,7 @@
 
     if (!config.board_id) {
       appNotice = { tone: "error", message: "Choose a Jira board first. Open Settings and click Connect Jira." };
-      settingsOpen = true;
+      openSettings("jira");
       return;
     }
 
@@ -1320,7 +1472,12 @@
     await tick();
 
     try {
-      const projection = mergeSyncedWorkspace(applyConfiguredBoardName(await syncJiraWorkspace(config)));
+      const projection = mergeSyncedWorkspace(
+        applyConfiguredBoardName(await syncJiraWorkspace(config)),
+        activeBoard?.columns,
+        LEGACY_SEED_CARD_ID,
+        SYNC_RETAIN_MISSING_CARD_MS,
+      );
       workspace = projection;
       cacheSavedAt = Date.now();
       saveCachedWorkspace(projection);
@@ -1353,6 +1510,7 @@
 
     const config = buildJiraConfig();
     if (!config) return;
+    const serverId = selectedServer.id;
 
     testingConnection = true;
     connectionMessage = null;
@@ -1360,11 +1518,11 @@
 
     try {
       const status = await testJiraMcpConnection(config);
-      discoveredTools = status.tools;
+      rememberMcpTools(serverId, status.tools);
       connectionMessage = status.board_count > 0 || status.issue_count > 0
         ? `Jira connected. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
         : `MCP connected with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
-      rememberMcpConnection(selectedServer.id, {
+      rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
         message: connectionMessage,
@@ -1373,7 +1531,8 @@
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       settingsError = message;
-      rememberMcpConnection(selectedServer.id, {
+      rememberMcpTools(serverId, []);
+      rememberMcpConnection(serverId, {
         status: "disconnected",
         testedAt: Date.now(),
         message,
@@ -1386,6 +1545,7 @@
 
   async function testSelectedMcpConnection() {
     if (!selectedServer) return;
+    const serverId = selectedServer.id;
 
     const serverConfig = selectedServer.kind === "jira"
       ? buildJiraConfig()?.server
@@ -1402,9 +1562,9 @@
 
     try {
       const status = await testMcpServerConnection(serverConfig);
-      discoveredTools = status.tools;
+      rememberMcpTools(serverId, status.tools);
       connectionMessage = `Connected. ${status.tool_count} MCP tool${status.tool_count === 1 ? "" : "s"} available.`;
-      rememberMcpConnection(selectedServer.id, {
+      rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
         message: connectionMessage,
@@ -1413,7 +1573,8 @@
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       settingsError = message;
-      rememberMcpConnection(selectedServer.id, {
+      rememberMcpTools(serverId, []);
+      rememberMcpConnection(serverId, {
         status: "disconnected",
         testedAt: Date.now(),
         message,
@@ -1487,7 +1648,7 @@
         },
       };
       settings = nextSettings;
-      saveSettings(nextSettings);
+      await persistSettingsAndSecrets(nextSettings);
       connectionMessage = `Jira connected. Selected ${selectedBoard.name}. Click Sync Jira board.`;
       appNotice = { tone: "success", message: connectionMessage };
     } catch (reason) {
@@ -1566,7 +1727,7 @@
     };
   }
 
-  function persistSettings() {
+  async function persistSettings() {
     const nextSettings = settingsWithInstructionDrafts();
     settings = nextSettings;
 
@@ -1575,8 +1736,13 @@
       return;
     }
 
-    saveSettings(nextSettings);
-    settingsOpen = false;
+    try {
+      await persistSettingsAndSecrets(nextSettings);
+    } catch (reason: unknown) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+      return;
+    }
+    closeSettings();
     settingsError = null;
     syncError = null;
   }
@@ -1763,7 +1929,6 @@
 
   function beginAgentRun(card: CardProjection, continuation = false) {
     const previousSession = agentRunSessions[card.id];
-    agentConsoleOpen = true;
     agentRunCardId = card.id;
     agentRunTitle = card.title;
     agentRunStatus = "running";
@@ -1824,15 +1989,22 @@
     agentTerminalInput = "";
   }
 
-  function hasTerminalState(card: CardProjection): boolean {
-    return card.execution === "running" || typeof card.execution === "object";
+  function openAgentConsole(card?: CardProjection | null) {
+    if (card && agentRunSessions[card.id]) {
+      openAgentRunForCard(card);
+      return;
+    }
+
+    if (hasAgentConsoleSession) {
+      agentConsoleOpen = true;
+      return;
+    }
+
+    appNotice = { tone: "info", message: "No Agent console session is available yet." };
   }
 
   function selectCard(card: CardProjection) {
     selectedCardId = card.id;
-    if (hasTerminalState(card) && agentRunSessions[card.id]) {
-      openAgentRunForCard(card);
-    }
   }
 
   function setAgentRunStatus(status: AgentRunSession["status"]) {
@@ -1914,20 +2086,34 @@
       : null;
   }
 
-  function agentJiraComment(resultSummary: string, resultBody: string): string {
-    const details = resultBody.trim().slice(0, 3500);
+  function agentJiraComment(resultSummary: string, resultBody: string, config: AiWorkerConfig): string {
+    const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
+    const model = config.runtime === "opencode" ? config.opencode_model : config.model;
+    const evidence = labelledAgentValue(resultBody, "EVIDENCE")
+      ?? labelledAgentValue(resultBody, "DETAILS")
+      ?? resultSummary;
+
     return [
-      "Spacesly Agent completed this task.",
+      "Spacesly marked this task done.",
       "",
-      `Provider: ${selectedAiProvider.label}`,
-      `Model: ${selectedAiModel.label}`,
+      `Agent: ${runtime} / ${model}`,
       "",
-      "Summary:",
-      resultSummary,
+      `Summary: ${singleLine(resultSummary, 500)}`,
       "",
-      "Details:",
-      details || resultSummary,
+      `Verification: ${singleLine(evidence, 900)}`,
     ].join("\n");
+  }
+
+  function labelledAgentValue(output: string, label: "EVIDENCE" | "DETAILS"): string | null {
+    const pattern = new RegExp(`^${label}:\\s*([\\s\\S]*?)(?=^STATUS:|^SUMMARY:|^EVIDENCE:|^DETAILS:|$)`, "im");
+    const value = output.match(pattern)?.[1]?.trim();
+    return value || null;
+  }
+
+  function singleLine(value: string, maxChars: number): string {
+    const cleaned = value.replace(/```[\s\S]*?```/g, "").replace(/\s+/g, " ").trim();
+    if (cleaned.length <= maxChars) return cleaned;
+    return `${cleaned.slice(0, maxChars - 3).trim()}...`;
   }
 
   function updateCardExecution(cardId: string, execution: ExecutionState) {
@@ -1977,6 +2163,12 @@
     return column?.intent === "in_progress";
   }
 
+  function queueCard(cardId: string) {
+    const queuedColumnId = columnIdByIntent("queued");
+    if (!queuedColumnId || cardColumnIntent(cardId) === "queued") return;
+    void moveCardAndSync(cardId, queuedColumnId);
+  }
+
   async function moveCardAndSync(cardId: string, targetColumnId: string) {
     if (shouldStartWorkerForColumn(targetColumnId)) {
       await startWorkerForCard(cardId);
@@ -2015,8 +2207,13 @@
   }
 
   async function startWorkerForCard(cardId: string) {
+    if (runningWorkerCardIds[cardId]) {
+      appNotice = { tone: "info", message: "Agent is already running this card." };
+      return;
+    }
+
     const card = activeCardById.get(cardId);
-    if (!card) return;
+    if (!card || card.execution === "running") return;
 
     const config = buildAiWorkerConfig();
     if (!config) return;
@@ -2030,9 +2227,9 @@
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
 
-    runningWorkerCardId = cardId;
+    runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
     beginAgentRun(card, isContinuation);
-    const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : selectedAiModel.label;
+    const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
     appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
 
     try {
@@ -2043,7 +2240,7 @@
         updateCardExecution(cardId, "running");
       }
       setAgentProgress(15);
-      appendAgentLog("info", "model", config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${selectedAiProvider.label} / ${selectedAiModel.label}.`);
+      appendAgentLog("info", "model", config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${config.provider_name} / ${config.model}.`);
 
       if (issueKey && !isContinuation) {
         const jiraConfig = buildJiraConfig();
@@ -2097,14 +2294,14 @@
       if (issueKey) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
-          appendAgentLog("info", "jira", `Posting Agent comment to ${issueKey}.`);
-          setAgentProgress(88);
-          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result.summary, result.raw_response));
-          appendAgentLog("success", "jira", `Agent comment posted to ${issueKey}.`);
           appendAgentLog("info", "jira", `Moving ${issueKey} to Done.`);
-          setAgentProgress(94);
+          setAgentProgress(88);
           await transitionJiraIssue(jiraConfig, issueKey, "Done");
           appendAgentLog("success", "jira", `${issueKey} is Done in Jira.`);
+          appendAgentLog("info", "jira", `Posting Spacesly completion comment to ${issueKey}.`);
+          setAgentProgress(94);
+          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result.summary, result.raw_response, config));
+          appendAgentLog("success", "jira", `Spacesly completion comment posted to ${issueKey}.`);
         }
       }
 
@@ -2120,7 +2317,8 @@
       appendAgentLog("error", "blocked", message);
       appNotice = { tone: "error", message };
     } finally {
-      runningWorkerCardId = null;
+      const { [cardId]: _finished, ...remainingRuns } = runningWorkerCardIds;
+      runningWorkerCardIds = remainingRuns;
     }
   }
 </script>
@@ -2137,11 +2335,11 @@
         <span>⌄</span>
       </div>
 
-      <button class="icon-button" type="button" aria-label="Settings" onclick={() => (settingsOpen = true)}>Settings</button>
+      <button class="icon-button" type="button" aria-label="Settings" onclick={() => openSettings()}>Settings</button>
 
       <nav class="mode-switch" aria-label="Workspace mode">
         <button class:active={workspaceMode === "board"} type="button" aria-label="Board view" onclick={() => setWorkspaceMode("board")}>Board</button>
-        <button type="button" aria-label="Files view" disabled>Files</button>
+        <button class:active={workspaceMode === "files"} type="button" aria-label="Files view" onclick={() => setWorkspaceMode("files")}>Files</button>
         <button class:active={workspaceMode === "term"} type="button" aria-label="Terminal view" onclick={openTermWorkspace}>Term</button>
       </nav>
 
@@ -2150,7 +2348,7 @@
         class="worker-pill"
         type="button"
         title={workerStatusLabel}
-        onclick={() => (settingsOpen = true)}
+        onclick={() => openSettings("agent")}
       >
         <span></span>
         {selectedAgentLabel}
@@ -2170,32 +2368,32 @@
               <p>Settings</p>
               <h2>{settingsTitle}</h2>
             </div>
-            <button type="button" onclick={() => (settingsOpen = false)}>×</button>
+            <button type="button" onclick={closeSettings}>×</button>
           </header>
 
           <div class:mcp={settingsTab === "mcp"} class="settings-grid">
             <aside class="settings-nav" aria-label="Settings navigation">
-              <button class:active={settingsTab === "agent"} type="button" onclick={() => (settingsTab = "agent")}>
+              <button class:active={settingsTab === "agent"} type="button" onclick={() => switchSettingsTab("agent")}>
                 <strong>Agent</strong>
                 <span>Model and worker runtime</span>
               </button>
-              <button class:active={settingsTab === "rules"} type="button" onclick={() => (settingsTab = "rules")}>
+              <button class:active={settingsTab === "rules"} type="button" onclick={() => switchSettingsTab("rules")}>
                 <strong>Rules</strong>
                 <span>Operating guardrails</span>
               </button>
-              <button class:active={settingsTab === "skills"} type="button" onclick={() => (settingsTab = "skills")}>
+              <button class:active={settingsTab === "skills"} type="button" onclick={() => switchSettingsTab("skills")}>
                 <strong>Skills</strong>
                 <span>Reusable playbooks</span>
               </button>
-              <button class:active={settingsTab === "mcp"} type="button" onclick={() => (settingsTab = "mcp")}>
+              <button class:active={settingsTab === "mcp"} type="button" onclick={() => switchSettingsTab("mcp")}>
                 <strong>MCP</strong>
                 <span>Tools and server connections</span>
               </button>
-              <button class:active={settingsTab === "jira"} type="button" onclick={() => (settingsTab = "jira")}>
+              <button class:active={settingsTab === "jira"} type="button" onclick={() => switchSettingsTab("jira")}>
                 <strong>Jira</strong>
                 <span>Board sync and credentials</span>
               </button>
-              <button class:active={settingsTab === "theme"} type="button" onclick={() => (settingsTab = "theme")}>
+              <button class:active={settingsTab === "theme"} type="button" onclick={() => switchSettingsTab("theme")}>
                 <strong>Theme</strong>
                 <span>Appearance preferences</span>
               </button>
@@ -2841,11 +3039,11 @@
                   <p class="settings-success">{connectionMessage}</p>
                 {/if}
 
-                {#if settingsTab === "mcp" && discoveredTools.length > 0}
+                {#if settingsTab === "mcp" && selectedMcpTools.length > 0}
                   <details class="tool-list">
-                    <summary>Available MCP tools ({discoveredTools.length})</summary>
+                    <summary>Available MCP tools ({selectedMcpTools.length})</summary>
                     <div>
-                      {#each discoveredTools as tool}
+                      {#each selectedMcpTools as tool}
                         <code>{tool}</code>
                       {/each}
                     </div>
@@ -2893,7 +3091,7 @@
         {#if appNotice}
           <div class={`app-notice ${appNotice.tone}`} role="status">
             <span>{appNotice.message}</span>
-            <button type="button" aria-label="Dismiss notification" onclick={() => (appNotice = null)}>×</button>
+            <button type="button" aria-label="Dismiss notification" onclick={dismissAppNotice}>×</button>
           </div>
         {/if}
 
@@ -2904,11 +3102,11 @@
           </div>
         {/if}
 
-        {#if workspaceMode === "board"}
         <div
-          class:with-console={agentConsoleOpen && agentRunLogs.length > 0}
+          class:with-console={agentConsoleOpen && hasAgentConsoleSession}
+          class:is-hidden={workspaceMode !== "board"}
           class="workspace-body"
-          style={agentConsoleOpen && agentRunLogs.length > 0 ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px;` : undefined}
+          style={agentConsoleOpen && hasAgentConsoleSession ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px;` : undefined}
         >
         <div class="board-panel">
           <div class="resize-toolbar" aria-label="Board sizing controls">
@@ -2941,6 +3139,18 @@
                 ></span>
               </span>
             </div>
+            {#if hasAgentConsoleSession}
+              <button
+                class="agent-console-launch"
+                class:active={agentConsoleOpen}
+                type="button"
+                onclick={() => openAgentConsole()}
+              >
+                <span class={`agent-console-dot ${agentRunStatus}`}></span>
+                <span>Open Agent Console</span>
+                <strong>{agentRunProgress}%</strong>
+              </button>
+            {/if}
           </div>
         <div class="board" style={`--lane-width: ${layoutPrefs.laneWidth}px;`}>
           {#each displayColumns as column (column.id)}
@@ -2976,15 +3186,17 @@
                   <TaskCard
                     card={card}
                     selected={selectedCard?.id === card.id}
-                    canStartAgent={canStartAgent(card)}
-                    actionLabel={agentActionLabel(card)}
+                    canStartAgent={canStartAgent(card, Boolean(runningWorkerCardIds[card.id]))}
+                    actionLabel={agentActionLabel(card, Boolean(runningWorkerCardIds[card.id]), Boolean(operatorNotesForCard(card.id)))}
                     executionLabel={executionLabel(card.execution)}
                     ticketLabel={ticketLabel(card)}
                     isBlocked={isBlocked(card.execution)}
+                    isQueued={column.intent === "queued"}
                     showActions={column.intent === "backlog" || column.intent === "queued" || isBlocked(card.execution)}
                     showDelete={column.intent === "backlog"}
                     minHeight={layoutPrefs.cardMinHeight}
                     onSelect={() => selectCard(card)}
+                    onQueue={() => queueCard(card.id)}
                     onStartAgent={() => void startWorkerForCard(card.id)}
                     onDelete={() => removeCard(card.id)}
                     onDragStart={(event) => {
@@ -3002,6 +3214,15 @@
                     <button type="button" onclick={() => setDoneVisibleLimit("all")}>Show all</button>
                   </div>
                 {/if}
+                {#if column.hiddenLaneCardCount > 0}
+                  <div class="lane-pagination-card">
+                    <span>Showing {column.cards.length} of {column.totalCardCount} cards.</span>
+                    <div>
+                      <button type="button" onclick={() => showMoreLaneCards(column)}>Show {Math.min(LANE_VISIBLE_INCREMENT, column.hiddenLaneCardCount)} more</button>
+                      <button type="button" onclick={() => showAllLaneCards(column)}>Show all</button>
+                    </div>
+                  </div>
+                {/if}
               </div>
 
               {#if column.intent === "backlog"}
@@ -3014,7 +3235,7 @@
         </div>
         </div>
 
-        {#if agentConsoleOpen && agentRunLogs.length > 0}
+        {#if agentConsoleOpen && hasAgentConsoleSession}
           <div class="grid-resize-handle">
             <span
               class="drag-handle horizontal"
@@ -3130,7 +3351,7 @@
         {/if}
         </div>
 
-        {#if newTaskOpen}
+        {#if workspaceMode === "board" && newTaskOpen}
           <aside class="new-task-popover" aria-label="Create new task">
             <button class="close-detail" type="button" aria-label="Close" onclick={() => (newTaskOpen = false)}>×</button>
             <div>
@@ -3160,7 +3381,7 @@
           </aside>
         {/if}
 
-        {#if selectedCard}
+        {#if workspaceMode === "board" && selectedCard}
           <aside class="detail-popover" aria-label="Selected task detail">
             <button class="close-detail" type="button" aria-label="Close" onclick={() => (selectedCardId = null)}>×</button>
             <div class="task-status waiting">
@@ -3207,10 +3428,15 @@
                 {#if isBlocked(selectedCard.execution)}
                   <button
                     type="button"
-                    disabled={!canStartAgent(selectedCard)}
+                    disabled={!canStartAgent(selectedCard, Boolean(runningWorkerCardIds[selectedCard.id]))}
                     onclick={() => void startWorkerForCard(selectedCard.id)}
                   >
-                    {agentActionLabel(selectedCard)}
+                    {agentActionLabel(selectedCard, Boolean(runningWorkerCardIds[selectedCard.id]), Boolean(operatorNotesForCard(selectedCard.id)))}
+                  </button>
+                {/if}
+                {#if selectedCardAgentSession}
+                  <button type="button" class="open-console-action" onclick={() => openAgentConsole(selectedCard)}>
+                    Open Agent Console
                   </button>
                 {/if}
                 <button type="button" onclick={() => (selectedCardId = null)}>Close</button>
@@ -3218,8 +3444,119 @@
             </footer>
           </aside>
         {/if}
-        {:else}
-          <div class="term-workspace" style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}>
+
+          <div class:is-hidden={workspaceMode !== "files"} class="files-workspace">
+            <aside class="file-browser-pane" aria-label="Workspace files">
+              <header>
+                <div>
+                  <p>Files</p>
+                  <h2>{fileRootLabel}{fileDirectory ? `/${fileDirectory}` : ""}</h2>
+                </div>
+                <div class="file-header-actions">
+                  <button type="button" disabled={fileLoading} onclick={() => void openFolderFromDialog()}>
+                    Open Folder
+                  </button>
+                  <button type="button" disabled={fileLoading} onclick={() => void openFileFromDialog()}>
+                    Open File
+                  </button>
+                  <button type="button" disabled={fileLoading} onclick={() => void refreshFileDirectory(fileDirectory)}>
+                    {fileLoading ? "Loading" : "Refresh"}
+                  </button>
+                </div>
+              </header>
+              <div class="file-sync-note">File browser starts at home. Use Open Folder or Open File to choose the editor root.</div>
+              <nav class="file-breadcrumbs" aria-label="Current directory">
+                {#each directoryBreadcrumbs(fileDirectory) as crumb (crumb.path)}
+                  <button class:active={crumb.path === fileDirectory} type="button" onclick={() => void refreshFileDirectory(crumb.path)}>{crumb.label}</button>
+                {/each}
+              </nav>
+              {#if fileError}
+                <div class="file-error" role="status">{fileError}</div>
+              {/if}
+              <div class="file-list" role="list">
+                {#if parentDirectory(fileDirectory) !== null}
+                  <button class="file-row directory" type="button" onclick={() => void refreshFileDirectory(parentDirectory(fileDirectory) ?? "")}>
+                    <span>../</span>
+                    <small>Parent directory</small>
+                  </button>
+                {/if}
+                {#each fileEntries as entry (entry.path)}
+                  <button
+                    class:directory={entry.is_dir}
+                    class:active={activeEditorPath === entry.path}
+                    class="file-row"
+                    type="button"
+                    onclick={() => void openFileEntry(entry)}
+                  >
+                    <span>{entry.is_dir ? `${entry.name}/` : entry.name}</span>
+                    <small>{entry.is_dir ? "Directory" : formatBytes(entry.size)}</small>
+                  </button>
+                {:else}
+                  <div class="file-empty">No files in this directory.</div>
+                {/each}
+              </div>
+            </aside>
+
+            <section class="code-editor-pane" aria-label="Code editor">
+              <header>
+                <div>
+                  <p>Editor</p>
+                  <h2>{activeEditorFile?.name ?? "No file open"}</h2>
+                </div>
+                <div class="editor-actions">
+                  <span class:dirty={activeEditorDirty}>{activeEditorDirty ? "Unsaved" : activeEditorFile ? "Saved" : "Idle"}</span>
+                  <button type="button" disabled={!activeEditorFile || formattingFilePath !== null} onclick={() => void formatActiveFile()}>
+                    {formattingFilePath ? "Formatting" : "Format"}
+                  </button>
+                  <button type="button" disabled={!activeEditorFile || savingFilePath !== null} onclick={() => void saveActiveFile()}>
+                    {savingFilePath ? "Saving" : "Save"}
+                  </button>
+                </div>
+              </header>
+              {#if openEditorFiles.length > 0}
+                <div class="editor-tabs" role="tablist" aria-label="Open files">
+                  {#each openEditorFiles as file (file.path)}
+                    <div class:active={file.path === activeEditorPath} class:dirty={file.dirty} class="editor-tab">
+                      <button type="button" onclick={() => selectEditorTab(file.path)}>
+                        <span>{file.name}</span>
+                        <small>{file.dirty ? "•" : ""}</small>
+                      </button>
+                      <button type="button" aria-label={`Close ${file.name}`} onclick={() => closeEditorTab(file.path)}>×</button>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              {#if activeEditorFile}
+                {#key activeEditorFile.path}
+                  <textarea
+                    bind:this={editorTextarea}
+                    class="code-editor"
+                    spellcheck="false"
+                    value={activeEditorFile.content}
+                    oninput={markActiveEditorDirty}
+                    onkeydown={handleEditorKeydown}
+                  ></textarea>
+                {/key}
+                {#if editorDiagnostic}
+                  <div class="editor-diagnostic" role="status">
+                    <strong>Language check</strong>
+                    <span>{editorDiagnostic}</span>
+                  </div>
+                {/if}
+              {:else}
+                <div class="editor-empty">
+                  <strong>Open a file to start editing</strong>
+                  <span>Browse the workspace on the left. Text files up to 1 MB are supported in this first editor pass.</span>
+                </div>
+              {/if}
+              <footer>
+                <span>{fileStatusLabel}</span>
+                <span>Ctrl/Cmd+S saves · Ctrl/Cmd+Shift+F formats</span>
+              </footer>
+            </section>
+          </div>
+
+          <div class:is-hidden={workspaceMode !== "term"} class="term-workspace" style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}>
             <section class="workspace-terminal-pane" aria-label="Local shell terminal">
               <header>
                 <div>
@@ -3258,7 +3595,7 @@
                   <p>Agent Chat</p>
                   <h2>{settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.label}</h2>
                 </div>
-                <button type="button" onclick={() => (settingsOpen = true)}>Runtime</button>
+                <button type="button" onclick={() => openSettings("agent")}>Runtime</button>
               </header>
               <div class="workspace-chat-messages">
                 {#each workspaceChatMessages as message (message.id)}
@@ -3267,6 +3604,7 @@
                     <p>{message.text}</p>
                   </article>
                 {/each}
+                <div class="workspace-chat-end" bind:this={workspaceChatEnd}></div>
               </div>
               <form
                 class="workspace-chat-input"
@@ -3277,14 +3615,15 @@
               >
                 <textarea
                   bind:this={workspaceChatTextarea}
-                  placeholder="Ask about work, or say: create a task, queue ABC-123, move ABC-123 to in progress, start agent on this card, sync Jira..."
+                  placeholder="Enter sends. Shift+Enter for multiline. Try: queue ABC-123, start agent on ABC-123, sync Jira..."
                   disabled={workspaceChatRunning}
+                  rows="2"
+                  onkeydown={handleWorkspaceChatKeydown}
                 ></textarea>
-                <button type="submit" disabled={workspaceChatRunning}>{workspaceChatRunning ? "Thinking" : "Send"}</button>
+                <button type="submit" disabled={workspaceChatRunning}>{workspaceChatRunning ? "Working" : "Run"}</button>
               </form>
             </section>
           </div>
-        {/if}
       </section>
     {:else}
       <section class="state-panel">Preparing workspace projection...</section>
@@ -3292,6 +3631,8 @@
 
     <footer class="statusbar">
       <span>{cacheStatusLabel}</span>
+      <span>{boardResourceLabel}</span>
+      <span>{cacheSizeLabel}</span>
       <span>{currentDate}</span>
       <span>{currentTime}</span>
     </footer>

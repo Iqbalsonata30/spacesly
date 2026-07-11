@@ -705,6 +705,33 @@ export async function writeFile(
   return invoke("write_file", { workspaceId, relativePath, content });
 }
 
+export async function workspaceRootPath(workspaceId: string): Promise<string> {
+  return invoke<string>("workspace_root_path", { workspaceId });
+}
+
+export async function setWorkspaceRoot(absolutePath: string): Promise<string> {
+  return invoke<string>("set_workspace_root", { absolutePath });
+}
+
+export async function ptyCurrentDirectory(terminalId: string): Promise<string | null> {
+  return invoke<string | null>("pty_current_directory", { terminalId });
+}
+
+export interface AppSecrets {
+  jira_api_token: string;
+  jira_personal_access_token: string;
+  jira_password: string;
+  ai_api_keys: Record<string, string>;
+}
+
+export async function loadAppSecrets(): Promise<AppSecrets> {
+  return invoke<AppSecrets>("load_app_secrets");
+}
+
+export async function saveAppSecrets(secrets: AppSecrets): Promise<void> {
+  return invoke("save_app_secrets", { secrets });
+}
+
 // ── Git ─────────────────────────────────────────────────────────────
 
 export interface ChangedFile {

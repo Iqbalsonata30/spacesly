@@ -74,12 +74,17 @@ pub fn transition_issue(
     let base_url = normalized_base_url(&auth.base_url)?;
     let transitions_url = format!("{base_url}/rest/api/2/issue/{issue_key}/transitions");
     let transitions: TransitionPage = send(auth, client.get(&transitions_url))?;
-    let transition = transitions
+    let Some(transition) = transitions
         .transitions
         .iter()
         .find(|transition| status_matches(&transition.to.name, target_status))
         .or_else(|| transitions.transitions.iter().find(|transition| status_matches(&transition.name, target_status)))
-        .ok_or_else(|| {
+    else {
+        if issue_is_already_in_status(auth, &client, &base_url, issue_key, target_status)? {
+            return Ok(());
+        }
+
+        return Err({
             let available = transitions
                 .transitions
                 .iter()
@@ -87,7 +92,8 @@ pub fn transition_issue(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("No Jira transition to '{target_status}' is available for {issue_key}. Available transitions: {available}")
-        })?;
+        });
+    };
 
     let body = serde_json::json!({
         "transition": {
@@ -96,6 +102,18 @@ pub fn transition_issue(
     });
 
     send_empty(auth, client.post(&transitions_url).json(&body))
+}
+
+fn issue_is_already_in_status(
+    auth: &JiraAuthConfig,
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    issue_key: &str,
+    target_status: &str,
+) -> Result<bool, String> {
+    let issue_url = format!("{base_url}/rest/api/2/issue/{issue_key}");
+    let issue: RestIssue = send(auth, client.get(issue_url))?;
+    Ok(status_matches(&issue.fields.status.name, target_status))
 }
 
 /// Assigns a Jira issue to the configured user.

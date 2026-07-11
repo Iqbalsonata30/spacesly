@@ -1,3 +1,4 @@
+use super::files::WorkspaceRoot;
 use super::shell_env::inject_shell_env;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ pub struct PtySession {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
+    child_pid: Option<u32>,
 }
 
 impl PtyRegistry {
@@ -27,6 +29,7 @@ impl PtyRegistry {
 
 pub fn open_pty_terminal(
     state: &PtyState,
+    workspace_root: &WorkspaceRoot,
     terminal_id: String,
     workdir: Option<String>,
     on_data: Channel<Vec<u8>>,
@@ -66,7 +69,7 @@ pub fn open_pty_terminal(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .or_else(|| std::env::var("HOME").ok())
+        .or_else(|| workspace_root.path().ok().map(|path| path.to_string_lossy().to_string()))
         .unwrap_or_else(|| ".".to_string());
     command.cwd(cwd);
 
@@ -83,6 +86,7 @@ pub fn open_pty_terminal(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("Failed to spawn shell: {error}"))?;
+    let child_pid = child.process_id();
     drop(pair.slave);
 
     let writer = pair
@@ -104,6 +108,7 @@ pub fn open_pty_terminal(
                 writer,
                 child,
                 master: pair.master,
+                child_pid,
             },
         );
 
@@ -121,6 +126,33 @@ pub fn open_pty_terminal(
     });
 
     Ok(())
+}
+
+pub fn pty_current_directory(
+    state: &PtyState,
+    terminal_id: String,
+) -> Result<Option<String>, String> {
+    let registry = state.lock().map_err(|error| error.to_string())?;
+    let session = registry
+        .sessions
+        .get(&terminal_id)
+        .ok_or_else(|| "Terminal session is not open.".to_string())?;
+    let Some(pid) = session.child_pid else {
+        return Ok(None);
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .map(|path| Some(path.to_string_lossy().to_string()))
+            .map_err(|error| format!("Failed to read terminal cwd: {error}"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Ok(None)
+    }
 }
 
 pub fn write_pty_terminal(

@@ -163,7 +163,7 @@ pub fn chat_ai_worker(
     if config.runtime == "opencode" {
         validate_opencode_config(&config)?;
         let prompt = format!(
-            "You are the Spacesly workspace Agent chat. You can help the user reason about the workspace and you may request controlled board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+            "You are the Spacesly workspace Agent chat. Focus on the latest user command first. Help the user reason about tasks, terminal context, Jira work, and Agent execution. Include useful context: the relevant ticket/card/status when known, what action you will request or what happened, and the next step or blocker. You may request controlled board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 180 words.\n\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
             governance_context(&config),
             request.terminal_context.as_deref().unwrap_or("none"),
             message,
@@ -202,7 +202,7 @@ pub fn chat_ai_worker(
 
     validate_config(&config)?;
     let system_prompt = format!(
-        "You are the Spacesly workspace Agent chat. Help the user reason about tasks, shell output, local commands, Jira work, and Agent execution. You may request controlled Spacesly board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 120 words.\n\n{}",
+        "You are the Spacesly workspace Agent chat. Focus on the latest user command first. Help the user reason about tasks, shell output, local commands, Jira work, and Agent execution. Include useful context: the relevant ticket/card/status when known, what action you will request or what happened, and the next step or blocker. You may request controlled Spacesly board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 180 words.\n\n{}",
         governance_context(&config),
     );
     let user_prompt = format!(
@@ -255,13 +255,13 @@ fn governance_context(config: &AiWorkerConfig) -> String {
 
     if !rules.is_empty() {
         sections.push(format!(
-            "User-defined Agent rules. These are mandatory and override generic behavior unless they conflict with system safety:\n{rules}"
+            "User-defined Agent rules. These are mandatory operating constraints. Follow every applicable rule exactly. If a requested action conflicts with these rules or system safety, stop and return STATUS: BLOCKED with the conflict:\n{rules}"
         ));
     }
 
     if !skills.is_empty() {
         sections.push(format!(
-            "User-defined Agent skills. Apply relevant skills when the task matches their domain:\n{skills}"
+            "User-defined Agent skills/playbooks. Before acting, identify any skill that matches the task, then follow that skill as the required procedure for the matching work. If no skill applies, say so briefly in DETAILS. If a skill cannot be followed because tools/access are missing, return STATUS: BLOCKED:\n{skills}"
         ));
     }
 
@@ -801,5 +801,44 @@ fn describe_reqwest_error(error: &reqwest::Error) -> String {
             .to_string()
     } else {
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_governance(rules: &str, skills: &str) -> AiWorkerConfig {
+        AiWorkerConfig {
+            runtime: "api".to_string(),
+            provider_name: "OpenAI".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            api_style: "openai_chat".to_string(),
+            api_key: "token".to_string(),
+            model: "gpt-5.5".to_string(),
+            opencode_command: "opencode".to_string(),
+            opencode_model: "openai/gpt-5.5".to_string(),
+            opencode_workdir: None,
+            opencode_auto_approve: false,
+            agent_rules: rules.to_string(),
+            agent_skills: skills.to_string(),
+            temperature: 0.2,
+        }
+    }
+
+    #[test]
+    fn governance_context_marks_rules_as_mandatory() {
+        let context = governance_context(&config_with_governance("Never guess.", ""));
+
+        assert!(context.contains("mandatory operating constraints"));
+        assert!(context.contains("Never guess."));
+    }
+
+    #[test]
+    fn governance_context_marks_skills_as_required_procedures() {
+        let context = governance_context(&config_with_governance("", "Skill: Deploy safely"));
+
+        assert!(context.contains("required procedure"));
+        assert!(context.contains("Skill: Deploy safely"));
     }
 }
