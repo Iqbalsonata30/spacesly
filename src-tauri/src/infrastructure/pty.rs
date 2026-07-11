@@ -32,15 +32,14 @@ pub fn open_pty_terminal(
     workspace_root: &WorkspaceRoot,
     terminal_id: String,
     workdir: Option<String>,
-    on_data: Channel<Vec<u8>>,
+    on_data: Channel<Vec<u8>>, 
 ) -> Result<(), String> {
-    if state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .sessions
-        .contains_key(&terminal_id)
     {
-        return Ok(());
+        let mut registry = state.lock().map_err(|error| error.to_string())?;
+        prune_dead_session(&mut registry, &terminal_id)?;
+        if registry.sessions.contains_key(&terminal_id) {
+            return Ok(());
+        }
     }
 
     let pty_system = native_pty_system();
@@ -128,14 +127,26 @@ pub fn open_pty_terminal(
     Ok(())
 }
 
+pub fn close_pty_terminal(state: &PtyState, terminal_id: String) -> Result<(), String> {
+    let mut registry = state.lock().map_err(|error| error.to_string())?;
+    match registry.sessions.remove(&terminal_id) {
+        Some(session) => {
+            close_session(session);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 pub fn pty_current_directory(
     state: &PtyState,
     terminal_id: String,
 ) -> Result<Option<String>, String> {
-    let registry = state.lock().map_err(|error| error.to_string())?;
+    let mut registry = state.lock().map_err(|error| error.to_string())?;
+    prune_dead_session(&mut registry, &terminal_id)?;
     let session = registry
         .sessions
-        .get(&terminal_id)
+        .get_mut(&terminal_id)
         .ok_or_else(|| "Terminal session is not open.".to_string())?;
     let Some(pid) = session.child_pid else {
         return Ok(None);
@@ -161,6 +172,7 @@ pub fn write_pty_terminal(
     data: Vec<u8>,
 ) -> Result<(), String> {
     let mut registry = state.lock().map_err(|error| error.to_string())?;
+    prune_dead_session(&mut registry, &terminal_id)?;
     let session = registry
         .sessions
         .get_mut(&terminal_id)
@@ -178,6 +190,7 @@ pub fn resize_pty_terminal(
     cols: u16,
 ) -> Result<(), String> {
     let mut registry = state.lock().map_err(|error| error.to_string())?;
+    prune_dead_session(&mut registry, &terminal_id)?;
     let session = registry
         .sessions
         .get_mut(&terminal_id)
@@ -196,8 +209,30 @@ pub fn resize_pty_terminal(
 pub fn close_all_terminals(state: &PtyState) {
     if let Ok(mut registry) = state.lock() {
         for (_, mut session) in registry.sessions.drain() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
+            close_session(session);
         }
     }
+}
+
+fn prune_dead_session(registry: &mut PtyRegistry, terminal_id: &str) -> Result<(), String> {
+    let should_remove = match registry.sessions.get_mut(terminal_id) {
+        Some(session) => match session.child.try_wait() {
+            Ok(Some(_)) | Err(_) => true,
+            Ok(None) => false,
+        },
+        None => return Ok(()),
+    };
+
+    if should_remove {
+        if let Some(session) = registry.sessions.remove(terminal_id) {
+            close_session(session);
+        }
+    }
+
+    Ok(())
+}
+
+fn close_session(mut session: PtySession) {
+    let _ = session.child.kill();
+    let _ = session.child.wait();
 }

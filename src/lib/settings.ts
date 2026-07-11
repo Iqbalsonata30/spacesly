@@ -37,6 +37,13 @@ export interface AppSettings {
   aiWorker: AiWorkerSettings;
 }
 
+export interface AppSecrets {
+  jira_api_token: string;
+  jira_personal_access_token: string;
+  jira_password: string;
+  ai_api_keys: Record<string, string>;
+}
+
 export interface AiWorkerSettings {
   runtime: "api" | "opencode";
   providerId: string;
@@ -146,6 +153,33 @@ export function settingsWithoutSecrets(settings: AppSettings): AppSettings {
       ...settings.aiWorker,
       apiKeys: {},
     },
+  };
+}
+
+export function secretsFromSettings(settings: AppSettings): AppSecrets {
+  return {
+    jira_api_token: settings.jira.apiToken,
+    jira_personal_access_token: settings.jira.personalAccessToken,
+    jira_password: settings.jira.password,
+    ai_api_keys: settings.aiWorker.apiKeys,
+  };
+}
+
+export function hasAnySecret(secrets: AppSecrets): boolean {
+  return Boolean(
+    secrets.jira_api_token
+      || secrets.jira_personal_access_token
+      || secrets.jira_password
+      || Object.values(secrets.ai_api_keys).some((value) => value.trim()),
+  );
+}
+
+export function mergeAppSecrets(localSecrets: AppSecrets, storedSecrets: AppSecrets): AppSecrets {
+  return {
+    jira_api_token: localSecrets.jira_api_token || storedSecrets.jira_api_token,
+    jira_personal_access_token: localSecrets.jira_personal_access_token || storedSecrets.jira_personal_access_token,
+    jira_password: localSecrets.jira_password || storedSecrets.jira_password,
+    ai_api_keys: { ...storedSecrets.ai_api_keys, ...localSecrets.ai_api_keys },
   };
 }
 

@@ -2,10 +2,19 @@ use super::shell_env::inject_shell_env;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
+use wait_timeout::ChildExt;
+
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const MIN_TIMEOUT_SECONDS: u64 = 1;
+const MAX_TIMEOUT_SECONDS: u64 = 300;
+const MAX_CAPTURE_HEAD_BYTES: usize = 1_048_576;
+const MAX_CAPTURE_TAIL_BYTES: usize = 8_192;
+const DRAIN_BUFFER_SIZE: usize = 8192;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ShellCommandRequest {
@@ -33,6 +42,12 @@ pub struct ShellCompletionRequest {
 pub struct ShellCompletionResult {
     pub replacement: Option<String>,
     pub suggestions: Vec<String>,
+}
+
+struct CapturedStream {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    truncated: bool,
 }
 
 pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandResult, String> {
@@ -67,47 +82,53 @@ pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandRes
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to start shell command: {error}"))?;
-    let timeout = Duration::from_secs(request.timeout_seconds.unwrap_or(30).clamp(1, 300));
-    let started = Instant::now();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture shell stdout.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture shell stderr.".to_string())?;
+    let stdout_reader = thread::spawn(move || capture_stream(stdout));
+    let stderr_reader = thread::spawn(move || capture_stream(stderr));
 
-    loop {
-        if child
-            .try_wait()
-            .map_err(|error| format!("Failed to poll shell command: {error}"))?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| format!("Failed to read shell command output: {error}"))?;
-            let (stdout, exit_code, cwd) =
-                parse_shell_stdout(&String::from_utf8_lossy(&output.stdout));
-            return Ok(ShellCommandResult {
-                exit_code: exit_code.or_else(|| output.status.code()),
-                stdout,
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                timed_out: false,
-                cwd,
-            });
-        }
-
-        if started.elapsed() >= timeout {
+    let timeout = Duration::from_secs(
+        request
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
+    );
+    let timed_out = match child
+        .wait_timeout(timeout)
+        .map_err(|error| format!("Failed to wait for shell command: {error}"))?
+    {
+        Some(_) => false,
+        None => {
             let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|error| format!("Failed to stop shell command after timeout: {error}"))?;
-            let (stdout, exit_code, cwd) =
-                parse_shell_stdout(&String::from_utf8_lossy(&output.stdout));
-            return Ok(ShellCommandResult {
-                exit_code: exit_code.or_else(|| output.status.code()),
-                stdout,
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                timed_out: true,
-                cwd,
-            });
+            true
         }
+    };
 
-        sleep(Duration::from_millis(40));
-    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Failed to read shell command output: {error}"))?;
+    let stdout_capture = stdout_reader
+        .join()
+        .map_err(|_| "Failed to collect shell stdout.".to_string())?;
+    let stderr_capture = stderr_reader
+        .join()
+        .map_err(|_| "Failed to collect shell stderr.".to_string())?;
+
+    let (stdout, exit_code, cwd) = parse_shell_stdout(&render_stream(stdout_capture, "stdout"));
+
+    Ok(ShellCommandResult {
+        exit_code: exit_code.or_else(|| status.code()),
+        stdout,
+        stderr: render_stream(stderr_capture, "stderr"),
+        timed_out,
+        cwd,
+    })
 }
 
 pub fn complete_shell_input(
@@ -263,4 +284,105 @@ fn parse_shell_stdout(stdout: &str) -> (String, Option<i32>, Option<String>) {
     }
 
     (output_lines.join("\n"), exit_code, cwd)
+}
+
+fn capture_stream<R: Read>(mut reader: R) -> CapturedStream {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; DRAIN_BUFFER_SIZE];
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => {
+                if !truncated {
+                    let remaining = MAX_CAPTURE_HEAD_BYTES.saturating_sub(head.len());
+                    if remaining > 0 {
+                        let to_copy = remaining.min(size);
+                        head.extend_from_slice(&buffer[..to_copy]);
+                        if to_copy < size {
+                            truncated = true;
+                            push_tail(&mut tail, &buffer[to_copy..size]);
+                        }
+                        continue;
+                    }
+                    truncated = true;
+                }
+
+                push_tail(&mut tail, &buffer[..size]);
+            }
+            Err(_) => break,
+        }
+    }
+
+    CapturedStream {
+        head,
+        tail,
+        truncated,
+    }
+}
+
+fn render_stream(capture: CapturedStream, stream_name: &str) -> String {
+    let mut text = String::from_utf8_lossy(&capture.head).to_string();
+
+    if capture.truncated {
+        text.push_str(&format!(
+            "\n[spacesly] {stream_name} truncated after {MAX_CAPTURE_HEAD_BYTES} bytes; showing last {MAX_CAPTURE_TAIL_BYTES} bytes"
+        ));
+        if !capture.tail.is_empty() {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&capture.tail));
+        }
+    } else if !capture.tail.is_empty() {
+        text.push_str(&String::from_utf8_lossy(&capture.tail));
+    }
+
+    text
+}
+
+fn push_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    if chunk.len() >= MAX_CAPTURE_TAIL_BYTES {
+        tail.clear();
+        tail.extend_from_slice(&chunk[chunk.len() - MAX_CAPTURE_TAIL_BYTES..]);
+        return;
+    }
+
+    let overflow = tail.len() + chunk.len();
+    if overflow > MAX_CAPTURE_TAIL_BYTES {
+        let drain = overflow - MAX_CAPTURE_TAIL_BYTES;
+        tail.drain(0..drain);
+    }
+    tail.extend_from_slice(chunk);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_stream_truncates_at_limit() {
+        let input = vec![b'a'; MAX_CAPTURE_HEAD_BYTES + MAX_CAPTURE_TAIL_BYTES + 32];
+        let capture = capture_stream(std::io::Cursor::new(input));
+
+        assert_eq!(capture.head.len(), MAX_CAPTURE_HEAD_BYTES);
+        assert_eq!(capture.tail.len(), MAX_CAPTURE_TAIL_BYTES);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn run_shell_command_times_out_and_kills_child() {
+        let result = run_shell_command(ShellCommandRequest {
+            command: "sleep 2; printf done".to_string(),
+            workdir: None,
+            timeout_seconds: Some(1),
+        })
+        .expect("shell command should complete with timeout");
+
+        assert!(result.timed_out);
+    }
 }

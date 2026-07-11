@@ -3,24 +3,25 @@ mod domain;
 mod infrastructure;
 
 use application::app::{AppState, ImportedIssue};
+use application::files_service::FilesService;
+use application::git_service::GitService;
 use domain::entity::Workspace;
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, execute_ai_worker_task as execute_ai_worker_task_impl,
     test_ai_worker as test_ai_worker_impl, AiWorkerChatRequest, AiWorkerConfig, AiWorkerResult,
     AiWorkerStatus, AiWorkerTask,
 };
-use infrastructure::files::{
-    list_directory as list_directory_impl, read_file_at_root as read_file_impl,
-    workspace_root_path as workspace_root_path_impl, write_file as write_file_impl, FileEntry,
-    WorkspaceRoot,
-};
+use infrastructure::files::{FileEntry, WorkspaceRoot};
+use infrastructure::formatting::format_code as format_code_impl;
+use infrastructure::git::GitWorkspaceInfo;
 use infrastructure::jira_rest::{add_comment, assign_issue, transition_issue};
 use infrastructure::mcp::{
     fetch_jira_boards, fetch_jira_issues, test_jira_connection, test_mcp_connection, JiraBoard,
     JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
 use infrastructure::pty::{
-    close_all_terminals, open_pty_terminal as open_pty_terminal_impl,
+    close_all_terminals, close_pty_terminal as close_pty_terminal_impl,
+    open_pty_terminal as open_pty_terminal_impl,
     pty_current_directory as pty_current_directory_impl,
     resize_pty_terminal as resize_pty_terminal_impl, write_pty_terminal as write_pty_terminal_impl,
     PtyRegistry, PtyState,
@@ -161,7 +162,7 @@ async fn list_directory(
 ) -> Result<Vec<FileEntry>, String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        list_directory_impl(&root, workspace_id, relative_path)
+        FilesService::new(root).list_directory(workspace_id, relative_path)
     })
     .await
     .map_err(|error| format!("File listing task failed: {error}"))?
@@ -174,7 +175,9 @@ async fn read_file(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || read_file_impl(&root, workspace_id, relative_path))
+    tauri::async_runtime::spawn_blocking(move || {
+        FilesService::new(root).read_file(workspace_id, relative_path)
+    })
         .await
         .map_err(|error| format!("File read task failed: {error}"))?
 }
@@ -188,7 +191,7 @@ async fn write_file(
 ) -> Result<(), String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        write_file_impl(&root, workspace_id, relative_path, content)
+        FilesService::new(root).write_file(workspace_id, relative_path, content)
     })
     .await
     .map_err(|error| format!("File write task failed: {error}"))?
@@ -200,9 +203,20 @@ async fn workspace_root_path(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || workspace_root_path_impl(&root, workspace_id))
+    tauri::async_runtime::spawn_blocking(move || FilesService::new(root).workspace_root_path(workspace_id))
         .await
         .map_err(|error| format!("Workspace root task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn set_workspace_root(
+    absolute_path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<String, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || FilesService::new(root).set_workspace_root(absolute_path))
+        .await
+        .map_err(|error| format!("Set workspace root task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -217,6 +231,32 @@ async fn save_app_secrets(secrets: AppSecrets) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || save_app_secrets_impl(secrets))
         .await
         .map_err(|error| format!("Save secrets task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn format_code(formatter: String, source: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
+        .await
+        .map_err(|error| format!("Format task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_workspace_git_info(workspace_root: State<'_, WorkspaceRoot>) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).workspace_git_info())
+        .await
+        .map_err(|error| format!("Workspace git info task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn checkout_workspace_git_branch(
+    branch: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).checkout_branch(branch))
+        .await
+        .map_err(|error| format!("Checkout branch task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -235,6 +275,11 @@ fn open_pty_terminal(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<(), String> {
     open_pty_terminal_impl(&state, &workspace_root, terminal_id, workdir, on_data)
+}
+
+#[tauri::command]
+fn close_pty_terminal(terminal_id: String, state: State<'_, PtyState>) -> Result<(), String> {
+    close_pty_terminal_impl(&state, terminal_id)
 }
 
 #[tauri::command]
@@ -300,11 +345,16 @@ pub fn run() {
             read_file,
             write_file,
             workspace_root_path,
+            set_workspace_root,
             load_app_secrets,
             save_app_secrets,
+            format_code,
+            get_workspace_git_info,
+            checkout_workspace_git_branch,
             run_shell_command,
             complete_shell_input,
             open_pty_terminal,
+            close_pty_terminal,
             write_pty_terminal,
             resize_pty_terminal,
             pty_current_directory

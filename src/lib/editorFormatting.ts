@@ -1,3 +1,6 @@
+import { formatCode } from "$lib/ipc";
+import { editorFormatterForPath } from "$lib/editorPlugins";
+
 type PrettierModules = {
   format: (source: string, options: { parser: string; plugins: Array<string | URL | object> }) => Promise<string>;
   plugins: Array<string | URL | object>;
@@ -7,6 +10,7 @@ let prettierModulesPromise: Promise<PrettierModules> | null = null;
 
 export function prettierParserForPath(path: string): string | null {
   const name = path.toLowerCase();
+  if (editorFormatterForPath(path) && editorFormatterForPath(path) !== "prettier") return null;
   if (name.endsWith(".ts") || name.endsWith(".tsx") || name.endsWith(".mts") || name.endsWith(".cts")) return "typescript";
   if (name.endsWith(".js") || name.endsWith(".jsx") || name.endsWith(".mjs") || name.endsWith(".cjs")) return "babel";
   if (name.endsWith(".svelte")) return null;
@@ -19,6 +23,11 @@ export function prettierParserForPath(path: string): string | null {
 }
 
 export async function formatEditorText(path: string, source: string): Promise<string> {
+  const formatter = editorFormatterForPath(path);
+  if (formatter === "rustfmt" || formatter === "gofmt") {
+    return formatCode(formatter, source);
+  }
+
   const parser = prettierParserForPath(path);
   if (!parser) throw new Error(`No Prettier parser configured for ${path}.`);
 

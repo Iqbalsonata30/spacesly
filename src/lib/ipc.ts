@@ -1,5 +1,58 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { FileEntry } from "$lib/ipc/files";
+export type {
+  AiWorkerChatRequest,
+  AiWorkerConfig,
+  AiWorkerResult,
+  AiWorkerStatus,
+  AiWorkerTask,
+} from "$lib/ipc/agent";
+export { chatAiWorker, executeAiWorkerTask, testAiWorker } from "$lib/ipc/agent";
+export type { FileEntry } from "$lib/ipc/files";
+export {
+  listDirectory,
+  readFile,
+  setWorkspaceRoot,
+  workspaceRootPath,
+  writeFile,
+} from "$lib/ipc/files";
+export type { GitWorkspaceInfo } from "$lib/ipc/git";
+export { checkoutWorkspaceGitBranch, getWorkspaceGitInfo } from "$lib/ipc/git";
+export type {
+  JiraBoard,
+  JiraConnectionStatus,
+  JiraIssue,
+  JiraMcpConfig,
+  JiraMcpServerConfig,
+  McpConnectionStatus,
+} from "$lib/ipc/jira";
+export {
+  addJiraComment,
+  assignJiraIssue,
+  getJiraBoards,
+  getJiraIssues,
+  syncJiraWorkspace,
+  testJiraMcpConnection,
+  testMcpServerConnection,
+  transitionJiraIssue,
+} from "$lib/ipc/jira";
+export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
+export type {
+  ShellCommandRequest,
+  ShellCommandResult,
+  ShellCompletionRequest,
+  ShellCompletionResult,
+} from "$lib/ipc/terminal";
+export {
+  closePtyTerminal,
+  completeShellInput,
+  openPtyTerminal,
+  ptyCurrentDirectory,
+  resizePtyTerminal,
+  runShellCommand,
+  writePtyTerminal,
+} from "$lib/ipc/terminal";
 
 // ── Types ────────────────────────────────────────────────────────────
 export interface WorkspaceProjection {
@@ -124,128 +177,6 @@ export interface AgentStatusEvent {
   status: string;
 }
 
-export interface JiraIssue {
-  key: string;
-  summary: string;
-  description: string | null;
-  status: string;
-  issue_type: string;
-}
-
-export interface JiraBoard {
-  id: string;
-  name: string;
-  board_type: string;
-}
-
-export interface JiraConnectionStatus {
-  tool_count: number;
-  issue_count: number;
-  board_count: number;
-  tools: string[];
-}
-
-export interface JiraMcpServerConfig {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
-
-export interface McpConnectionStatus {
-  tool_count: number;
-  tools: string[];
-}
-
-export interface JiraMcpConfig {
-  server: JiraMcpServerConfig;
-  auth: {
-    base_url: string;
-    auth_mode: string;
-    username: string;
-    api_token: string;
-    personal_access_token: string;
-    password: string;
-  };
-  tool_name: string;
-  board_tool_name: string;
-  board_issues_tool_name: string;
-  jql: string;
-  board_id: string | null;
-  project_key: string | null;
-  board_name: string | null;
-  page_size: number;
-  max_pages: number;
-}
-
-export interface AiWorkerConfig {
-  runtime: "api" | "opencode";
-  provider_name: string;
-  base_url: string;
-  api_style: "openai_chat" | "openai_responses" | "anthropic_messages";
-  api_key: string;
-  model: string;
-  opencode_command: string;
-  opencode_model: string;
-  opencode_workdir: string | null;
-  opencode_auto_approve: boolean;
-  agent_rules: string;
-  agent_skills: string;
-  temperature: number;
-}
-
-export interface AiWorkerTask {
-  key: string | null;
-  title: string;
-  description: string;
-  labels: string[];
-  url: string | null;
-  operator_notes?: string | null;
-  previous_output?: string | null;
-}
-
-export interface AiWorkerChatRequest {
-  message: string;
-  terminal_context: string | null;
-}
-
-export interface AiWorkerStatus {
-  connected: boolean;
-  provider_name: string;
-  model: string;
-  message: string;
-}
-
-export interface AiWorkerResult {
-  summary: string;
-  raw_response: string;
-  completion_status: "completed" | "blocked";
-  blocked_reason: string | null;
-}
-
-export interface ShellCommandRequest {
-  command: string;
-  workdir: string | null;
-  timeout_seconds: number | null;
-}
-
-export interface ShellCommandResult {
-  exit_code: number | null;
-  stdout: string;
-  stderr: string;
-  timed_out: boolean;
-  cwd: string | null;
-}
-
-export interface ShellCompletionRequest {
-  input: string;
-  workdir: string | null;
-}
-
-export interface ShellCompletionResult {
-  replacement: string | null;
-  suggestions: string[];
-}
-
 // ── Repository ───────────────────────────────────────────────────────
 
 export async function addRepo(path: string): Promise<RepoDetail> {
@@ -351,97 +282,8 @@ export async function checkRepoGhAccess(
   return invoke<string | null>("check_repo_gh_access", { path, profiles });
 }
 
-// ── Jira ─────────────────────────────────────────────────────────────
-
-export async function getJiraIssues(config: JiraMcpConfig): Promise<JiraIssue[]> {
-  return invoke<JiraIssue[]>("get_jira_issues", { config });
-}
-
-export async function getJiraBoards(config: JiraMcpConfig): Promise<JiraBoard[]> {
-  return invoke<JiraBoard[]>("get_jira_boards", { config });
-}
-
-export async function testJiraMcpConnection(config: JiraMcpConfig): Promise<JiraConnectionStatus> {
-  return invoke<JiraConnectionStatus>("test_jira_mcp_connection", { config });
-}
-
-export async function testMcpServerConnection(config: JiraMcpServerConfig): Promise<McpConnectionStatus> {
-  return invoke<McpConnectionStatus>("test_mcp_server_connection", { config });
-}
-
 export async function getWorkspace(): Promise<WorkspaceProjection> {
   return invoke<WorkspaceProjection>("get_workspace");
-}
-
-export async function syncJiraWorkspace(config: JiraMcpConfig): Promise<WorkspaceProjection> {
-  return invoke<WorkspaceProjection>("sync_jira_workspace", { config });
-}
-
-export async function transitionJiraIssue(
-  config: JiraMcpConfig,
-  issueKey: string,
-  targetStatus: string,
-): Promise<void> {
-  return invoke("transition_jira_issue", { config, issueKey, targetStatus });
-}
-
-export async function assignJiraIssue(
-  config: JiraMcpConfig,
-  issueKey: string,
-): Promise<void> {
-  return invoke("assign_jira_issue", { config, issueKey });
-}
-
-export async function addJiraComment(
-  config: JiraMcpConfig,
-  issueKey: string,
-  comment: string,
-): Promise<void> {
-  return invoke("add_jira_comment", { config, issueKey, comment });
-}
-
-export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStatus> {
-  return invoke<AiWorkerStatus>("test_ai_worker", { config });
-}
-
-export async function executeAiWorkerTask(
-  config: AiWorkerConfig,
-  task: AiWorkerTask,
-): Promise<AiWorkerResult> {
-  return invoke<AiWorkerResult>("execute_ai_worker_task", { config, task });
-}
-
-export async function chatAiWorker(
-  config: AiWorkerConfig,
-  request: AiWorkerChatRequest,
-): Promise<AiWorkerResult> {
-  return invoke<AiWorkerResult>("chat_ai_worker", { config, request });
-}
-
-export async function runShellCommand(request: ShellCommandRequest): Promise<ShellCommandResult> {
-  return invoke<ShellCommandResult>("run_shell_command", { request });
-}
-
-export async function completeShellInput(request: ShellCompletionRequest): Promise<ShellCompletionResult> {
-  return invoke<ShellCompletionResult>("complete_shell_input", { request });
-}
-
-export async function openPtyTerminal(
-  terminalId: string,
-  workdir: string | null,
-  onData: (data: number[]) => void,
-): Promise<void> {
-  const channel = new Channel<number[]>();
-  channel.onmessage = onData;
-  return invoke("open_pty_terminal", { terminalId, workdir, onData: channel });
-}
-
-export async function writePtyTerminal(terminalId: string, data: number[]): Promise<void> {
-  return invoke("write_pty_terminal", { terminalId, data });
-}
-
-export async function resizePtyTerminal(terminalId: string, rows: number, cols: number): Promise<void> {
-  return invoke("resize_pty_terminal", { terminalId, rows, cols });
 }
 
 // ── Repo Branch ─────────────────────────────────────────────────────
@@ -674,62 +516,8 @@ export async function renameBranch(
   return invoke<WorkspaceInfo>("rename_branch", { workspaceId, newName });
 }
 
-// ── File Browser ────────────────────────────────────────────────────
-
-export interface FileEntry {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  size: number;
-}
-
-export async function listDirectory(
-  workspaceId: string,
-  relativePath: string = "",
-): Promise<FileEntry[]> {
-  return invoke<FileEntry[]>("list_directory", { workspaceId, relativePath });
-}
-
-export async function readFile(
-  workspaceId: string,
-  relativePath: string,
-): Promise<string> {
-  return invoke<string>("read_file", { workspaceId, relativePath });
-}
-
-export async function writeFile(
-  workspaceId: string,
-  relativePath: string,
-  content: string,
-): Promise<void> {
-  return invoke("write_file", { workspaceId, relativePath, content });
-}
-
-export async function workspaceRootPath(workspaceId: string): Promise<string> {
-  return invoke<string>("workspace_root_path", { workspaceId });
-}
-
-export async function setWorkspaceRoot(absolutePath: string): Promise<string> {
-  return invoke<string>("set_workspace_root", { absolutePath });
-}
-
-export async function ptyCurrentDirectory(terminalId: string): Promise<string | null> {
-  return invoke<string | null>("pty_current_directory", { terminalId });
-}
-
-export interface AppSecrets {
-  jira_api_token: string;
-  jira_personal_access_token: string;
-  jira_password: string;
-  ai_api_keys: Record<string, string>;
-}
-
-export async function loadAppSecrets(): Promise<AppSecrets> {
-  return invoke<AppSecrets>("load_app_secrets");
-}
-
-export async function saveAppSecrets(secrets: AppSecrets): Promise<void> {
-  return invoke("save_app_secrets", { secrets });
+export async function formatCode(formatter: "rustfmt" | "gofmt", source: string): Promise<string> {
+  return invoke<string>("format_code", { formatter, source });
 }
 
 // ── Git ─────────────────────────────────────────────────────────────
