@@ -130,9 +130,24 @@ export function loadSettings(): AppSettings {
   if (!raw) return structuredClone(defaultSettings);
 
   try {
-    return normalizeSettings(JSON.parse(raw));
+    const settings = settingsWithoutSecrets(normalizeSettings(JSON.parse(raw)));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    return settings;
   } catch {
     return structuredClone(defaultSettings);
+  }
+}
+
+export function loadLegacySettingsSecrets(): AppSecrets {
+  if (typeof localStorage === "undefined") return emptyAppSecrets();
+
+  const raw = localStorage.getItem(SETTINGS_KEY);
+  if (!raw) return emptyAppSecrets();
+
+  try {
+    return secretsFromSettings(normalizeSettings(JSON.parse(raw)));
+  } catch {
+    return emptyAppSecrets();
   }
 }
 
@@ -153,6 +168,15 @@ export function settingsWithoutSecrets(settings: AppSettings): AppSettings {
       ...settings.aiWorker,
       apiKeys: {},
     },
+  };
+}
+
+function emptyAppSecrets(): AppSecrets {
+  return {
+    jira_api_token: "",
+    jira_personal_access_token: "",
+    jira_password: "",
+    ai_api_keys: {},
   };
 }
 

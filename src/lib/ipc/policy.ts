@@ -16,6 +16,29 @@ export type IpcPolicy = {
   retryDelayMs?: number;
 };
 
+type StructuredIpcError = {
+  category: IpcErrorCategory;
+  message: string;
+  retryable?: boolean;
+};
+
+export const IPC_POLICIES = {
+  aiChat: { timeoutMs: 120_000, retries: 0 },
+  aiExecution: { timeoutMs: 180_000, retries: 0 },
+  aiTest: { timeoutMs: 30_000, retries: 1, retryDelayMs: 750 },
+  fileRead: { timeoutMs: 15_000, retries: 0 },
+  fileWrite: { timeoutMs: 20_000, retries: 0 },
+  gitMutation: { timeoutMs: 30_000, retries: 0 },
+  gitRead: { timeoutMs: 15_000, retries: 1, retryDelayMs: 250 },
+  jiraMutation: { timeoutMs: 30_000, retries: 0 },
+  jiraRead: { timeoutMs: 30_000, retries: 2, retryDelayMs: 500 },
+  jiraTest: { timeoutMs: 20_000, retries: 1, retryDelayMs: 500 },
+  pty: { timeoutMs: 5_000, retries: 0 },
+  secret: { timeoutMs: 10_000, retries: 0 },
+  shellCompletion: { timeoutMs: 3_000, retries: 0 },
+  workspaceCache: { timeoutMs: 10_000, retries: 0 },
+} satisfies Record<string, IpcPolicy>;
+
 export class IpcPolicyError extends Error {
   readonly category: IpcErrorCategory;
   readonly command: string;
@@ -32,7 +55,7 @@ export class IpcPolicyError extends Error {
 
 export async function invokeWithPolicy<T>(
   command: string,
-  args: Record<string, unknown> | undefined,
+  args: Parameters<typeof invoke<T>>[1],
   policy: IpcPolicy,
 ): Promise<T> {
   const retries = policy.retries ?? 0;
@@ -75,27 +98,52 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, command: string)
 
 function normalizeIpcError(command: string, reason: unknown): IpcPolicyError {
   if (reason instanceof IpcPolicyError) return reason;
+
+  const structured = parseStructuredIpcError(reason);
+  if (structured) {
+    return new IpcPolicyError(
+      command,
+      structured.category,
+      structured.message,
+      structured.retryable === true,
+    );
+  }
+
   const message = reason instanceof Error ? reason.message : String(reason);
-  const lower = message.toLowerCase();
-  const category = categorizeMessage(lower);
-  return new IpcPolicyError(command, category, message, isRetryable(category, lower));
+  return new IpcPolicyError(command, "unknown", message, false);
 }
 
-function categorizeMessage(message: string): IpcErrorCategory {
-  if (message.includes("timed out") || message.includes("timeout")) return "timeout";
-  if (message.includes("cancel") || message.includes("aborted")) return "cancelled";
-  if (message.includes("unauthorized") || message.includes("forbidden") || message.includes("401")) return "auth";
-  if (message.includes("permission denied") || message.includes("access denied") || message.includes("403")) return "permission";
-  if (message.includes("not found") || message.includes("no such file") || message.includes("404")) return "not_found";
-  if (message.includes("invalid") || message.includes("validation") || message.includes("bad request") || message.includes("400")) return "validation";
-  if (message.includes("429") || message.includes("502") || message.includes("503") || message.includes("504")) return "transient";
-  if (message.includes("connection") || message.includes("temporarily") || message.includes("unavailable")) return "transient";
-  return "unknown";
+function parseStructuredIpcError(reason: unknown): StructuredIpcError | null {
+  const value = typeof reason === "string" ? parseJsonObject(reason) : reason;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  const candidate = value as Partial<StructuredIpcError>;
+  if (!isIpcErrorCategory(candidate.category) || typeof candidate.message !== "string") return null;
+
+  return {
+    category: candidate.category,
+    message: candidate.message,
+    retryable: candidate.retryable === true,
+  };
 }
 
-function isRetryable(category: IpcErrorCategory, message: string): boolean {
-  if (category === "timeout" || category === "transient") return true;
-  return message.includes("rate limit") || message.includes("reset by peer");
+function parseJsonObject(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isIpcErrorCategory(value: unknown): value is IpcErrorCategory {
+  return value === "timeout"
+    || value === "transient"
+    || value === "auth"
+    || value === "permission"
+    || value === "validation"
+    || value === "not_found"
+    || value === "cancelled"
+    || value === "unknown";
 }
 
 function backoffMs(baseDelayMs: number, attempt: number): number {

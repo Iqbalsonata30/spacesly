@@ -10,7 +10,6 @@
   };
 
   type Props = {
-    style?: string;
     displayColumns: BoardDisplayColumn[];
     selectedCardId: string | null;
     draggedCardId: string | null;
@@ -44,7 +43,6 @@
   };
 
   let {
-    style,
     displayColumns,
     selectedCardId,
     draggedCardId,
@@ -78,8 +76,7 @@
   }: Props = $props();
 </script>
 
-<div class:with-console={agentConsoleOpen && hasAgentConsoleSession} class="workspace-body" style={style}>
-  <div class="board-panel">
+<div class="board-panel">
     <div class="resize-toolbar" aria-label="Board sizing controls">
       <span>Board visibility</span>
       <div title="Drag horizontally to resize columns">
@@ -193,5 +190,4 @@
         </section>
       {/each}
     </div>
-  </div>
 </div>

@@ -1,8 +1,4 @@
-import { invokeWithPolicy } from "$lib/ipc/policy";
-
-const AI_TEST_POLICY = { timeoutMs: 30_000, retries: 1, retryDelayMs: 750 };
-const AI_EXECUTION_POLICY = { timeoutMs: 180_000, retries: 0 };
-const AI_CHAT_POLICY = { timeoutMs: 120_000, retries: 0 };
+import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 
 export interface AiWorkerConfig {
   runtime: "api" | "opencode";
@@ -33,6 +29,7 @@ export interface AiWorkerTask {
 export interface AiWorkerChatRequest {
   message: string;
   terminal_context: string | null;
+  session_context: string | null;
 }
 
 export interface AiWorkerStatus {
@@ -42,27 +39,33 @@ export interface AiWorkerStatus {
   message: string;
 }
 
-export interface AiWorkerResult {
+export interface AiWorkerTaskResult {
   summary: string;
-  raw_response: string;
+  evidence: string[];
+  details: string[];
+  next: string[];
   completion_status: "completed" | "blocked";
   blocked_reason: string | null;
 }
 
+export interface AiWorkerChatResult {
+  message: string;
+}
+
 export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStatus> {
-  return invokeWithPolicy<AiWorkerStatus>("test_ai_worker", { config }, AI_TEST_POLICY);
+  return invokeWithPolicy<AiWorkerStatus>("test_ai_worker", { config }, IPC_POLICIES.aiTest);
 }
 
 export async function executeAiWorkerTask(
   config: AiWorkerConfig,
   task: AiWorkerTask,
-): Promise<AiWorkerResult> {
-  return invokeWithPolicy<AiWorkerResult>("execute_ai_worker_task", { config, task }, AI_EXECUTION_POLICY);
+): Promise<AiWorkerTaskResult> {
+  return invokeWithPolicy<AiWorkerTaskResult>("execute_ai_worker_task", { config, task }, IPC_POLICIES.aiExecution);
 }
 
 export async function chatAiWorker(
   config: AiWorkerConfig,
   request: AiWorkerChatRequest,
-): Promise<AiWorkerResult> {
-  return invokeWithPolicy<AiWorkerResult>("chat_ai_worker", { config, request }, AI_CHAT_POLICY);
+): Promise<AiWorkerChatResult> {
+  return invokeWithPolicy<AiWorkerChatResult>("chat_ai_worker", { config, request }, IPC_POLICIES.aiChat);
 }

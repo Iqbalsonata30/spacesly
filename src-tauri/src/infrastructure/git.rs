@@ -25,19 +25,22 @@ pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, Stri
 
     let current_branch = git_output(&repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
         .and_then(|value| normalize_branch_name(&value));
-    let branches = git_output(&repo_root, ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
-        .map(|output| {
-            let mut branches: Vec<String> = output
-                .lines()
-                .map(str::trim)
-                .filter(|branch| !branch.is_empty())
-                .map(ToString::to_string)
-                .collect();
-            branches.sort_unstable();
-            branches.dedup();
-            branches
-        })
-        .unwrap_or_default();
+    let branches = git_output(
+        &repo_root,
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .map(|output| {
+        let mut branches: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        branches.sort_unstable();
+        branches.dedup();
+        branches
+    })
+    .unwrap_or_default();
 
     Ok(GitWorkspaceInfo {
         is_git_repo: true,
@@ -47,7 +50,10 @@ pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, Stri
     })
 }
 
-pub fn checkout_workspace_git_branch(root: &WorkspaceRoot, branch: String) -> Result<GitWorkspaceInfo, String> {
+pub fn checkout_workspace_git_branch(
+    root: &WorkspaceRoot,
+    branch: String,
+) -> Result<GitWorkspaceInfo, String> {
     let workspace_root = root.path()?;
     let Some(repo_root) = git_repo_root(&workspace_root)? else {
         return Err("Workspace root is not inside a git repository.".to_string());

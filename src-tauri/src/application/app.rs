@@ -170,9 +170,7 @@ mod tests {
 
         assert_eq!(workspace.name, "Personal command center");
         assert_eq!(board.columns.len(), 4);
-        assert!(board.columns
-            .iter()
-            .all(|column| column.cards.is_empty()));
+        assert!(board.columns.iter().all(|column| column.cards.is_empty()));
     }
 
     #[test]

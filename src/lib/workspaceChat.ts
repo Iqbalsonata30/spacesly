@@ -1,4 +1,4 @@
-import type { CardProjection, ColumnIntent, WorkspaceProjection } from "$lib/ipc";
+import type { CardProjection, WorkspaceProjection } from "$lib/ipc";
 
 export type WorkspaceChatAction =
   | { type: "create_task"; title: string; description?: string }
@@ -7,6 +7,14 @@ export type WorkspaceChatAction =
   | { type: "select_card"; card_id?: string; ticket?: string; title?: string }
   | { type: "delete_card"; card_id?: string; ticket?: string; title?: string }
   | { type: "sync_jira" };
+
+export type WorkspaceChatActionContext = {
+  activeCardIds?: Set<string>;
+  selectedCardId?: string | null;
+  lastCardId?: string | null;
+  recentCardIds?: string[];
+  lastCreatedCardId?: string | null;
+};
 
 export function terminalContext(): string {
   return "PTY terminal is active. Ask about visible terminal output or paste relevant output into chat when needed.";
@@ -45,6 +53,19 @@ export function boardContext(activeBoard: WorkspaceProjection["projects"][number
     JSON.stringify(cards),
     "Allowed board actions: create_task, move_card, start_agent, select_card, delete_card, sync_jira.",
     "If you want Spacesly to mutate the board, append a final line starting with SPACESLY_ACTIONS: followed by a JSON array of actions. Use card_id when possible. Use target todo/queued/in_progress/done for move_card.",
+  ].join("\n");
+}
+
+export function chatSessionContext(context: WorkspaceChatActionContext | null | undefined): string {
+  if (!context) return "Chat session context: none.";
+
+  const recent = context.recentCardIds?.filter(Boolean).slice(0, 6) ?? [];
+  return [
+    "Chat session context:",
+    `Selected card: ${context.selectedCardId ?? "none"}`,
+    `Last card: ${context.lastCardId ?? "none"}`,
+    `Last created card: ${context.lastCreatedCardId ?? "none"}`,
+    `Recent cards: ${recent.length > 0 ? recent.join(", ") : "none"}`,
   ].join("\n");
 }
 
@@ -96,7 +117,7 @@ export function normalizeWorkspaceAction(value: unknown): WorkspaceChatAction[] 
   return [];
 }
 
-export function fastWorkspaceChatActions(message: string, activeCardIds?: Set<string>): WorkspaceChatAction[] {
+export function fastWorkspaceChatActions(message: string, context?: WorkspaceChatActionContext): WorkspaceChatAction[] {
   const text = message.trim();
   const lower = text.toLowerCase();
 
@@ -106,28 +127,33 @@ export function fastWorkspaceChatActions(message: string, activeCardIds?: Set<st
   if (createMatch?.[1]) return [{ type: "create_task", title: createMatch[1].trim() }];
 
   const queueMatch = text.match(/^queue\s+(.+)$/i);
-  if (queueMatch?.[1]) return [{ type: "move_card", ...cardReference(queueMatch[1], activeCardIds), target: "queued" }];
+  if (queueMatch?.[1]) return [{ type: "move_card", ...parseCardReference(queueMatch[1], context), target: "queued" }];
 
   const moveMatch = text.match(/^move\s+(.+?)\s+to\s+(todo|queue|queued|in[\s_-]?progress|done)$/i);
   if (moveMatch?.[1] && moveMatch[2]) {
-    return [{ type: "move_card", ...cardReference(moveMatch[1], activeCardIds), target: normalizeBoardTarget(moveMatch[2]) }];
+    return [{ type: "move_card", ...parseCardReference(moveMatch[1], context), target: normalizeBoardTarget(moveMatch[2]) }];
   }
 
-  const startMatch = text.match(/^start(?:\s+agent)?(?:\s+(?:on|for))?\s+(.+)$/i);
-  if (startMatch?.[1]) return [{ type: "start_agent", ...cardReference(startMatch[1], activeCardIds) }];
+  const startMatch = text.match(/^(?:start|run|continue|execute)(?:\s+agent)?(?:\s+(?:on|for|with))?\s+(.+)$/i);
+  if (startMatch?.[1]) return [{ type: "start_agent", ...parseCardReference(startMatch[1], context) }];
+
+  if (/^(?:start|run|continue|execute)(?:\s+it|\s+that|\s+this|\s+again)?$/i.test(text)) {
+    return [{ type: "start_agent", ...parseCardReference("it", context) }];
+  }
 
   const openMatch = text.match(/^(?:open|show|select)\s+(.+)$/i);
-  if (openMatch?.[1]) return [{ type: "select_card", ...cardReference(openMatch[1], activeCardIds) }];
+  if (openMatch?.[1]) return [{ type: "select_card", ...parseCardReference(openMatch[1], context) }];
 
   const deleteMatch = text.match(/^(?:delete|remove)\s+(.+)$/i);
-  if (deleteMatch?.[1]) return [{ type: "delete_card", ...cardReference(deleteMatch[1], activeCardIds) }];
+  if (deleteMatch?.[1]) return [{ type: "delete_card", ...parseCardReference(deleteMatch[1], context) }];
 
   return [];
 }
 
-export function cardReference(value: string, activeCardIds?: Set<string>): { card_id?: string; ticket?: string; title?: string } {
+export function parseCardReference(value: string, context?: WorkspaceChatActionContext): { card_id?: string; ticket?: string; title?: string } {
   const text = value.trim().replace(/^task\s+/i, "");
-  if (activeCardIds?.has(text)) return { card_id: text };
+  const contextualCard = resolveContextCardId(text, context);
+  if (contextualCard) return { card_id: contextualCard };
   if (/^[A-Z][A-Z0-9]+-\d+$/i.test(text)) return { ticket: text.toUpperCase() };
   return { title: text };
 }
@@ -137,6 +163,23 @@ export function normalizeBoardTarget(value: string): "todo" | "queued" | "in_pro
   if (normalized === "in_progress") return "in_progress";
   if (normalized === "queue") return "queued";
   return normalized as "todo" | "queued" | "done";
+}
+
+function resolveContextCardId(value: string, context?: WorkspaceChatActionContext): string | null {
+  if (!context) return null;
+
+  if (context.activeCardIds?.has(value)) return value;
+
+  const recentCardIds = context.recentCardIds?.filter((cardId) => context.activeCardIds?.has(cardId)) ?? [];
+  if (/^(it|that|this|them|again)$/i.test(value)) {
+    if (context.lastCreatedCardId && context.activeCardIds?.has(context.lastCreatedCardId)) return context.lastCreatedCardId;
+    if (context.lastCardId && context.activeCardIds?.has(context.lastCardId)) return context.lastCardId;
+    if (recentCardIds[0]) return recentCardIds[0];
+    if (context.selectedCardId && context.activeCardIds?.has(context.selectedCardId)) return context.selectedCardId;
+    return null;
+  }
+
+  return null;
 }
 
 function stringField(value: unknown): string | undefined {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import AgentOutput from "$lib/components/AgentOutput.svelte";
+  import type { AiWorkerTaskResult } from "$lib/ipc";
 
   type AgentRunLog = {
     id: string;
@@ -34,6 +35,7 @@
     phases: AgentPhase[];
     logs: AgentRunLog[];
     output: string;
+    result: AiWorkerTaskResult | null;
     runStatus: AgentRunStatus;
     terminalLines: AgentTerminalLine[];
     terminalInput: string;
@@ -57,6 +59,7 @@
     phases,
     logs,
     output,
+    result,
     runStatus,
     terminalLines,
     terminalInput,
@@ -120,7 +123,7 @@
     <header>
       <span>Current output</span>
     </header>
-    <AgentOutput output={output} runStatus={runStatus} />
+    <AgentOutput output={output} result={result} runStatus={runStatus} />
   </div>
   <div class="stack-resize-handle">
     <span

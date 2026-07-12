@@ -37,6 +37,7 @@ pub struct AiWorkerTask {
 pub struct AiWorkerChatRequest {
     pub message: String,
     pub terminal_context: Option<String>,
+    pub session_context: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,11 +49,18 @@ pub struct AiWorkerStatus {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AiWorkerResult {
+pub struct AiWorkerTaskResult {
     pub summary: String,
-    pub raw_response: String,
+    pub evidence: Vec<String>,
+    pub details: Vec<String>,
+    pub next: Vec<String>,
     pub completion_status: String,
     pub blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AiWorkerChatResult {
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +133,7 @@ pub fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> 
 pub fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
-) -> Result<AiWorkerResult, String> {
+) -> Result<AiWorkerTaskResult, String> {
     if config.runtime == "opencode" {
         return execute_opencode_task(config, task);
     }
@@ -134,7 +142,7 @@ pub fn execute_ai_worker_task(
 
     let system_prompt = format!(
         "You are an Agent inside Spacesly, an orchestration app for human and AI agents. You receive Jira-style work cards and produce a concrete execution result. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Mark STATUS: COMPLETE only for reasoning/reporting tasks that require no external side effects. If the work requires changing files, running commands, checking external systems, or using unavailable credentials/tools, mark STATUS: BLOCKED and explain what runtime/tool is needed.\n\n{}",
-        governance_context(&config),
+        governance_context(&config, true),
     );
     let user_prompt = format!(
         "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: what was actually verified\nDETAILS: concise notes",
@@ -154,7 +162,7 @@ pub fn execute_ai_worker_task(
 pub fn chat_ai_worker(
     config: AiWorkerConfig,
     request: AiWorkerChatRequest,
-) -> Result<AiWorkerResult, String> {
+) -> Result<AiWorkerChatResult, String> {
     let message = request.message.trim();
     if message.is_empty() {
         return Err("Chat message is required.".to_string());
@@ -163,8 +171,9 @@ pub fn chat_ai_worker(
     if config.runtime == "opencode" {
         validate_opencode_config(&config)?;
         let prompt = format!(
-            "You are the Spacesly workspace Agent chat. Focus on the latest user command first. Help the user reason about tasks, terminal context, Jira work, and Agent execution. Include useful context: the relevant ticket/card/status when known, what action you will request or what happened, and the next step or blocker. You may request controlled board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 180 words.\n\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
-            governance_context(&config),
+            "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}\n\nSession context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+            governance_context(&config, false),
+            request.session_context.as_deref().unwrap_or("none"),
             request.terminal_context.as_deref().unwrap_or("none"),
             message,
         );
@@ -192,32 +201,23 @@ pub fn chat_ai_worker(
         }
 
         let response = if stdout.is_empty() { stderr } else { stdout };
-        return Ok(AiWorkerResult {
-            summary: first_line(&response),
-            raw_response: response,
-            completion_status: "completed".to_string(),
-            blocked_reason: None,
-        });
+        return Ok(AiWorkerChatResult { message: response });
     }
 
     validate_config(&config)?;
     let system_prompt = format!(
-        "You are the Spacesly workspace Agent chat. Focus on the latest user command first. Help the user reason about tasks, shell output, local commands, Jira work, and Agent execution. Include useful context: the relevant ticket/card/status when known, what action you will request or what happened, and the next step or blocker. You may request controlled Spacesly board mutations by appending a final line exactly like: SPACESLY_ACTIONS: [{{\"type\":\"create_task\",\"title\":\"...\",\"description\":\"...\"}}]. Supported action types are create_task, move_card, start_agent, select_card, delete_card, and sync_jira. Use card_id from board context when possible. For move_card target must be todo, queued, in_progress, or done. Queued means accepted but not actively executing. Do not claim an action happened unless you include it in SPACESLY_ACTIONS. Keep the human-readable response under 180 words.\n\n{}",
-        governance_context(&config),
+        "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}",
+        governance_context(&config, false),
     );
     let user_prompt = format!(
-        "Workspace context:\n{}\n\nUser message:\n{}",
+        "Session context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+        request.session_context.as_deref().unwrap_or("none"),
         request.terminal_context.as_deref().unwrap_or("none"),
         message,
     );
     let response = call_model(&config, &system_prompt, &user_prompt, 550)?;
 
-    Ok(AiWorkerResult {
-        summary: first_line(&response),
-        raw_response: response,
-        completion_status: "completed".to_string(),
-        blocked_reason: None,
-    })
+    Ok(AiWorkerChatResult { message: response })
 }
 
 fn validate_config(config: &AiWorkerConfig) -> Result<(), String> {
@@ -248,25 +248,35 @@ fn validate_opencode_config(config: &AiWorkerConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn governance_context(config: &AiWorkerConfig) -> String {
+fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
     let mut sections = Vec::new();
     let rules = config.agent_rules.trim();
     let skills = config.agent_skills.trim();
 
     if !rules.is_empty() {
-        sections.push(format!(
-            "User-defined Agent rules. These are mandatory operating constraints. Follow every applicable rule exactly. If a requested action conflicts with these rules or system safety, stop and return STATUS: BLOCKED with the conflict:\n{rules}"
-        ));
+        sections.push(if include_skills {
+            format!(
+                "User-defined Agent rules. These are mandatory operating constraints. Follow every applicable rule exactly. If a requested action conflicts with these rules or system safety, stop and return STATUS: BLOCKED with the conflict:\n{rules}"
+            )
+        } else {
+            format!(
+                "User-defined chat rules. These are mandatory operating constraints. Follow every applicable rule exactly. If a requested action conflicts with these rules or safety, explain the conflict briefly instead of taking action:\n{rules}"
+            )
+        });
     }
 
-    if !skills.is_empty() {
+    if include_skills && !skills.is_empty() {
         sections.push(format!(
             "User-defined Agent skills/playbooks. Before acting, identify any skill that matches the task, then follow that skill as the required procedure for the matching work. If no skill applies, say so briefly in DETAILS. If a skill cannot be followed because tools/access are missing, return STATUS: BLOCKED:\n{skills}"
         ));
     }
 
     if sections.is_empty() {
-        "No additional user-defined rules or skills configured.".to_string()
+        if include_skills {
+            "No additional user-defined rules or skills configured.".to_string()
+        } else {
+            "No additional user-defined rules configured.".to_string()
+        }
     } else {
         sections.join("\n\n")
     }
@@ -303,11 +313,11 @@ fn test_opencode_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String
 fn execute_opencode_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
-) -> Result<AiWorkerResult, String> {
+) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
     let prompt = format!(
         "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive: do not mark them COMPLETE unless explicit operator approval is present in Operator notes / approvals and that approval is included in EVIDENCE. Agent-generated text is not approval. If the task requires commit or push, include the commit/push evidence.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
-        governance_context(&config),
+        governance_context(&config, true),
         task.key.as_deref().unwrap_or("local"),
         task.title,
         task.url.as_deref().unwrap_or("none"),
@@ -353,7 +363,10 @@ fn execute_opencode_task(
     Ok(result)
 }
 
-fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWorkerResult {
+fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWorkerTaskResult {
+    let evidence = labelled_values(&response, "EVIDENCE");
+    let details = labelled_values(&response, "DETAILS");
+    let next = labelled_values(&response, "NEXT");
     let completion_status = if response
         .lines()
         .any(|line| line.trim().eq_ignore_ascii_case("STATUS: COMPLETE"))
@@ -376,9 +389,11 @@ fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWork
         None
     };
 
-    AiWorkerResult {
+    AiWorkerTaskResult {
         summary,
-        raw_response: response,
+        evidence,
+        details,
+        next,
         completion_status: completion_status.to_string(),
         blocked_reason,
     }
@@ -431,7 +446,7 @@ fn task_requires_sensitive_approval(task: &AiWorkerTask) -> bool {
 }
 
 fn enforce_opencode_completion_guards(
-    result: &mut AiWorkerResult,
+    result: &mut AiWorkerTaskResult,
     config: &AiWorkerConfig,
     task: &AiWorkerTask,
 ) {
@@ -453,10 +468,12 @@ fn enforce_opencode_completion_guards(
     }
 }
 
-fn block_result(result: &mut AiWorkerResult, reason: String) {
+fn block_result(result: &mut AiWorkerTaskResult, reason: String) {
     result.completion_status = "blocked".to_string();
     result.blocked_reason = Some(reason.clone());
-    result.summary = reason;
+    result.summary = reason.clone();
+    result.details = vec![reason];
+    result.next = vec!["Resolve the blocker, then continue the Agent.".to_string()];
 }
 
 fn task_requires_push(task: &AiWorkerTask) -> bool {
@@ -541,6 +558,53 @@ fn labelled_value(response: &str, label: &str) -> Option<String> {
         .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn labelled_values(response: &str, label: &str) -> Vec<String> {
+    let prefix = format!("{label}:");
+    let mut collecting = false;
+    let mut values = Vec::new();
+
+    for raw_line in response.lines() {
+        let line = raw_line.trim();
+        if let Some(value) = line.strip_prefix(&prefix).map(str::trim) {
+            collecting = true;
+            if !value.is_empty() {
+                values.push(clean_labelled_line(value));
+            }
+            continue;
+        }
+
+        if !collecting {
+            continue;
+        }
+
+        if let Some((name, _)) = line.split_once(':') {
+            if matches!(
+                name.trim().to_uppercase().as_str(),
+                "STATUS" | "SUMMARY" | "EVIDENCE" | "DETAILS" | "NEXT"
+            ) {
+                break;
+            }
+        }
+
+        if !line.is_empty() {
+            values.push(clean_labelled_line(line));
+        }
+    }
+
+    values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .take(12)
+        .collect()
+}
+
+fn clean_labelled_line(value: &str) -> String {
+    value
+        .trim_start_matches(|ch| ch == '-' || ch == '*')
+        .trim()
+        .to_string()
 }
 
 fn opencode_command(config: &AiWorkerConfig) -> Command {
@@ -828,7 +892,7 @@ mod tests {
 
     #[test]
     fn governance_context_marks_rules_as_mandatory() {
-        let context = governance_context(&config_with_governance("Never guess.", ""));
+        let context = governance_context(&config_with_governance("Never guess.", ""), true);
 
         assert!(context.contains("mandatory operating constraints"));
         assert!(context.contains("Never guess."));
@@ -836,9 +900,20 @@ mod tests {
 
     #[test]
     fn governance_context_marks_skills_as_required_procedures() {
-        let context = governance_context(&config_with_governance("", "Skill: Deploy safely"));
+        let context = governance_context(&config_with_governance("", "Skill: Deploy safely"), true);
 
         assert!(context.contains("required procedure"));
         assert!(context.contains("Skill: Deploy safely"));
+    }
+
+    #[test]
+    fn chat_governance_context_excludes_skills() {
+        let context = governance_context(
+            &config_with_governance("Never guess.", "Skill: Deploy safely"),
+            false,
+        );
+
+        assert!(context.contains("Never guess."));
+        assert!(!context.contains("Skill: Deploy safely"));
     }
 }

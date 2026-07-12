@@ -1,4 +1,6 @@
 <script lang="ts">
+  import type { AiWorkerTaskResult } from "$lib/ipc";
+
   type AgentRunStatus = "idle" | "running" | "completed" | "blocked";
   type AgentOutputStatus = "complete" | "blocked" | "working" | "unknown";
   type AgentOutputView = {
@@ -11,16 +13,34 @@
     nextSteps: string[];
   };
 
-  let { output, runStatus } = $props<{
+  let { output, result, runStatus } = $props<{
     output: string;
+    result: AiWorkerTaskResult | null;
     runStatus: AgentRunStatus;
   }>();
 
-  let view = $derived(parseAgentOutput(output, runStatus));
+  let view = $derived(parseAgentOutput(output, result, runStatus));
 
-  function parseAgentOutput(value: string, statusValue: AgentRunStatus): AgentOutputView {
-    const text = stripAnsi(value).trim();
-    const waiting = !text || text === "Waiting for Agent output..." || text === "Agent is processing the task context...";
+  function parseAgentOutput(value: string, resultValue: AiWorkerTaskResult | null, statusValue: AgentRunStatus): AgentOutputView {
+    if (resultValue) {
+      const status = resultValue.completion_status === "completed" ? "complete" : "blocked";
+      const nextSteps = resultValue.next.length > 0
+        ? resultValue.next
+        : nextStepLines(status, resultValue.details, resultValue.evidence);
+
+      return {
+        status,
+        label: statusLabel(status),
+        summary: resultValue.summary,
+        outcome: outcomeText(status, resultValue.summary),
+        evidence: resultValue.evidence.slice(0, 6),
+        changes: resultValue.details.slice(0, 5),
+        nextSteps,
+      };
+    }
+
+    const text = value.trim();
+    const waiting = !text || text === "Waiting for Agent output...";
 
     if (waiting) {
       const status = statusValue === "blocked" ? "blocked" : statusValue === "completed" ? "complete" : "working";
@@ -35,76 +55,26 @@
       };
     }
 
-    const sections = labelledSections(text);
-    const fallbackLines = cleanOutputLines(text.split(/\n+/));
-    const explicitStatus = sections.STATUS?.join(" ").toLowerCase() ?? "";
-    const status = explicitStatus.includes("complete")
+    const fallbackLines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+    const status = statusValue === "completed"
       ? "complete"
-      : explicitStatus.includes("blocked")
+      : statusValue === "blocked"
         ? "blocked"
-        : statusValue === "completed"
-          ? "complete"
-          : statusValue === "blocked"
-            ? "blocked"
-            : "unknown";
-
-    const summary = cleanSentence(sections.SUMMARY?.join(" ") || fallbackLines[0] || "No summary returned.");
-    const evidence = cleanOutputLines(sections.EVIDENCE ?? []).slice(0, 6);
-    const detailLines = cleanOutputLines(sections.DETAILS ?? fallbackLines.slice(1));
+        : "working";
+    const summary = fallbackLines[0] || "No summary returned.";
+    const detailLines = fallbackLines.slice(1, 8);
     const changes = detailLines.filter(isChangeLine).slice(0, 5);
-    const nextSteps = nextStepLines(status, detailLines, evidence);
+    const nextSteps = nextStepLines(status, detailLines, []);
 
     return {
       status,
       label: statusLabel(status),
       summary,
       outcome: outcomeText(status, summary),
-      evidence,
+      evidence: [],
       changes: changes.length > 0 ? changes : detailLines.slice(0, 4),
       nextSteps,
     };
-  }
-
-  function stripAnsi(value: string): string {
-    return value.replace(/\x1b\[[0-9;]*m/g, "");
-  }
-
-  function labelledSections(value: string): Record<string, string[]> {
-    const sections: Record<string, string[]> = {};
-    let activeKey: string | null = null;
-
-    for (const rawLine of value.split("\n")) {
-      const line = rawLine.trimEnd();
-      const match = line.match(/^(STATUS|SUMMARY|EVIDENCE|DETAILS):\s*(.*)$/i);
-      if (match) {
-        activeKey = match[1].toUpperCase();
-        sections[activeKey] = match[2] ? [match[2].trim()] : [];
-        continue;
-      }
-
-      if (activeKey && line.trim()) sections[activeKey].push(line.trim());
-    }
-
-    return sections;
-  }
-
-  function cleanOutputLines(lines: string[]): string[] {
-    return lines
-      .flatMap((line) => line.split("\n"))
-      .map((line) => cleanSentence(line.replace(/^[-*•]\s*/, "")))
-      .filter(Boolean)
-      .filter((line) => !/^(STATUS|SUMMARY|EVIDENCE|DETAILS):?$/i.test(line))
-      .slice(0, 12);
-  }
-
-  function cleanSentence(value: string): string {
-    return value
-      .replace(/^STATUS:\s*/i, "")
-      .replace(/^SUMMARY:\s*/i, "")
-      .replace(/^EVIDENCE:\s*/i, "")
-      .replace(/^DETAILS:\s*/i, "")
-      .replace(/`{3}/g, "")
-      .trim();
   }
 
   function isChangeLine(value: string): boolean {

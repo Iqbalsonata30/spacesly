@@ -1,27 +1,27 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a workspace.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceId(pub String);
 
 /// Unique identifier for a project.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectId(pub String);
 
 /// Unique identifier for a board.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoardId(pub String);
 
 /// Unique identifier for a column.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ColumnId(pub String);
 
 /// Unique identifier for a card.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CardId(pub String);
 
 /// A workspace groups projects and their execution context.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
@@ -29,7 +29,7 @@ pub struct Workspace {
 }
 
 /// A project contains one or more boards.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Project {
     pub id: ProjectId,
     pub workspace_id: WorkspaceId,
@@ -38,7 +38,7 @@ pub struct Project {
 }
 
 /// A board is a workflow projection made of ordered columns.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Board {
     pub id: BoardId,
     pub name: String,
@@ -46,7 +46,7 @@ pub struct Board {
 }
 
 /// A board column represents a workflow state.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Column {
     pub id: ColumnId,
     pub name: String,
@@ -55,7 +55,7 @@ pub struct Column {
 }
 
 /// The semantic meaning of a column.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnIntent {
     Backlog,
@@ -66,7 +66,7 @@ pub enum ColumnIntent {
 }
 
 /// A card represents work imported from a tool or created locally.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Card {
     pub id: CardId,
     pub title: String,
@@ -80,7 +80,7 @@ pub struct Card {
 }
 
 /// Origin of the work item.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardSource {
     Jira { key: String },
@@ -88,7 +88,7 @@ pub enum CardSource {
 }
 
 /// Priority used by the workspace board.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
@@ -97,7 +97,7 @@ pub enum Priority {
 }
 
 /// Observable workflow execution state for a card.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionState {
     Idle,

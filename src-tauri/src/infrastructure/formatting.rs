@@ -13,15 +13,23 @@ pub fn format_code(formatter: String, source: String) -> Result<String, String> 
     }
 }
 
-fn format_with_command(command: &'static str, args: &'static [&'static str], source: String) -> Result<String, String> {
+fn format_with_command(
+    command: &'static str,
+    args: &'static [&'static str],
+    source: String,
+) -> Result<String, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = run_formatter(command, args, source);
         let _ = tx.send(result);
     });
 
-    rx.recv_timeout(FORMAT_TIMEOUT)
-        .map_err(|_| format!("{command} timed out after {} seconds.", FORMAT_TIMEOUT.as_secs()))?
+    rx.recv_timeout(FORMAT_TIMEOUT).map_err(|_| {
+        format!(
+            "{command} timed out after {} seconds.",
+            FORMAT_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 fn run_formatter(command: &str, args: &[&str], source: String) -> Result<String, String> {

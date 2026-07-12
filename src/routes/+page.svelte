@@ -12,6 +12,7 @@
   import WorkspaceChatPane from "$lib/components/WorkspaceChatPane.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
+  import { chatTitleForCard, isGenericChatTitle, summarizeChatTitle } from "$lib/chatSession";
   import { displayPath, fileName, normalizeAbsolutePath, parentDirectory } from "$lib/filesFeature";
   import {
     agentActivity,
@@ -26,14 +27,18 @@
   } from "$lib/boardWorkflow";
   import { capList, capText } from "$lib/boundedBuffers";
   import {
+    createWorkspaceChatSession,
     loadUiState,
     serializeUiState,
     type UiState,
+    type WorkspaceChatActivity,
     type WorkspaceChatMessage,
+    type WorkspaceChatSession,
     type WorkspaceMode,
   } from "$lib/uiState";
   import {
     chatTargetLabel,
+    chatSessionContext,
     executionLabel,
     extractWorkspaceActions,
     fastWorkspaceChatActions,
@@ -41,6 +46,7 @@
     workspaceAgentContext,
     stripWorkspaceActions,
     type WorkspaceChatAction,
+    type WorkspaceChatActionContext,
   } from "$lib/workspaceChat";
   import "@xterm/xterm/css/xterm.css";
   import "./page.css";
@@ -77,6 +83,7 @@
     type ExecutionState,
     type FileEntry,
     type GitWorkspaceInfo,
+    type AiWorkerTaskResult,
     type JiraMcpConfig,
     type JiraBoard,
     type WorkspaceProjection,
@@ -84,6 +91,7 @@
   } from "$lib/ipc";
   import {
     createMcpServer,
+    loadLegacySettingsSecrets,
     loadSettings,
     saveSettings,
     hasAnySecret,
@@ -105,17 +113,14 @@
   };
 
   const initialSettings = loadSettings();
-  const emptyAppSecrets: AppSecrets = {
-    jira_api_token: "",
-    jira_personal_access_token: "",
-    jira_password: "",
-    ai_api_keys: {},
-  };
-  const cachedWorkspace = loadCachedWorkspace();
+  const initialAppSecrets = loadLegacySettingsSecrets();
   const AGENT_STATUS_KEY = "spacesly.agent.status.v1";
   const MAX_AGENT_LOGS = 120;
   const MAX_AGENT_TERMINAL_LINES = 80;
   const MAX_WORKSPACE_CHAT_MESSAGES = 80;
+  const MAX_CHAT_SESSIONS = 6;
+  const MAX_WORKSPACE_CHAT_ACTIVITIES = 120;
+  const MAX_WORKSPACE_CHAT_RECENT_CARDS = 12;
   const MAX_AGENT_OUTPUT_CHARS = 32_000;
   const DEFAULT_DONE_VISIBLE_LIMIT = 20;
   const DEFAULT_LANE_VISIBLE_LIMIT = 40;
@@ -195,9 +200,23 @@
       chatMessages: defaultWorkspaceChatMessages,
     });
 
+    const activeSession = state.workspaceChatSession;
     return {
       ...state,
       workspaceChatMessages: state.workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+      workspaceChatSessions: state.workspaceChatSessions.map((session) => ({
+        ...session,
+        messages: session.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+        activities: session.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
+        recentCardIds: session.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+      })),
+      workspaceChatActiveSessionId: state.workspaceChatActiveSessionId ?? activeSession.id,
+      workspaceChatSession: {
+        ...activeSession,
+        messages: activeSession.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+        activities: activeSession.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
+        recentCardIds: activeSession.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+      },
     };
   })();
 
@@ -220,9 +239,12 @@
     status: "idle" | "running" | "completed" | "blocked";
     progress: number;
     output: string;
+    result: AiWorkerTaskResult | null;
     logs: AgentRunLog[];
     terminalLines: AgentTerminalLine[];
   };
+
+  type ChatSessionState = WorkspaceChatSession;
 
   type AgentPhaseKey = "prepare" | "jira" | "model" | "execute" | "writeback" | "done";
   type AgentPhase = {
@@ -245,8 +267,8 @@
     cardColumnIntentById: Map<string, ColumnIntent>;
   };
 
-  let workspace = $state<WorkspaceProjection | null>(cachedWorkspace?.workspace ?? null);
-  let cacheSavedAt = $state<number | null>(cachedWorkspace?.savedAt ?? null);
+  let workspace = $state<WorkspaceProjection | null>(null);
+  let cacheSavedAt = $state<number | null>(null);
   let error = $state<string | null>(null);
   let syncError = $state<string | null>(null);
   let syncing = $state(false);
@@ -259,18 +281,15 @@
   let workerStatus = $state<AiWorkerStatus | null>(null);
   let agentConnectionStates = $state<Record<string, AgentConnectionState>>(loadAgentConnectionStates());
   let mcpConnectionStates = $state<Record<string, McpConnectionState>>({});
-  let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(
-    cachedWorkspace
-      ? { tone: "info", message: "Loaded saved cards instantly. Sync Jira only when you need fresh updates." }
-      : null,
-  );
+  let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
   let mcpToolsByServer = $state<Record<string, string[]>>({});
   let settingsOpen = $state(false);
   let settingsTab = $state<"agent" | "rules" | "skills" | "mcp" | "jira" | "theme">("agent");
   let settingsError = $state<string | null>(null);
   let settings = $state<AppSettings>(initialSettings);
-  let appSecrets = $state<AppSecrets>(emptyAppSecrets);
+  let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let secretsHydrated = $state(false);
+  let workspaceCacheHydrated = $state(false);
   let filesStateHydrated = $state(false);
   let selectedServerId = $state(initialSettings.jira.serverId);
   let workspaceMode = $state<WorkspaceMode>(initialUiState.workspaceMode);
@@ -288,6 +307,7 @@
   let agentRunStatus = $state<"idle" | "running" | "completed" | "blocked">("idle");
   let agentRunProgress = $state(0);
   let agentRunOutput = $state("");
+  let agentRunResult = $state<AiWorkerTaskResult | null>(null);
   let agentRunLogs = $state<AgentRunLog[]>([]);
   let agentTerminalLines = $state<AgentTerminalLine[]>([]);
   let agentTerminalInput = $state("");
@@ -304,6 +324,9 @@
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRunning = $state(false);
+  let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
+  let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
+  let workspaceChatActiveSessionId = $state<string>(initialUiState.workspaceChatActiveSessionId ?? initialUiState.workspaceChatSession.id);
   let workspaceChatMessages = $state<WorkspaceChatMessage[]>(initialUiState.workspaceChatMessages);
   let layoutPrefs = $state<LayoutPrefs>(loadLayoutPrefs());
   let layoutResizeDrag: LayoutResizeDrag | null = null;
@@ -331,8 +354,12 @@
   let switchingWorkspaceBranch = $state(false);
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceGitInfoRequestId = 0;
+  let backlogStartConfirmation = $state<{ cardId: string; title: string } | null>(null);
+  let backlogStartConfirmationResolve: ((confirmed: boolean) => void) | null = null;
 
   onMount(() => {
+    void hydrateCachedWorkspace();
+
     const timer = window.setInterval(() => {
       now = new Date();
     }, 60_000);
@@ -341,7 +368,7 @@
   });
 
   $effect(() => {
-    if (workspace) return;
+    if (workspace || !workspaceCacheHydrated) return;
 
     getWorkspace()
       .then((projection) => {
@@ -442,6 +469,7 @@
     if (appNoticeTimer) clearTimeout(appNoticeTimer);
     if (terminalFrameId !== null) window.cancelAnimationFrame(terminalFrameId);
     if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
+    resolveBacklogStartConfirmation(false);
     flushUiState();
     workspaceTerminalResizeObserver?.disconnect();
     void closePtyTerminal(workspaceTerminalId).catch(() => {});
@@ -622,7 +650,7 @@
   }
 
   async function hydrateSecrets() {
-    const localSecrets = secretsFromSettings(settings);
+    const localSecrets = appSecrets;
     try {
       const storedSecrets = await loadAppSecrets();
       const mergedSecrets = hasAnySecret(localSecrets)
@@ -636,6 +664,7 @@
 
       appSecrets = mergedSecrets;
       settings = settingsWithoutSecrets(settings);
+      secretsHydrated = true;
     } catch (reason: unknown) {
       appNotice = {
         tone: "error",
@@ -644,8 +673,28 @@
     }
   }
 
+  async function hydrateCachedWorkspace() {
+    try {
+      const cached = await loadCachedWorkspace();
+      if (cached && !workspace) {
+        workspace = cached.workspace;
+        cacheSavedAt = cached.savedAt;
+        appNotice = { tone: "info", message: "Loaded saved cards. Sync Jira only when you need fresh updates." };
+      }
+    } catch (reason: unknown) {
+      appNotice = {
+        tone: "error",
+        message: `Could not load workspace cache: ${reason instanceof Error ? reason.message : String(reason)}`,
+      };
+    } finally {
+      workspaceCacheHydrated = true;
+    }
+  }
+
   async function persistSettingsAndSecrets(value: AppSettings) {
-    await saveAppSecrets(appSecrets);
+    const storedSecrets = await loadAppSecrets();
+    const mergedSecrets = hasAnySecret(appSecrets) ? mergeAppSecrets(appSecrets, storedSecrets) : storedSecrets;
+    await saveAppSecrets(mergedSecrets);
     saveSettings(value);
   }
 
@@ -662,6 +711,21 @@
         workspaceMode,
         workspaceShellWorkdir,
         workspaceChatMessages: workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+        workspaceChatSession: {
+          ...workspaceChatSession,
+          messages: workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+          activities: workspaceChatSession.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
+          recentCardIds: workspaceChatSession.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+        },
+        workspaceChatSessions: workspaceChatSessions.map((session) => ({
+          ...session,
+          messages: session.id === workspaceChatSession.id
+            ? workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES)
+            : session.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+          activities: session.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
+          recentCardIds: session.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+        })),
+        workspaceChatActiveSessionId,
         doneVisibleLimit,
         workspaceFilesRoot,
         workspaceFilesDirectory,
@@ -1271,12 +1335,128 @@
   }
 
   function appendWorkspaceChat(message: Omit<WorkspaceChatMessage, "id">) {
-    workspaceChatMessages = capList([
-      ...workspaceChatMessages,
-      { ...message, id: `chat-${Date.now().toString(36)}-${workspaceChatMessages.length}` },
-    ], MAX_WORKSPACE_CHAT_MESSAGES);
+    const entry: WorkspaceChatMessage = {
+      ...message,
+      id: `chat-${Date.now().toString(36)}-${workspaceChatMessages.length}`,
+    };
+    workspaceChatMessages = capList([...workspaceChatMessages, entry], MAX_WORKSPACE_CHAT_MESSAGES);
+    workspaceChatSession = {
+      ...workspaceChatSession,
+      updatedAt: Date.now(),
+      messages: workspaceChatMessages,
+      title: isGenericChatTitle(workspaceChatSession.title) && message.role === "user"
+        ? summarizeChatTitle(message.text)
+        : workspaceChatSession.title,
+    };
+    syncWorkspaceChatSession();
+    appendWorkspaceChatActivity({
+      kind: "message",
+      label: message.role,
+      text: message.text,
+    });
     saveUiState();
     scrollWorkspaceChatToLatest();
+  }
+
+  function appendWorkspaceChatActivity(activity: Omit<WorkspaceChatActivity, "id" | "at">) {
+    const entry: WorkspaceChatActivity = {
+      ...activity,
+      id: `chat-activity-${Date.now().toString(36)}-${workspaceChatSession.activities.length}`,
+      at: Date.now(),
+    };
+    workspaceChatSession = {
+      ...workspaceChatSession,
+      updatedAt: Date.now(),
+      activities: capList([...workspaceChatSession.activities, entry], MAX_WORKSPACE_CHAT_ACTIVITIES),
+    };
+    syncWorkspaceChatSession();
+    saveUiState();
+  }
+
+  function syncWorkspaceChatSession() {
+    const normalizedSession = {
+      ...workspaceChatSession,
+      messages: workspaceChatMessages,
+      activities: workspaceChatSession.activities,
+    };
+    workspaceChatSession = normalizedSession;
+    workspaceChatActiveSessionId = normalizedSession.id;
+    workspaceChatSessions = capList(
+      [normalizedSession, ...workspaceChatSessions.filter((session) => session.id !== normalizedSession.id)],
+      MAX_CHAT_SESSIONS,
+    );
+  }
+
+  function activateWorkspaceChatSession(sessionId: string) {
+    const session = workspaceChatSessions.find((entry) => entry.id === sessionId);
+    if (!session || session.id === workspaceChatActiveSessionId) return;
+
+    workspaceChatActiveSessionId = session.id;
+    workspaceChatSession = {
+      ...session,
+      messages: session.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+      activities: session.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
+      recentCardIds: session.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+    };
+    workspaceChatMessages = workspaceChatSession.messages;
+    saveUiState();
+    scrollWorkspaceChatToLatest();
+  }
+
+  function startWorkspaceChatSession() {
+    const sessionNumber = workspaceChatSessions.length + 1;
+    const session = createWorkspaceChatSession([], `Chat ${sessionNumber}`);
+    workspaceChatSessions = capList([session, ...workspaceChatSessions], MAX_CHAT_SESSIONS);
+    workspaceChatActiveSessionId = session.id;
+    workspaceChatSession = session;
+    workspaceChatMessages = session.messages;
+    saveUiState();
+    scrollWorkspaceChatToLatest();
+  }
+
+  function setWorkspaceChatSessionCard(cardId: string | null, options: { created?: boolean } = {}) {
+    const card = cardId ? activeCardById.get(cardId) ?? null : null;
+    const recentCardIds = cardId
+      ? capList([cardId, ...workspaceChatSession.recentCardIds.filter((entry) => entry !== cardId)], MAX_WORKSPACE_CHAT_RECENT_CARDS)
+      : workspaceChatSession.recentCardIds;
+    workspaceChatSession = {
+      ...workspaceChatSession,
+      updatedAt: Date.now(),
+      title: card && (options.created || isGenericChatTitle(workspaceChatSession.title))
+        ? chatTitleForCard(card)
+        : workspaceChatSession.title,
+      lastCardId: cardId ?? workspaceChatSession.lastCardId,
+      lastCreatedCardId: options.created && cardId ? cardId : workspaceChatSession.lastCreatedCardId,
+      recentCardIds,
+    };
+    syncWorkspaceChatSession();
+    saveUiState();
+  }
+
+  function workspaceChatActionContext(): WorkspaceChatActionContext {
+    return {
+      activeCardIds,
+      selectedCardId,
+      lastCardId: workspaceChatSession.lastCardId,
+      lastCreatedCardId: workspaceChatSession.lastCreatedCardId,
+      recentCardIds: workspaceChatSession.recentCardIds,
+    };
+  }
+
+  function workspaceChatSessionPromptContext(): string {
+    const recentMessages = workspaceChatMessages
+      .filter((message) => message.id !== "chat-welcome")
+      .slice(-10)
+      .map((message) => `${message.role}: ${singleLine(message.text, 500)}`);
+    const recentActivities = workspaceChatSession.activities
+      .slice(-8)
+      .map((activity) => `${activity.kind}/${activity.label}: ${singleLine(activity.text, 300)}`);
+
+    return [
+      chatSessionContext(workspaceChatActionContext()),
+      recentMessages.length > 0 ? ["Recent chat turns:", ...recentMessages].join("\n") : "Recent chat turns: none.",
+      recentActivities.length > 0 ? ["Recent tool activity:", ...recentActivities].join("\n") : "Recent tool activity: none.",
+    ].join("\n\n");
   }
 
   function scrollWorkspaceChatToLatest() {
@@ -1366,7 +1546,7 @@
     appendWorkspaceChat({ role: "user", text: message });
     focusWorkspaceChatInput();
 
-    const localActions = fastWorkspaceChatActions(message, activeCardIds);
+    const localActions = fastWorkspaceChatActions(message, workspaceChatActionContext());
     if (localActions.length > 0) {
       const actionSummary = await applyWorkspaceChatActions(localActions);
       appendWorkspaceChat({ role: "system", text: actionSummary });
@@ -1383,9 +1563,11 @@
       const result = await chatAiWorker(config, {
         message,
         terminal_context: workspaceAgentContext(activeBoard),
+        session_context: workspaceChatSessionPromptContext(),
       });
-      const actions = extractWorkspaceActions(result.raw_response);
-      appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(result.raw_response) });
+      const response = result.message;
+      const actions = extractWorkspaceActions(response);
+      appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(response) });
       if (actions.length > 0) {
         const actionSummary = await applyWorkspaceChatActions(actions);
         appendWorkspaceChat({ role: "system", text: actionSummary });
@@ -1404,12 +1586,24 @@
     for (const action of actions.slice(0, 5)) {
       if (action.type === "create_task") {
         const card = createBoardTask(action.title, action.description ?? "Created by Spacesly Agent chat.");
-        results.push(card ? `Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.` : `Could not create task "${action.title}".`);
+        if (card) {
+          setWorkspaceChatSessionCard(card.id, { created: true });
+          appendWorkspaceChatActivity({
+            kind: "tool",
+            label: "create_task",
+            text: `Created ${ticketLabel(card)}: ${card.title}`,
+            cardId: card.id,
+          });
+          results.push(`Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.`);
+        } else {
+          results.push(`Could not create task "${action.title}".`);
+        }
         continue;
       }
 
       if (action.type === "sync_jira") {
         await syncJira();
+        appendWorkspaceChatActivity({ kind: "tool", label: "sync_jira", text: "Requested Jira sync from chat." });
         results.push("Jira sync requested. Watch the board notice for fetched card count or errors.");
         continue;
       }
@@ -1422,18 +1616,23 @@
 
       if (action.type === "select_card") {
         selectCard(card);
+        setWorkspaceChatSessionCard(card.id);
         setWorkspaceMode("board");
+        appendWorkspaceChatActivity({ kind: "tool", label: "select_card", text: `Opened ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
         results.push(`Opened ${ticketLabel(card)}: "${card.title}". Current state: ${executionDetail(card.execution)}.`);
         continue;
       }
 
       if (action.type === "delete_card") {
         const removed = removeCard(card.id);
+        appendWorkspaceChatActivity({ kind: "tool", label: "delete_card", text: `${removed ? "Removed" : "Failed to remove"} ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
         results.push(removed ? `Removed ${ticketLabel(card)} from Spacesly.` : `Could not remove ${ticketLabel(card)}.`);
         continue;
       }
 
       if (action.type === "start_agent") {
+        setWorkspaceChatSessionCard(card.id);
+        appendWorkspaceChatActivity({ kind: "tool", label: "start_agent", text: `Requested Agent start for ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
         await startWorkerForCard(card.id);
         results.push(`Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`);
         continue;
@@ -1446,28 +1645,13 @@
           continue;
         }
         await moveCardAndSync(card.id, columnId);
+        setWorkspaceChatSessionCard(card.id);
+        appendWorkspaceChatActivity({ kind: "tool", label: "move_card", text: `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}.`, cardId: card.id });
         results.push(`Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}. Jira write-back is attempted only for In Progress and Done.`);
       }
     }
 
     return results.length > 0 ? `Command result: ${results.join(" ")}` : "Command result: no board actions were applied.";
-  }
-
-  function resolveActionCard(action: { card_id?: string; ticket?: string; title?: string }): CardProjection | null {
-    if (action.card_id && activeCardById.has(action.card_id)) return activeCardById.get(action.card_id) ?? null;
-
-    const ticket = action.ticket?.toLowerCase();
-    if (ticket) {
-      const byTicket = activeCards.find((card) => ticketLabel(card).toLowerCase() === ticket);
-      if (byTicket) return byTicket;
-    }
-
-    const title = action.title?.toLowerCase();
-    if (title) {
-      return activeCards.find((card) => card.title.toLowerCase().includes(title)) ?? null;
-    }
-
-    return null;
   }
 
   function columnIdForChatTarget(target: "todo" | "queued" | "in_progress" | "done"): string | null {
@@ -1878,9 +2062,30 @@
     };
   }
 
-  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState) {
-    if (!workspace) return;
+  function updateActiveBoard(
+    transform: (board: BoardProjection) => BoardProjection,
+  ): boolean {
+    if (!workspace) return false;
 
+    const [project, ...otherProjects] = workspace.projects;
+    const [board, ...otherBoards] = project?.boards ?? [];
+    if (!project || !board) return false;
+
+    const nextBoard = transform(board);
+    workspace = {
+      ...workspace,
+      projects: [
+        {
+          ...project,
+          boards: [nextBoard, ...otherBoards],
+        },
+        ...otherProjects,
+      ],
+    };
+    return true;
+  }
+
+  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState) {
     const movedCard = activeCardById.get(cardId);
     if (!movedCard) return;
 
@@ -1893,23 +2098,18 @@
       ...(execution !== undefined ? { execution } : {}),
     };
 
-    workspace = {
-      ...workspace,
-      projects: workspace.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) => {
-            const cards = column.cards.filter((card) => card.id !== cardId);
-            return column.id === targetColumnId
-              ? { ...column, cards: [...cards, cardForTarget] }
-              : { ...column, cards };
-          }),
-        })),
-      })),
-    };
+    if (!updateActiveBoard((board) => ({
+      ...board,
+      columns: board.columns.map((column) => {
+        const cards = column.cards.filter((card) => card.id !== cardId);
+        return column.id === targetColumnId
+          ? { ...column, cards: [...cards, cardForTarget] }
+          : { ...column, cards };
+      }),
+    }))) return;
+
     cacheSavedAt = Date.now();
-    saveCachedWorkspace(workspace);
+    saveCachedWorkspace(workspace!);
     appNotice = { tone: "info", message: "Card moved in Spacesly." };
   }
 
@@ -1922,34 +2122,26 @@
   }
 
   function removeCard(cardId: string): boolean {
-    if (!workspace) return false;
-
     const card = activeCardById.get(cardId);
     if (!card || card.execution === "running") {
       appNotice = { tone: "error", message: "Running cards cannot be removed." };
       return false;
     }
 
-    workspace = {
-      ...workspace,
-      projects: workspace.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) => ({
-            ...column,
-            cards: column.cards.filter((entry) => entry.id !== cardId),
-          })),
-        })),
+    if (!updateActiveBoard((board) => ({
+      ...board,
+      columns: board.columns.map((column) => ({
+        ...column,
+        cards: column.cards.filter((entry) => entry.id !== cardId),
       })),
-    };
+    }))) return false;
 
     if (selectedCardId === cardId) selectedCardId = null;
     if (agentRunCardId === cardId) agentConsoleOpen = false;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
     cacheSavedAt = Date.now();
-    saveCachedWorkspace(workspace);
+    saveCachedWorkspace(workspace!);
     appNotice = {
       tone: "success",
       message: card.source === "local"
@@ -1977,20 +2169,14 @@
       execution: "idle",
     };
 
-    workspace = {
-      ...workspace,
-      projects: workspace.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) =>
-            column.intent === "backlog" ? { ...column, cards: [...column.cards, card] } : column,
-          ),
-        })),
-      })),
-    };
+    if (!updateActiveBoard((board) => ({
+      ...board,
+      columns: board.columns.map((column) =>
+        column.intent === "backlog" ? { ...column, cards: [...column.cards, card] } : column,
+      ),
+    }))) return null;
     cacheSavedAt = Date.now();
-    saveCachedWorkspace(workspace);
+    saveCachedWorkspace(workspace!);
     return card;
   }
 
@@ -2013,6 +2199,7 @@
     agentRunStatus = "running";
     agentRunProgress = continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5;
     agentRunOutput = continuation && previousSession?.output ? previousSession.output : "Waiting for Agent output...";
+    agentRunResult = continuation && previousSession?.result ? previousSession.result : null;
     agentRunLogs = continuation && previousSession ? previousSession.logs : [];
     agentTerminalLines = continuation && previousSession
       ? previousSession.terminalLines
@@ -2023,7 +2210,20 @@
             text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
           },
         ];
-    appendAgentLog("info", continuation ? "continue" : "start", continuation ? `Agent continuation started for ${ticketLabel(card)}.` : `Agent run started for ${ticketLabel(card)}.`);
+    appendStructuredAgentLog(
+      "info",
+      continuation ? "continue" : "start",
+      continuation ? `Agent continuation started for ${ticketLabel(card)}.` : `Agent run started for ${ticketLabel(card)}.`,
+      [
+        `Work item: ${ticketLabel(card)} · ${card.title}`,
+        `Continuation: ${continuation ? "yes" : "no"}`,
+      ],
+      [
+        `Execution state: ${executionDetail(card.execution)}`,
+        `Terminal session opened for approvals, constraints, and operator notes.`,
+      ],
+      ["Review the context export, then continue with the run."],
+    );
   }
 
   function activeAgentSession(): AgentRunSession | null {
@@ -2035,6 +2235,7 @@
       status: agentRunStatus,
       progress: agentRunProgress,
       output: agentRunOutput,
+      result: agentRunResult,
       logs: agentRunLogs,
       terminalLines: agentTerminalLines,
     };
@@ -2063,6 +2264,7 @@
     agentRunStatus = session.status;
     agentRunProgress = session.progress;
     agentRunOutput = session.output;
+    agentRunResult = session.result;
     agentRunLogs = session.logs;
     agentTerminalLines = session.terminalLines;
     agentTerminalInput = "";
@@ -2115,6 +2317,64 @@
     persistActiveAgentRun();
   }
 
+  function appendStructuredAgentLog(
+    tone: AgentRunLog["tone"],
+    label: string,
+    summary: string,
+    evidence: string[],
+    details: string[],
+    next: string[],
+  ) {
+    appendAgentLog(
+      tone,
+      label,
+      [
+        `STATUS: ${tone === "success" ? "Complete" : tone === "error" ? "Blocked" : "Running"}`,
+        `SUMMARY: ${summary}`,
+        "EVIDENCE:",
+        ...evidence.map((line) => `- ${line}`),
+        "DETAILS:",
+        ...details.map((line) => `- ${line}`),
+        ...(next.length > 0 ? ["NEXT:", ...next.map((line) => `- ${line}`)] : []),
+      ].join("\n"),
+    );
+  }
+
+  function buildAgentContextExport(
+    card: CardProjection,
+    config: AiWorkerConfig,
+    issueKey: string | null,
+    operatorNotes: string | null,
+    previousOutput: string | null,
+  ): string {
+    const runtimeLabel = config.runtime === "opencode"
+      ? `OpenCode ${config.opencode_model}`
+      : `${config.provider_name} ${config.model}`;
+    const description = card.description.trim();
+    const clippedDescription = description.length > 320 ? `${description.slice(0, 320)}…` : description;
+    const clippedPreviousOutput = previousOutput?.trim()
+      ? (previousOutput.length > 240 ? `${previousOutput.slice(0, 240)}…` : previousOutput)
+      : "None";
+
+    return [
+      "STATUS: Running",
+      `SUMMARY: ${ticketLabel(card)} is prepared for Agent execution.`,
+      "EVIDENCE:",
+      `- Work item: ${ticketLabel(card)} · ${card.title}`,
+      `- Runtime: ${runtimeLabel}`,
+      `- Jira link: ${issueKey ? `Issue ${issueKey}` : "Not linked"}`,
+      `- Labels: ${card.labels.length > 0 ? card.labels.join(", ") : "None"}`,
+      `- Task description: ${clippedDescription || "None"}`,
+      "DETAILS:",
+      `- Current board state: ${executionDetail(card.execution)}`,
+      `- Operator notes: ${operatorNotes ? operatorNotes : "None"}`,
+      `- Previous output: ${clippedPreviousOutput}`,
+      "- Verification target: return evidence before marking complete.",
+      "NEXT:",
+      "- Pass the exported context to the runtime and wait for evidence.",
+    ].join("\n");
+  }
+
   function appendTerminalLine(prompt: string, text: string) {
     agentTerminalLines = capList([
       ...agentTerminalLines,
@@ -2132,9 +2392,23 @@
     if (!input) return;
 
     appendTerminalLine("operator", input);
-    appendAgentLog("info", "operator", input);
+    appendStructuredAgentLog(
+      "info",
+      "operator",
+      "Operator note recorded for the running session.",
+      [`Input: ${input}`],
+      ["Operator note saved to the running session."],
+      ["Continue the Agent with the updated guidance."],
+    );
     if (agentRunStatus === "blocked" && isApprovalText(input)) {
-      appendAgentLog("success", "approval", "Operator approval recorded for this card session. Continue the Agent to finish remaining work.");
+      appendStructuredAgentLog(
+        "success",
+        "approval",
+        "Operator approval recorded for this card session.",
+        ["Approval text detected in operator input."],
+        ["The blocked session can continue."],
+        ["Continue the Agent to finish remaining work."],
+      );
       appNotice = { tone: "info", message: "Approval recorded. Continue the Agent on this card when ready." };
     }
     agentTerminalInput = "";
@@ -2165,28 +2439,52 @@
       : null;
   }
 
-  function agentJiraComment(resultSummary: string, resultBody: string, config: AiWorkerConfig): string {
+  function resolveSessionCardId(): string | null {
+    const candidates = [
+      workspaceChatSession.lastCreatedCardId,
+      workspaceChatSession.lastCardId,
+      ...workspaceChatSession.recentCardIds,
+      selectedCardId,
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+
+    for (const cardId of candidates) {
+      if (activeCardById.has(cardId)) return cardId;
+    }
+
+    return null;
+  }
+
+  function agentResultText(result: AiWorkerTaskResult): string {
+    const sections = [
+      `STATUS: ${result.completion_status === "completed" ? "COMPLETE" : "BLOCKED"}`,
+      `SUMMARY: ${result.summary}`,
+      "EVIDENCE:",
+      ...(result.evidence.length > 0 ? result.evidence.map((line) => `- ${line}`) : ["- none"]),
+      "DETAILS:",
+      ...(result.details.length > 0 ? result.details.map((line) => `- ${line}`) : ["- none"]),
+    ];
+
+    if (result.next.length > 0) {
+      sections.push("NEXT:", ...result.next.map((line) => `- ${line}`));
+    }
+
+    return sections.join("\n");
+  }
+
+  function agentJiraComment(result: AiWorkerTaskResult, config: AiWorkerConfig): string {
     const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
     const model = config.runtime === "opencode" ? config.opencode_model : config.model;
-    const evidence = labelledAgentValue(resultBody, "EVIDENCE")
-      ?? labelledAgentValue(resultBody, "DETAILS")
-      ?? resultSummary;
+    const evidence = result.evidence.join("\n") || result.details.join("\n") || result.summary;
 
     return [
       "Spacesly marked this task done.",
       "",
       `Agent: ${runtime} / ${model}`,
       "",
-      `Summary: ${singleLine(resultSummary, 500)}`,
+      `Summary: ${singleLine(result.summary, 500)}`,
       "",
       `Verification: ${singleLine(evidence, 900)}`,
     ].join("\n");
-  }
-
-  function labelledAgentValue(output: string, label: "EVIDENCE" | "DETAILS"): string | null {
-    const pattern = new RegExp(`^${label}:\\s*([\\s\\S]*?)(?=^STATUS:|^SUMMARY:|^EVIDENCE:|^DETAILS:|$)`, "im");
-    const value = output.match(pattern)?.[1]?.trim();
-    return value || null;
   }
 
   function singleLine(value: string, maxChars: number): string {
@@ -2199,21 +2497,33 @@
     if (!workspace) return;
     const completedAt = typeof execution === "object" && "completed" in execution ? Date.now() : null;
 
-    workspace = {
-      ...workspace,
-      projects: workspace.projects.map((project) => ({
-        ...project,
-        boards: project.boards.map((board) => ({
-          ...board,
-          columns: board.columns.map((column) => ({
-            ...column,
-            cards: column.cards.map((card) => card.id === cardId ? { ...card, execution, completedAt } : card),
-          })),
-        })),
+    if (!updateActiveBoard((board) => ({
+      ...board,
+      columns: board.columns.map((column) => ({
+        ...column,
+        cards: column.cards.map((card) => card.id === cardId ? { ...card, execution, completedAt } : card),
       })),
-    };
+    }))) return;
     cacheSavedAt = Date.now();
-    saveCachedWorkspace(workspace);
+    saveCachedWorkspace(workspace!);
+  }
+
+  function resolveActionCard(action: { card_id?: string; ticket?: string; title?: string }): CardProjection | null {
+    if (action.card_id && activeCardById.has(action.card_id)) return activeCardById.get(action.card_id) ?? null;
+
+    const ticket = action.ticket?.toLowerCase();
+    if (ticket) {
+      const byTicket = activeCards.find((card) => ticketLabel(card).toLowerCase() === ticket);
+      if (byTicket) return byTicket;
+    }
+
+    const title = action.title?.toLowerCase();
+    if (title) {
+      return activeCards.find((card) => card.title.toLowerCase().includes(title)) ?? null;
+    }
+
+    const sessionCardId = resolveSessionCardId();
+    return sessionCardId ? activeCardById.get(sessionCardId) ?? null : null;
   }
 
   function columnIdByIntent(intent: "queued" | "in_progress" | "done"): string | null {
@@ -2246,6 +2556,22 @@
     const queuedColumnId = columnIdByIntent("queued");
     if (!queuedColumnId || cardColumnIntent(cardId) === "queued") return;
     void moveCardAndSync(cardId, queuedColumnId);
+  }
+
+  function requestBacklogStartConfirmation(card: CardProjection): Promise<boolean> {
+    if (cardColumnIntent(card.id) !== "backlog") return Promise.resolve(true);
+    if (backlogStartConfirmation) return Promise.resolve(false);
+
+    backlogStartConfirmation = { cardId: card.id, title: card.title };
+    return new Promise<boolean>((resolve) => {
+      backlogStartConfirmationResolve = resolve;
+    });
+  }
+
+  function resolveBacklogStartConfirmation(confirmed: boolean) {
+    backlogStartConfirmation = null;
+    backlogStartConfirmationResolve?.(confirmed);
+    backlogStartConfirmationResolve = null;
   }
 
   async function moveCardAndSync(cardId: string, targetColumnId: string) {
@@ -2293,6 +2619,7 @@
 
     const card = activeCardById.get(cardId);
     if (!card || card.execution === "running") return;
+    if (!(await requestBacklogStartConfirmation(card))) return;
 
     const config = buildAiWorkerConfig();
     if (!config) return;
@@ -2313,35 +2640,92 @@
 
     try {
       if (cardColumnIntent(cardId) !== "in_progress") {
-        appendAgentLog("info", "board", "Moved card to In Progress locally.");
+        appendStructuredAgentLog(
+          "info",
+          "board",
+          "Moved card to In Progress locally.",
+          [`Card: ${ticketLabel(card)}`],
+          [`Local board projection moved to In Progress.`],
+          ["Continue with Jira and runtime setup."],
+        );
         moveCard(cardId, inProgressColumnId, "running");
       } else {
         updateCardExecution(cardId, "running");
       }
       setAgentProgress(15);
-      appendAgentLog("info", "model", config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${config.provider_name} / ${config.model}.`);
+      appendStructuredAgentLog(
+        "info",
+        "model",
+        config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${config.provider_name} / ${config.model}.`,
+        [`Runtime selected: ${config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`}`],
+        [`Model configuration validated for this run.`],
+        ["Wait for the execution result before marking progress."],
+      );
 
       if (issueKey && !isContinuation) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
-          appendAgentLog("info", "jira", `Assigning ${issueKey} and moving Jira to In Progress.`);
+          appendStructuredAgentLog(
+            "info",
+            "jira",
+            `Assigning ${issueKey} and moving Jira to In Progress.`,
+            [`Issue: ${issueKey}`],
+            [`Jira transition target: In Progress`],
+            ["Wait for the Jira transition confirmation before execution."],
+          );
           setAgentProgress(25);
           await assignJiraIssue(jiraConfig, issueKey);
           await transitionJiraIssue(jiraConfig, issueKey, "In Progress");
-          appendAgentLog("success", "jira", `${issueKey} is In Progress in Jira.`);
+          appendStructuredAgentLog(
+            "success",
+            "jira",
+            `${issueKey} is In Progress in Jira.`,
+            [`Issue transitioned to In Progress successfully.`],
+            [`Jira state now mirrors the local run state.`],
+            ["Proceed with the exported task context."],
+          );
           setAgentProgress(35);
         }
       } else {
-        appendAgentLog("info", "local", "Local Spacesly task. Jira sync is not required.");
+        appendStructuredAgentLog(
+          "info",
+          "local",
+          "Local Spacesly task. Jira sync is not required.",
+          [`Issue linked: none`],
+          [`The run will stay local and update only the board state.`],
+          ["Proceed with the exported task context."],
+        );
         setAgentProgress(35);
       }
       if (issueKey && isContinuation) {
-        appendAgentLog("info", "jira", `${issueKey} is already in execution. Skipping duplicate Jira In Progress transition.`);
+        appendStructuredAgentLog(
+          "info",
+          "jira",
+          `${issueKey} is already in execution. Skipping duplicate Jira In Progress transition.`,
+          [`Issue: ${issueKey}`],
+          [`Continuation run detected.`],
+          ["Proceed with the exported task context."],
+        );
         setAgentProgress(35);
       }
 
-      appendAgentLog("info", "agent", "Sending task context to Agent.");
-      setAgentRunOutput("Agent is processing the task context...");
+      appendStructuredAgentLog(
+        "info",
+        "context",
+        `Exported structured context for ${ticketLabel(card)}.`,
+        [
+          `Sections: SUMMARY, EVIDENCE, DETAILS`,
+          `Runtime: ${config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`}`,
+          `Jira: ${issueKey ?? "none"}`,
+        ],
+        [
+          `Operator notes: ${operatorNotes ? "included" : "none"}`,
+          `Previous output: ${previousOutput ? "included" : "none"}`,
+          `Task description clipped to keep logs readable.`,
+        ],
+        ["Pass the exported context to the runtime and wait for evidence."],
+      );
+      setAgentRunOutput(buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput));
       setAgentProgress(55);
       const result = await executeAiWorkerTask(config, {
         key: issueKey,
@@ -2352,35 +2736,108 @@
         operator_notes: operatorNotes,
         previous_output: previousOutput,
       });
-      appendAgentLog(result.completion_status === "completed" ? "success" : "error", "agent", result.summary);
-      setAgentRunOutput(result.raw_response);
-      appendTerminalLine("agent", result.raw_response);
+      appendStructuredAgentLog(
+        result.completion_status === "completed" ? "success" : "error",
+        "agent",
+        result.summary,
+        [
+          `Completion status: ${result.completion_status}`,
+          `Blocked reason: ${result.blocked_reason ?? "none"}`,
+        ],
+        [
+          `Evidence lines: ${result.evidence.length}`,
+          `Detail lines: ${result.details.length}`,
+        ],
+        result.completion_status === "completed"
+          ? ["Review the result, then write back to board and Jira."]
+          : ["Inspect the blocker, add notes if needed, and continue."],
+      );
+      agentRunResult = result;
+      setAgentRunOutput(agentResultText(result));
+      appendTerminalLine("agent", agentResultText(result));
       setAgentProgress(75);
 
       if (result.completion_status !== "completed") {
         const reason = result.blocked_reason ?? result.summary;
         updateCardExecution(cardId, { blocked: { reason } });
         setAgentRunStatus("blocked");
-        appendAgentLog("error", "blocked", "Agent did not complete and verify the requested work. Card will not move to Done.");
+        appendStructuredAgentLog(
+          "error",
+          "blocked",
+          "Agent did not complete and verify the requested work. Card will not move to Done.",
+          [
+            `Completion status: ${result.completion_status}`,
+            `Blocked reason: ${reason}`,
+          ],
+          [
+            `Card execution remains blocked until the issue is resolved.`,
+            `No Done transition will occur for this run.`,
+          ],
+          ["Add operator notes or fix the blocker, then continue the Agent."],
+        );
         appNotice = { tone: "error", message: `${ticketLabel(card)} blocked: ${reason}` };
         return;
       }
 
-      appendAgentLog("info", "board", "Stored Agent summary on card and moved card to Done locally.");
+      appendStructuredAgentLog(
+        "success",
+        "board",
+        "Stored Agent summary on card and moved card to Done locally.",
+        [
+          `Card: ${ticketLabel(card)}`,
+          `Board target: Done`,
+        ],
+        [
+          `Local workspace projection updated with the verified summary.`,
+          `Completed timestamp stored for the card.`,
+        ],
+        issueKey ? ["Write Jira completion state and add the completion comment."] : ["No Jira issue linked; board write-back is complete."],
+      );
       moveCard(cardId, doneColumnId, { completed: { summary: result.summary } });
       setAgentProgress(82);
 
       if (issueKey) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
-          appendAgentLog("info", "jira", `Moving ${issueKey} to Done.`);
+          appendStructuredAgentLog(
+            "info",
+            "jira",
+            `Moving ${issueKey} to Done.`,
+            [
+              `Issue: ${issueKey}`,
+              `Transition target: Done`,
+            ],
+            ["Posting board completion back to Jira."],
+            ["Wait for the Jira transition result before finalizing the run."],
+          );
           setAgentProgress(88);
           await transitionJiraIssue(jiraConfig, issueKey, "Done");
-          appendAgentLog("success", "jira", `${issueKey} is Done in Jira.`);
-          appendAgentLog("info", "jira", `Posting Spacesly completion comment to ${issueKey}.`);
+          appendStructuredAgentLog(
+            "success",
+            "jira",
+            `${issueKey} is Done in Jira.`,
+            [`Issue transitioned to Done successfully.`],
+            [`Jira state now matches the local board state.`],
+            [`Post the completion comment with evidence.`],
+          );
+          appendStructuredAgentLog(
+            "info",
+            "jira",
+            `Posting Spacesly completion comment to ${issueKey}.`,
+            [`Comment target: ${issueKey}`],
+            [`Comment includes summary and verification evidence.`],
+            [`Wait for comment confirmation before final completion.`],
+          );
           setAgentProgress(94);
-          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result.summary, result.raw_response, config));
-          appendAgentLog("success", "jira", `Spacesly completion comment posted to ${issueKey}.`);
+          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result, config));
+          appendStructuredAgentLog(
+            "success",
+            "jira",
+            `Spacesly completion comment posted to ${issueKey}.`,
+            [`Completion comment posted successfully.`],
+            [`Evidence is now persisted in Jira.`],
+            [`Finalize the run as completed.`],
+          );
         }
       }
 
@@ -2391,9 +2848,17 @@
       const message = reason instanceof Error ? reason.message : String(reason);
       updateCardExecution(cardId, { blocked: { reason: message } });
       setAgentRunStatus("blocked");
+      agentRunResult = null;
       setAgentRunOutput(message);
       appendTerminalLine("error", message);
-      appendAgentLog("error", "blocked", message);
+      appendStructuredAgentLog(
+        "error",
+        "blocked",
+        message,
+        [`Failure: ${message}`],
+        [`The run was interrupted before completion.`],
+        [`Resolve the failure, then retry the Agent.`],
+      );
       appNotice = { tone: "error", message };
     } finally {
       const { [cardId]: _finished, ...remainingRuns } = runningWorkerCardIds;
@@ -3162,7 +3627,7 @@
         <strong>Unable to load workspace</strong>
         <p>{error}</p>
       </section>
-    {:else if activeBoard}
+        {:else if activeBoard}
       <section class="board-shell">
         {#if appNotice}
           <div class={`app-notice ${appNotice.tone}`} role="status">
@@ -3178,8 +3643,13 @@
           </div>
         {/if}
 
-        <BoardWorkspace
+        <div
+          class:with-console={agentConsoleOpen && hasAgentConsoleSession}
+          class:is-hidden={workspaceMode !== "board"}
+          class="workspace-body"
           style={agentConsoleOpen && hasAgentConsoleSession ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;` : `--lane-width: ${layoutPrefs.laneWidth}px;`}
+        >
+        <BoardWorkspace
           {displayColumns}
           {selectedCardId}
           {draggedCardId}
@@ -3239,6 +3709,7 @@
             phases={agentPhases}
             logs={agentRunLogs}
             output={agentRunOutput}
+            result={agentRunResult}
             runStatus={agentRunStatus}
             terminalLines={agentTerminalLines}
             terminalInput={agentTerminalInput}
@@ -3251,6 +3722,7 @@
             onOpenCard={(cardId) => (selectedCardId = cardId)}
           />
         {/if}
+        </div>
         {#if workspaceMode === "board" && newTaskOpen}
           <NewTaskPopover
             title={newTaskTitle}
@@ -3414,6 +3886,10 @@
             <WorkspaceChatPane
               title={settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.label}
               onOpenRuntimeSettings={() => openSettings("agent")}
+              sessions={workspaceChatSessions}
+              activeSessionId={workspaceChatActiveSessionId}
+              onNewSession={startWorkspaceChatSession}
+              onSwitchSession={activateWorkspaceChatSession}
               messages={workspaceChatMessages}
               running={workspaceChatRunning}
               onTextareaReady={(element) => {
@@ -3425,8 +3901,31 @@
               onSubmit={() => void sendWorkspaceChat()}
               onKeydown={handleWorkspaceChatKeydown}
             />
-          </div>
+        </div>
       </section>
+      {#if backlogStartConfirmation}
+        <div class="confirm-backdrop" role="presentation" onclick={() => resolveBacklogStartConfirmation(false)}></div>
+        <div class="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirm-backlog-start-title">
+          <header>
+            <div>
+              <p>Confirm start</p>
+              <h2 id="confirm-backlog-start-title">Start backlog task?</h2>
+            </div>
+            <button type="button" aria-label="Close confirmation" onclick={() => resolveBacklogStartConfirmation(false)}>×</button>
+          </header>
+          <div class="confirm-body">
+            <p>
+              <strong>{backlogStartConfirmation.title}</strong>
+              will move from Backlog to In Progress and begin Agent execution.
+            </p>
+            <p>This will create a running task immediately. Continue?</p>
+          </div>
+          <footer>
+            <button type="button" onclick={() => resolveBacklogStartConfirmation(false)}>Cancel</button>
+            <button class="confirm-primary" type="button" onclick={() => resolveBacklogStartConfirmation(true)}>Start Agent</button>
+          </footer>
+        </div>
+      {/if}
     {:else}
       <section class="state-panel">Preparing workspace projection...</section>
     {/if}

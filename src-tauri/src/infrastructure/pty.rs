@@ -32,7 +32,7 @@ pub fn open_pty_terminal(
     workspace_root: &WorkspaceRoot,
     terminal_id: String,
     workdir: Option<String>,
-    on_data: Channel<Vec<u8>>, 
+    on_data: Channel<Vec<u8>>,
 ) -> Result<(), String> {
     {
         let mut registry = state.lock().map_err(|error| error.to_string())?;
@@ -68,7 +68,12 @@ pub fn open_pty_terminal(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .or_else(|| workspace_root.path().ok().map(|path| path.to_string_lossy().to_string()))
+        .or_else(|| {
+            workspace_root
+                .path()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| ".".to_string());
     command.cwd(cwd);
 

@@ -1,9 +1,5 @@
 import type { WorkspaceProjection } from "$lib/ipc";
-import { invokeWithPolicy } from "$lib/ipc/policy";
-
-const JIRA_READ_POLICY = { timeoutMs: 30_000, retries: 2, retryDelayMs: 500 };
-const JIRA_TEST_POLICY = { timeoutMs: 20_000, retries: 1, retryDelayMs: 500 };
-const JIRA_MUTATION_POLICY = { timeoutMs: 30_000, retries: 0 };
+import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 
 export interface JiraIssue {
   key: string;
@@ -59,23 +55,23 @@ export interface JiraMcpConfig {
 }
 
 export async function getJiraIssues(config: JiraMcpConfig): Promise<JiraIssue[]> {
-  return invokeWithPolicy<JiraIssue[]>("get_jira_issues", { config }, JIRA_READ_POLICY);
+  return invokeWithPolicy<JiraIssue[]>("get_jira_issues", { config }, IPC_POLICIES.jiraRead);
 }
 
 export async function getJiraBoards(config: JiraMcpConfig): Promise<JiraBoard[]> {
-  return invokeWithPolicy<JiraBoard[]>("get_jira_boards", { config }, JIRA_READ_POLICY);
+  return invokeWithPolicy<JiraBoard[]>("get_jira_boards", { config }, IPC_POLICIES.jiraRead);
 }
 
 export async function testJiraMcpConnection(config: JiraMcpConfig): Promise<JiraConnectionStatus> {
-  return invokeWithPolicy<JiraConnectionStatus>("test_jira_mcp_connection", { config }, JIRA_TEST_POLICY);
+  return invokeWithPolicy<JiraConnectionStatus>("test_jira_mcp_connection", { config }, IPC_POLICIES.jiraTest);
 }
 
 export async function testMcpServerConnection(config: JiraMcpServerConfig): Promise<McpConnectionStatus> {
-  return invokeWithPolicy<McpConnectionStatus>("test_mcp_server_connection", { config }, JIRA_TEST_POLICY);
+  return invokeWithPolicy<McpConnectionStatus>("test_mcp_server_connection", { config }, IPC_POLICIES.jiraTest);
 }
 
 export async function syncJiraWorkspace(config: JiraMcpConfig): Promise<WorkspaceProjection> {
-  return invokeWithPolicy<WorkspaceProjection>("sync_jira_workspace", { config }, JIRA_READ_POLICY);
+  return invokeWithPolicy<WorkspaceProjection>("sync_jira_workspace", { config }, IPC_POLICIES.jiraRead);
 }
 
 export async function transitionJiraIssue(
@@ -83,11 +79,11 @@ export async function transitionJiraIssue(
   issueKey: string,
   targetStatus: string,
 ): Promise<void> {
-  return invokeWithPolicy<void>("transition_jira_issue", { config, issueKey, targetStatus }, JIRA_MUTATION_POLICY);
+  return invokeWithPolicy<void>("transition_jira_issue", { config, issueKey, targetStatus }, IPC_POLICIES.jiraMutation);
 }
 
 export async function assignJiraIssue(config: JiraMcpConfig, issueKey: string): Promise<void> {
-  return invokeWithPolicy<void>("assign_jira_issue", { config, issueKey }, JIRA_MUTATION_POLICY);
+  return invokeWithPolicy<void>("assign_jira_issue", { config, issueKey }, IPC_POLICIES.jiraMutation);
 }
 
 export async function addJiraComment(
@@ -95,5 +91,5 @@ export async function addJiraComment(
   issueKey: string,
   comment: string,
 ): Promise<void> {
-  return invokeWithPolicy<void>("add_jira_comment", { config, issueKey, comment }, JIRA_MUTATION_POLICY);
+  return invokeWithPolicy<void>("add_jira_comment", { config, issueKey, comment }, IPC_POLICIES.jiraMutation);
 }

@@ -78,7 +78,12 @@ pub fn transition_issue(
         .transitions
         .iter()
         .find(|transition| status_matches(&transition.to.name, target_status))
-        .or_else(|| transitions.transitions.iter().find(|transition| status_matches(&transition.name, target_status)))
+        .or_else(|| {
+            transitions
+                .transitions
+                .iter()
+                .find(|transition| status_matches(&transition.name, target_status))
+        })
     else {
         if issue_is_already_in_status(auth, &client, &base_url, issue_key, target_status)? {
             return Ok(());

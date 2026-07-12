@@ -2,22 +2,21 @@ mod application;
 mod domain;
 mod infrastructure;
 
-use application::app::{AppState, ImportedIssue};
+use application::app::AppState;
 use application::files_service::FilesService;
 use application::git_service::GitService;
+use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, execute_ai_worker_task as execute_ai_worker_task_impl,
-    test_ai_worker as test_ai_worker_impl, AiWorkerChatRequest, AiWorkerConfig, AiWorkerResult,
-    AiWorkerStatus, AiWorkerTask,
+    test_ai_worker as test_ai_worker_impl, AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig,
+    AiWorkerStatus, AiWorkerTask, AiWorkerTaskResult,
 };
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::GitWorkspaceInfo;
-use infrastructure::jira_rest::{add_comment, assign_issue, transition_issue};
 use infrastructure::mcp::{
-    fetch_jira_boards, fetch_jira_issues, test_jira_connection, test_mcp_connection, JiraBoard,
-    JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
+    JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
 use infrastructure::pty::{
     close_all_terminals, close_pty_terminal as close_pty_terminal_impl,
@@ -34,6 +33,10 @@ use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
     ShellCommandRequest, ShellCommandResult, ShellCompletionRequest, ShellCompletionResult,
 };
+use infrastructure::workspace_cache::{
+    load_cached_workspace as load_cached_workspace_impl,
+    save_cached_workspace as save_cached_workspace_impl, CachedWorkspace,
+};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::State;
@@ -45,21 +48,21 @@ fn get_workspace() -> Workspace {
 
 #[tauri::command]
 async fn get_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_jira_issues(config))
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().issues(config))
         .await
         .map_err(|error| format!("Jira issue task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn get_jira_boards(config: JiraMcpConfig) -> Result<Vec<JiraBoard>, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_jira_boards(config))
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().boards(config))
         .await
         .map_err(|error| format!("Jira board task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn test_jira_mcp_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || test_jira_connection(config))
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().test_jira_connection(config))
         .await
         .map_err(|error| format!("Jira MCP test task failed: {error}"))?
 }
@@ -68,32 +71,16 @@ async fn test_jira_mcp_connection(config: JiraMcpConfig) -> Result<JiraConnectio
 async fn test_mcp_server_connection(
     config: McpServerConfig,
 ) -> Result<McpConnectionStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || test_mcp_connection(config))
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().test_mcp_connection(config))
         .await
         .map_err(|error| format!("MCP test task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn sync_jira_workspace(config: JiraMcpConfig) -> Result<Workspace, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let issues = fetch_jira_issues(config)?;
-        let imported_issues: Vec<ImportedIssue> = issues
-            .into_iter()
-            .map(|issue| ImportedIssue {
-                key: issue.key,
-                summary: issue.summary,
-                description: issue.description,
-                status: issue.status,
-                issue_type: issue.issue_type,
-                url: issue.url,
-                labels: issue.labels,
-            })
-            .collect();
-
-        Ok(AppState::new().workspace_with_imported_issues(&imported_issues))
-    })
-    .await
-    .map_err(|error| format!("Jira sync task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().sync_workspace(config))
+        .await
+        .map_err(|error| format!("Jira sync task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -103,7 +90,7 @@ async fn transition_jira_issue(
     target_status: String,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        transition_issue(&config.auth, &issue_key, &target_status)
+        JiraService::new().transition_issue(config, issue_key, target_status)
     })
     .await
     .map_err(|error| format!("Jira transition task failed: {error}"))?
@@ -111,7 +98,7 @@ async fn transition_jira_issue(
 
 #[tauri::command]
 async fn assign_jira_issue(config: JiraMcpConfig, issue_key: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || assign_issue(&config.auth, &issue_key))
+    tauri::async_runtime::spawn_blocking(move || JiraService::new().assign_issue(config, issue_key))
         .await
         .map_err(|error| format!("Jira assign task failed: {error}"))?
 }
@@ -122,9 +109,11 @@ async fn add_jira_comment(
     issue_key: String,
     comment: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || add_comment(&config.auth, &issue_key, &comment))
-        .await
-        .map_err(|error| format!("Jira comment task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().add_comment(config, issue_key, comment)
+    })
+    .await
+    .map_err(|error| format!("Jira comment task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -138,7 +127,7 @@ async fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String
 async fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
-) -> Result<AiWorkerResult, String> {
+) -> Result<AiWorkerTaskResult, String> {
     tauri::async_runtime::spawn_blocking(move || execute_ai_worker_task_impl(config, task))
         .await
         .map_err(|error| format!("Agent execution task failed: {error}"))?
@@ -148,7 +137,7 @@ async fn execute_ai_worker_task(
 async fn chat_ai_worker(
     config: AiWorkerConfig,
     request: AiWorkerChatRequest,
-) -> Result<AiWorkerResult, String> {
+) -> Result<AiWorkerChatResult, String> {
     tauri::async_runtime::spawn_blocking(move || chat_ai_worker_impl(config, request))
         .await
         .map_err(|error| format!("Agent chat task failed: {error}"))?
@@ -178,8 +167,8 @@ async fn read_file(
     tauri::async_runtime::spawn_blocking(move || {
         FilesService::new(root).read_file(workspace_id, relative_path)
     })
-        .await
-        .map_err(|error| format!("File read task failed: {error}"))?
+    .await
+    .map_err(|error| format!("File read task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -203,9 +192,11 @@ async fn workspace_root_path(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || FilesService::new(root).workspace_root_path(workspace_id))
-        .await
-        .map_err(|error| format!("Workspace root task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        FilesService::new(root).workspace_root_path(workspace_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace root task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -214,9 +205,11 @@ async fn set_workspace_root(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || FilesService::new(root).set_workspace_root(absolute_path))
-        .await
-        .map_err(|error| format!("Set workspace root task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        FilesService::new(root).set_workspace_root(absolute_path)
+    })
+    .await
+    .map_err(|error| format!("Set workspace root task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -234,6 +227,20 @@ async fn save_app_secrets(secrets: AppSecrets) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn load_cached_workspace() -> Result<Option<CachedWorkspace>, String> {
+    tauri::async_runtime::spawn_blocking(load_cached_workspace_impl)
+        .await
+        .map_err(|error| format!("Load workspace cache task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_cached_workspace(workspace: Workspace) -> Result<CachedWorkspace, String> {
+    tauri::async_runtime::spawn_blocking(move || save_cached_workspace_impl(workspace))
+        .await
+        .map_err(|error| format!("Save workspace cache task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -241,7 +248,9 @@ async fn format_code(formatter: String, source: String) -> Result<String, String
 }
 
 #[tauri::command]
-async fn get_workspace_git_info(workspace_root: State<'_, WorkspaceRoot>) -> Result<GitWorkspaceInfo, String> {
+async fn get_workspace_git_info(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || GitService::new(root).workspace_git_info())
         .await
@@ -348,6 +357,8 @@ pub fn run() {
             set_workspace_root,
             load_app_secrets,
             save_app_secrets,
+            load_cached_workspace,
+            save_cached_workspace,
             format_code,
             get_workspace_git_info,
             checkout_workspace_git_branch,
