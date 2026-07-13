@@ -3772,17 +3772,24 @@
       </section>
         {:else if activeBoard}
       <section class="board-shell">
-        {#if appNotice}
-          <div class={`app-notice ${appNotice.tone}`} role="status">
-            <span>{appNotice.message}</span>
-            <button type="button" aria-label="Dismiss notification" onclick={dismissAppNotice}>×</button>
-          </div>
-        {/if}
-
-        {#if syncError}
-          <div class="sync-error" role="status">
-            <strong>Jira sync failed</strong>
-            <span>{syncError}</span>
+        {#if appNotice || syncError}
+          <div class="notification-stack" aria-live="polite">
+            {#if appNotice}
+              <div class={`notification-card app-notice ${appNotice.tone}`} role="status">
+                <div>
+                  <strong>{appNotice.tone === "error" ? "Action failed" : appNotice.tone === "success" ? "Success" : "Notice"}</strong>
+                  <span>{appNotice.message}</span>
+                </div>
+                <button type="button" aria-label="Dismiss notification" onclick={dismissAppNotice}>×</button>
+              </div>
+            {:else if syncError}
+              <div class="notification-card sync-error" role="status">
+                <div>
+                  <strong>Jira sync failed</strong>
+                  <span>{syncError}</span>
+                </div>
+              </div>
+            {/if}
           </div>
         {/if}
 

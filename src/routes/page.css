@@ -1976,60 +1976,82 @@
     color: #b9d6aa;
   }
 
-  .sync-error {
+  .notification-stack {
     position: absolute;
     top: 18px;
     right: 18px;
-    z-index: 4;
+    z-index: 8;
     display: grid;
-    max-width: 420px;
-    gap: 6px;
+    width: min(450px, calc(100% - 36px));
+    gap: 10px;
+    pointer-events: none;
+  }
+
+  .notification-card {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
     border: 1px solid rgba(181, 86, 78, 0.48);
     border-radius: 10px;
     padding: 12px 14px;
     background: rgba(42, 22, 24, 0.96);
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+    pointer-events: auto;
   }
 
-  .sync-error strong {
+  .notification-card > div {
+    display: grid;
+    min-width: 0;
+    gap: 5px;
+  }
+
+  .notification-card strong {
     color: #f0b0aa;
+    font-size: 13px;
+    font-weight: 900;
   }
 
-  .sync-error span {
+  .notification-card span {
     color: #c9a8aa;
     font-size: 13px;
     line-height: 1.4;
+    overflow-wrap: anywhere;
   }
 
   .app-notice {
-    position: absolute;
-    top: 18px;
-    left: 50%;
-    z-index: 5;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    max-width: min(680px, calc(100% - 40px));
-    transform: translateX(-50%);
     border: 1px solid #3a3548;
-    border-radius: 999px;
-    padding: 10px 12px 10px 16px;
     background: rgba(28, 27, 33, 0.96);
-    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  .app-notice strong,
+  .app-notice span {
     color: #d8d2e2;
   }
 
   .app-notice.success {
     border-color: rgba(126, 158, 107, 0.58);
+    background: rgba(27, 38, 28, 0.96);
+  }
+
+  .app-notice.success strong,
+  .app-notice.success span {
     color: #b9d6aa;
   }
 
   .app-notice.error {
     border-color: rgba(181, 86, 78, 0.58);
+    background: rgba(42, 22, 24, 0.96);
+  }
+
+  .app-notice.error strong,
+  .app-notice.error span {
     color: #f0b0aa;
   }
 
   .app-notice button {
+    flex: 0 0 auto;
     display: grid;
     width: 24px;
     height: 24px;
