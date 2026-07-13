@@ -243,17 +243,37 @@
   .files-workspace {
     display: grid;
     grid-template-columns: minmax(240px, var(--file-sidebar-width)) 1px minmax(0, 1fr);
-    gap: 12px;
+    gap: 22px;
     height: 100%;
     min-height: 0;
     overflow: hidden;
+  }
+
+  .files-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+    min-height: 0;
+    padding-top: 2px;
+    overflow: hidden;
+  }
+
+  .files-sidebar > .segmented-control {
+    margin-bottom: 2px;
+  }
+
+  .files-sidebar > .file-browser-pane,
+  .files-sidebar > .git-actions-pane {
+    flex: 1 1 auto;
+    min-height: 0;
   }
 
   .files-workspace.collapsed {
     grid-template-columns: 42px minmax(0, 1fr);
   }
 
-  .files-workspace.collapsed .file-browser-pane,
+  .files-workspace.collapsed .files-sidebar,
   .files-workspace.collapsed .file-resize-handle {
     display: none;
   }
@@ -290,13 +310,14 @@
   }
 
   .code-editor-pane {
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    display: flex;
+    flex-direction: column;
     height: 100%;
   }
 
   .editor-stage {
     position: relative;
-    height: 100%;
+    flex: 1 1 auto;
     min-height: 0;
     overflow: hidden;
     background: #111016;
@@ -312,16 +333,6 @@
   .editor-panel:not(.active) {
     visibility: hidden;
     pointer-events: none;
-  }
-
-  .file-header-actions {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 8px;
-    min-width: 0;
-    border-bottom: 1px solid #25232d;
-    padding: 10px;
-    background: #111016;
   }
 
   .file-browser-pane > header,
@@ -459,15 +470,6 @@
     opacity: 0.55;
   }
 
-  .file-breadcrumbs {
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    border-bottom: 1px solid #25232d;
-    padding: 8px 10px;
-    background: #111016;
-  }
-
   .file-sync-note {
     overflow: hidden;
     border-bottom: 1px solid #25232d;
@@ -480,17 +482,56 @@
     white-space: nowrap;
   }
 
-  .file-breadcrumbs button {
-    flex: 0 0 auto;
-    height: 28px;
-    max-width: 160px;
-    overflow: hidden;
+  .file-filter {
+    display: grid;
+    gap: 6px;
+    border-bottom: 1px solid #25232d;
+    padding: 10px 12px;
+    background: #111016;
+  }
+
+  .file-filter span {
+    color: #8f88a8;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .file-filter input {
+    color-scheme: dark;
+    border: 1px solid #25232c;
+    border-radius: 9px;
+    padding: 9px 10px;
+    background: #09090d;
+    color: #cfc8dc;
+    font: inherit;
+  }
+
+  .file-refresh-action {
+    align-self: start;
+    height: 30px;
     padding: 0 10px;
-    border-color: #34313d;
+    border: 1px solid #34313d;
+    border-radius: 8px;
+    background: #1f1e27;
     color: #b8d6e4;
     font-size: 12px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    font-weight: 800;
+  }
+
+  .file-filter-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid #25232d;
+    padding: 10px;
+    background: #111016;
+  }
+
+  .file-refresh-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.52;
   }
 
   .file-breadcrumbs button.active {
@@ -530,7 +571,7 @@
     min-height: 34px;
     border: 1px solid transparent;
     border-radius: 8px;
-    padding: 0 10px;
+    padding: 0 10px 0 calc(10px + (var(--file-depth, 0) * 14px));
     background: transparent;
     text-align: left;
   }
@@ -543,6 +584,21 @@
 
   .file-row.directory span {
     color: #b8d6e4;
+  }
+
+  .file-row span {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .file-row span em {
+    flex: 0 0 auto;
+    width: 12px;
+    color: #8f88a8;
+    font-style: normal;
+    text-align: center;
   }
 
   .file-row span {
@@ -2856,12 +2912,25 @@
     white-space: nowrap;
   }
 
+  .agent-console-footer-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+  }
+
   .agent-console footer button {
     height: 32px;
     padding: 0 10px;
     color: #b8d6e4;
     font-size: 12px;
     font-weight: 900;
+  }
+
+  .agent-console footer button.manual-done-action {
+    border-color: rgba(185, 214, 170, 0.38);
+    background: rgba(43, 56, 38, 0.42);
+    color: #b9d6aa;
   }
 
   .close-detail {

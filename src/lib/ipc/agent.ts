@@ -60,7 +60,8 @@ export async function executeAiWorkerTask(
   config: AiWorkerConfig,
   task: AiWorkerTask,
 ): Promise<AiWorkerTaskResult> {
-  return invokeWithPolicy<AiWorkerTaskResult>("execute_ai_worker_task", { config, task }, IPC_POLICIES.aiExecution);
+  const result = await invokeWithPolicy<unknown>("execute_ai_worker_task", { config, task }, IPC_POLICIES.aiExecution);
+  return validateAiWorkerTaskResult(result);
 }
 
 export async function chatAiWorker(
@@ -68,4 +69,38 @@ export async function chatAiWorker(
   request: AiWorkerChatRequest,
 ): Promise<AiWorkerChatResult> {
   return invokeWithPolicy<AiWorkerChatResult>("chat_ai_worker", { config, request }, IPC_POLICIES.aiChat);
+}
+
+function validateAiWorkerTaskResult(result: unknown): AiWorkerTaskResult {
+  if (typeof result !== "object" || result === null) {
+    return invalidAiWorkerTaskResult("Agent returned an invalid structured result.");
+  }
+
+  const value = result as Partial<AiWorkerTaskResult>;
+  const validStatus = value.completion_status === "completed" || value.completion_status === "blocked";
+  const validShape = typeof value.summary === "string"
+    && Array.isArray(value.evidence)
+    && Array.isArray(value.details)
+    && Array.isArray(value.next)
+    && value.evidence.every((line) => typeof line === "string")
+    && value.details.every((line) => typeof line === "string")
+    && value.next.every((line) => typeof line === "string")
+    && (value.blocked_reason === null || typeof value.blocked_reason === "string");
+
+  if (!validStatus || !validShape) {
+    return invalidAiWorkerTaskResult("Agent returned an invalid structured result.");
+  }
+
+  return value as AiWorkerTaskResult;
+}
+
+function invalidAiWorkerTaskResult(reason: string): AiWorkerTaskResult {
+  return {
+    summary: reason,
+    evidence: [],
+    details: ["Spacesly could not validate the Agent result payload at the IPC boundary."],
+    next: ["Retry the Agent or switch to a runtime that returns the required structured result."],
+    completion_status: "blocked",
+    blocked_reason: reason,
+  };
 }

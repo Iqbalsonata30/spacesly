@@ -12,12 +12,21 @@ export interface GitWorkspaceInfo {
   behind_count: number;
 }
 
+export interface GitChangedFile {
+  path: string;
+  status: string;
+}
+
 export async function getWorkspaceGitInfo(): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>("get_workspace_git_info", undefined, IPC_POLICIES.gitRead);
 }
 
 export async function getPathGitInfo(path: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>("get_path_git_info", { path }, IPC_POLICIES.gitRead);
+}
+
+export async function getWorkspaceChangedFiles(): Promise<GitChangedFile[]> {
+  return invokeWithPolicy<GitChangedFile[]>("get_workspace_changed_files", undefined, IPC_POLICIES.gitRead);
 }
 
 export async function checkoutWorkspaceGitBranch(branch: string): Promise<GitWorkspaceInfo> {

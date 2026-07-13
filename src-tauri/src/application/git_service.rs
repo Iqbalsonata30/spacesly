@@ -1,8 +1,10 @@
 use crate::infrastructure::files::WorkspaceRoot;
+use crate::infrastructure::git::{checkout_workspace_git_branch, workspace_git_info, GitWorkspaceInfo};
 use crate::infrastructure::git::{
-    checkout_workspace_git_branch, git_info_for_path, workspace_git_info, GitWorkspaceInfo,
+    commit_workspace_git_changes, merge_workspace_git_branch, pull_workspace_git_changes,
+    push_workspace_git_changes, rebase_workspace_git_branch, workspace_changed_files, CommitResult,
+    GitChangedFile,
 };
-use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct GitService {
@@ -18,11 +20,31 @@ impl GitService {
         workspace_git_info(&self.root)
     }
 
+    pub fn changed_files(&self) -> Result<Vec<GitChangedFile>, String> {
+        workspace_changed_files(&self.root)
+    }
+
     pub fn checkout_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
         checkout_workspace_git_branch(&self.root, branch)
     }
 
-    pub fn git_info_for_path(&self, path: PathBuf) -> Result<GitWorkspaceInfo, String> {
-        git_info_for_path(Path::new(&path))
+    pub fn pull_changes(&self) -> Result<GitWorkspaceInfo, String> {
+        pull_workspace_git_changes(&self.root)
+    }
+
+    pub fn commit_changes(&self, message: String) -> Result<CommitResult, String> {
+        commit_workspace_git_changes(&self.root, message)
+    }
+
+    pub fn push_changes(&self) -> Result<GitWorkspaceInfo, String> {
+        push_workspace_git_changes(&self.root)
+    }
+
+    pub fn merge_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
+        merge_workspace_git_branch(&self.root, branch)
+    }
+
+    pub fn rebase_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
+        rebase_workspace_git_branch(&self.root, branch)
     }
 }

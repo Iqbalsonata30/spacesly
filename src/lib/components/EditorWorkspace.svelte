@@ -1,7 +1,5 @@
 <script lang="ts">
   import CodeEditor from "$lib/components/CodeEditor.svelte";
-  import GitBranchPicker from "$lib/components/GitBranchPicker.svelte";
-  import type { GitWorkspaceInfo } from "$lib/ipc";
 
   type CodeEditorHandle = {
     getValue: () => string;
@@ -28,16 +26,12 @@
     formattingFilePath: string | null;
     savingFilePath: string | null;
     editorDiagnostic: string | null;
-    workspaceGitInfo: GitWorkspaceInfo | null;
-    workspaceGitLoading: boolean;
-    switchingWorkspaceBranch: boolean;
     fileStatusLabel: string;
     onFormatActiveFile: () => void;
     onSaveActiveFile: () => void;
     onSelectEditorTab: (path: string) => void;
     onCloseEditorTab: (path: string) => void;
     onSetEditorDirty: (path: string, dirty: boolean) => void;
-    onSwitchWorkspaceBranch: (branch: string) => void;
   };
 
   let {
@@ -49,19 +43,14 @@
     formattingFilePath,
     savingFilePath,
     editorDiagnostic,
-    workspaceGitInfo,
-    workspaceGitLoading,
-    switchingWorkspaceBranch,
     fileStatusLabel,
     onFormatActiveFile,
     onSaveActiveFile,
     onSelectEditorTab,
     onCloseEditorTab,
     onSetEditorDirty,
-    onSwitchWorkspaceBranch,
   }: Props = $props();
 
-  let hasDirtyFiles = $derived(openEditorFiles.some((file) => file.dirty));
 </script>
 
 <section class="code-editor-pane" aria-label="Code editor">
@@ -113,13 +102,6 @@
   {/if}
   <footer>
     <div class="editor-footer-info">
-      <GitBranchPicker
-        gitInfo={workspaceGitInfo}
-        loading={workspaceGitLoading}
-        switching={switchingWorkspaceBranch}
-        dirty={hasDirtyFiles}
-        onSwitch={(branch) => onSwitchWorkspaceBranch(branch)}
-      />
       <span>{fileStatusLabel}</span>
     </div>
     <div class="editor-actions">

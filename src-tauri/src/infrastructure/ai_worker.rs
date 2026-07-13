@@ -58,6 +58,21 @@ pub struct AiWorkerTaskResult {
     pub blocked_reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StructuredAiWorkerTaskResult {
+    summary: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    details: Vec<String>,
+    #[serde(default)]
+    next: Vec<String>,
+    #[serde(alias = "status")]
+    completion_status: String,
+    #[serde(default)]
+    blocked_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AiWorkerCompletionStatus {
@@ -148,11 +163,11 @@ pub fn execute_ai_worker_task(
     validate_config(&config)?;
 
     let system_prompt = format!(
-        "You are an Agent inside Spacesly, an orchestration app for human and AI agents. You receive Jira-style work cards and produce a concrete execution result. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Mark STATUS: COMPLETE only for reasoning/reporting tasks that require no external side effects. If the work requires changing files, running commands, checking external systems, or using unavailable credentials/tools, mark STATUS: BLOCKED and explain what runtime/tool is needed.\n\n{}",
+        "You are an Agent inside Spacesly, an orchestration app for human and AI agents. You receive Jira-style work cards and produce a concrete execution result. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the work requires changing files, running commands, checking external systems, or using unavailable credentials/tools, set completion_status to blocked and explain what runtime/tool is needed. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
         governance_context(&config, true),
     );
     let user_prompt = format!(
-        "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: what was actually verified\nDETAILS: concise notes",
+        "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually verified\"],\n  \"details\": [\"concise notes\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
         task.key.as_deref().unwrap_or("local"),
         task.title,
         task.url.as_deref().unwrap_or("none"),
@@ -163,7 +178,7 @@ pub fn execute_ai_worker_task(
     );
 
     let response = call_model(&config, &system_prompt, &user_prompt, 700)?;
-    Ok(result_from_response(response, Some(&task)))
+    Ok(result_from_structured_response(response, Some(&task)))
 }
 
 pub fn chat_ai_worker(
@@ -404,6 +419,104 @@ fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWork
         next,
         completion_status,
         blocked_reason,
+    }
+}
+
+fn result_from_structured_response(
+    response: String,
+    task: Option<&AiWorkerTask>,
+) -> AiWorkerTaskResult {
+    match parse_structured_result(&response) {
+        Ok(mut result) => {
+            if result.completion_status == AiWorkerCompletionStatus::Completed
+                && missing_sensitive_approval(task)
+            {
+                block_result(&mut result, completion_guard_reason(task));
+            }
+            result
+        }
+        Err(error) => invalid_structured_result(response, error),
+    }
+}
+
+fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String> {
+    let raw = extract_json_object(response)
+        .ok_or_else(|| "response did not contain a JSON object".to_string())?;
+    let parsed: StructuredAiWorkerTaskResult = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse JSON result: {error}"))?;
+    let completion_status = match parsed.completion_status.trim().to_lowercase().as_str() {
+        "completed" | "complete" => AiWorkerCompletionStatus::Completed,
+        "blocked" | "block" => AiWorkerCompletionStatus::Blocked,
+        other => return Err(format!("invalid completion_status: {other}")),
+    };
+    let summary = parsed.summary.trim().to_string();
+    if summary.is_empty() {
+        return Err("summary is required".to_string());
+    }
+    if completion_status == AiWorkerCompletionStatus::Blocked
+        && parsed
+            .blocked_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .is_none()
+    {
+        return Err("blocked_reason is required when completion_status is blocked".to_string());
+    }
+
+    Ok(AiWorkerTaskResult {
+        summary,
+        evidence: clean_result_lines(parsed.evidence),
+        details: clean_result_lines(parsed.details),
+        next: clean_result_lines(parsed.next),
+        completion_status,
+        blocked_reason: parsed
+            .blocked_reason
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty()),
+    })
+}
+
+fn extract_json_object(response: &str) -> Option<&str> {
+    let trimmed = response.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+
+    trimmed
+        .find('{')
+        .and_then(|start| trimmed.rfind('}').map(|end| (start, end)))
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| &trimmed[start..=end])
+}
+
+fn clean_result_lines(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .take(12)
+        .collect()
+}
+
+fn invalid_structured_result(response: String, error: String) -> AiWorkerTaskResult {
+    let raw = first_line(&response);
+    let detail = if raw.is_empty() {
+        error.clone()
+    } else {
+        format!("{error}. First response line: {raw}")
+    };
+
+    AiWorkerTaskResult {
+        summary: "Agent returned an invalid structured result.".to_string(),
+        evidence: Vec::new(),
+        details: vec![detail],
+        next: vec![
+            "Retry the Agent or switch to a runtime that can return the required JSON result."
+                .to_string(),
+        ],
+        completion_status: AiWorkerCompletionStatus::Blocked,
+        blocked_reason: Some(error),
     }
 }
 
@@ -1007,6 +1120,102 @@ mod tests {
         .expect("serialize task result");
 
         assert_eq!(value["completion_status"].as_str(), Some("completed"));
+    }
+
+    #[test]
+    fn structured_result_parses_completed_json() {
+        let result = result_from_structured_response(
+            r#"{
+              "completion_status": "completed",
+              "summary": "Queue summarized.",
+              "evidence": ["Read visible board state"],
+              "details": ["No external tools required"],
+              "next": [],
+              "blocked_reason": null
+            }"#
+            .to_string(),
+            None,
+        );
+
+        assert_eq!(
+            result.completion_status,
+            AiWorkerCompletionStatus::Completed
+        );
+        assert_eq!(result.summary, "Queue summarized.");
+        assert_eq!(result.evidence, vec!["Read visible board state"]);
+        assert_eq!(result.blocked_reason, None);
+    }
+
+    #[test]
+    fn structured_result_blocks_invalid_json() {
+        let result = result_from_structured_response("STATUS: COMPLETE".to_string(), None);
+
+        assert_eq!(result.completion_status, AiWorkerCompletionStatus::Blocked);
+        assert_eq!(
+            result.summary,
+            "Agent returned an invalid structured result."
+        );
+        assert!(result
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("response did not contain a JSON object"));
+    }
+
+    #[test]
+    fn structured_result_requires_blocked_reason() {
+        let result = result_from_structured_response(
+            r#"{
+              "completion_status": "blocked",
+              "summary": "Cannot access Jira.",
+              "evidence": [],
+              "details": [],
+              "next": [],
+              "blocked_reason": null
+            }"#
+            .to_string(),
+            None,
+        );
+
+        assert_eq!(result.completion_status, AiWorkerCompletionStatus::Blocked);
+        assert!(result
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("blocked_reason is required"));
+    }
+
+    #[test]
+    fn structured_result_keeps_sensitive_task_blocked_without_approval() {
+        let task = AiWorkerTask {
+            key: Some("SEC-1".to_string()),
+            title: "Update API token".to_string(),
+            description: "Change secret token handling.".to_string(),
+            labels: Vec::new(),
+            url: None,
+            operator_notes: None,
+            previous_output: None,
+        };
+
+        let result = result_from_structured_response(
+            r#"{
+              "completion_status": "completed",
+              "summary": "Updated token handling.",
+              "evidence": ["Reasoned about the change"],
+              "details": [],
+              "next": [],
+              "blocked_reason": null
+            }"#
+            .to_string(),
+            Some(&task),
+        );
+
+        assert_eq!(result.completion_status, AiWorkerCompletionStatus::Blocked);
+        assert!(result
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("needs explicit operator approval"));
     }
 
     #[test]

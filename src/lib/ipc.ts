@@ -1,6 +1,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { FileEntry } from "$lib/ipc/files";
+import type { GitWorkspaceInfo } from "$lib/ipc/git";
 export type {
   AiWorkerChatResult,
   AiWorkerChatRequest,
@@ -18,8 +19,8 @@ export {
   workspaceRootPath,
   writeFile,
 } from "$lib/ipc/files";
-export type { GitWorkspaceInfo } from "$lib/ipc/git";
-export { checkoutWorkspaceGitBranch, getPathGitInfo, getWorkspaceGitInfo } from "$lib/ipc/git";
+export type { GitChangedFile, GitWorkspaceInfo } from "$lib/ipc/git";
+export { checkoutWorkspaceGitBranch, getPathGitInfo, getWorkspaceChangedFiles, getWorkspaceGitInfo } from "$lib/ipc/git";
 export type {
   JiraBoard,
   JiraConnectionStatus,
@@ -567,15 +568,24 @@ export interface CommitResult {
   message: string;
 }
 
-export async function gitCommit(
-  workspaceId: string,
-  message: string,
-): Promise<CommitResult> {
-  return invoke<CommitResult>("git_commit", { workspaceId, message });
+export async function gitCommit(message: string): Promise<CommitResult> {
+  return invoke<CommitResult>("commit_workspace_git_changes", { message });
 }
 
-export async function gitPush(workspaceId: string): Promise<void> {
-  return invoke("git_push", { workspaceId });
+export async function gitPush(): Promise<GitWorkspaceInfo> {
+  return invoke<GitWorkspaceInfo>("push_workspace_git_changes");
+}
+
+export async function gitPull(): Promise<GitWorkspaceInfo> {
+  return invoke<GitWorkspaceInfo>("pull_workspace_git_changes");
+}
+
+export async function gitMergeBranch(branch: string): Promise<GitWorkspaceInfo> {
+  return invoke<GitWorkspaceInfo>("merge_workspace_git_branch", { branch });
+}
+
+export async function gitRebaseBranch(branch: string): Promise<GitWorkspaceInfo> {
+  return invoke<GitWorkspaceInfo>("rebase_workspace_git_branch", { branch });
 }
 
 export async function checkMainBehind(repoId: string): Promise<number> {

@@ -27,6 +27,7 @@
     onTerminalInputChange: (value: string) => void;
     onSubmitTerminalInput: () => void;
     onOpenCard: (cardId: string) => void;
+    onMarkBlockedDone: (cardId: string) => void;
   };
 
   let {
@@ -52,6 +53,7 @@
     onTerminalInputChange,
     onSubmitTerminalInput,
     onOpenCard,
+    onMarkBlockedDone,
   }: Props = $props();
 </script>
 
@@ -166,7 +168,12 @@
   {#if runCardId}
     <footer>
       <span>{runCardId}</span>
-      <button type="button" onclick={() => onOpenCard(runCardId)}>Open card</button>
+      <div class="agent-console-footer-actions">
+        {#if runStatus === "blocked"}
+          <button class="manual-done-action" type="button" onclick={() => onMarkBlockedDone(runCardId)}>Done</button>
+        {/if}
+        <button type="button" onclick={() => onOpenCard(runCardId)}>Open card</button>
+      </div>
     </footer>
   {/if}
 </aside>

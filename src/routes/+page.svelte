@@ -1,19 +1,16 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { Terminal } from "@xterm/xterm";
-  import { FitAddon } from "@xterm/addon-fit";
-  import AgentConsolePanel from "$lib/components/AgentConsolePanel.svelte";
+  import type { Terminal as XtermTerminal } from "@xterm/xterm";
+  import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
-  import EditorWorkspace from "$lib/components/EditorWorkspace.svelte";
-  import FileBrowserPane from "$lib/components/FileBrowserPane.svelte";
-  import McpConnectionSettings from "$lib/components/McpConnectionSettings.svelte";
   import NewTaskPopover from "$lib/components/NewTaskPopover.svelte";
-  import WorkspaceChatPane from "$lib/components/WorkspaceChatPane.svelte";
+  import NotificationStack from "$lib/components/NotificationStack.svelte";
+  import SegmentedControl from "$lib/components/SegmentedControl.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
   import { chatTitleForCard, isGenericChatTitle, summarizeChatTitle } from "$lib/chatSession";
-  import { displayPath, fileName, normalizeAbsolutePath, parentDirectory } from "$lib/filesFeature";
+  import { displayPath, fileName, normalizeAbsolutePath } from "$lib/filesFeature";
+  import { collectAncestorPaths, pruneExpandedFolderTree } from "$lib/fileBrowser";
   import {
     agentActivity,
     agentActionLabel,
@@ -61,7 +58,6 @@
     type WorkspaceChatAction,
     type WorkspaceChatActionContext,
   } from "$lib/workspaceChat";
-  import "@xterm/xterm/css/xterm.css";
   import "./page.css";
   import {
     addJiraComment,
@@ -71,6 +67,12 @@
     executeAiWorkerTask,
     getJiraBoards,
     getPathGitInfo,
+    getWorkspaceChangedFiles,
+    gitCommit,
+    gitMergeBranch,
+    gitPull,
+    gitPush,
+    gitRebaseBranch,
     getWorkspaceGitInfo,
     getWorkspace,
     listDirectory,
@@ -97,6 +99,7 @@
     type ColumnIntent,
     type ExecutionState,
     type FileEntry,
+    type GitChangedFile,
     type GitWorkspaceInfo,
     type AiWorkerTaskResult,
     type JiraMcpConfig,
@@ -301,11 +304,27 @@
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
   let workspaceShellWorkdir = $state(initialUiState.workspaceShellWorkdir);
   let workspaceTerminalContainer: HTMLDivElement | null = $state(null);
-  let workspaceTerminal: Terminal | null = null;
-  let workspaceFitAddon: FitAddon | null = null;
+  let workspaceTerminal: XtermTerminal | null = null;
+  let workspaceFitAddon: XtermFitAddon | null = null;
   let workspaceTerminalResizeObserver: ResizeObserver | null = null;
   let workspaceTerminalOpened = $state(false);
   const workspaceTerminalId = "main-workspace-terminal";
+  let workspaceTerminalRuntime: Promise<{
+    Terminal: typeof import("@xterm/xterm").Terminal;
+    FitAddon: typeof import("@xterm/addon-fit").FitAddon;
+  }> | null = null;
+  let editorWorkspaceModule = $state<typeof import("$lib/components/EditorWorkspace.svelte") | null>(null);
+  let editorWorkspaceRuntime: Promise<typeof import("$lib/components/EditorWorkspace.svelte")> | null = null;
+  let fileBrowserModule = $state<typeof import("$lib/components/FileBrowserPane.svelte") | null>(null);
+  let fileBrowserRuntime: Promise<typeof import("$lib/components/FileBrowserPane.svelte")> | null = null;
+  let gitActionsModule = $state<typeof import("$lib/components/GitActionsPane.svelte") | null>(null);
+  let gitActionsRuntime: Promise<typeof import("$lib/components/GitActionsPane.svelte")> | null = null;
+  let workspaceChatModule = $state<typeof import("$lib/components/WorkspaceChatPane.svelte") | null>(null);
+  let workspaceChatRuntime: Promise<typeof import("$lib/components/WorkspaceChatPane.svelte")> | null = null;
+  let mcpConnectionModule = $state<typeof import("$lib/components/McpConnectionSettings.svelte") | null>(null);
+  let mcpConnectionRuntime: Promise<typeof import("$lib/components/McpConnectionSettings.svelte")> | null = null;
+  let agentConsoleModule = $state<typeof import("$lib/components/AgentConsolePanel.svelte") | null>(null);
+  let agentConsoleRuntime: Promise<typeof import("$lib/components/AgentConsolePanel.svelte")> | null = null;
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
@@ -325,7 +344,12 @@
   let fileRootLabel = $state("~");
   let fileLoading = $state(false);
   let fileError = $state<string | null>(null);
+  let fileFilter = $state("");
+  let expandedFileEntries = $state<Record<string, FileEntry[]>>({});
+  let expandingFilePaths = $state<Record<string, true>>({});
+  let fileTreeRevision = 0;
   let fileSidebarCollapsed = $state(false);
+  let workspaceSidebarTab = $state<"explorer" | "source-control">("explorer");
   let workspaceFilesRoot = $state(initialUiState.workspaceFilesRoot);
   let workspaceFilesDirectory = $state(initialUiState.workspaceFilesDirectory);
   let openEditorFiles = $state<OpenEditorFile[]>([]);
@@ -337,12 +361,15 @@
   let workspaceGitInfo = $state<GitWorkspaceInfo | null>(null);
   let workspaceGitLoading = $state(false);
   let workspaceGitError = $state<string | null>(null);
+  let workspaceChangedFiles = $state<GitChangedFile[]>([]);
   let selectedWorkspaceBranch = $state("");
   let switchingWorkspaceBranch = $state(false);
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceGitInfoRequestId = 0;
+  let workspaceChangedFilesRequestId = 0;
   let backlogStartConfirmation = $state<{ cardId: string; title: string } | null>(null);
   let backlogStartConfirmationResolve: ((confirmed: boolean) => void) | null = null;
+  let manualDoneConfirmation = $state<{ cardId: string; title: string } | null>(null);
 
   onMount(() => {
     void hydrateCachedWorkspace();
@@ -377,6 +404,28 @@
   });
 
   $effect(() => {
+    if (workspaceMode === "files") {
+      void loadFileBrowserRuntime();
+      void loadEditorWorkspaceRuntime();
+      void loadGitActionsRuntime();
+    } else if (workspaceMode === "term") {
+      void loadWorkspaceChatRuntime();
+    }
+  });
+
+  $effect(() => {
+    if (settingsOpen && settingsTab === "mcp") {
+      void loadMcpConnectionRuntime();
+    }
+  });
+
+  $effect(() => {
+    if (agentConsoleOpen && hasAgentConsoleSession) {
+      void loadAgentConsoleRuntime();
+    }
+  });
+
+  $effect(() => {
     if (workspaceMode === "files" && workspace && fileEntries.length === 0 && !fileLoading) {
       void refreshFileDirectory(fileDirectory);
     }
@@ -400,6 +449,19 @@
       workspaceGitInfo = null;
       workspaceGitError = null;
       workspaceGitLoading = false;
+      workspaceChangedFiles = [];
+      selectedWorkspaceBranch = "";
+      return;
+    }
+
+    void refreshWorkspaceGitState();
+  });
+
+  async function refreshWorkspaceGitInfo() {
+    if (!workspaceRoot) {
+      workspaceGitInfo = null;
+      workspaceGitError = null;
+      workspaceGitLoading = false;
       selectedWorkspaceBranch = "";
       return;
     }
@@ -408,22 +470,41 @@
     workspaceGitLoading = true;
     workspaceGitError = null;
 
-    void getWorkspaceGitInfo()
-      .then((info) => {
-        if (requestId !== workspaceGitInfoRequestId) return;
-        workspaceGitInfo = info.is_git_repo ? info : null;
-        selectedWorkspaceBranch = info.current_branch ?? "";
-      })
-      .catch((reason: unknown) => {
-        if (requestId !== workspaceGitInfoRequestId) return;
-        workspaceGitInfo = null;
-        workspaceGitError = reason instanceof Error ? reason.message : String(reason);
-      })
-      .finally(() => {
-        if (requestId !== workspaceGitInfoRequestId) return;
-        workspaceGitLoading = false;
-      });
-  });
+    try {
+      const info = await getWorkspaceGitInfo();
+      if (requestId !== workspaceGitInfoRequestId) return;
+      workspaceGitInfo = info.is_git_repo ? info : null;
+      selectedWorkspaceBranch = info.current_branch ?? "";
+    } catch (reason: unknown) {
+      if (requestId !== workspaceGitInfoRequestId) return;
+      workspaceGitInfo = null;
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (requestId !== workspaceGitInfoRequestId) return;
+      workspaceGitLoading = false;
+    }
+  }
+
+  async function refreshWorkspaceChangedFiles() {
+    if (!workspaceRoot) {
+      workspaceChangedFiles = [];
+      return;
+    }
+
+    const requestId = ++workspaceChangedFilesRequestId;
+    try {
+      const files = await getWorkspaceChangedFiles();
+      if (requestId !== workspaceChangedFilesRequestId) return;
+      workspaceChangedFiles = files;
+    } catch {
+      if (requestId !== workspaceChangedFilesRequestId) return;
+      workspaceChangedFiles = [];
+    }
+  }
+
+  async function refreshWorkspaceGitState() {
+    await Promise.all([refreshWorkspaceGitInfo(), refreshWorkspaceChangedFiles()]);
+  }
 
   $effect(() => {
     if (!workspace || filesStateHydrated) return;
@@ -518,6 +599,8 @@
   );
   let activeEditorReady = $derived(Boolean(activeEditorFile?.editor));
   let activeEditorDirty = $derived(Boolean(activeEditorFile?.dirty));
+  let hasDirtyEditorFiles = $derived(openEditorFiles.some((file) => file.dirty));
+
   let fileStatusLabel = $derived(
     fileLoading
       ? "Loading files"
@@ -743,17 +826,24 @@
 
   async function refreshFileDirectory(relativePath = fileDirectory) {
     if (!workspace || fileLoading) return;
+    const revision = fileTreeRevision + 1;
+    fileTreeRevision = revision;
     fileLoading = true;
     fileError = null;
     fileDirectory = relativePath;
     workspaceFilesDirectory = relativePath;
     saveUiState();
     try {
-      fileEntries = await listDirectory(workspace.id, relativePath);
+      const entries = await listDirectory(workspace.id, relativePath);
+      if (revision !== fileTreeRevision) return;
+      fileEntries = entries;
+      expandedFileEntries = {};
+      expandingFilePaths = {};
     } catch (reason: unknown) {
+      if (revision !== fileTreeRevision) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      fileLoading = false;
+      if (revision === fileTreeRevision) fileLoading = false;
     }
   }
 
@@ -807,6 +897,16 @@
     await validateActiveEditorSyntax();
   }
 
+  async function refreshWorkspaceAfterGitAction(refreshFiles = true, refreshEditors = true) {
+    await refreshWorkspaceGitState();
+    if (refreshFiles) {
+      await refreshFileDirectory(fileDirectory);
+    }
+    if (refreshEditors) {
+      await refreshOpenEditorFilesFromDisk();
+    }
+  }
+
   async function switchWorkspaceBranch(branch: string) {
     if (!workspaceGitInfo?.is_git_repo || switchingWorkspaceBranch) return;
     if (openEditorFiles.some((file) => file.dirty)) {
@@ -825,9 +925,7 @@
       const info = await checkoutWorkspaceGitBranch(branch);
       workspaceGitInfo = info.is_git_repo ? info : null;
       selectedWorkspaceBranch = info.current_branch ?? branch;
-      await refreshWorkspaceRootLabel();
-      await refreshFileDirectory(fileDirectory);
-      await refreshOpenEditorFilesFromDisk();
+      await refreshWorkspaceAfterGitAction();
       appNotice = { tone: "success", message: `Switched to ${selectedWorkspaceBranch || branch}` };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -835,6 +933,70 @@
       selectedWorkspaceBranch = workspaceGitInfo?.current_branch ?? branch;
     } finally {
       switchingWorkspaceBranch = false;
+    }
+  }
+
+  async function pullWorkspaceGitChanges() {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      const info = await gitPull();
+      workspaceGitInfo = info.is_git_repo ? info : null;
+      await refreshWorkspaceAfterGitAction();
+      appNotice = { tone: "success", message: "Pulled latest changes." };
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+    }
+  }
+
+  async function commitWorkspaceGitChanges(message: string) {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      const result = await gitCommit(message);
+      await refreshWorkspaceAfterGitAction(false, false);
+      appNotice = { tone: "success", message: `Committed ${result.hash.slice(0, 7)}` };
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+    }
+  }
+
+  async function pushWorkspaceGitChanges() {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      const info = await gitPush();
+      workspaceGitInfo = info.is_git_repo ? info : null;
+      await refreshWorkspaceAfterGitAction(false, false);
+      appNotice = { tone: "success", message: "Pushed changes." };
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+    }
+  }
+
+  async function mergeWorkspaceGitBranch(branch: string) {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      const info = await gitMergeBranch(branch);
+      workspaceGitInfo = info.is_git_repo ? info : null;
+      await refreshWorkspaceAfterGitAction();
+      appNotice = { tone: "success", message: `Merged ${branch}` };
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+    }
+  }
+
+  async function rebaseWorkspaceGitBranch(branch: string) {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      const info = await gitRebaseBranch(branch);
+      workspaceGitInfo = info.is_git_repo ? info : null;
+      await refreshWorkspaceAfterGitAction();
+      appNotice = { tone: "success", message: `Rebased onto ${branch}` };
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
     }
   }
 
@@ -849,9 +1011,8 @@
       fileRootLabel = displayPath(savedRoot);
     }
 
-    const savedDirectory = initialUiState.workspaceFilesDirectory || "";
     const savedActivePath = initialUiState.workspaceFilesActivePath;
-    const targetDirectory = savedDirectory || (savedActivePath ? parentDirectory(savedActivePath) ?? "" : "");
+    const targetDirectory = "";
 
     if (fileDirectory !== targetDirectory) {
       await refreshFileDirectory(targetDirectory);
@@ -861,6 +1022,7 @@
       const existingFile = openEditorFiles.find((file) => file.path === savedActivePath);
       if (existingFile) {
         activeEditorPath = savedActivePath;
+        await expandFileAncestors(savedActivePath);
         saveUiState();
         return;
       }
@@ -873,7 +1035,8 @@
 
   async function openFolderFromDialog() {
     if (!workspace) return;
-    const selected = await openDialog({ directory: true, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    workspaceSidebarTab = "explorer";
+    const selected = await openDialogIfAvailable({ directory: true, multiple: false, defaultPath: workspaceRoot ?? undefined });
     if (typeof selected !== "string") return;
 
     await setWorkspaceRoot(selected);
@@ -881,15 +1044,21 @@
     workspaceFilesDirectory = "";
     openEditorFiles = [];
     activeEditorPath = null;
+    expandedFileEntries = {};
+    expandingFilePaths = {};
+    fileTreeRevision += 1;
+    fileFilter = "";
     await refreshWorkspaceRootLabel();
     await refreshFileDirectory("");
+    await refreshWorkspaceGitState();
     saveUiState();
     appNotice = { tone: "success", message: `Opened folder ${fileRootLabel}` };
   }
 
   async function openFileFromDialog() {
     if (!workspace) return;
-    const selected = await openDialog({ directory: false, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    workspaceSidebarTab = "explorer";
+    const selected = await openDialogIfAvailable({ directory: false, multiple: false, defaultPath: workspaceRoot ?? undefined });
     if (typeof selected !== "string") return;
 
     const normalized = normalizeAbsolutePath(selected);
@@ -899,16 +1068,38 @@
     await setWorkspaceRoot(parent);
     fileDirectory = "";
     workspaceFilesDirectory = "";
+    expandedFileEntries = {};
+    expandingFilePaths = {};
+    fileTreeRevision += 1;
+    fileFilter = "";
     await refreshWorkspaceRootLabel();
     await refreshFileDirectory("");
+    await expandFileAncestors(name);
     await openFileEntry({ name, path: name, is_dir: false, size: 0 });
+    await refreshWorkspaceGitState();
     saveUiState();
     appNotice = { tone: "success", message: `Opened ${name}` };
   }
 
+  async function createNewFile() {
+    if (!workspace) return;
+    workspaceSidebarTab = "explorer";
+    const target = window.prompt("New file name", fileDirectory ? `${fileDirectory}/untitled.txt` : "untitled.txt");
+    if (!target) return;
+
+    const normalized = target.replace(/^\/+/, "").trim();
+    if (!normalized) return;
+
+    await writeFile(workspace.id, normalized, "");
+    await refreshWorkspaceGitState();
+    await refreshFileDirectory(fileDirectory);
+    await openFileEntry({ name: fileName(normalized), path: normalized, is_dir: false, size: 0 });
+    appNotice = { tone: "success", message: `Created ${normalized}` };
+  }
+
   async function openFileEntry(entry: FileEntry) {
     if (entry.is_dir) {
-      await refreshFileDirectory(entry.path);
+      await toggleFileFolder(entry);
       return;
     }
 
@@ -929,6 +1120,7 @@
         ...openEditorFiles,
         { path: entry.path, name: entry.name, content, savedContent: content, dirty: false, editor: null },
       ];
+      await expandFileAncestors(entry.path);
       await tick();
       activeEditorFile?.editor?.focus();
       scheduleEditorDiagnostics();
@@ -937,6 +1129,50 @@
       activeEditorPath = openEditorFiles.at(-1)?.path ?? null;
     } finally {
       fileLoading = false;
+    }
+  }
+
+  async function toggleFileFolder(entry: FileEntry) {
+    if (!workspace || !entry.is_dir || expandingFilePaths[entry.path]) return;
+
+    if (expandedFileEntries[entry.path]) {
+      expandedFileEntries = pruneExpandedFolderTree(expandedFileEntries, entry.path);
+      return;
+    }
+
+    const revision = fileTreeRevision;
+    expandingFilePaths = { ...expandingFilePaths, [entry.path]: true };
+    fileError = null;
+    try {
+      const children = await listDirectory(workspace.id, entry.path);
+      if (revision !== fileTreeRevision) return;
+      expandedFileEntries = { ...expandedFileEntries, [entry.path]: children };
+    } catch (reason: unknown) {
+      if (revision !== fileTreeRevision) return;
+      fileError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (revision !== fileTreeRevision) return;
+      const { [entry.path]: _finished, ...remaining } = expandingFilePaths;
+      expandingFilePaths = remaining;
+    }
+  }
+
+  function clearFileFilter() {
+    fileFilter = "";
+  }
+
+  function collapseAllFileFolders() {
+    expandedFileEntries = {};
+    expandingFilePaths = {};
+  }
+
+  async function expandFileAncestors(path: string) {
+    if (!workspace) return;
+
+    for (const current of collectAncestorPaths(path)) {
+      if (expandedFileEntries[current] || expandingFilePaths[current]) continue;
+      const folderEntry: FileEntry = { name: current.split("/").at(-1) ?? current, path: current, is_dir: true, size: 0 };
+      await toggleFileFolder(folderEntry);
     }
   }
 
@@ -971,17 +1207,19 @@
   async function saveActiveFile() {
     const editor = activeEditorFile?.editor;
     if (!workspace || !activeEditorPath || !editor) return;
+    const path = activeEditorPath;
     const content = editor.getValue();
-    savingFilePath = activeEditorPath;
+    savingFilePath = path;
     fileError = null;
     try {
-      await writeFile(workspace.id, activeEditorPath, content);
+      await writeFile(workspace.id, path, content);
       openEditorFiles = openEditorFiles.map((file) =>
-        file.path === activeEditorPath ? { ...file, content, savedContent: content, dirty: false } : file,
+        file.path === path ? { ...file, content, savedContent: content, dirty: false } : file,
       );
       editor.markSaved(content);
-      appNotice = { tone: "success", message: `Saved ${activeEditorPath}` };
+      appNotice = { tone: "success", message: `Saved ${path}` };
       await validateActiveEditorSyntax();
+      await refreshWorkspaceGitState();
       void refreshFileDirectory(fileDirectory);
     } catch (reason: unknown) {
       fileError = reason instanceof Error ? reason.message : String(reason);
@@ -1470,6 +1708,12 @@
       return;
     }
 
+    const { Terminal, FitAddon } = await loadWorkspaceTerminalRuntime();
+    if (!workspaceTerminalContainer || workspaceTerminalOpened) {
+      workspaceTerminal?.focus();
+      return;
+    }
+
     workspaceTerminal = new Terminal({
       cursorBlink: true,
       convertEol: true,
@@ -1522,7 +1766,84 @@
   }
 
   function openTermWorkspace() {
+    void loadWorkspaceTerminalRuntime();
     setWorkspaceMode("term");
+  }
+
+  function loadWorkspaceTerminalRuntime() {
+    workspaceTerminalRuntime ??= (async () => {
+      await import("@xterm/xterm/css/xterm.css");
+      const [terminal, fit] = await Promise.all([
+      import("@xterm/xterm"),
+      import("@xterm/addon-fit"),
+      ]);
+
+      return {
+        Terminal: terminal.Terminal,
+        FitAddon: fit.FitAddon,
+      };
+    })();
+
+    return workspaceTerminalRuntime;
+  }
+
+  async function openDialogIfAvailable(options: Parameters<typeof import("@tauri-apps/plugin-dialog").open>[0]) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    return open(options);
+  }
+
+  function loadEditorWorkspaceRuntime() {
+    editorWorkspaceRuntime ??= import("$lib/components/EditorWorkspace.svelte").then((module) => {
+      editorWorkspaceModule = module;
+      return module;
+    });
+
+    return editorWorkspaceRuntime;
+  }
+
+  function loadFileBrowserRuntime() {
+    fileBrowserRuntime ??= import("$lib/components/FileBrowserPane.svelte").then((module) => {
+      fileBrowserModule = module;
+      return module;
+    });
+
+    return fileBrowserRuntime;
+  }
+
+  function loadGitActionsRuntime() {
+    gitActionsRuntime ??= import("$lib/components/GitActionsPane.svelte").then((module) => {
+      gitActionsModule = module;
+      return module;
+    });
+
+    return gitActionsRuntime;
+  }
+
+  function loadWorkspaceChatRuntime() {
+    workspaceChatRuntime ??= import("$lib/components/WorkspaceChatPane.svelte").then((module) => {
+      workspaceChatModule = module;
+      return module;
+    });
+
+    return workspaceChatRuntime;
+  }
+
+  function loadMcpConnectionRuntime() {
+    mcpConnectionRuntime ??= import("$lib/components/McpConnectionSettings.svelte").then((module) => {
+      mcpConnectionModule = module;
+      return module;
+    });
+
+    return mcpConnectionRuntime;
+  }
+
+  function loadAgentConsoleRuntime() {
+    agentConsoleRuntime ??= import("$lib/components/AgentConsolePanel.svelte").then((module) => {
+      agentConsoleModule = module;
+      return module;
+    });
+
+    return agentConsoleRuntime;
   }
 
   async function sendWorkspaceChat() {
@@ -2312,6 +2633,11 @@
     persistActiveAgentRun();
   }
 
+  function setAgentRunGitSnapshot(snapshot: AgentRunGitSnapshot | null) {
+    agentRunGitSnapshot = snapshot;
+    persistActiveAgentRun();
+  }
+
   function setAgentProgress(value: number) {
     agentRunProgress = Math.max(agentRunProgress, Math.min(100, value));
     persistActiveAgentRun();
@@ -2672,6 +2998,73 @@
     backlogStartConfirmationResolve = null;
   }
 
+  function requestManualDoneConfirmation(cardId: string) {
+    const card = activeCardById.get(cardId);
+    if (!card) return;
+    if (agentRunStatus !== "blocked") {
+      appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
+      return;
+    }
+
+    manualDoneConfirmation = { cardId, title: card.title };
+  }
+
+  async function confirmManualDone(confirmed: boolean) {
+    const target = manualDoneConfirmation;
+    manualDoneConfirmation = null;
+    if (!confirmed || !target) return;
+
+    await markBlockedAgentDoneManually(target.cardId);
+  }
+
+  async function markBlockedAgentDoneManually(cardId: string) {
+    const card = activeCardById.get(cardId);
+    const doneColumnId = columnIdByIntent("done");
+    if (!card || !doneColumnId) return;
+    if (agentRunStatus !== "blocked") {
+      appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
+      return;
+    }
+
+    const summary = "Marked Done manually by operator after resolving the blocked Agent task.";
+    moveCard(cardId, doneColumnId, { completed: { summary } });
+    updateCardExecution(cardId, { completed: { summary } });
+    setAgentRunStatus("completed");
+    setAgentProgress(100);
+    appendAgentSessionTranscript("approval", summary);
+    appendStructuredAgentLog(
+      "success",
+      "manual-done",
+      summary,
+      ["Operator confirmed the task was resolved outside the Agent."],
+      ["Spacesly moved the task to Done without rerunning the Agent."],
+      ["Review Jira writeback status if the task is linked to Jira."],
+    );
+
+    const issueKey = jiraKey(card);
+    const jiraConfig = issueKey ? buildJiraConfig() : null;
+    if (issueKey && jiraConfig) {
+      try {
+        await addJiraComment(
+          jiraConfig,
+          issueKey,
+          [
+            "Spacesly marked this task Done manually.",
+            "",
+            "Reason: Operator confirmed the blocked Agent task was resolved outside the Agent.",
+          ].join("\n"),
+        );
+        await transitionJiraIssue(jiraConfig, issueKey, "Done");
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        appNotice = { tone: "error", message };
+        return;
+      }
+    }
+
+    appNotice = { tone: "success", message: `${ticketLabel(card)} marked Done manually.` };
+  }
+
   async function moveCardAndSync(cardId: string, targetColumnId: string) {
     if (shouldStartWorkerForColumn(targetColumnId)) {
       await startWorkerForCard(cardId);
@@ -2730,16 +3123,19 @@
     const isContinuation = existingSession?.status === "blocked";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
-    const runGitInfo = config.opencode_workdir?.trim()
-      ? await getPathGitInfo(config.opencode_workdir.trim())
-      : await getWorkspaceGitInfo();
-
     runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
-    beginAgentRun(card, isContinuation, gitSnapshotFromInfo(runGitInfo));
+    beginAgentRun(card, isContinuation, null);
     const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
     appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
 
     try {
+      if (config.runtime === "opencode") {
+        const runGitInfo = config.opencode_workdir?.trim()
+          ? await getPathGitInfo(config.opencode_workdir.trim())
+          : await getWorkspaceGitInfo();
+        setAgentRunGitSnapshot(gitSnapshotFromInfo(runGitInfo));
+      }
+
       if (cardColumnIntent(cardId) !== "in_progress") {
         appendStructuredAgentLog(
           "info",
@@ -3115,14 +3511,25 @@
             {#if selectedServer}
               <form class="settings-form" onsubmit={(event) => event.preventDefault()}>
                 {#if settingsTab === "mcp"}
-                <McpConnectionSettings
-                  server={selectedServer}
-                  jiraBaseUrl={settings.jira.baseUrl}
-                  jiraPrincipal={settings.jira.username}
-                  jiraAuthMode={settings.jira.authMode}
-                  onUpdate={updateSelectedServer}
-                  onError={(message) => (settingsError = message)}
-                />
+                  {#if mcpConnectionModule}
+                    {@const McpConnectionSettings = mcpConnectionModule.default}
+                    <McpConnectionSettings
+                      server={selectedServer}
+                      jiraBaseUrl={settings.jira.baseUrl}
+                      jiraPrincipal={settings.jira.username}
+                      jiraAuthMode={settings.jira.authMode}
+                      onUpdate={updateSelectedServer}
+                      onError={(message) => (settingsError = message)}
+                    />
+                  {:else}
+                    <section class="settings-section">
+                      <div>
+                        <p class="section-kicker">MCP Connection</p>
+                        <h3>Loading connection settings</h3>
+                      </div>
+                      <p class="field-help">Preparing MCP controls only when this settings tab is opened.</p>
+                    </section>
+                  {/if}
                 {/if}
 
                 {#if settingsTab === "agent"}
@@ -3772,26 +4179,7 @@
       </section>
         {:else if activeBoard}
       <section class="board-shell">
-        {#if appNotice || syncError}
-          <div class="notification-stack" aria-live="polite">
-            {#if appNotice}
-              <div class={`notification-card app-notice ${appNotice.tone}`} role="status">
-                <div>
-                  <strong>{appNotice.tone === "error" ? "Action failed" : appNotice.tone === "success" ? "Success" : "Notice"}</strong>
-                  <span>{appNotice.message}</span>
-                </div>
-                <button type="button" aria-label="Dismiss notification" onclick={dismissAppNotice}>×</button>
-              </div>
-            {:else if syncError}
-              <div class="notification-card sync-error" role="status">
-                <div>
-                  <strong>Jira sync failed</strong>
-                  <span>{syncError}</span>
-                </div>
-              </div>
-            {/if}
-          </div>
-        {/if}
+        <NotificationStack notice={appNotice} {syncError} onDismissNotice={dismissAppNotice} />
 
         <div
           class:with-console={agentConsoleOpen && hasAgentConsoleSession}
@@ -3848,30 +4236,56 @@
               onpointercancel={endLayoutResize}
             ></span>
           </div>
-          <AgentConsolePanel
-            style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}
-            title={agentRunTitle}
-            status={agentRunStatus}
-            progress={agentRunProgress}
-            activityTitle={agentActivityTitle}
-            activityDetail={agentActivityDetail}
-            nextStep={agentNextStep}
-            phases={agentPhases}
-            logs={agentRunLogs}
-            transcript={agentRunTranscript}
-            output={agentRunOutput}
-            result={agentRunResult}
-            runStatus={agentRunStatus}
-            terminalLines={agentTerminalLines}
-            terminalInput={agentTerminalInput}
-            runCardId={agentRunCardId}
-            onClose={() => (agentConsoleOpen = false)}
-            onResizeLog={(event) => beginLayoutResize(event, "agentLogHeight", 110, 320, "y")}
-            onResizeOutput={(event) => beginLayoutResize(event, "agentOutputHeight", 140, 420, "y")}
-            onTerminalInputChange={(value) => (agentTerminalInput = value)}
-            onSubmitTerminalInput={submitAgentTerminalInput}
-            onOpenCard={(cardId) => (selectedCardId = cardId)}
-          />
+          {#if agentConsoleModule}
+            {@const AgentConsolePanel = agentConsoleModule.default}
+            <AgentConsolePanel
+              style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}
+              title={agentRunTitle}
+              status={agentRunStatus}
+              progress={agentRunProgress}
+              activityTitle={agentActivityTitle}
+              activityDetail={agentActivityDetail}
+              nextStep={agentNextStep}
+              phases={agentPhases}
+              logs={agentRunLogs}
+              transcript={agentRunTranscript}
+              output={agentRunOutput}
+              result={agentRunResult}
+              runStatus={agentRunStatus}
+              terminalLines={agentTerminalLines}
+              terminalInput={agentTerminalInput}
+              runCardId={agentRunCardId}
+              onClose={() => (agentConsoleOpen = false)}
+              onResizeLog={(event) => beginLayoutResize(event, "agentLogHeight", 110, 320, "y")}
+              onResizeOutput={(event) => beginLayoutResize(event, "agentOutputHeight", 140, 420, "y")}
+              onTerminalInputChange={(value) => (agentTerminalInput = value)}
+              onSubmitTerminalInput={submitAgentTerminalInput}
+              onOpenCard={(cardId) => (selectedCardId = cardId)}
+              onMarkBlockedDone={requestManualDoneConfirmation}
+            />
+          {:else}
+            <aside class="agent-console" aria-label="Agent run console loading" style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}>
+              <header>
+                <div>
+                  <p>Agent Console</p>
+                  <h3>{agentRunTitle}</h3>
+                </div>
+                <div class={`run-state ${agentRunStatus}`}>{agentRunStatus}</div>
+                <button type="button" aria-label="Close Agent console" onclick={() => (agentConsoleOpen = false)}>×</button>
+              </header>
+              <div class="console-progress" aria-label="Agent run progress">
+                <div class="agent-progress-head">
+                  <div>
+                    <span>Now</span>
+                    <strong>Loading console</strong>
+                  </div>
+                  <strong>{agentRunProgress}%</strong>
+                </div>
+                <progress max="100" value={agentRunProgress}></progress>
+                <p>Preparing the Agent console only when opened.</p>
+              </div>
+            </aside>
+          {/if}
         {/if}
         </div>
         {#if workspaceMode === "board" && newTaskOpen}
@@ -3955,19 +4369,85 @@
             class="files-workspace"
             style={`--file-sidebar-width: ${layoutPrefs.fileSidebarWidth}px;`}
           >
-            <FileBrowserPane
-              {fileRootLabel}
-              {fileDirectory}
-              {fileLoading}
-              {fileError}
-              {fileEntries}
-              {activeEditorPath}
-              onOpenFolder={() => void openFolderFromDialog()}
-              onOpenFile={() => void openFileFromDialog()}
-              onRefreshDirectory={(path) => void refreshFileDirectory(path)}
-              onOpenEntry={(entry) => void openFileEntry(entry)}
-              onToggleSidebar={toggleFileSidebar}
-            />
+            <div class="files-sidebar">
+              <SegmentedControl
+                ariaLabel="Workspace sidebar tabs"
+                activeValue={workspaceSidebarTab}
+                items={[
+                  { value: "explorer", label: "Explorer" },
+                  { value: "source-control", label: "Source Control", badge: workspaceChangedFiles.length > 0 ? workspaceChangedFiles.length : undefined },
+                ]}
+                onSelect={(value) => (workspaceSidebarTab = value as typeof workspaceSidebarTab)}
+              />
+
+              {#if workspaceSidebarTab === "explorer"}
+                {#if fileBrowserModule}
+                  {@const FileBrowserPane = fileBrowserModule.default}
+                  <FileBrowserPane
+                    {fileRootLabel}
+                    {fileDirectory}
+                    {fileLoading}
+                    {fileError}
+                    {fileEntries}
+                    {fileFilter}
+                    changedFiles={workspaceChangedFiles}
+                    expandedFolders={expandedFileEntries}
+                    expandingFolders={expandingFilePaths}
+                    {activeEditorPath}
+                    onOpenFolder={() => void openFolderFromDialog()}
+                    onOpenFile={() => void openFileFromDialog()}
+                    onCreateFile={() => void createNewFile()}
+                    onRefreshDirectory={() => void refreshFileDirectory("")}
+                    onOpenEntry={(entry) => void openFileEntry(entry)}
+                    onToggleFolder={(entry) => void toggleFileFolder(entry)}
+                    onFilterChange={(filter) => (fileFilter = filter)}
+                    onClearFilter={clearFileFilter}
+                    onCollapseAll={collapseAllFileFolders}
+                    onToggleSidebar={toggleFileSidebar}
+                  />
+                {:else}
+                  <aside class="file-browser-pane" aria-label="Workspace files loading">
+                    <header>
+                      <div>
+                        <p>Explorer</p>
+                        <h2>Loading browser</h2>
+                      </div>
+                    </header>
+                    <div class="file-empty">Preparing file browser only when Files mode is used.</div>
+                  </aside>
+                {/if}
+              {:else}
+                {#if gitActionsModule}
+                  {@const GitActionsPane = gitActionsModule.default}
+                  <GitActionsPane
+                    {workspaceGitInfo}
+                    {workspaceGitLoading}
+                    {workspaceGitError}
+                    {switchingWorkspaceBranch}
+                    hasDirtyEditors={hasDirtyEditorFiles}
+                    changedFiles={workspaceChangedFiles}
+                    onSwitchBranch={(branch) => void switchWorkspaceBranch(branch)}
+                    onPull={pullWorkspaceGitChanges}
+                    onCommit={commitWorkspaceGitChanges}
+                    onPush={pushWorkspaceGitChanges}
+                    onMerge={mergeWorkspaceGitBranch}
+                    onRebase={rebaseWorkspaceGitBranch}
+                    onRefresh={() => refreshWorkspaceGitState()}
+                    onOpenFile={(path) => void openFileEntry({ name: fileName(path), path, is_dir: false, size: 0 })}
+                  />
+                {:else}
+                  <aside class="git-actions-pane git-actions-loading" aria-label="Git actions loading">
+                    <header>
+                      <div>
+                        <p>Source control</p>
+                        <h2>Loading actions</h2>
+                      </div>
+                    </header>
+                    <div class="git-empty">Preparing git actions only when Files mode is used.</div>
+                  </aside>
+                {/if}
+              {/if}
+            </div>
 
             {#if fileSidebarCollapsed}
               <button class="file-sidebar-rail" type="button" onclick={toggleFileSidebar} aria-label="Show file browser">
@@ -3987,26 +4467,38 @@
               </div>
             {/if}
 
-            <EditorWorkspace
-              {openEditorFiles}
-              {activeEditorPath}
-              {activeEditorFile}
-              {activeEditorReady}
-              {activeEditorDirty}
-              {formattingFilePath}
-              {savingFilePath}
-              {editorDiagnostic}
-              {workspaceGitInfo}
-              {workspaceGitLoading}
-              {switchingWorkspaceBranch}
-              {fileStatusLabel}
-              onFormatActiveFile={() => void formatActiveFile()}
-              onSaveActiveFile={() => void saveActiveFile()}
-              onSelectEditorTab={selectEditorTab}
-              onCloseEditorTab={closeEditorTab}
-              onSetEditorDirty={setEditorDirty}
-              onSwitchWorkspaceBranch={(branch) => void switchWorkspaceBranch(branch)}
-            />
+            {#if editorWorkspaceModule}
+              {@const EditorWorkspace = editorWorkspaceModule.default}
+              <EditorWorkspace
+                {openEditorFiles}
+                {activeEditorPath}
+                {activeEditorFile}
+                {activeEditorReady}
+                {activeEditorDirty}
+                {formattingFilePath}
+                {savingFilePath}
+                {editorDiagnostic}
+                {fileStatusLabel}
+                onFormatActiveFile={() => void formatActiveFile()}
+                onSaveActiveFile={() => void saveActiveFile()}
+                onSelectEditorTab={selectEditorTab}
+                onCloseEditorTab={closeEditorTab}
+                onSetEditorDirty={setEditorDirty}
+              />
+            {:else}
+              <section class="code-editor-pane editor-loading" aria-label="Code editor loading">
+                <header>
+                  <div>
+                    <p>Editor</p>
+                    <h2>Loading editor</h2>
+                  </div>
+                </header>
+                <div class="editor-empty">
+                  <strong>Preparing workspace editor</strong>
+                  <span>The editing bundle loads only when Files mode is used.</span>
+                </div>
+              </section>
+            {/if}
           </div>
 
           <div class:is-hidden={workspaceMode !== "term"} class="term-workspace" style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}>
@@ -4034,24 +4526,37 @@
               ></span>
             </div>
 
-            <WorkspaceChatPane
-              title={settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.label}
-              onOpenRuntimeSettings={() => openSettings("agent")}
-              sessions={workspaceChatSessions}
-              activeSessionId={workspaceChatActiveSessionId}
-              onNewSession={startWorkspaceChatSession}
-              onSwitchSession={activateWorkspaceChatSession}
-              messages={workspaceChatMessages}
-              running={workspaceChatRunning}
-              onTextareaReady={(element) => {
-                workspaceChatTextarea = element;
-              }}
-              onEndReady={(element) => {
-                workspaceChatEnd = element;
-              }}
-              onSubmit={() => void sendWorkspaceChat()}
-              onKeydown={handleWorkspaceChatKeydown}
-            />
+            {#if workspaceChatModule}
+              {@const WorkspaceChatPane = workspaceChatModule.default}
+              <WorkspaceChatPane
+                title={settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.label}
+                onOpenRuntimeSettings={() => openSettings("agent")}
+                sessions={workspaceChatSessions}
+                activeSessionId={workspaceChatActiveSessionId}
+                onNewSession={startWorkspaceChatSession}
+                onSwitchSession={activateWorkspaceChatSession}
+                messages={workspaceChatMessages}
+                running={workspaceChatRunning}
+                onTextareaReady={(element) => {
+                  workspaceChatTextarea = element;
+                }}
+                onEndReady={(element) => {
+                  workspaceChatEnd = element;
+                }}
+                onSubmit={() => void sendWorkspaceChat()}
+                onKeydown={handleWorkspaceChatKeydown}
+              />
+            {:else}
+              <section class="workspace-chat-pane" aria-label="Agent chat loading">
+                <header>
+                  <div>
+                    <p>Agent Chat</p>
+                    <h2>Loading chat</h2>
+                  </div>
+                </header>
+                <div class="chat-empty">Preparing chat only when Terminal mode is used.</div>
+              </section>
+            {/if}
         </div>
       </section>
       {#if backlogStartConfirmation}
@@ -4074,6 +4579,29 @@
           <footer>
             <button type="button" onclick={() => resolveBacklogStartConfirmation(false)}>Cancel</button>
             <button class="confirm-primary" type="button" onclick={() => resolveBacklogStartConfirmation(true)}>Start Agent</button>
+          </footer>
+        </div>
+      {/if}
+      {#if manualDoneConfirmation}
+        <div class="confirm-backdrop" role="presentation" onclick={() => void confirmManualDone(false)}></div>
+        <div class="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirm-manual-done-title">
+          <header>
+            <div>
+              <p>Confirm manual completion</p>
+              <h2 id="confirm-manual-done-title">Mark task Done?</h2>
+            </div>
+            <button type="button" aria-label="Close confirmation" onclick={() => void confirmManualDone(false)}>×</button>
+          </header>
+          <div class="confirm-body">
+            <p>
+              <strong>{manualDoneConfirmation.title}</strong>
+              is currently blocked. Continue only if you manually solved the task outside the Agent.
+            </p>
+            <p>Spacesly will move the card to Done and update Jira if this task is linked.</p>
+          </div>
+          <footer>
+            <button type="button" onclick={() => void confirmManualDone(false)}>Cancel</button>
+            <button class="confirm-primary" type="button" onclick={() => void confirmManualDone(true)}>Done</button>
           </footer>
         </div>
       {/if}

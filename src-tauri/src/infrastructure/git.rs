@@ -17,6 +17,18 @@ pub struct GitWorkspaceInfo {
     pub behind_count: u32,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct GitChangedFile {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CommitResult {
+    pub hash: String,
+    pub message: String,
+}
+
 pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
     let workspace_root = root.path()?;
     git_info_for_path(&workspace_root)
@@ -68,9 +80,12 @@ pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
     let (ahead_count, behind_count) = if upstream_branch.is_some() {
-        git_output(&repo_root, ["rev-list", "--left-right", "--count", "HEAD...@{u}"])
-            .and_then(|value| parse_ahead_behind(&value))
-            .unwrap_or((0, 0))
+        git_output(
+            &repo_root,
+            ["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+        )
+        .and_then(|value| parse_ahead_behind(&value))
+        .unwrap_or((0, 0))
     } else {
         (0, 0)
     };
@@ -113,6 +128,112 @@ pub fn checkout_workspace_git_branch(
     workspace_git_info(root)
 }
 
+pub fn workspace_changed_files(root: &WorkspaceRoot) -> Result<Vec<GitChangedFile>, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .current_dir(&repo_root)
+        .output()
+        .map_err(|error| format!("Failed to run git status: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+      let line = line.trim_end();
+      if line.len() < 4 {
+          continue;
+      }
+
+      let raw_status = &line[0..2];
+      let status = if raw_status.starts_with("??") {
+          "U".to_string()
+      } else if raw_status.contains('D') {
+          "D".to_string()
+      } else if raw_status.contains('A') {
+          "A".to_string()
+      } else {
+          "M".to_string()
+      };
+
+      let mut path = line[3..].trim().to_string();
+      if let Some((_, renamed_path)) = path.split_once(" -> ") {
+          path = renamed_path.trim().to_string();
+      }
+
+      if !path.is_empty() {
+          files.push(GitChangedFile { path, status });
+      }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+pub fn pull_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root)?;
+    run_git(&repo_root, ["pull"])?;
+    workspace_git_info(root)
+}
+
+pub fn commit_workspace_git_changes(
+    root: &WorkspaceRoot,
+    message: String,
+) -> Result<CommitResult, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("Commit message is required.".to_string());
+    }
+
+    run_git(&repo_root, ["add", "-A"])?;
+    run_git(&repo_root, ["commit", "-m", message])?;
+    let hash = git_output(&repo_root, ["rev-parse", "HEAD"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Failed to read commit hash after commit.".to_string())?;
+
+    Ok(CommitResult {
+        hash,
+        message: message.to_string(),
+    })
+}
+
+pub fn push_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root)?;
+    run_git(&repo_root, ["push"])?;
+    workspace_git_info(root)
+}
+
+pub fn merge_workspace_git_branch(
+    root: &WorkspaceRoot,
+    branch: String,
+) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Merge branch is required.".to_string());
+    }
+
+    run_git(&repo_root, ["merge", branch, "--no-edit"])?;
+    workspace_git_info(root)
+}
+
+pub fn rebase_workspace_git_branch(
+    root: &WorkspaceRoot,
+    branch: String,
+) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Rebase branch is required.".to_string());
+    }
+
+    run_git(&repo_root, ["rebase", branch])?;
+    workspace_git_info(root)
+}
+
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
     let output = git_output(path, ["rev-parse", "--show-toplevel"]);
     match output {
@@ -139,6 +260,24 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
     }
 
     Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("Failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn workspace_repo_root(root: &WorkspaceRoot) -> Result<PathBuf, String> {
+    let workspace_root = root.path()?;
+    git_repo_root(&workspace_root)?.ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
 }
 
 fn normalize_branch_name(value: &str) -> Option<String> {

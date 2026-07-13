@@ -14,8 +14,8 @@ use infrastructure::ai_worker::{
 };
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
-use infrastructure::git::GitWorkspaceInfo;
 use infrastructure::git::git_info_for_path;
+use infrastructure::git::{CommitResult, GitChangedFile, GitWorkspaceInfo};
 use infrastructure::mcp::{
     JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
@@ -269,6 +269,16 @@ async fn get_path_git_info(path: String) -> Result<GitWorkspaceInfo, String> {
 }
 
 #[tauri::command]
+async fn get_workspace_changed_files(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<Vec<GitChangedFile>, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).changed_files())
+        .await
+        .map_err(|error| format!("Workspace changed files task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn checkout_workspace_git_branch(
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
@@ -277,6 +287,59 @@ async fn checkout_workspace_git_branch(
     tauri::async_runtime::spawn_blocking(move || GitService::new(root).checkout_branch(branch))
         .await
         .map_err(|error| format!("Checkout branch task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn pull_workspace_git_changes(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).pull_changes())
+        .await
+        .map_err(|error| format!("Git pull task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn commit_workspace_git_changes(
+    message: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<CommitResult, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).commit_changes(message))
+        .await
+        .map_err(|error| format!("Git commit task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn push_workspace_git_changes(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).push_changes())
+        .await
+        .map_err(|error| format!("Git push task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn merge_workspace_git_branch(
+    branch: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).merge_branch(branch))
+        .await
+        .map_err(|error| format!("Git merge task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn rebase_workspace_git_branch(
+    branch: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitWorkspaceInfo, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).rebase_branch(branch))
+        .await
+        .map_err(|error| format!("Git rebase task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -373,7 +436,13 @@ pub fn run() {
             format_code,
             get_workspace_git_info,
             get_path_git_info,
+            get_workspace_changed_files,
             checkout_workspace_git_branch,
+            pull_workspace_git_changes,
+            commit_workspace_git_changes,
+            push_workspace_git_changes,
+            merge_workspace_git_branch,
+            rebase_workspace_git_branch,
             run_shell_command,
             complete_shell_input,
             open_pty_terminal,
