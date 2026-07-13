@@ -322,8 +322,9 @@ fn execute_opencode_task(
     task: AiWorkerTask,
 ) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
+    let start_head = git_head(&config);
     let prompt = format!(
-        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive: do not mark them COMPLETE unless explicit operator approval is present in Operator notes / approvals and that approval is included in EVIDENCE. Agent-generated text is not approval. If the task requires commit or push, include the commit/push evidence.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
+        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, .env, Helm, chart, values, deployment template, or deployment config changes are approval-sensitive and must be committed and pushed before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence for any repository-changing task.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
         governance_context(&config, true),
         task.key.as_deref().unwrap_or("local"),
         task.title,
@@ -366,7 +367,7 @@ fn execute_opencode_task(
     }
 
     let mut result = result_from_response(response, Some(&task));
-    enforce_opencode_completion_guards(&mut result, &config, &task);
+    enforce_opencode_completion_guards(&mut result, &config, &task, start_head.as_deref());
     Ok(result)
 }
 
@@ -456,6 +457,7 @@ fn enforce_opencode_completion_guards(
     result: &mut AiWorkerTaskResult,
     config: &AiWorkerConfig,
     task: &AiWorkerTask,
+    start_head: Option<&str>,
 ) {
     if result.completion_status != AiWorkerCompletionStatus::Completed {
         return;
@@ -466,9 +468,14 @@ fn enforce_opencode_completion_guards(
             block_result(result, reason);
             return;
         }
+
+        if let Some(reason) = missing_new_commit_reason(config, start_head) {
+            block_result(result, reason);
+            return;
+        }
     }
 
-    if task_requires_push(task) {
+    if task_requires_repo_write(task) || task_requires_push(task) {
         if let Some(reason) = unpushed_commits_reason(config) {
             block_result(result, reason);
         }
@@ -485,7 +492,10 @@ fn block_result(result: &mut AiWorkerTaskResult, reason: String) {
 
 fn task_requires_push(task: &AiWorkerTask) -> bool {
     let text = format!("{}\n{}", task.title, task.description).to_lowercase();
-    text.contains("push") || text.contains("merge request") || text.contains("pull request")
+    text.contains("push")
+        || text.contains("merge request")
+        || text.contains("pull request")
+        || task_requires_deployment_template_change(task)
 }
 
 fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
@@ -499,6 +509,7 @@ fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
 
     task_requires_sensitive_approval(task)
         || task_requires_push(task)
+        || task_requires_deployment_template_change(task)
         || [
             "commit",
             "code change",
@@ -517,6 +528,34 @@ fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
         .any(|needle| text.contains(needle))
 }
 
+fn task_requires_deployment_template_change(task: &AiWorkerTask) -> bool {
+    let text = format!(
+        "{}\n{}\n{}",
+        task.title,
+        task.description,
+        task.labels.join(" ")
+    )
+    .to_lowercase();
+
+    [
+        "helm",
+        "chart",
+        "values.yaml",
+        "values yml",
+        "deployment template",
+        "deployment-config",
+        "deployment config",
+        "qcash-deployment",
+        "env variable",
+        "environment variable",
+        "configmap",
+        "secret.yaml",
+        "secret yml",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn dirty_worktree_reason(config: &AiWorkerConfig) -> Option<String> {
     let status = git_output(config, ["status", "--porcelain"])?;
     if status.trim().is_empty() {
@@ -527,13 +566,37 @@ fn dirty_worktree_reason(config: &AiWorkerConfig) -> Option<String> {
 }
 
 fn unpushed_commits_reason(config: &AiWorkerConfig) -> Option<String> {
-    let status = git_output(config, ["status", "--porcelain=v1", "--branch"])?;
-    let first_line = status.lines().next().unwrap_or_default();
-    if first_line.contains("ahead") {
-        Some("Agent left local commits that are not pushed. Push or approve the remaining write-back before marking Done.".to_string())
+    let Some(upstream) = git_output(
+        config,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    ) else {
+        return Some("Agent completed local repository changes, but the branch has no upstream. Push to a remote branch before marking Jira Done.".to_string());
+    };
+    if upstream.trim().is_empty() {
+        return Some("Agent completed local repository changes, but the branch has no upstream. Push to a remote branch before marking Jira Done.".to_string());
+    }
+
+    if git_status(config, ["merge-base", "--is-ancestor", "HEAD", "@{u}"])? {
+        None
+    } else {
+        Some("Agent completed local repository changes, but the latest commit is not pushed to upstream. Push the commit before marking Jira Done.".to_string())
+    }
+}
+
+fn missing_new_commit_reason(config: &AiWorkerConfig, start_head: Option<&str>) -> Option<String> {
+    let Some(start_head) = start_head else {
+        return Some("Spacesly could not capture the starting git commit. Commit and push the repository changes before marking Jira Done.".to_string());
+    };
+    let current_head = git_head(config)?;
+    if current_head.trim() == start_head.trim() {
+        Some("Agent did not create a new commit for the repository change. Commit and push the Helm/env/template update before marking Jira Done.".to_string())
     } else {
         None
     }
+}
+
+fn git_head(config: &AiWorkerConfig) -> Option<String> {
+    git_output(config, ["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
 }
 
 fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<String> {
@@ -546,6 +609,13 @@ fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Optio
     }
 
     Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_status<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<bool> {
+    let mut command = Command::new("git");
+    command.args(args);
+    command.current_dir(opencode_workdir(config)?);
+    command.output().ok().map(|output| output.status.success())
 }
 
 fn opencode_workdir(config: &AiWorkerConfig) -> Option<PathBuf> {
@@ -937,5 +1007,39 @@ mod tests {
         .expect("serialize task result");
 
         assert_eq!(value["completion_status"].as_str(), Some("completed"));
+    }
+
+    #[test]
+    fn helm_env_template_tasks_require_commit_and_push() {
+        let task = AiWorkerTask {
+            key: Some("QCASH-1".to_string()),
+            title: "Update env variable in qcash-deployment Helm template".to_string(),
+            description: "Change values.yaml for the prerelease chart.".to_string(),
+            labels: vec!["deployment".to_string()],
+            url: None,
+            operator_notes: Some("approval granted".to_string()),
+            previous_output: None,
+        };
+
+        assert!(task_requires_deployment_template_change(&task));
+        assert!(task_requires_repo_write(&task));
+        assert!(task_requires_push(&task));
+    }
+
+    #[test]
+    fn non_repo_chat_task_does_not_require_push() {
+        let task = AiWorkerTask {
+            key: Some("QCASH-2".to_string()),
+            title: "Explain current queue".to_string(),
+            description: "Summarize the visible board state.".to_string(),
+            labels: Vec::new(),
+            url: None,
+            operator_notes: None,
+            previous_output: None,
+        };
+
+        assert!(!task_requires_deployment_template_change(&task));
+        assert!(!task_requires_repo_write(&task));
+        assert!(!task_requires_push(&task));
     }
 }

@@ -26,7 +26,18 @@
     mergeSyncedWorkspace,
     withCompletionMetadata,
   } from "$lib/boardWorkflow";
-  import { createAgentRunSession, type AgentRunLog, type AgentRunSession, type AgentRunStatus, type AgentTerminalLine } from "$lib/agentRun";
+  import {
+    agentSessionReplay,
+    appendAgentSessionEvent,
+    createAgentRunSession,
+    createAgentSessionEvent,
+    type AgentRunGitSnapshot,
+    type AgentRunLog,
+    type AgentRunSession,
+    type AgentRunStatus,
+    type AgentSessionEvent,
+    type AgentTerminalLine,
+  } from "$lib/agentRun";
   import { capList, capText } from "$lib/boundedBuffers";
   import {
     createWorkspaceChatSession,
@@ -59,6 +70,7 @@
     chatAiWorker,
     executeAiWorkerTask,
     getJiraBoards,
+    getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
     listDirectory,
@@ -120,6 +132,8 @@
   const AGENT_STATUS_KEY = "spacesly.agent.status.v1";
   const MAX_AGENT_LOGS = 120;
   const MAX_AGENT_TERMINAL_LINES = 80;
+  const MAX_AGENT_SESSION_EVENTS = 120;
+  const MAX_AGENT_SESSION_REPLAY_CHARS = 12_000;
   const MAX_WORKSPACE_CHAT_MESSAGES = 80;
   const MAX_CHAT_SESSIONS = 6;
   const MAX_WORKSPACE_CHAT_ACTIVITIES = 120;
@@ -281,6 +295,8 @@
   let agentRunResult = $state<AiWorkerTaskResult | null>(null);
   let agentRunLogs = $state<AgentRunLog[]>([]);
   let agentTerminalLines = $state<AgentTerminalLine[]>([]);
+  let agentRunGitSnapshot = $state<AgentRunGitSnapshot | null>(null);
+  let agentRunTranscript = $state<AgentSessionEvent[]>([]);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
   let workspaceShellWorkdir = $state(initialUiState.workspaceShellWorkdir);
@@ -2163,7 +2179,7 @@
     appNotice = { tone: "success", message: "Task created. Queue it or click Start when you want the Agent to run it." };
   }
 
-  function beginAgentRun(card: CardProjection, continuation = false) {
+  function beginAgentRun(card: CardProjection, continuation = false, gitSnapshot: AgentRunGitSnapshot | null = gitSnapshotFromInfo(workspaceGitInfo)) {
     const previousSession = agentRunSessions[card.id];
     agentRunCardId = card.id;
     agentRunTitle = card.title;
@@ -2172,6 +2188,10 @@
     agentRunOutput = continuation && previousSession?.output ? previousSession.output : "Waiting for Agent output...";
     agentRunResult = continuation && previousSession?.result ? previousSession.result : null;
     agentRunLogs = continuation && previousSession ? previousSession.logs : [];
+    agentRunGitSnapshot = continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot;
+    agentRunTranscript = continuation && previousSession
+      ? (previousSession.transcript ?? [])
+      : [createAgentSessionEvent("system", "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.")];
     agentTerminalLines = continuation && previousSession
       ? previousSession.terminalLines
       : [
@@ -2197,6 +2217,16 @@
     );
   }
 
+  function gitSnapshotFromInfo(info: GitWorkspaceInfo | null): AgentRunGitSnapshot | null {
+    if (!info?.is_git_repo) return null;
+
+    return {
+      repo_root: info.repo_root,
+      current_branch: info.current_branch,
+      head_commit: info.head_commit,
+    };
+  }
+
   function activeAgentSession(): AgentRunSession | null {
     if (!agentRunCardId) return null;
 
@@ -2209,7 +2239,18 @@
       agentRunResult,
       agentRunLogs,
       agentTerminalLines,
+      agentRunGitSnapshot,
+      agentRunTranscript,
     );
+  }
+
+  function appendAgentSessionTranscript(type: AgentSessionEvent["type"], text: string) {
+    agentRunTranscript = appendAgentSessionEvent(
+      agentRunTranscript,
+      createAgentSessionEvent(type, text),
+      MAX_AGENT_SESSION_EVENTS,
+    );
+    persistActiveAgentRun();
   }
 
   function persistActiveAgentRun() {
@@ -2238,6 +2279,8 @@
     agentRunResult = session.result;
     agentRunLogs = session.logs;
     agentTerminalLines = session.terminalLines;
+    agentRunGitSnapshot = session.gitSnapshot;
+    agentRunTranscript = session.transcript ?? [];
     agentTerminalInput = "";
   }
 
@@ -2323,8 +2366,9 @@
       : `${config.provider_name} ${config.model}`;
     const description = card.description.trim();
     const clippedDescription = description.length > 320 ? `${description.slice(0, 320)}…` : description;
-    const clippedPreviousOutput = previousOutput?.trim()
-      ? (previousOutput.length > 240 ? `${previousOutput.slice(0, 240)}…` : previousOutput)
+    const transcript = previousOutput?.trim() ? previousOutput : null;
+    const clippedPreviousOutput = transcript
+      ? (transcript.length > 1200 ? `${transcript.slice(-1200)}…` : transcript)
       : "None";
 
     return [
@@ -2339,7 +2383,7 @@
       "DETAILS:",
       `- Current board state: ${executionDetail(card.execution)}`,
       `- Operator notes: ${operatorNotes ? operatorNotes : "None"}`,
-      `- Previous output: ${clippedPreviousOutput}`,
+      `- Session transcript replay: ${clippedPreviousOutput}`,
       "- Verification target: return evidence before marking complete.",
       "NEXT:",
       "- Pass the exported context to the runtime and wait for evidence.",
@@ -2363,6 +2407,7 @@
     if (!input) return;
 
     appendTerminalLine("operator", input);
+    appendAgentSessionTranscript(isApprovalText(input) ? "approval" : "operator_note", input);
     appendStructuredAgentLog(
       "info",
       "operator",
@@ -2404,6 +2449,9 @@
 
   function previousOutputForCard(cardId: string): string | null {
     const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
+    const transcript = agentSessionReplay(session?.transcript ?? [], MAX_AGENT_SESSION_REPLAY_CHARS);
+    if (transcript) return transcript;
+
     const output = session?.output?.trim();
     return output && output !== "Waiting for Agent output..." && output !== "Agent is processing the task context..."
       ? output
@@ -2442,10 +2490,18 @@
     return sections.join("\n");
   }
 
-  function agentJiraComment(result: AiWorkerTaskResult, config: AiWorkerConfig): string {
+  function agentJiraComment(result: AiWorkerTaskResult, config: AiWorkerConfig, gitInfo: GitWorkspaceInfo | null = null): string {
     const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
     const model = config.runtime === "opencode" ? config.opencode_model : config.model;
     const evidence = result.evidence.join("\n") || result.details.join("\n") || result.summary;
+    const gitEvidence = gitInfo?.head_commit
+      ? [
+          "",
+          `Commit: ${gitInfo.head_commit}`,
+          `Branch: ${gitInfo.current_branch ?? "unknown"}`,
+          `Upstream: ${gitInfo.upstream_branch ?? "none"}`,
+        ]
+      : [];
 
     return [
       "Spacesly marked this task done.",
@@ -2455,7 +2511,78 @@
       `Summary: ${singleLine(result.summary, 500)}`,
       "",
       `Verification: ${singleLine(evidence, 900)}`,
+      ...gitEvidence,
     ].join("\n");
+  }
+
+  function agentWritebackRequiresPushedCommit(card: CardProjection, result: AiWorkerTaskResult): boolean {
+    const text = [
+      card.title,
+      card.description,
+      card.labels.join(" "),
+      result.summary,
+      result.evidence.join(" "),
+      result.details.join(" "),
+    ].join("\n").toLowerCase();
+
+    return [
+      "helm",
+      "chart",
+      "values.yaml",
+      "values yml",
+      "deployment template",
+      "deployment-config",
+      "deployment config",
+      "qcash-deployment",
+      "env variable",
+      "environment variable",
+      "configmap",
+      "secret.yaml",
+      "secret yml",
+    ].some((needle) => text.includes(needle));
+  }
+
+  async function verifyAgentJiraDoneGate(card: CardProjection, result: AiWorkerTaskResult, config: AiWorkerConfig): Promise<GitWorkspaceInfo | null> {
+    if (!agentWritebackRequiresPushedCommit(card, result)) return null;
+
+    const gitPath = config.opencode_workdir?.trim() || workspaceRoot || workspaceGitInfo?.repo_root || null;
+    if (!gitPath) {
+      throw new Error("Jira Done blocked: Spacesly cannot determine the git workdir for this Helm/env/template change.");
+    }
+
+    const info = config.opencode_workdir?.trim() ? await getPathGitInfo(gitPath) : await getWorkspaceGitInfo();
+    workspaceGitInfo = info.is_git_repo ? info : null;
+    selectedWorkspaceBranch = info.current_branch ?? "";
+
+    if (!info.is_git_repo) {
+      throw new Error("Jira Done blocked: Spacesly cannot verify a git repository for this Helm/env/template change.");
+    }
+
+    if (!agentRunGitSnapshot?.head_commit) {
+      throw new Error("Jira Done blocked: Spacesly did not capture the starting commit for this Agent run.");
+    }
+
+    if (!info.head_commit) {
+      throw new Error("Jira Done blocked: Spacesly cannot read the current git HEAD commit.");
+    }
+
+    if (info.head_commit === agentRunGitSnapshot.head_commit) {
+      throw new Error("Jira Done blocked: no new commit was created for this Helm/env/template change.");
+    }
+
+    if (info.dirty_worktree) {
+      throw new Error("Jira Done blocked: the worktree still has uncommitted changes.");
+    }
+
+    if (!info.upstream_branch) {
+      throw new Error("Jira Done blocked: the current branch has no upstream remote branch.");
+    }
+
+    if (info.ahead_count > 0) {
+      throw new Error("Jira Done blocked: the latest commit has not been pushed to upstream.");
+    }
+
+    return info;
   }
 
   function singleLine(value: string, maxChars: number): string {
@@ -2603,9 +2730,12 @@
     const isContinuation = existingSession?.status === "blocked";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
+    const runGitInfo = config.opencode_workdir?.trim()
+      ? await getPathGitInfo(config.opencode_workdir.trim())
+      : await getWorkspaceGitInfo();
 
     runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
-    beginAgentRun(card, isContinuation);
+    beginAgentRun(card, isContinuation, gitSnapshotFromInfo(runGitInfo));
     const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
     appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
 
@@ -2745,12 +2875,14 @@
       agentRunResult = result;
       setAgentRunOutput(agentResultText(result));
       appendTerminalLine("agent", agentResultText(result));
+      appendAgentSessionTranscript(result.completion_status === "completed" ? "agent_output" : "blocker", agentResultText(result));
       setAgentProgress(75);
 
       if (result.completion_status !== "completed") {
         const reason = result.blocked_reason ?? result.summary;
         updateCardExecution(cardId, { blocked: { reason } });
         setAgentRunStatus("blocked");
+        appendAgentSessionTranscript("blocker", reason);
         appendStructuredAgentLog(
           "error",
           "blocked",
@@ -2766,6 +2898,26 @@
           ["Add operator notes or fix the blocker, then continue the Agent."],
         );
         appNotice = { tone: "error", message: `${ticketLabel(card)} blocked: ${reason}` };
+        return;
+      }
+
+      let gitWritebackInfo: GitWorkspaceInfo | null = null;
+      try {
+        gitWritebackInfo = await verifyAgentJiraDoneGate(card, result, config);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        updateCardExecution(cardId, { blocked: { reason: message } });
+        setAgentRunStatus("blocked");
+        appendAgentSessionTranscript("blocker", message);
+        appendStructuredAgentLog(
+          "error",
+          "blocked",
+          message,
+          ["The Agent finished, but Jira writeback was blocked before Done."],
+          ["Resolve the git evidence issue, then retry the writeback."],
+          ["Commit and push the repository change, then run the writeback again."],
+        );
+        appNotice = { tone: "error", message };
         return;
       }
 
@@ -2819,7 +2971,7 @@
             [`Wait for comment confirmation before final completion.`],
           );
           setAgentProgress(94);
-          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result, config));
+          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result, config, gitWritebackInfo));
           appendStructuredAgentLog(
             "success",
             "jira",
@@ -2841,6 +2993,7 @@
       agentRunResult = null;
       setAgentRunOutput(message);
       appendTerminalLine("error", message);
+      appendAgentSessionTranscript("error", message);
       appendStructuredAgentLog(
         "error",
         "blocked",
@@ -3698,6 +3851,7 @@
             nextStep={agentNextStep}
             phases={agentPhases}
             logs={agentRunLogs}
+            transcript={agentRunTranscript}
             output={agentRunOutput}
             result={agentRunResult}
             runStatus={agentRunStatus}

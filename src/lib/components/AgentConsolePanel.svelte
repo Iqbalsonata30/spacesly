@@ -2,7 +2,7 @@
   import AgentOutput from "$lib/components/AgentOutput.svelte";
   import type { AgentPhase } from "$lib/boardWorkflow";
   import type { AiWorkerTaskResult } from "$lib/ipc";
-  import type { AgentRunLog, AgentRunStatus, AgentTerminalLine } from "$lib/agentRun";
+  import type { AgentRunLog, AgentRunStatus, AgentSessionEvent, AgentTerminalLine } from "$lib/agentRun";
 
   type Props = {
     style?: string;
@@ -14,6 +14,7 @@
     nextStep: string;
     phases: AgentPhase[];
     logs: AgentRunLog[];
+    transcript: AgentSessionEvent[];
     output: string;
     result: AiWorkerTaskResult | null;
     runStatus: AgentRunStatus;
@@ -38,6 +39,7 @@
     nextStep,
     phases,
     logs,
+    transcript,
     output,
     result,
     runStatus,
@@ -105,6 +107,30 @@
     </header>
     <AgentOutput output={output} result={result} runStatus={runStatus} />
   </div>
+  <section class="agent-session-thread" aria-label="Agent session transcript">
+    <header>
+      <span>Task session</span>
+      <strong>{transcript.length} event{transcript.length === 1 ? "" : "s"}</strong>
+    </header>
+    <div class="agent-session-events">
+      {#if transcript.length === 0}
+        <article class="agent-session-event empty">
+          <strong>No session history yet</strong>
+          <p>Approvals, notes, blockers, and Agent outputs will appear here.</p>
+        </article>
+      {:else}
+        {#each transcript as event (event.id)}
+          <article class={`agent-session-event ${event.type}`}>
+            <div>
+              <strong>{event.type.replace("_", " ")}</strong>
+              <time>{new Date(event.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</time>
+            </div>
+            <p>{event.text}</p>
+          </article>
+        {/each}
+      {/if}
+    </div>
+  </section>
   <div class="stack-resize-handle">
     <span
       class="drag-handle vertical"

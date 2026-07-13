@@ -10,16 +10,30 @@ pub struct GitWorkspaceInfo {
     pub repo_root: Option<String>,
     pub current_branch: Option<String>,
     pub branches: Vec<String>,
+    pub head_commit: Option<String>,
+    pub upstream_branch: Option<String>,
+    pub dirty_worktree: bool,
+    pub ahead_count: u32,
+    pub behind_count: u32,
 }
 
 pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
     let workspace_root = root.path()?;
-    let Some(repo_root) = git_repo_root(&workspace_root)? else {
+    git_info_for_path(&workspace_root)
+}
+
+pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
+    let Some(repo_root) = git_repo_root(path)? else {
         return Ok(GitWorkspaceInfo {
             is_git_repo: false,
             repo_root: None,
             current_branch: None,
             branches: Vec::new(),
+            head_commit: None,
+            upstream_branch: None,
+            dirty_worktree: false,
+            ahead_count: 0,
+            behind_count: 0,
         });
     };
 
@@ -41,12 +55,36 @@ pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, Stri
         branches
     })
     .unwrap_or_default();
+    let head_commit = git_output(&repo_root, ["rev-parse", "HEAD"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let upstream_branch = git_output(
+        &repo_root,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
+    let dirty_worktree = git_output(&repo_root, ["status", "--porcelain"])
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let (ahead_count, behind_count) = if upstream_branch.is_some() {
+        git_output(&repo_root, ["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+            .and_then(|value| parse_ahead_behind(&value))
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
 
     Ok(GitWorkspaceInfo {
         is_git_repo: true,
         repo_root: Some(repo_root.to_string_lossy().to_string()),
         current_branch,
         branches,
+        head_commit,
+        upstream_branch,
+        dirty_worktree,
+        ahead_count,
+        behind_count,
     })
 }
 
@@ -110,4 +148,11 @@ fn normalize_branch_name(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
 }

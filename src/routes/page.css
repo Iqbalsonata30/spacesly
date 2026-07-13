@@ -2626,6 +2626,109 @@
     background: #111118;
   }
 
+  .agent-session-thread {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0;
+    border-top: 1px solid #272530;
+    background: #101018;
+  }
+
+  .agent-session-thread > header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border-bottom: 1px solid #201f29;
+  }
+
+  .agent-session-thread > header span {
+    color: #8f88a8;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .agent-session-thread > header strong {
+    color: #d8d1e6;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .agent-session-events {
+    display: grid;
+    gap: 8px;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 10px 12px 12px;
+    scrollbar-gutter: stable;
+  }
+
+  .agent-session-event {
+    display: grid;
+    gap: 5px;
+    padding: 10px 11px;
+    border: 1px solid #252432;
+    border-radius: 12px;
+    background: #15141b;
+  }
+
+  .agent-session-event > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .agent-session-event strong {
+    color: #f1edf5;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .agent-session-event time {
+    color: #8f88a8;
+    font-size: 10px;
+  }
+
+  .agent-session-event p {
+    margin: 0;
+    color: #cfc8dc;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .agent-session-event.approval {
+    border-color: rgba(185, 214, 170, 0.22);
+    background: rgba(43, 56, 38, 0.34);
+  }
+
+  .agent-session-event.agent_output {
+    border-color: rgba(184, 214, 228, 0.18);
+  }
+
+  .agent-session-event.blocker,
+  .agent-session-event.error {
+    border-color: rgba(240, 176, 170, 0.22);
+    background: rgba(55, 30, 32, 0.34);
+  }
+
+  .agent-session-event.empty {
+    border-style: dashed;
+    background: transparent;
+  }
+
+  .agent-session-event.empty strong,
+  .agent-session-event.empty p {
+    color: #8f88a8;
+  }
+
   .console-output header {
     border-bottom: 1px solid #272530;
     padding: 7px 10px;

@@ -15,6 +15,7 @@ use infrastructure::ai_worker::{
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::GitWorkspaceInfo;
+use infrastructure::git::git_info_for_path;
 use infrastructure::mcp::{
     JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
@@ -258,6 +259,16 @@ async fn get_workspace_git_info(
 }
 
 #[tauri::command]
+async fn get_path_git_info(path: String) -> Result<GitWorkspaceInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(path);
+        git_info_for_path(&path)
+    })
+    .await
+    .map_err(|error| format!("Path git info task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn checkout_workspace_git_branch(
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
@@ -361,6 +372,7 @@ pub fn run() {
             save_cached_workspace,
             format_code,
             get_workspace_git_info,
+            get_path_git_info,
             checkout_workspace_git_branch,
             run_shell_command,
             complete_shell_input,

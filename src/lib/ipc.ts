@@ -19,7 +19,7 @@ export {
   writeFile,
 } from "$lib/ipc/files";
 export type { GitWorkspaceInfo } from "$lib/ipc/git";
-export { checkoutWorkspaceGitBranch, getWorkspaceGitInfo } from "$lib/ipc/git";
+export { checkoutWorkspaceGitBranch, getPathGitInfo, getWorkspaceGitInfo } from "$lib/ipc/git";
 export type {
   JiraBoard,
   JiraConnectionStatus,
