@@ -19,12 +19,14 @@
     agentActionLabel,
     agentPhaseTimeline,
     canStartAgent,
+    type AgentPhase,
     descriptionParts,
     executionDetail,
     isBlocked,
     mergeSyncedWorkspace,
     withCompletionMetadata,
   } from "$lib/boardWorkflow";
+  import { createAgentRunSession, type AgentRunLog, type AgentRunSession, type AgentRunStatus, type AgentTerminalLine } from "$lib/agentRun";
   import { capList, capText } from "$lib/boundedBuffers";
   import {
     createWorkspaceChatSession,
@@ -74,6 +76,7 @@
     writeFile,
     writePtyTerminal,
     workspaceRootPath,
+    IpcPolicyError,
     type AiWorkerConfig,
     type AiWorkerStatus,
     type BoardProjection,
@@ -132,20 +135,6 @@
   const ERROR_NOTICE_AUTO_DISMISS_MS = 5_000;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
   const UI_STATE_KEY = "spacesly.ui.v1";
-
-  type AgentRunLog = {
-    id: string;
-    at: string;
-    tone: "info" | "success" | "error";
-    label: string;
-    message: string;
-  };
-
-  type AgentTerminalLine = {
-    id: string;
-    prompt: string;
-    text: string;
-  };
 
   type LayoutPrefs = {
     laneWidth: number;
@@ -233,25 +222,7 @@
     toolCount: number;
   };
 
-  type AgentRunSession = {
-    cardId: string;
-    title: string;
-    status: "idle" | "running" | "completed" | "blocked";
-    progress: number;
-    output: string;
-    result: AiWorkerTaskResult | null;
-    logs: AgentRunLog[];
-    terminalLines: AgentTerminalLine[];
-  };
-
   type ChatSessionState = WorkspaceChatSession;
-
-  type AgentPhaseKey = "prepare" | "jira" | "model" | "execute" | "writeback" | "done";
-  type AgentPhase = {
-    key: AgentPhaseKey;
-    label: string;
-    state: "pending" | "active" | "done" | "blocked";
-  };
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;
@@ -304,7 +275,7 @@
   let agentConsoleOpen = $state(false);
   let agentRunCardId = $state<string | null>(null);
   let agentRunTitle = $state("No active run");
-  let agentRunStatus = $state<"idle" | "running" | "completed" | "blocked">("idle");
+  let agentRunStatus = $state<AgentRunStatus>("idle");
   let agentRunProgress = $state(0);
   let agentRunOutput = $state("");
   let agentRunResult = $state<AiWorkerTaskResult | null>(null);
@@ -2229,16 +2200,16 @@
   function activeAgentSession(): AgentRunSession | null {
     if (!agentRunCardId) return null;
 
-    return {
-      cardId: agentRunCardId,
-      title: agentRunTitle,
-      status: agentRunStatus,
-      progress: agentRunProgress,
-      output: agentRunOutput,
-      result: agentRunResult,
-      logs: agentRunLogs,
-      terminalLines: agentTerminalLines,
-    };
+    return createAgentRunSession(
+      agentRunCardId,
+      agentRunTitle,
+      agentRunStatus,
+      agentRunProgress,
+      agentRunOutput,
+      agentRunResult,
+      agentRunLogs,
+      agentTerminalLines,
+    );
   }
 
   function persistActiveAgentRun() {
@@ -2288,7 +2259,7 @@
     selectedCardId = card.id;
   }
 
-  function setAgentRunStatus(status: AgentRunSession["status"]) {
+  function setAgentRunStatus(status: AgentRunStatus) {
     agentRunStatus = status;
     persistActiveAgentRun();
   }
@@ -2727,15 +2698,34 @@
       );
       setAgentRunOutput(buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput));
       setAgentProgress(55);
-      const result = await executeAiWorkerTask(config, {
-        key: issueKey,
-        title: card.title,
-        description: card.description,
-        labels: card.labels,
-        url: card.url,
-        operator_notes: operatorNotes,
-        previous_output: previousOutput,
-      });
+      let result: AiWorkerTaskResult;
+      try {
+        result = await executeAiWorkerTask(config, {
+          key: issueKey,
+          title: card.title,
+          description: card.description,
+          labels: card.labels,
+          url: card.url,
+          operator_notes: operatorNotes,
+          previous_output: previousOutput,
+        });
+      } catch (reason) {
+        if (reason instanceof IpcPolicyError && reason.category === "timeout") {
+          setAgentRunStatus("timeout");
+          appendStructuredAgentLog(
+            "error",
+            "timeout",
+            "Spacesly stopped waiting for the Agent response before a structured result arrived.",
+            [reason.message],
+            ["The card is not marked blocked.", "Check the Agent runtime output if it is still running."],
+            ["Continue or retry from the current card once the runtime finishes or becomes available."],
+          );
+          appNotice = { tone: "info", message: `${ticketLabel(card)} timed out waiting for the Agent response.` };
+          return;
+        }
+
+        throw reason;
+      }
       appendStructuredAgentLog(
         result.completion_status === "completed" ? "success" : "error",
         "agent",

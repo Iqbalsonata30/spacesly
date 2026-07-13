@@ -9,9 +9,11 @@
     EditorState: typeof import("@codemirror/state").EditorState;
     EditorView: typeof import("@codemirror/view").EditorView;
     keymap: typeof import("@codemirror/view").keymap;
+    indentWithTab: typeof import("@codemirror/commands").indentWithTab;
     HighlightStyle: typeof import("@codemirror/language").HighlightStyle;
     syntaxHighlighting: typeof import("@codemirror/language").syntaxHighlighting;
     tags: typeof import("@lezer/highlight").tags;
+    vim: typeof import("@replit/codemirror-vim").vim;
   };
 
   type Props = {
@@ -50,7 +52,7 @@
       if (!host) return;
 
       try {
-        const [{ basicSetup, EditorState, EditorView, keymap, HighlightStyle, syntaxHighlighting, tags }, language] = await Promise.all([
+        const [{ basicSetup, EditorState, EditorView, keymap, indentWithTab, HighlightStyle, syntaxHighlighting, tags, vim }, language] = await Promise.all([
           loadRuntime(),
           loadLanguage(path),
         ]);
@@ -62,9 +64,11 @@
             doc: currentValue,
             extensions: [
               basicSetup,
+              vim({ status: true }),
               ...(language ? [language] : []),
               softDraculaHighlight({ HighlightStyle, syntaxHighlighting, tags }),
               keymap.of([
+                indentWithTab,
                 {
                   key: "Mod-s",
                   run: () => {
@@ -119,6 +123,19 @@
                 },
                 "&.cm-focused": {
                   outline: "none",
+                },
+                ".cm-panels-bottom": {
+                  borderTop: "1px solid #282631",
+                  backgroundColor: "#111016",
+                  color: "#a99bd6",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "11px",
+                  fontWeight: "800",
+                },
+                ".cm-vim-panel input": {
+                  backgroundColor: "transparent",
+                  color: "#d8d2e4",
+                  font: "inherit",
                 },
               }, { dark: true }),
             ],
@@ -184,16 +201,20 @@
       import("codemirror"),
       import("@codemirror/state"),
       import("@codemirror/view"),
+      import("@codemirror/commands"),
       import("@codemirror/language"),
       import("@lezer/highlight"),
-    ]).then(([codemirror, state, view, language, highlight]) => ({
+      import("@replit/codemirror-vim"),
+    ]).then(([codemirror, state, view, commands, language, highlight, vim]) => ({
       basicSetup: codemirror.basicSetup,
       EditorState: state.EditorState,
       EditorView: view.EditorView,
       keymap: view.keymap,
+      indentWithTab: commands.indentWithTab,
       HighlightStyle: language.HighlightStyle,
       syntaxHighlighting: language.syntaxHighlighting,
       tags: highlight.tags,
+      vim: vim.vim,
     }));
     return runtimePromise;
   }
@@ -224,6 +245,15 @@
   async function loadLanguage(filePath: string): Promise<Extension | null> {
     return editorLanguagePluginForPath(filePath)?.load() ?? null;
   }
+
+  function insertFallbackIndent(textarea: HTMLTextAreaElement, outdent: boolean) {
+    if (outdent) return;
+
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    textarea.setRangeText("  ", start, end, "end");
+    setValue(textarea.value);
+  }
 </script>
 
 <div class="code-editor-shell" aria-busy={loading} aria-label={`Code editor for ${path}`}>
@@ -244,6 +274,9 @@
         } else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "f") {
           event.preventDefault();
           onFormat();
+        } else if (event.key === "Tab") {
+          event.preventDefault();
+          insertFallbackIndent(event.currentTarget, event.shiftKey);
         }
       }}
     ></textarea>

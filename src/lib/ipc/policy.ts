@@ -24,7 +24,7 @@ type StructuredIpcError = {
 
 export const IPC_POLICIES = {
   aiChat: { timeoutMs: 120_000, retries: 0 },
-  aiExecution: { timeoutMs: 180_000, retries: 0 },
+  aiExecution: { timeoutMs: 30 * 60_000, retries: 0 },
   aiTest: { timeoutMs: 30_000, retries: 1, retryDelayMs: 750 },
   fileRead: { timeoutMs: 15_000, retries: 0 },
   fileWrite: { timeoutMs: 20_000, retries: 0 },

@@ -19,7 +19,7 @@ export type AgentPhaseKey = "prepare" | "jira" | "model" | "execute" | "writebac
 export type AgentPhase = {
   key: AgentPhaseKey;
   label: string;
-  state: "pending" | "active" | "done" | "blocked";
+  state: "pending" | "active" | "done" | "blocked" | "timeout";
 };
 
 export function withCompletionMetadata(card: CardProjection, columnIntent: ColumnIntent): CardProjection {
@@ -138,10 +138,18 @@ export function executionDetail(execution: ExecutionState): string {
 }
 
 export function agentActivity(
-  status: "idle" | "queued" | "running" | "blocked" | "completed",
+  status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed",
   progress: number,
   log: AgentRunLog | null,
 ): { title: string; detail: string; next: string } {
+  if (status === "timeout") {
+    return {
+      title: "Response timed out",
+      detail: log?.message ?? "Spacesly stopped waiting for the Agent response before a structured result arrived.",
+      next: "Check the Agent runtime output, then continue or retry from this card.",
+    };
+  }
+
   if (status === "blocked") {
     return {
       title: "Blocked",
@@ -197,7 +205,7 @@ export function agentActivity(
   };
 }
 
-export function agentPhaseTimeline(status: "idle" | "queued" | "running" | "blocked" | "completed", progress: number): AgentPhase[] {
+export function agentPhaseTimeline(status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed", progress: number): AgentPhase[] {
   const phases: Array<Omit<AgentPhase, "state"> & { threshold: number }> = [
     { key: "prepare", label: "Prepare", threshold: 5 },
     { key: "jira", label: "Jira", threshold: 25 },
@@ -213,8 +221,8 @@ export function agentPhaseTimeline(status: "idle" | "queued" | "running" | "bloc
     return {
       key: phase.key,
       label: phase.label,
-      state: status === "blocked" && active
-        ? "blocked"
+      state: (status === "blocked" || status === "timeout") && active
+        ? status
         : progress >= phase.threshold && (!next || progress >= next.threshold)
           ? "done"
           : active

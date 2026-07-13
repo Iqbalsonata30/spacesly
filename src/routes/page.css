@@ -291,10 +291,12 @@
 
   .code-editor-pane {
     grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: 100%;
   }
 
   .editor-stage {
     position: relative;
+    height: 100%;
     min-height: 0;
     overflow: hidden;
     background: #111016;
@@ -564,6 +566,7 @@
     place-items: center;
     align-content: center;
     gap: 8px;
+    height: 100%;
     min-height: 0;
     padding: 24px;
     color: #8f88a8;
@@ -586,7 +589,9 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 10px;
+    min-width: 0;
   }
 
   .editor-actions span {
@@ -667,7 +672,7 @@
   .editor-diagnostic {
     position: absolute;
     right: 18px;
-    bottom: 44px;
+    bottom: 58px;
     display: grid;
     gap: 5px;
     max-width: min(520px, calc(100% - 36px));
@@ -706,9 +711,10 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    min-height: 32px;
+    min-height: 42px;
+    flex-wrap: wrap;
     border-top: 1px solid #24222b;
-    padding: 0 12px;
+    padding: 6px 12px;
     background: #111016;
     color: #77718a;
     font-size: 11px;
@@ -718,14 +724,19 @@
   .editor-footer-info {
     display: inline-flex;
     align-items: center;
+    flex: 1 1 240px;
     min-width: 0;
     gap: 10px;
   }
 
-  .code-editor-pane footer span:first-child {
+  .editor-footer-info > span {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .code-editor-pane footer .editor-actions {
+    flex: 0 1 auto;
   }
 
   .board-panel {
@@ -2518,6 +2529,12 @@
     color: #f0b0aa;
   }
 
+  .agent-phase.timeout {
+    border-color: rgba(240, 190, 120, 0.34);
+    background: rgba(89, 60, 25, 0.22);
+    color: #f0be78;
+  }
+
   .agent-console footer {
     justify-content: space-between;
     border-top: 1px solid #272530;
@@ -2585,6 +2602,10 @@
 
   .run-state.blocked {
     color: #f0b0aa;
+  }
+
+  .run-state.timeout {
+    color: #f0be78;
   }
 
   .console-lines {

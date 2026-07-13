@@ -1,8 +1,8 @@
 <script lang="ts">
   import type { AiWorkerTaskResult } from "$lib/ipc";
+  import type { AgentRunStatus } from "$lib/agentRun";
 
-  type AgentRunStatus = "idle" | "running" | "completed" | "blocked";
-  type AgentOutputStatus = "complete" | "blocked" | "working" | "unknown";
+  type AgentOutputStatus = "complete" | "blocked" | "timeout" | "working" | "unknown";
   type AgentOutputView = {
     status: AgentOutputStatus;
     label: string;
@@ -43,7 +43,7 @@
     const waiting = !text || text === "Waiting for Agent output...";
 
     if (waiting) {
-      const status = statusValue === "blocked" ? "blocked" : statusValue === "completed" ? "complete" : "working";
+      const status = displayStatus(statusValue);
       return {
         status,
         label: statusLabel(status),
@@ -56,11 +56,7 @@
     }
 
     const fallbackLines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    const status = statusValue === "completed"
-      ? "complete"
-      : statusValue === "blocked"
-        ? "blocked"
-        : "working";
+    const status = displayStatus(statusValue);
     const summary = fallbackLines[0] || "No summary returned.";
     const detailLines = fallbackLines.slice(1, 8);
     const changes = detailLines.filter(isChangeLine).slice(0, 5);
@@ -83,6 +79,7 @@
 
   function nextStepLines(status: AgentOutputStatus, details: string[], evidence: string[]): string[] {
     if (status === "complete") return ["Review the evidence, then keep or sync the completed Jira state."];
+    if (status === "timeout") return ["Check the Agent runtime output, then continue or retry from this card."];
     if (status === "working") return ["Wait for the Agent to return evidence or a blocker."];
 
     const blockers = [...details, ...evidence].filter((line) => /(need|needs|blocked|approve|approval|missing|failed|cannot|can't|uncommitted|unpushed|permission)/i.test(line));
@@ -94,6 +91,7 @@
   function statusLabel(status: AgentOutputStatus): string {
     if (status === "complete") return "Completed";
     if (status === "blocked") return "Needs attention";
+    if (status === "timeout") return "Timed out";
     if (status === "working") return "Working";
     return "Review needed";
   }
@@ -101,8 +99,16 @@
   function outcomeText(status: AgentOutputStatus, summary: string): string {
     if (status === "complete") return "The Agent reported the task complete with evidence.";
     if (status === "blocked") return "The Agent stopped before marking the task Done.";
+    if (status === "timeout") return "Spacesly stopped waiting before a structured result arrived.";
     if (status === "working") return "The Agent is still running.";
     return summary;
+  }
+
+  function displayStatus(status: AgentRunStatus): AgentOutputStatus {
+    if (status === "completed") return "complete";
+    if (status === "blocked") return "blocked";
+    if (status === "timeout") return "timeout";
+    return "working";
   }
 </script>
 
@@ -203,6 +209,11 @@
     color: #f0b0aa;
   }
 
+  .agent-output-card.timeout .agent-output-mark {
+    background: rgba(240, 190, 120, 0.12);
+    color: #f0be78;
+  }
+
   .agent-output-hero div:last-child {
     display: grid;
     gap: 5px;
@@ -242,6 +253,11 @@
   .agent-output-panel.next {
     border-color: rgba(240, 176, 170, 0.24);
     background: rgba(55, 30, 32, 0.42);
+  }
+
+  .agent-output-card.timeout .agent-output-panel.next {
+    border-color: rgba(240, 190, 120, 0.24);
+    background: rgba(60, 44, 20, 0.38);
   }
 
   .agent-output-card.complete .agent-output-panel.next {
@@ -286,5 +302,9 @@
 
   .agent-output-card.complete .agent-output-panel.next li::before {
     background: #b9d6aa;
+  }
+
+  .agent-output-card.timeout .agent-output-panel.next li::before {
+    background: #f0be78;
   }
 </style>

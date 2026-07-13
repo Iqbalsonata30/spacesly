@@ -39,6 +39,7 @@ export {
   transitionJiraIssue,
 } from "$lib/ipc/jira";
 export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
+export { IpcPolicyError } from "$lib/ipc/policy";
 export type {
   ShellCommandRequest,
   ShellCommandResult,

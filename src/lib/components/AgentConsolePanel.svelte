@@ -1,28 +1,8 @@
 <script lang="ts">
   import AgentOutput from "$lib/components/AgentOutput.svelte";
+  import type { AgentPhase } from "$lib/boardWorkflow";
   import type { AiWorkerTaskResult } from "$lib/ipc";
-
-  type AgentRunLog = {
-    id: string;
-    at: string;
-    tone: "info" | "success" | "error";
-    label: string;
-    message: string;
-  };
-
-  type AgentTerminalLine = {
-    id: string;
-    prompt: string;
-    text: string;
-  };
-
-  type AgentPhase = {
-    key: string;
-    state: string;
-    label: string;
-  };
-
-  type AgentRunStatus = "idle" | "running" | "completed" | "blocked";
+  import type { AgentRunLog, AgentRunStatus, AgentTerminalLine } from "$lib/agentRun";
 
   type Props = {
     style?: string;

@@ -54,8 +54,15 @@ pub struct AiWorkerTaskResult {
     pub evidence: Vec<String>,
     pub details: Vec<String>,
     pub next: Vec<String>,
-    pub completion_status: String,
+    pub completion_status: AiWorkerCompletionStatus,
     pub blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AiWorkerCompletionStatus {
+    Completed,
+    Blocked,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -372,12 +379,12 @@ fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWork
         .any(|line| line.trim().eq_ignore_ascii_case("STATUS: COMPLETE"))
         && !missing_sensitive_approval(task)
     {
-        "completed"
+        AiWorkerCompletionStatus::Completed
     } else {
-        "blocked"
+        AiWorkerCompletionStatus::Blocked
     };
     let summary = labelled_value(&response, "SUMMARY").unwrap_or_else(|| first_line(&response));
-    let blocked_reason = if completion_status == "blocked" {
+    let blocked_reason = if completion_status == AiWorkerCompletionStatus::Blocked {
         Some(if missing_sensitive_approval(task) {
             completion_guard_reason(task)
         } else {
@@ -394,7 +401,7 @@ fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWork
         evidence,
         details,
         next,
-        completion_status: completion_status.to_string(),
+        completion_status,
         blocked_reason,
     }
 }
@@ -450,7 +457,7 @@ fn enforce_opencode_completion_guards(
     config: &AiWorkerConfig,
     task: &AiWorkerTask,
 ) {
-    if result.completion_status != "completed" {
+    if result.completion_status != AiWorkerCompletionStatus::Completed {
         return;
     }
 
@@ -469,7 +476,7 @@ fn enforce_opencode_completion_guards(
 }
 
 fn block_result(result: &mut AiWorkerTaskResult, reason: String) {
-    result.completion_status = "blocked".to_string();
+    result.completion_status = AiWorkerCompletionStatus::Blocked;
     result.blocked_reason = Some(reason.clone());
     result.summary = reason.clone();
     result.details = vec![reason];
@@ -915,5 +922,20 @@ mod tests {
 
         assert!(context.contains("Never guess."));
         assert!(!context.contains("Skill: Deploy safely"));
+    }
+
+    #[test]
+    fn task_result_serializes_completion_status_for_ipc() {
+        let value = serde_json::to_value(AiWorkerTaskResult {
+            summary: "Done".to_string(),
+            evidence: vec!["Checked output".to_string()],
+            details: Vec::new(),
+            next: Vec::new(),
+            completion_status: AiWorkerCompletionStatus::Completed,
+            blocked_reason: None,
+        })
+        .expect("serialize task result");
+
+        assert_eq!(value["completion_status"].as_str(), Some("completed"));
     }
 }

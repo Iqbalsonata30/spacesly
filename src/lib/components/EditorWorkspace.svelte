@@ -70,15 +70,6 @@
       <p>Editor</p>
       <h2>{activeEditorFile?.name ?? "No file open"}</h2>
     </div>
-    <div class="editor-actions">
-      <span class:dirty={activeEditorDirty}>{activeEditorDirty ? "Unsaved" : activeEditorFile ? "Saved" : "Idle"}</span>
-      <button type="button" disabled={!activeEditorReady || formattingFilePath !== null} onclick={() => onFormatActiveFile()}>
-        {formattingFilePath ? "Formatting" : "Format"}
-      </button>
-      <button type="button" disabled={!activeEditorReady || savingFilePath !== null} onclick={() => onSaveActiveFile()}>
-        {savingFilePath ? "Saving" : "Save"}
-      </button>
-    </div>
   </header>
   {#if openEditorFiles.length > 0}
     <div class="editor-tabs" role="tablist" aria-label="Open files">
@@ -131,6 +122,15 @@
       />
       <span>{fileStatusLabel}</span>
     </div>
-    <span>Ctrl/Cmd+S saves · Ctrl/Cmd+Shift+F formats</span>
+    <div class="editor-actions">
+      <span class:dirty={activeEditorDirty}>{activeEditorDirty ? "Unsaved" : activeEditorFile ? "Saved" : "Idle"}</span>
+      <button type="button" disabled={!activeEditorReady || formattingFilePath !== null} onclick={() => onFormatActiveFile()}>
+        {formattingFilePath ? "Formatting" : "Format"}
+      </button>
+      <button type="button" disabled={!activeEditorReady || savingFilePath !== null} onclick={() => onSaveActiveFile()}>
+        {savingFilePath ? "Saving" : "Save"}
+      </button>
+      <span>Vim · Ctrl/Cmd+S saves · Ctrl/Cmd+Shift+F formats</span>
+    </div>
   </footer>
 </section>
