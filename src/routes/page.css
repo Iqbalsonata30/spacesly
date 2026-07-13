@@ -2388,7 +2388,7 @@
     position: relative;
     z-index: 1;
     display: grid;
-    grid-template-rows: auto auto minmax(110px, var(--agent-log-height)) 1px minmax(140px, var(--agent-output-height)) 1px minmax(120px, var(--agent-approval-height)) auto;
+    grid-template-rows: auto auto minmax(96px, var(--agent-log-height)) 1px minmax(130px, var(--agent-output-height)) 1px minmax(110px, 1fr) minmax(96px, var(--agent-approval-height)) auto;
     min-height: 0;
     height: 100%;
     overflow: hidden;
@@ -2681,6 +2681,7 @@
 
   .agent-session-events {
     display: grid;
+    align-content: start;
     gap: 8px;
     overflow-y: auto;
     min-height: 0;
@@ -2722,6 +2723,8 @@
     color: #cfc8dc;
     font-size: 12px;
     line-height: 1.45;
+    max-height: 8.7em;
+    overflow: auto;
     white-space: pre-wrap;
     word-break: break-word;
   }

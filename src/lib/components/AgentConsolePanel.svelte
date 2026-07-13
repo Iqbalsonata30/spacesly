@@ -107,6 +107,14 @@
     </header>
     <AgentOutput output={output} result={result} runStatus={runStatus} />
   </div>
+  <div class="stack-resize-handle">
+    <span
+      class="drag-handle vertical"
+      role="separator"
+      aria-orientation="vertical"
+      onpointerdown={onResizeOutput}
+    ></span>
+  </div>
   <section class="agent-session-thread" aria-label="Agent session transcript">
     <header>
       <span>Task session</span>
@@ -131,14 +139,6 @@
       {/if}
     </div>
   </section>
-  <div class="stack-resize-handle">
-    <span
-      class="drag-handle vertical"
-      role="separator"
-      aria-orientation="vertical"
-      onpointerdown={onResizeOutput}
-    ></span>
-  </div>
   <div class="operator-terminal">
     <div class="terminal-lines">
       {#each terminalLines as line (line.id)}
