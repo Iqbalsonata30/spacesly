@@ -96,7 +96,7 @@
   <label>
     <span>Arguments</span>
     <textarea
-      placeholder="["--transport", "stdio"]"
+      placeholder='["--transport", "stdio"]'
       oninput={(event) => updateArgs(event.currentTarget.value)}
       value={JSON.stringify(server.args)}></textarea>
   </label>

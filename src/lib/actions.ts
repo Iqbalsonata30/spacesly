@@ -5,9 +5,9 @@ export interface TooltipOptions {
 }
 
 export function tooltip(node: HTMLElement, options: TooltipOptions) {
-  let opts = options;
+  const opts = options;
   let element: HTMLDivElement | null = null;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timer: ReturnType<typeof setTimeout> | null = null;
 
   function show() {
     if (element || !opts.text) return;
