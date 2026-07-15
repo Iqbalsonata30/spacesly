@@ -72,12 +72,15 @@ jobs:
           sha256sum *.* | tee SHA256SUMS
 
       - name: Sign combined checksums
-        if: secrets.GPG_PRIVATE_KEY != ''
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         working-directory: release-artifacts
         run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "No GPG key configured, skipping signing"
+            exit 0
+          fi
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --detach-sign --armor SHA256SUMS
 
