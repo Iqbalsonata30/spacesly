@@ -44,7 +44,7 @@
   let {
     style,
     title,
-    _status,
+    status: _status,
     progress,
     phases,
     logs,

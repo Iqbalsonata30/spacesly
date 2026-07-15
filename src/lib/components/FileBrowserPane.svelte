@@ -56,7 +56,7 @@
     onOpenEntry,
     onToggleFolder,
     onFilterChange,
-    _onClearFilter,
+    onClearFilter: _onClearFilter,
     onCollapseAll,
     onToggleSidebar,
   }: Props = $props();
