@@ -20,13 +20,18 @@
     executionDetail,
     isBlocked,
     mergeSyncedWorkspace,
+    recoverInterruptedAgentRuns,
     withCompletionMetadata,
   } from "$lib/boardWorkflow";
   import {
     agentSessionReplay,
     appendAgentSessionEvent,
+    clearActiveAgentRun,
+    clearActiveAgentRuns,
     createAgentRunSession,
     createAgentSessionEvent,
+    loadActiveAgentRunCardIds,
+    markActiveAgentRun,
     type AgentRunGitSnapshot,
     type AgentRunLog,
     type AgentRunSession,
@@ -133,6 +138,7 @@
   const MAX_AGENT_TERMINAL_LINES = 80;
   const MAX_AGENT_SESSION_EVENTS = 120;
   const MAX_AGENT_SESSION_REPLAY_CHARS = 12_000;
+  const MAX_RETAINED_AGENT_SESSIONS = 50;
   const MAX_WORKSPACE_CHAT_MESSAGES = 80;
   const MAX_CHAT_SESSIONS = 6;
   const MAX_WORKSPACE_CHAT_ACTIVITIES = 120;
@@ -294,6 +300,7 @@
   let agentRunTranscript = $state<AgentSessionEvent[]>([]);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
+  let latestAgentSessionId = $state<string | null>(null);
   let workspaceShellWorkdir = $state(initialUiState.workspaceShellWorkdir);
   let workspaceTerminalContainer: HTMLDivElement | null = $state(null);
   let workspaceTerminal: XtermTerminal | null = null;
@@ -678,11 +685,7 @@
   let agentPhases = $derived(agentPhaseTimeline(visibleAgentRunStatus, visibleAgentRunProgress));
   let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
   let latestAgentSession = $derived<AgentRunSession | null>(
-    Object.values(agentRunSessions).sort((left, right) => {
-      const leftLog = left.logs.at(-1)?.id ?? "";
-      const rightLog = right.logs.at(-1)?.id ?? "";
-      return rightLog.localeCompare(leftLog);
-    })[0] ?? null,
+    latestAgentSessionId ? agentRunSessions[latestAgentSessionId] ?? null : null,
   );
   let settingsTitle = $derived(
     {
@@ -760,9 +763,21 @@
     try {
       const cached = await loadCachedWorkspace();
       if (cached && !workspace) {
-        workspace = cached.workspace;
+        const storage = typeof localStorage === "undefined" ? undefined : localStorage;
+        const interruptedCardIds = loadActiveAgentRunCardIds(storage);
+        workspace = recoverInterruptedAgentRuns(cached.workspace, interruptedCardIds);
         cacheSavedAt = cached.savedAt;
-        appNotice = { tone: "info", message: "Loaded saved cards. Sync Jira only when you need fresh updates." };
+        if (interruptedCardIds.length > 0) {
+          clearActiveAgentRuns(storage);
+          cacheSavedAt = Date.now();
+          saveCachedWorkspace(workspace);
+          appNotice = {
+            tone: "info",
+            message: `${interruptedCardIds.length} Agent run${interruptedCardIds.length === 1 ? " was" : "s were"} interrupted when Spacesly closed. Review and retry when ready.`,
+          };
+        } else {
+          appNotice = { tone: "info", message: "Loaded saved cards. Sync Jira only when you need fresh updates." };
+        }
       }
     } catch (reason: unknown) {
       appNotice = {
@@ -2442,7 +2457,7 @@
     return true;
   }
 
-  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState) {
+  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState, announce = true) {
     const movedCard = activeCardById.get(cardId);
     if (!movedCard) return;
 
@@ -2467,7 +2482,7 @@
 
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace!);
-    appNotice = { tone: "info", message: "Card moved in Spacesly." };
+    if (announce) appNotice = { tone: "info", message: "Card moved in Spacesly." };
   }
 
   function executionForColumn(columnId: string): ExecutionState | null {
@@ -2475,6 +2490,7 @@
     if (intent === "backlog") return "idle";
     if (intent === "queued") return "queued";
     if (intent === "in_progress") return "running";
+    if (intent === "done") return { completed: { summary: "Marked Done manually." } };
     return null;
   }
 
@@ -2498,6 +2514,10 @@
     if (agentRunCardId === cardId) agentRunCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
+    if (latestAgentSessionId === cardId) {
+      latestAgentSessionId = Object.values(remainingSessions)
+        .sort((left, right) => sessionActivityAt(right) - sessionActivityAt(left))[0]?.cardId ?? null;
+    }
     if (agentConsoleCardId === cardId) {
       const fallback = Object.values(remainingSessions)[0] ?? null;
       agentConsoleCardId = fallback?.cardId ?? null;
@@ -2644,11 +2664,34 @@
     if (!session) return;
 
     const nextSession = transform(session);
-    agentRunSessions = {
-      ...agentRunSessions,
-      [cardId]: nextSession,
-    };
+    latestAgentSessionId = cardId;
+    agentRunSessions[cardId] = nextSession;
+    agentRunSessions = retainAgentSessions(agentRunSessions);
     if (agentRunCardId === cardId) applyAgentSessionToConsole(nextSession);
+  }
+
+  function retainAgentSessions(sessions: Record<string, AgentRunSession>): Record<string, AgentRunSession> {
+    const entries = Object.entries(sessions);
+    if (entries.length <= MAX_RETAINED_AGENT_SESSIONS) return sessions;
+
+    const candidates = entries
+      .filter(([cardId, session]) =>
+        session.status !== "running"
+        && cardId !== agentConsoleCardId
+        && cardId !== agentRunCardId,
+      )
+      .sort(([, left], [, right]) => sessionActivityAt(left) - sessionActivityAt(right));
+
+    const retained = { ...sessions };
+    for (const [cardId] of candidates) {
+      if (Object.keys(retained).length <= MAX_RETAINED_AGENT_SESSIONS) break;
+      delete retained[cardId];
+    }
+    return retained;
+  }
+
+  function sessionActivityAt(session: AgentRunSession): number {
+    return session.transcript.at(-1)?.at ?? 0;
   }
 
   function appendAgentSessionTranscript(type: AgentSessionEvent["type"], text: string) {
@@ -2675,10 +2718,9 @@
     const session = activeAgentSession();
     if (!session) return;
 
-    agentRunSessions = {
-      ...agentRunSessions,
-      [session.cardId]: session,
-    };
+    latestAgentSessionId = session.cardId;
+    agentRunSessions[session.cardId] = session;
+    agentRunSessions = retainAgentSessions(agentRunSessions);
     agentConsoleCardId ??= session.cardId;
   }
 
@@ -2997,26 +3039,65 @@
   function agentJiraComment(result: AiWorkerTaskResult, config: AiWorkerConfig, gitInfo: GitWorkspaceInfo | null = null): string {
     const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
     const model = config.runtime === "opencode" ? config.opencode_model : config.model;
-    const evidence = result.evidence.join("\n") || result.details.join("\n") || result.summary;
-    const gitEvidence = gitInfo?.head_commit
-      ? [
-          "",
-          `Commit: ${gitInfo.head_commit}`,
-          `Branch: ${gitInfo.current_branch ?? "unknown"}`,
-          `Upstream: ${gitInfo.upstream_branch ?? "none"}`,
-        ]
-      : [];
+    const verification = result.evidence.length > 0
+      ? uniqueLines(result.evidence.map(userFacingVerification).filter(Boolean)).slice(0, 4)
+      : ["Verification was not reported."];
+    const nextSteps = result.next
+      .map((line) => singleLine(line, 300))
+      .filter((line) => line && !/^review the (result|evidence)/i.test(line) && !/^keep or sync the completed/i.test(line));
+    const operationalDetails = [
+      `Runtime: ${runtime}`,
+      `Model: ${model}`,
+      `Environment: ${config.runtime === "opencode" ? config.opencode_workdir || "OpenCode workspace" : "API Agent"}`,
+      ...(gitInfo?.current_branch ? [`Branch: ${gitInfo.current_branch}`] : []),
+      ...(gitInfo?.head_commit ? [`Revision: ${gitInfo.head_commit}`] : []),
+      ...(gitInfo?.upstream_branch ? [`Upstream: ${gitInfo.upstream_branch}`] : []),
+    ];
+    const evidence = [
+      `Completion status: ${result.completion_status}`,
+      ...(result.evidence.length > 0 ? ["Verification evidence:", ...result.evidence.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
+      ...(result.details.length > 0 ? ["Execution details:", ...result.details.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
+      ...(result.blocked_reason ? [`Blocked reason: ${jiraWikiText(result.blocked_reason, 900)}`] : []),
+      ...(result.next.length > 0 ? ["Reported follow-up:", ...result.next.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
+    ];
 
     return [
-      "Spacesly marked this task done.",
+      "h3. Task completed",
       "",
-      `Agent: ${runtime} / ${model}`,
+      `*${jiraWikiText(result.summary, 500)}*`,
       "",
-      `Summary: ${singleLine(result.summary, 500)}`,
+      result.evidence.length > 0 ? "Verification passed." : "Verification was not reported.",
+      ...verification.map((line) => `* ${jiraWikiText(line, 300)}`),
       "",
-      `Verification: ${singleLine(evidence, 900)}`,
-      ...gitEvidence,
+      "Action needed: " + (nextSteps.length > 0 ? "see below." : "No action is required."),
+      ...(nextSteps.length > 0 ? nextSteps.map((line) => `* ${jiraWikiText(line, 300)}`) : []),
+      "",
+      "{expand:title=Operational details}",
+      ...operationalDetails.map((line) => `* ${jiraWikiText(line, 500)}`),
+      "{expand}",
+      "",
+      "{expand:title=Execution evidence}",
+      ...evidence,
+      "{expand}",
     ].join("\n");
+  }
+
+  function userFacingVerification(value: string): string {
+    const line = singleLine(value, 300);
+    const normalized = line.toLowerCase();
+    if (/(bamboo|pipeline|build)/i.test(normalized)) return "Build pipeline completed successfully.";
+    if (/(openshift|kubernetes|ocp|pod|deployment|rollout)/i.test(normalized)) return "Deployment health was verified.";
+    if (/(test|lint|check|typecheck|compile)/i.test(normalized)) return "Automated checks passed.";
+    if (/(commit|push|upstream|branch)/i.test(normalized)) return "Repository changes were committed and synchronized.";
+    return line;
+  }
+
+  function uniqueLines(lines: string[]): string[] {
+    return [...new Set(lines.map((line) => line.trim()).filter(Boolean))];
+  }
+
+  function jiraWikiText(value: string, maxLength: number): string {
+    return singleLine(value, maxLength).replaceAll("{", "&#123;").replaceAll("}", "&#125;");
   }
 
   function agentWritebackRequiresPushedCommit(card: CardProjection): boolean {
@@ -3181,7 +3262,7 @@
   function requestManualDoneConfirmation(cardId: string) {
     const card = activeCardById.get(cardId);
     if (!card) return;
-    if (agentSessionForCard(cardId)?.status !== "blocked") {
+    if (!isBlocked(card.execution) && agentSessionForCard(cardId)?.status !== "blocked") {
       appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
       return;
     }
@@ -3201,7 +3282,7 @@
     const card = activeCardById.get(cardId);
     const doneColumnId = columnIdByIntent("done");
     if (!card || !doneColumnId) return;
-    if (agentSessionForCard(cardId)?.status !== "blocked") {
+    if (!isBlocked(card.execution) && agentSessionForCard(cardId)?.status !== "blocked") {
       appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
       return;
     }
@@ -3255,6 +3336,14 @@
     const card = activeCardById.get(cardId);
     const issueKey = card ? jiraKey(card) : null;
     const targetStatus = jiraTargetStatus(targetColumnId);
+    const sourceIntent = cardColumnIntentById.get(cardId);
+    const sourceColumn = sourceIntent ? activeColumnByIntent.get(sourceIntent) : undefined;
+    const sourceExecution = card?.execution;
+    const rollback = () => {
+      if (sourceColumn && sourceExecution !== undefined) {
+        moveCard(cardId, sourceColumn.id, sourceExecution, false);
+      }
+    };
 
     const localExecution = executionForColumn(targetColumnId);
     moveCard(cardId, targetColumnId, localExecution ?? undefined);
@@ -3262,7 +3351,11 @@
     if (!issueKey || !targetStatus) return;
 
     const config = buildJiraConfig();
-    if (!config) return;
+    if (!config) {
+      rollback();
+      appNotice = { tone: "error", message: `Could not sync ${issueKey} to Jira. Configure Jira before moving this issue.` };
+      return;
+    }
 
     try {
       if (targetStatus === "In Progress") {
@@ -3276,6 +3369,7 @@
           : `${issueKey} moved to ${targetStatus} in Jira.`,
       };
     } catch (reason) {
+      rollback();
       appNotice = {
         tone: "error",
         message: reason instanceof Error ? reason.message : String(reason),
@@ -3291,6 +3385,12 @@
 
     const card = activeCardById.get(cardId);
     if (!card || card.execution === "running") return;
+    const inProgressColumnId = columnIdByIntent("in_progress");
+    const doneColumnId = columnIdByIntent("done");
+    if (!inProgressColumnId || !doneColumnId) {
+      appNotice = { tone: "error", message: "Agent cannot start because this board is missing an In Progress or Done column." };
+      return;
+    }
     const runId = `agent-${cardId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
     runningWorkerRunIds = { ...runningWorkerRunIds, [cardId]: runId };
@@ -3313,21 +3413,20 @@
       appNotice = { tone: "error", message };
       return;
     }
+    markActiveAgentRun(typeof localStorage === "undefined" ? undefined : localStorage, cardId, runId);
 
     const issueKey = jiraKey(card);
-    const inProgressColumnId = columnIdByIntent("in_progress");
-    const doneColumnId = columnIdByIntent("done");
-    if (!inProgressColumnId || !doneColumnId) return;
     const existingSession = agentRunSessions[cardId];
     const isContinuation = existingSession?.status === "blocked" || existingSession?.status === "timeout";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
     let backendExecutionStarted = false;
-    beginAgentRun(card, isContinuation, null);
-    const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
-    appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
 
     try {
+      beginAgentRun(card, isContinuation, null);
+      const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
+      appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
+
       if (config.runtime === "opencode") {
         const runGitInfo = config.opencode_workdir?.trim()
           ? await getPathGitInfo(config.opencode_workdir.trim())
@@ -3626,6 +3725,7 @@
       );
       appNotice = { tone: "error", message };
     } finally {
+      clearActiveAgentRun(typeof localStorage === "undefined" ? undefined : localStorage, cardId, runId);
       if (!backendExecutionStarted) {
         await releaseAiWorkerRun(runId).catch(() => undefined);
       }
@@ -4439,9 +4539,10 @@
           onOpenAgentConsole={openAgentConsole}
           onDropCard={(cardId, columnId) => void moveCardAndSync(cardId, columnId)}
           onSelectCard={selectCard}
-          onQueueCard={queueCard}
-          onStartAgent={(cardId) => void startWorkerForCard(cardId)}
-          onDeleteCard={removeCard}
+           onQueueCard={queueCard}
+           onStartAgent={(cardId) => void startWorkerForCard(cardId)}
+           onMarkDone={requestManualDoneConfirmation}
+           onDeleteCard={removeCard}
           onDragStartCard={(cardId) => {
             draggedCardId = cardId;
           }}

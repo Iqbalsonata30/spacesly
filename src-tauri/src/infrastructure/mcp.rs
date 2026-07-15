@@ -2,13 +2,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::jira_rest;
 use super::shell_env::inject_shell_env;
+
+const MCP_RESPONSE_QUEUE_CAPACITY: usize = 128;
+const MCP_STDERR_LIMIT: usize = 64 * 1024;
+const MCP_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
+const MCP_HEADER_LINE_LIMIT: usize = 8 * 1024;
+const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MCP_MAX_SESSIONS: usize = 8;
 
 /// Jira issue data returned from a Jira MCP server.
 #[derive(Clone, Debug, Serialize)]
@@ -58,29 +65,7 @@ pub struct McpServerConfig {
 
 /// Validates any stdio MCP server by initializing it and listing tools.
 pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatus, String> {
-    let config = JiraMcpConfig {
-        server,
-        auth: JiraAuthConfig {
-            base_url: String::new(),
-            auth_mode: "api_token".to_string(),
-            username: String::new(),
-            api_token: String::new(),
-            personal_access_token: String::new(),
-            password: String::new(),
-        },
-        tool_name: "unused".to_string(),
-        board_tool_name: default_board_tool_name(),
-        board_issues_tool_name: default_board_issues_tool_name(),
-        jql: String::new(),
-        board_id: None,
-        project_key: None,
-        board_name: None,
-        page_size: default_page_size(),
-        max_pages: default_max_pages(),
-    };
-    let mut client = StdioMcpClient::start(&config)?;
-    client.initialize()?;
-    let tools = client.list_tools()?;
+    let tools = with_mcp_client(&server, |client| client.tools())?;
 
     Ok(McpConnectionStatus {
         tool_count: tools.len(),
@@ -144,43 +129,42 @@ fn default_board_issues_tool_name() -> String {
 
 /// Validates a Jira MCP server by listing tools and making small Jira calls.
 pub fn test_jira_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatus, String> {
-    let mut client = StdioMcpClient::start(&config)?;
-    client.initialize()?;
+    with_mcp_client(&config.server, |client| {
+        let tools = client.tools()?;
+        let search_tool = resolve_tool(&tools, &config.tool_name)?;
 
-    let tools = client.list_tools()?;
-    let search_tool = resolve_tool(&tools, &config.tool_name)?;
+        let issues_result = client.call_tool(
+            &search_tool,
+            json!({
+                "jql": config.jql,
+                "fields": "key,summary,status,issuetype",
+                "limit": 1
+            }),
+        )?;
+        let issue_count = parse_jira_issues(&issues_result)
+            .map(|issues| issues.len())
+            .unwrap_or(0);
 
-    let issues_result = client.call_tool(
-        &search_tool,
-        json!({
-            "jql": config.jql,
-            "fields": "key,summary,status,issuetype",
-            "limit": 1
-        }),
-    )?;
-    let issue_count = parse_jira_issues(&issues_result)
-        .map(|issues| issues.len())
-        .unwrap_or(0);
-
-    let board_count = resolve_tool(&tools, &config.board_tool_name)
-        .ok()
-        .and_then(|board_tool| fetch_boards_with_fallbacks(&mut client, &board_tool, &config).ok())
-        .or_else(|| {
-            jira_rest::fetch_boards(
-                &config.auth,
-                config.project_key.as_deref(),
-                config.board_name.as_deref(),
-            )
+        let board_count = resolve_tool(&tools, &config.board_tool_name)
             .ok()
-        })
-        .map(|boards| boards.len())
-        .unwrap_or(0);
+            .and_then(|board_tool| fetch_boards_with_fallbacks(client, &board_tool, &config).ok())
+            .or_else(|| {
+                jira_rest::fetch_boards(
+                    &config.auth,
+                    config.project_key.as_deref(),
+                    config.board_name.as_deref(),
+                )
+                .ok()
+            })
+            .map(|boards| boards.len())
+            .unwrap_or(0);
 
-    Ok(JiraConnectionStatus {
-        tool_count: tools.len(),
-        issue_count,
-        board_count,
-        tools,
+        Ok(JiraConnectionStatus {
+            tool_count: tools.len(),
+            issue_count,
+            board_count,
+            tools,
+        })
     })
 }
 
@@ -209,41 +193,36 @@ pub fn fetch_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String
         );
     }
 
-    let mut client = StdioMcpClient::start(&config)?;
-
-    client.initialize()?;
-    let tools = client.list_tools()?;
-    let (tool_name, arguments) = if let Some(board_id) = config
-        .board_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    {
-        let board_issues_tool = resolve_tool(&tools, &config.board_issues_tool_name)?;
-        (
-            board_issues_tool,
-            json!({
-                "board_id": board_id,
-                "jql": config.jql,
-                "fields": "key,summary,description,status,issuetype",
-                "start_at": 0,
-                "limit": 50
-            }),
-        )
-    } else {
-        let search_tool = resolve_tool(&tools, &config.tool_name)?;
-        (
-            search_tool,
-            json!({
-                "jql": config.jql,
-                "fields": "key,summary,description,status,issuetype",
-                "limit": 50
-            }),
-        )
-    };
-
-    let result = client.call_tool(&tool_name, arguments)?;
-
-    parse_jira_issues(&result)
+    with_mcp_client(&config.server, |client| {
+        let tools = client.tools()?;
+        let (tool_name, arguments) = if let Some(board_id) = config
+            .board_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            (
+                resolve_tool(&tools, &config.board_issues_tool_name)?,
+                json!({
+                    "board_id": board_id,
+                    "jql": config.jql,
+                    "fields": "key,summary,description,status,issuetype",
+                    "start_at": 0,
+                    "limit": 50
+                }),
+            )
+        } else {
+            (
+                resolve_tool(&tools, &config.tool_name)?,
+                json!({
+                    "jql": config.jql,
+                    "fields": "key,summary,description,status,issuetype",
+                    "limit": 50
+                }),
+            )
+        };
+        let result = client.call_tool(&tool_name, arguments)?;
+        parse_jira_issues(&result)
+    })
 }
 
 struct StdioMcpClient {
@@ -252,26 +231,23 @@ struct StdioMcpClient {
     responses: mpsc::Receiver<Value>,
     stderr: Arc<Mutex<String>>,
     next_id: u64,
+    tools: Option<Vec<String>>,
 }
 
 impl StdioMcpClient {
-    fn start(config: &JiraMcpConfig) -> Result<Self, String> {
-        if config.server.command.trim().is_empty() {
+    fn start(config: &McpServerConfig) -> Result<Self, String> {
+        if config.command.trim().is_empty() {
             return Err("MCP server command is required.".to_string());
         }
 
-        if config.tool_name.trim().is_empty() {
-            return Err("Jira MCP tool name is required.".to_string());
-        }
-
-        let mut command = Command::new(&config.server.command);
+        let mut command = Command::new(&config.command);
         command
-            .args(&config.server.args)
+            .args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         inject_shell_env(&mut command);
-        command.envs(&config.server.env);
+        command.envs(&config.env);
 
         let mut child = command
             .spawn()
@@ -279,7 +255,7 @@ impl StdioMcpClient {
                 if error.kind() == ErrorKind::NotFound {
                     format!(
                         "MCP command '{}' was not found. Use a full executable path, or enter a full command line in Settings such as 'npx -y <package>'. Original error: {error}",
-                        config.server.command
+                        config.command
                     )
                 } else {
                     format!("Failed to start Jira MCP server: {error}")
@@ -298,7 +274,7 @@ impl StdioMcpClient {
             .stderr
             .take()
             .ok_or_else(|| "Failed to open Jira MCP stderr".to_string())?;
-        let (tx, responses) = mpsc::channel();
+        let (tx, responses) = mpsc::sync_channel(MCP_RESPONSE_QUEUE_CAPACITY);
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
 
         spawn_stdout_reader(stdout, tx);
@@ -310,6 +286,7 @@ impl StdioMcpClient {
             responses,
             stderr: stderr_buffer,
             next_id: request_seed(),
+            tools: None,
         })
     }
 
@@ -350,6 +327,19 @@ impl StdioMcpClient {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .map(str::to_string)
             .collect())
+    }
+
+    fn tools(&mut self) -> Result<Vec<String>, String> {
+        if let Some(tools) = self.tools.as_ref() {
+            return Ok(tools.clone());
+        }
+        let tools = self.list_tools()?;
+        self.tools = Some(tools.clone());
+        Ok(tools)
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -431,13 +421,171 @@ impl Drop for StdioMcpClient {
     }
 }
 
-fn spawn_stdout_reader(stdout: std::process::ChildStdout, tx: mpsc::Sender<Value>) {
+struct McpSessionEntry {
+    client: Arc<Mutex<StdioMcpClient>>,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct McpSessionManager {
+    sessions: Mutex<HashMap<String, McpSessionEntry>>,
+}
+
+static MCP_SESSIONS: OnceLock<McpSessionManager> = OnceLock::new();
+
+fn mcp_session_manager() -> &'static McpSessionManager {
+    MCP_SESSIONS.get_or_init(McpSessionManager::default)
+}
+
+pub fn close_all_mcp_sessions() {
+    let Some(manager) = MCP_SESSIONS.get() else {
+        return;
+    };
+    let sessions = manager.sessions.lock().map(|mut sessions| {
+        sessions
+            .drain()
+            .map(|(_, entry)| entry.client)
+            .collect::<Vec<_>>()
+    });
+    if let Ok(sessions) = sessions {
+        drop(sessions);
+    }
+}
+
+fn with_mcp_client<T, F>(server: &McpServerConfig, operation: F) -> Result<T, String>
+where
+    F: FnOnce(&mut StdioMcpClient) -> Result<T, String>,
+{
+    let key = mcp_server_key(server);
+    let manager = mcp_session_manager();
+    let now = Instant::now();
+    let (session, expired) = {
+        let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
+        let expired = reap_idle_sessions(&mut sessions, now);
+        (
+            sessions.get(&key).map(|entry| Arc::clone(&entry.client)),
+            expired,
+        )
+    };
+    drop(expired);
+
+    let session = if let Some(session) = session {
+        session
+    } else {
+        let mut client = StdioMcpClient::start(server)?;
+        client.initialize()?;
+        client.tools()?;
+        let candidate = Arc::new(Mutex::new(client));
+        let (session, evicted) = {
+            let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
+            if let Some(existing) = sessions.get(&key) {
+                (Arc::clone(&existing.client), Vec::new())
+            } else {
+                let evicted = evict_oldest_idle_session(&mut sessions, now);
+                if sessions.len() >= MCP_MAX_SESSIONS {
+                    return Err(format!(
+                        "MCP session limit reached ({MCP_MAX_SESSIONS}). Close an unused MCP connection before starting another."
+                    ));
+                }
+                sessions.insert(
+                    key.clone(),
+                    McpSessionEntry {
+                        client: Arc::clone(&candidate),
+                        last_used: now,
+                    },
+                );
+                (candidate, evicted)
+            }
+        };
+        drop(evicted);
+        session
+    };
+
+    let mut client = session.lock().map_err(|error| error.to_string())?;
+    let result = operation(&mut client);
+    let alive = client.is_alive();
+    drop(client);
+
+    let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
+    if let Some(entry) = sessions.get_mut(&key) {
+        if Arc::ptr_eq(&entry.client, &session) {
+            if alive && result.is_ok() {
+                entry.last_used = Instant::now();
+            } else if !alive || result.is_err() {
+                sessions.remove(&key);
+            }
+        }
+    }
+    result
+}
+
+fn reap_idle_sessions(
+    sessions: &mut HashMap<String, McpSessionEntry>,
+    now: Instant,
+) -> Vec<Arc<Mutex<StdioMcpClient>>> {
+    let expired: Vec<String> = sessions
+        .iter()
+        .filter(|(_, entry)| {
+            Arc::strong_count(&entry.client) == 1
+                && now.duration_since(entry.last_used) >= MCP_SESSION_IDLE_TIMEOUT
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    expired
+        .into_iter()
+        .filter_map(|key| sessions.remove(&key).map(|entry| entry.client))
+        .collect()
+}
+
+fn evict_oldest_idle_session(
+    sessions: &mut HashMap<String, McpSessionEntry>,
+    now: Instant,
+) -> Vec<Arc<Mutex<StdioMcpClient>>> {
+    let mut evicted = reap_idle_sessions(sessions, now);
+    if sessions.len() < MCP_MAX_SESSIONS {
+        return evicted;
+    }
+    let oldest = sessions
+        .iter()
+        .filter(|(_, entry)| Arc::strong_count(&entry.client) == 1)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = oldest {
+        if let Some(entry) = sessions.remove(&key) {
+            evicted.push(entry.client);
+        }
+    }
+    evicted
+}
+
+fn mcp_server_key(server: &McpServerConfig) -> String {
+    let mut env: Vec<_> = server.env.iter().collect();
+    env.sort_by(|left, right| left.0.cmp(right.0));
+    format!(
+        "{}\0{}\0{}",
+        server.command,
+        server.args.join("\0"),
+        env.into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\0")
+    )
+}
+
+fn spawn_stdout_reader(stdout: std::process::ChildStdout, tx: mpsc::SyncSender<Value>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_stdout_message(&mut reader) {
                 Ok(Some(value)) => {
-                    let _ = tx.send(value);
+                    let is_response = value.get("id").is_some();
+                    if is_response {
+                        if tx.send(value).is_err() {
+                            break;
+                        }
+                    } else {
+                        let _ = tx.try_send(value);
+                    }
                 }
                 Ok(None) => break,
                 Err(_) => break,
@@ -451,25 +599,16 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr, buffer: Arc<Mutex<Stri
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if let Ok(mut output) = buffer.lock() {
-                if !output.is_empty() {
-                    output.push('\n');
-                }
-                output.push_str(&line);
+                append_bounded_text(&mut output, &line, MCP_STDERR_LIMIT);
             }
         }
     });
 }
 
-fn read_stdout_message(
-    reader: &mut BufReader<std::process::ChildStdout>,
-) -> Result<Option<Value>, String> {
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(|error| format!("Failed to read MCP stdout: {error}"))?;
-    if bytes == 0 {
+fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, String> {
+    let Some(line) = read_bounded_line(reader, MCP_MESSAGE_LIMIT)? else {
         return Ok(None);
-    }
+    };
 
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -484,13 +623,17 @@ fn read_stdout_message(
             .parse::<usize>()
             .map_err(|error| format!("Invalid MCP content length: {error}"))?;
         loop {
-            line.clear();
-            let bytes = reader
-                .read_line(&mut line)
-                .map_err(|error| format!("Failed to read MCP header: {error}"))?;
-            if bytes == 0 || line.trim_end_matches(['\r', '\n']).is_empty() {
+            let Some(header) = read_bounded_line(reader, MCP_HEADER_LINE_LIMIT)? else {
+                break;
+            };
+            if header.trim_end_matches(['\r', '\n']).is_empty() {
                 break;
             }
+        }
+        if length > MCP_MESSAGE_LIMIT {
+            return Err(format!(
+                "MCP message exceeds the {MCP_MESSAGE_LIMIT}-byte limit."
+            ));
         }
         let mut body = vec![0; length];
         reader
@@ -507,6 +650,75 @@ fn read_stdout_message(
             json!({ "jsonrpc": "2.0", "method": "_spacesly_log", "params": { "line": trimmed } }),
         )),
     }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<Option<String>, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|error| format!("Failed to read MCP stdout: {error}"))?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&bytes).to_string()));
+        }
+
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let length = newline + 1;
+            if bytes.len() + length > limit {
+                reader.consume(length);
+                return Err(format!("MCP line exceeds the {limit}-byte limit."));
+            }
+            bytes.extend_from_slice(&buffer[..length]);
+            reader.consume(length);
+            return Ok(Some(String::from_utf8_lossy(&bytes).to_string()));
+        }
+
+        if bytes.len() + buffer.len() > limit {
+            let length = buffer.len();
+            reader.consume(length);
+            drain_line(reader)?;
+            return Err(format!("MCP line exceeds the {limit}-byte limit."));
+        }
+
+        bytes.extend_from_slice(buffer);
+        let length = buffer.len();
+        reader.consume(length);
+    }
+}
+
+fn drain_line<R: BufRead>(reader: &mut R) -> Result<(), String> {
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|error| format!("Failed to drain MCP stdout: {error}"))?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(newline + 1);
+            return Ok(());
+        }
+        let length = buffer.len();
+        reader.consume(length);
+    }
+}
+
+fn append_bounded_text(output: &mut String, value: &str, limit: usize) {
+    if !output.is_empty() && output.len() < limit {
+        output.push('\n');
+    }
+    let remaining = limit.saturating_sub(output.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut length = value.len().min(remaining);
+    while length > 0 && !value.is_char_boundary(length) {
+        length -= 1;
+    }
+    output.push_str(&value[..length]);
 }
 
 fn request_seed() -> u64 {
@@ -787,5 +999,52 @@ mod tests {
         assert_eq!(issues[0].key, "SPC-1");
         assert_eq!(issues[0].summary, "Connect Jira");
         assert_eq!(issues[0].status, "To Do");
+    }
+
+    #[test]
+    fn rejects_oversized_mcp_lines_without_consuming_the_next_message() {
+        let input = b"123456789\n{\"id\":1,\"result\":{}}\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let error = read_bounded_line(&mut reader, 8).unwrap_err();
+        assert!(error.contains("exceeds"));
+
+        let next = read_stdout_message(&mut reader)
+            .expect("next message should remain readable")
+            .expect("next message should exist");
+        assert_eq!(next.get("id").and_then(Value::as_u64), Some(1));
+    }
+
+    #[test]
+    fn bounds_mcp_stderr_retention() {
+        let mut output = String::new();
+        append_bounded_text(
+            &mut output,
+            &"x".repeat(MCP_STDERR_LIMIT * 2),
+            MCP_STDERR_LIMIT,
+        );
+        append_bounded_text(&mut output, "later diagnostic", MCP_STDERR_LIMIT);
+        assert!(output.len() <= MCP_STDERR_LIMIT);
+    }
+
+    #[test]
+    fn server_key_is_stable_across_environment_order() {
+        let mut first_env = HashMap::new();
+        first_env.insert("TOKEN".to_string(), "secret".to_string());
+        first_env.insert("MODE".to_string(), "test".to_string());
+        let mut second_env = HashMap::new();
+        second_env.insert("MODE".to_string(), "test".to_string());
+        second_env.insert("TOKEN".to_string(), "secret".to_string());
+        let first = McpServerConfig {
+            command: "server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: first_env,
+        };
+        let second = McpServerConfig {
+            command: "server".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: second_env,
+        };
+
+        assert_eq!(mcp_server_key(&first), mcp_server_key(&second));
     }
 }

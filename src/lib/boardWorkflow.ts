@@ -28,6 +28,33 @@ export function withCompletionMetadata(card: CardProjection, columnIntent: Colum
   return { ...card, completedAt: null, syncMissingAt: null };
 }
 
+export function recoverInterruptedAgentRuns(
+  workspace: WorkspaceProjection,
+  interruptedCardIds: string[],
+): WorkspaceProjection {
+  if (interruptedCardIds.length === 0) return workspace;
+  const interrupted = new Set(interruptedCardIds);
+  const reason = "Agent execution was interrupted when Spacesly closed. Review the task, then retry when ready.";
+
+  return {
+    ...workspace,
+    projects: workspace.projects.map((project) => ({
+      ...project,
+      boards: project.boards.map((board) => ({
+        ...board,
+        columns: board.columns.map((column) => ({
+          ...column,
+          cards: column.cards.map((card) =>
+            interrupted.has(card.id) && card.execution === "running"
+              ? { ...card, execution: { blocked: { reason } } }
+              : card,
+          ),
+        })),
+      })),
+    })),
+  };
+}
+
 export function mergeSyncedWorkspace(
   projection: WorkspaceProjection,
   currentColumns: BoardProjection["columns"] | undefined,

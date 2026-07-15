@@ -19,7 +19,8 @@ use infrastructure::git::{
     invalidate_workspace_git_status, CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo,
 };
 use infrastructure::mcp::{
-    JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
+    close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
+    McpConnectionStatus, McpServerConfig,
 };
 use infrastructure::pty::{
     close_all_terminals, close_pty_terminal as close_pty_terminal_impl,
@@ -558,6 +559,7 @@ pub fn run() {
         .on_window_event(move |_window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 close_all_terminals(&shutdown_state);
+                close_all_mcp_sessions();
             }
         })
         .run(tauri::generate_context!())

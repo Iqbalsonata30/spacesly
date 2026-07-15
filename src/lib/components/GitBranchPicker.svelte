@@ -66,7 +66,7 @@
       </span>
       <span class="branch-button-copy">
         <small>{switching ? "Switching branch" : "Current branch"}</small>
-        <strong>{gitInfo.current_branch ?? "detached"}</strong>
+        <strong title={gitInfo.current_branch ?? "detached"}>{gitInfo.current_branch ?? "detached"}</strong>
       </span>
       <span class="branch-button-indicator">
         <ChevronDown size={14} class="open" />
@@ -111,16 +111,18 @@
   .branch-selector {
     position: relative;
     display: grid;
+    width: 100%;
     min-width: 0;
   }
 
   .branch-button {
-    display: flex;
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) 26px;
     align-items: center;
-    justify-content: space-between;
     gap: 10px;
     width: 100%;
     min-width: 0;
+    box-sizing: border-box;
     min-height: 46px;
     padding: 0 12px 0 10px;
     border: 1px solid var(--border-light);
@@ -159,7 +161,9 @@
 
   .branch-button-copy {
     display: grid;
+    width: 100%;
     min-width: 0;
+    overflow: hidden;
     gap: 1px;
     text-align: left;
   }
@@ -169,7 +173,10 @@
     font-size: 9px;
     font-weight: 900;
     letter-spacing: 0.12em;
+    overflow: hidden;
+    text-overflow: ellipsis;
     text-transform: uppercase;
+    white-space: nowrap;
   }
 
   .branch-button-copy strong {
@@ -223,7 +230,10 @@
     left: 0;
     z-index: 16;
     display: grid;
-    width: min(100%, 360px);
+    width: 100%;
+    min-width: 0;
+    max-width: 360px;
+    box-sizing: border-box;
     max-height: min(520px, calc(100vh - 220px));
     overflow: hidden;
     border: 1px solid var(--border-light);
@@ -240,6 +250,11 @@
     border-bottom: 1px solid var(--border);
     padding: 12px 14px;
     background: linear-gradient(180deg, var(--bg-titlebar), var(--bg-card));
+  }
+
+  .branch-picker header > div {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .branch-picker header p,
@@ -264,6 +279,7 @@
   }
 
   .branch-picker header button {
+    flex: 0 0 auto;
     width: 32px;
     height: 32px;
     padding: 0;
@@ -273,6 +289,9 @@
   }
 
   .branch-picker input {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     height: 42px;
     border: 0;
     border-bottom: 1px solid var(--border);
@@ -308,7 +327,9 @@
   .branch-picker-list button {
     display: grid;
     gap: 3px;
+    width: 100%;
     min-width: 0;
+    box-sizing: border-box;
     border-color: transparent;
     padding: 9px 10px;
     background: transparent;
@@ -323,6 +344,8 @@
   }
 
   .branch-picker-list strong {
+    display: block;
+    min-width: 0;
     overflow: hidden;
     color: var(--text-bright);
     font-size: 13px;

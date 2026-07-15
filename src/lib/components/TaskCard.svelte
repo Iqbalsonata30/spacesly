@@ -18,6 +18,7 @@
     onSelect,
     onQueue,
     onStartAgent,
+    onMarkDone,
     onDelete,
     onDragStart,
     onDragEnd,
@@ -36,6 +37,7 @@
     onSelect: () => void;
     onQueue: () => void;
     onStartAgent: () => void;
+    onMarkDone: () => void;
     onDelete: () => void;
     onDragStart: (event: DragEvent) => void;
     onDragEnd: () => void;
@@ -70,6 +72,11 @@
   function deleteCard(event: MouseEvent | KeyboardEvent): void {
     event.stopPropagation();
     onDelete();
+  }
+
+  function markDone(event: MouseEvent | KeyboardEvent): void {
+    event.stopPropagation();
+    if (isBlocked) onMarkDone();
   }
 </script>
 
@@ -138,6 +145,20 @@
           }
         }}
       >{actionLabel}</span>
+      {#if isBlocked}
+        <span
+          class="manual-done"
+          role="button"
+          tabindex="0"
+          onclick={markDone}
+          onkeydown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              markDone(event);
+            }
+          }}
+        >Mark Done</span>
+      {/if}
       {#if showDelete}
         <span
           class="delete"
@@ -331,6 +352,13 @@
   .actions .start[aria-disabled="true"] {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+
+  .actions .manual-done {
+    border-color: rgba(123, 198, 123, 0.42);
+    background: rgba(45, 83, 52, 0.28);
+    color: #a9dca9;
+    cursor: pointer;
   }
 
   .actions .delete {

@@ -5,15 +5,40 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 const AGENT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const CHAT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
+const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+const DIAGNOSTIC_OUTPUT_LIMIT: usize = 512 * 1024;
+const MAX_CONCURRENT_CHAT_RUNS: usize = 2;
+static ACTIVE_CHAT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+struct ChatRunGuard;
+
+impl Drop for ChatRunGuard {
+    fn drop(&mut self) {
+        ACTIVE_CHAT_RUNS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_chat_run() -> Result<ChatRunGuard, String> {
+    let active = ACTIVE_CHAT_RUNS.fetch_add(1, Ordering::AcqRel);
+    if active >= MAX_CONCURRENT_CHAT_RUNS {
+        ACTIVE_CHAT_RUNS.fetch_sub(1, Ordering::AcqRel);
+        return Err(format!(
+            "Spacesly is already processing {MAX_CONCURRENT_CHAT_RUNS} chat requests. Wait for one to finish before trying again."
+        ));
+    }
+    Ok(ChatRunGuard)
+}
 const MAX_CONCURRENT_AGENT_RUNS: usize = 4;
 
 #[derive(Default)]
@@ -323,6 +348,7 @@ pub fn chat_ai_worker(
     if message.is_empty() {
         return Err("Chat message is required.".to_string());
     }
+    let _chat_run = acquire_chat_run()?;
 
     if config.runtime == "opencode" {
         validate_opencode_config(&config)?;
@@ -333,7 +359,8 @@ pub fn chat_ai_worker(
             request.terminal_context.as_deref().unwrap_or("none"),
             message,
         );
-        let output = opencode_command(&config)
+        let mut command = opencode_command(&config);
+        command
             .args([
                 "run",
                 "--model",
@@ -343,9 +370,9 @@ pub fn chat_ai_worker(
             ])
             .arg("--title")
             .arg("Spacesly chat")
-            .arg(prompt)
-            .output()
-            .map_err(|error| format!("Failed to run OpenCode chat: {error}"))?;
+            .arg(prompt);
+        let output =
+            run_bounded_command(command, CHAT_TIMEOUT, CHAT_OUTPUT_LIMIT, "OpenCode chat")?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -440,10 +467,14 @@ fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
 
 fn test_opencode_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> {
     validate_opencode_config(&config)?;
-    let output = opencode_command(&config)
-        .args(["auth", "list"])
-        .output()
-        .map_err(|error| format!("Failed to run OpenCode command: {error}"))?;
+    let mut command = opencode_command(&config);
+    command.args(["auth", "list"]);
+    let output = run_bounded_command(
+        command,
+        DIAGNOSTIC_TIMEOUT,
+        DIAGNOSTIC_OUTPUT_LIMIT,
+        "OpenCode auth check",
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -519,8 +550,33 @@ fn execute_opencode_task(
 }
 
 fn run_cancellable_command(
-    mut command: Command,
+    command: Command,
     cancellation: Arc<AtomicBool>,
+) -> Result<Output, String> {
+    run_monitored_command(
+        command,
+        Some(cancellation),
+        None,
+        AGENT_OUTPUT_LIMIT,
+        "Agent",
+    )
+}
+
+fn run_bounded_command(
+    command: Command,
+    timeout: Duration,
+    output_limit: usize,
+    label: &str,
+) -> Result<Output, String> {
+    run_monitored_command(command, None, Some(timeout), output_limit, label)
+}
+
+fn run_monitored_command(
+    mut command: Command,
+    cancellation: Option<Arc<AtomicBool>>,
+    timeout: Option<Duration>,
+    output_limit: usize,
+    label: &str,
 ) -> Result<Output, String> {
     #[cfg(unix)]
     command.process_group(0);
@@ -539,15 +595,28 @@ fn run_cancellable_command(
         .stderr
         .take()
         .ok_or_else(|| "Agent process stderr was not captured.".to_string())?;
-    let stdout_thread = thread::spawn(move || read_limited(&mut stdout));
-    let stderr_thread = thread::spawn(move || read_limited(&mut stderr));
+    let stdout_thread = thread::spawn(move || read_limited_with_limit(&mut stdout, output_limit));
+    let stderr_thread = thread::spawn(move || read_limited_with_limit(&mut stderr, output_limit));
+    let started_at = Instant::now();
 
     loop {
-        if cancellation.load(Ordering::Acquire) {
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::Acquire))
+        {
             terminate_agent_process(&mut child);
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
-            return Err("Agent run was cancelled.".to_string());
+            return Err(format!("{label} was cancelled."));
+        }
+        if timeout.is_some_and(|limit| started_at.elapsed() >= limit) {
+            terminate_agent_process(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(format!(
+                "{label} timed out after {} seconds.",
+                timeout.unwrap().as_secs()
+            ));
         }
 
         match child.try_wait() {
@@ -563,6 +632,8 @@ fn run_cancellable_command(
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(error) => {
                 terminate_agent_process(&mut child);
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 return Err(format!("Failed to monitor Agent process: {error}"));
             }
         }
@@ -581,7 +652,7 @@ fn terminate_agent_process(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn read_limited(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+fn read_limited_with_limit(reader: &mut impl Read, output_limit: usize) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut buffer = [0u8; 8192];
     let mut truncated = false;
@@ -592,7 +663,7 @@ fn read_limited(reader: &mut impl Read) -> Result<Vec<u8>, String> {
         if size == 0 {
             break;
         }
-        let remaining = AGENT_OUTPUT_LIMIT.saturating_sub(output.len());
+        let remaining = output_limit.saturating_sub(output.len());
         if remaining > 0 {
             output.extend_from_slice(&buffer[..size.min(remaining)]);
         }
@@ -1546,5 +1617,35 @@ mod tests {
 
         assert!(result.unwrap_err().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_terminates_after_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+
+        let error = run_bounded_command(command, Duration::from_millis(150), 1_024, "test command")
+            .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_truncates_output() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 200 ]; do printf x; i=$((i + 1)); done",
+        ]);
+
+        let output = run_bounded_command(command, Duration::from_secs(2), 64, "test command")
+            .expect("command should complete");
+
+        assert!(output.stdout.len() < 100);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("output truncated"));
     }
 }

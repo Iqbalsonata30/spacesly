@@ -24,7 +24,7 @@ impl WorkspaceRoot {
         let path = home_dir()?
             .canonicalize()
             .map_err(|error| format!("Failed to canonicalize home directory: {error}"))?;
-        Ok(Self {
+        Ok(Self{
             path: Arc::new(Mutex::new(path)),
         })
     }
@@ -43,6 +43,7 @@ impl WorkspaceRoot {
         if !resolved.is_dir() {
             return Err("Selected path is not a directory.".to_string());
         }
+
         *self.path.lock().map_err(|error| error.to_string())? = resolved;
         Ok(())
     }
@@ -52,12 +53,15 @@ pub fn workspace_root_path(root: &WorkspaceRoot, _workspace_id: String) -> Resul
     Ok(root.path()?.to_string_lossy().to_string())
 }
 
-pub fn set_workspace_root(root: &WorkspaceRoot, absolute_path: String) -> Result<String, String> {
+pub fn set_workspace_root(
+    root: &WorkspaceRoot,
+    absolute_path: String,
+) -> Result<String, String> {
     let path = PathBuf::from(absolute_path);
     if !path.is_absolute() {
         return Err("Workspace root must be an absolute path.".to_string());
     }
-    root.set_path(path)?;
+    root.set_path( path)?;
     workspace_root_path(root, "workspace-personal".to_string())
 }
 

@@ -221,7 +221,7 @@
       <h2>{workspaceGitLoading && !workspaceGitInfo ? "Loading repository" : !hasRepo ? "No Git repository" : repoClean ? "Working tree clean" : "Review and commit changes"}</h2>
       <div class="source-header-meta">
         {#each headerMeta as meta}
-          <span>{meta}</span>
+          <span title={meta}>{meta}</span>
         {/each}
       </div>
     </div>
@@ -234,7 +234,7 @@
           <span class="branch-menu-button-icon"><GitMerge size={14} /></span>
           <span class="branch-menu-button-copy">
             <small>Target branch</small>
-            <strong>{mergeBranch || branchChoices[0] || "Choose branch"}</strong>
+            <strong title={mergeBranch || branchChoices[0] || "Choose branch"}>{mergeBranch || branchChoices[0] || "Choose branch"}</strong>
           </span>
           <span class="branch-menu-button-indicator"><ChevronDown size={14} /></span>
         </button>
@@ -398,8 +398,12 @@
     position: relative;
     display: flex;
     flex-direction: column;
+    width: 100%;
+    min-width: 0;
     min-height: 0;
+    box-sizing: border-box;
     overflow: hidden;
+    container-type: inline-size;
     border: 1px solid #272530;
     border-radius: 14px;
     background: linear-gradient(180deg, #121118, #101017);
@@ -407,7 +411,7 @@
 
   .source-header {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(200px, 260px);
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     align-items: start;
     border-bottom: 1px solid #25232d;
@@ -415,7 +419,7 @@
     background: linear-gradient(180deg, #1c1b21, #17161c);
   }
 
-  .source-header-copy { min-width: 0; }
+  .source-header-copy { min-width: 0; overflow: hidden; }
   .source-header-copy p,
   .source-header-copy h2 { margin: 0; }
   .source-header-copy p,
@@ -428,13 +432,17 @@
   }
   .source-header-copy h2 {
     margin-top: 6px;
+    overflow: hidden;
     color: #f1edf5;
     font-size: 13px;
     font-weight: 900;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .source-header-meta {
     display: flex;
     flex-wrap: wrap;
+    min-width: 0;
     gap: 8px;
     margin-top: 10px;
   }
@@ -447,21 +455,27 @@
     font-weight: 800;
   }
   .source-header-meta span {
+    display: block;
+    max-width: 100%;
     min-height: 24px;
+    box-sizing: border-box;
+    overflow: hidden;
     padding: 0 9px;
     border: 1px solid #2f2d37;
     border-radius: 999px;
     background: rgba(31, 30, 39, 0.8);
+    line-height: 22px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .source-header-controls {
     display: grid;
-    justify-self: end;
+    justify-self: stretch;
     width: 100%;
-    max-width: 260px;
     gap: 12px;
     min-width: 0;
   }
-  .branch-menu-wrap { position: relative; }
+  .branch-menu-wrap { position: relative; width: 100%; min-width: 0; }
   .branch-menu-button,
   .source-toolbar button,
   .commit-button,
@@ -478,21 +492,27 @@
     gap: 9px;
     align-items: center;
     width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     padding: 9px;
     border-radius: 12px;
     text-align: left;
   }
-  .branch-menu-button-copy { display: grid; min-width: 0; gap: 3px; }
+  .branch-menu-button-copy { display: grid; width: 100%; min-width: 0; overflow: hidden; gap: 3px; }
+  .branch-menu-button-copy small,
+  .branch-menu-button-copy strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .branch-menu-button-copy small { color: #8f88a8; font-size: 10px; font-weight: 900; text-transform: uppercase; }
-  .branch-menu-button-copy strong { overflow: hidden; color: #f1edf5; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+  .branch-menu-button-copy strong { color: #f1edf5; font-size: 12px; }
   .branch-menu-button-icon,
-  .branch-menu-button-indicator { display: inline-flex; color: #9d8cff; }
+  .branch-menu-button-indicator { display: inline-flex; flex: 0 0 auto; color: #9d8cff; }
   .branch-menu {
     position: absolute;
     z-index: 20;
     right: 0;
     top: calc(100% + 8px);
-    width: min(280px, 76vw);
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     border: 1px solid #34313e;
     border-radius: 14px;
     padding: 12px;
@@ -502,10 +522,11 @@
   .branch-menu-copy p,
   .branch-menu-copy strong,
   .branch-menu-copy span { display: block; margin: 0; }
+  .branch-menu-copy { min-width: 0; overflow: hidden; }
   .branch-menu-copy p { color: #8f88a8; font-size: 10px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; }
-  .branch-menu-copy strong { margin-top: 5px; color: #f1edf5; font-size: 13px; }
-  .branch-menu-copy span { margin-top: 4px; color: #8f88a8; font-size: 11px; }
-  .branch-menu label { display: grid; gap: 6px; margin-top: 12px; color: #8f88a8; font-size: 11px; font-weight: 900; text-transform: uppercase; }
+  .branch-menu-copy strong { margin-top: 5px; overflow: hidden; color: #f1edf5; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+  .branch-menu-copy span { margin-top: 4px; color: #8f88a8; font-size: 11px; overflow-wrap: anywhere; }
+  .branch-menu label { display: grid; min-width: 0; gap: 6px; margin-top: 12px; color: #8f88a8; font-size: 11px; font-weight: 900; text-transform: uppercase; }
   .branch-menu select,
   .commit-box textarea {
     border: 1px solid #2f2d37;
@@ -513,8 +534,8 @@
     background: #111018;
     color: #f1edf5;
   }
-  .branch-menu select { padding: 9px 10px; }
-  .branch-menu-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+  .branch-menu select { width: 100%; min-width: 0; box-sizing: border-box; padding: 9px 10px; text-overflow: ellipsis; }
+  .branch-menu-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 0; gap: 8px; margin-top: 12px; }
   .branch-menu-actions button,
   .source-toolbar button,
   .commit-button {
@@ -523,6 +544,8 @@
     justify-content: center;
     gap: 7px;
     min-height: 34px;
+    min-width: 0;
+    box-sizing: border-box;
     border-radius: 10px;
     padding: 0 10px;
     font-size: 12px;
@@ -542,12 +565,17 @@
   .commit-validation { padding: 8px 10px; }
   .source-body {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
+    min-width: 0;
     min-height: 0;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
     padding: 12px;
   }
   .source-card {
+    min-width: 0;
+    box-sizing: border-box;
     overflow: hidden;
     border: 1px solid #272530;
     border-radius: 14px;
@@ -561,11 +589,15 @@
     padding: 12px;
     border-bottom: 1px solid #24222d;
   }
-  .card-label-row h3 { margin: 4px 0 0; color: #f1edf5; font-size: 13px; font-weight: 900; }
+  .card-label-row > div { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+  .card-label-row h3 { margin: 4px 0 0; overflow: hidden; color: #f1edf5; font-size: 13px; font-weight: 900; text-overflow: ellipsis; white-space: nowrap; }
+  .card-label-row > small,
+  .card-label-row > strong { flex: 0 0 auto; min-width: max-content; }
   .card-label-row strong { color: #c7b8ff; font-size: 12px; }
   .source-toolbar {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 128px), 1fr));
+    min-width: 0;
     gap: 8px;
     padding: 12px;
   }
@@ -574,6 +606,7 @@
   .commit-box textarea {
     width: 100%;
     box-sizing: border-box;
+    max-width: 100%;
     resize: vertical;
     min-height: 92px;
     padding: 11px 12px;
@@ -612,6 +645,10 @@
     text-align: center;
   }
   .empty-state strong { font-size: 13px; }
+  .empty-state span,
+  .git-error,
+  .commit-validation,
+  .commit-helper { overflow-wrap: anywhere; }
   .empty-state.clean .empty-icon { color: #7bc67b; border-color: rgba(123, 198, 123, 0.35); }
   .empty-icon {
     display: inline-flex;
@@ -647,4 +684,15 @@
   }
   .context-menu button:last-child { border-bottom: 0; }
   .context-menu button:not(:disabled):hover { background: #242331; }
+
+  @container (min-width: 390px) {
+    .source-header {
+      grid-template-columns: minmax(0, 1fr) minmax(180px, 220px);
+    }
+
+    .source-header-controls {
+      justify-self: end;
+      max-width: 220px;
+    }
+  }
 </style>

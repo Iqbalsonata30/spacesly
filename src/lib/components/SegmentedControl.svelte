@@ -69,7 +69,8 @@
     display: grid;
     grid-template-columns: repeat(var(--segment-count), minmax(0, 1fr));
     gap: 0;
-    width: 97%;
+    width: 100%;
+    box-sizing: border-box;
     min-height: 48px;
     padding: 5px;
     border: 1px solid var(--border);
@@ -103,6 +104,7 @@
     justify-content: center;
     gap: 8px;
     min-height: 38px;
+    min-width: 0;
     border: 0;
     border-radius: 11px;
     background: transparent;
@@ -134,6 +136,9 @@
   }
 
   .segmented-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
@@ -141,6 +146,7 @@
     display: inline-grid;
     place-items: center;
     min-width: 24px;
+    flex: 0 0 auto;
     height: 20px;
     padding: 0 7px;
     border-radius: 999px;
