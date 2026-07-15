@@ -12,7 +12,6 @@ import {
   unstageAllWorkspaceGitFiles,
   unstageWorkspaceGitFile,
   type CommitResult,
-  type GitChangedFile,
   type GitStatus,
   type GitWorkspaceInfo,
 } from "$lib/ipc/git";

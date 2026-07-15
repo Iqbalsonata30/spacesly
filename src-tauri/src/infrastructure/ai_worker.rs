@@ -784,7 +784,7 @@ fn extract_json_object(response: &str) -> Option<&str> {
 
     trimmed
         .find('{')
-        .and_then(|start| trimmed.rfind('}').map(|end| (start, end)))
+        .zip(trimmed.rfind('}'))
         .filter(|(start, end)| start < end)
         .map(|(start, end)| &trimmed[start..=end])
 }
@@ -1067,10 +1067,7 @@ fn labelled_values(response: &str, label: &str) -> Vec<String> {
 }
 
 fn clean_labelled_line(value: &str) -> String {
-    value
-        .trim_start_matches(|ch| ch == '-' || ch == '*')
-        .trim()
-        .to_string()
+    value.trim_start_matches(['-', '*']).trim().to_string()
 }
 
 fn opencode_command(config: &AiWorkerConfig) -> Command {

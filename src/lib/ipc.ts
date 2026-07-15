@@ -1,7 +1,6 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { FileEntry } from "$lib/ipc/files";
-import type { GitWorkspaceInfo } from "$lib/ipc/git";
 export type {
   AiWorkerChatResult,
   AiWorkerChatRequest,

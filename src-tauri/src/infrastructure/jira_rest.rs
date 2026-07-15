@@ -52,6 +52,7 @@ pub fn fetch_boards(
 }
 
 /// Fetches issues from a Jira agile board directly from Jira REST.
+#[allow(dead_code)]
 pub fn fetch_board_issues(
     auth: &JiraAuthConfig,
     board_id: &str,

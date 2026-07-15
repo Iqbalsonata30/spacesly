@@ -7,10 +7,9 @@ export interface TooltipOptions {
 export function tooltip(node: HTMLElement, options: TooltipOptions) {
   const opts = options;
   let element: HTMLDivElement | null = null;
-  const timer: ReturnType<typeof setTimeout> | null = null;
 
-  function show() {
-    if (element || !opts.text) return;
+  function attach() {
+    if (element) return;
     element = document.createElement("div");
     element.className = "spacesly-tooltip";
 
@@ -28,4 +27,15 @@ export function tooltip(node: HTMLElement, options: TooltipOptions) {
 
     document.body.appendChild(element);
   }
+
+  node.addEventListener("mouseenter", attach);
+  node.addEventListener("focus", attach);
+
+  return {
+    destroy() {
+      if (element) {
+        element.remove();
+      }
+    },
+  };
 }

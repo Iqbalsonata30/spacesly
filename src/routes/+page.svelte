@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
@@ -601,10 +602,10 @@
   );
   let boardIndex = $derived.by((): BoardIndex => {
     const cards: CardProjection[] = [];
-    const cardById = new Map<string, CardProjection>();
-    const columnById = new Map<string, BoardProjection["columns"][number]>();
-    const columnByIntent = new Map<ColumnIntent, BoardProjection["columns"][number]>();
-    const cardColumnIntentById = new Map<string, ColumnIntent>();
+    const cardById = new SvelteMap<string, CardProjection>();
+    const columnById = new SvelteMap<string, BoardProjection["columns"][number]>();
+    const columnByIntent = new SvelteMap<ColumnIntent, BoardProjection["columns"][number]>();
+    const cardColumnIntentById = new SvelteMap<string, ColumnIntent>();
 
     for (const column of activeBoard?.columns ?? []) {
       columnById.set(column.id, column);
@@ -1294,9 +1295,10 @@
       if (revision !== fileTreeRevision) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      if (revision !== fileTreeRevision) return;
-      const { [entry.path]: _finished, ...remaining } = expandingFilePaths;
-      expandingFilePaths = remaining;
+      if (revision === fileTreeRevision) {
+        const { [entry.path]: _finished, ...remaining } = expandingFilePaths;
+        expandingFilePaths = remaining;
+      }
     }
   }
 
@@ -5010,7 +5012,7 @@
                   <details class="tool-list">
                     <summary>Available MCP tools ({selectedMcpTools.length})</summary>
                     <div>
-                      {#each selectedMcpTools as tool}
+                      {#each selectedMcpTools as tool (tool)}
                         <code>{tool}</code>
                       {/each}
                     </div>
@@ -5212,7 +5214,7 @@
             </div>
             <h3>{selectedCard.title}</h3>
             <p>
-              {#each descriptionParts(selectedCard.description) as part}
+              {#each descriptionParts(selectedCard.description) as part (part.url || part.text)}
                 {#if part.url}
                   <a href={part.url} target="_blank" rel="noreferrer">{part.text}</a>
                 {:else}

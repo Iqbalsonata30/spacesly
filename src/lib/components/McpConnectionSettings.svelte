@@ -96,7 +96,7 @@
   <label>
     <span>Arguments</span>
     <textarea
-      placeholder='["--transport", "stdio"]'
+      placeholder={JSON.stringify(["--transport", "stdio"])}
       oninput={(event) => updateArgs(event.currentTarget.value)}
       value={JSON.stringify(server.args)}></textarea>
   </label>
@@ -197,7 +197,7 @@
         <span>Environment</span>
         <textarea
           class="env-config"
-          placeholder={"API_URL=https://service.company.id\nAPI_TOKEN=..."}
+          placeholder="API_URL=https://service.company.id&#10;API_TOKEN=..."
           oninput={(event) => updateEnv(event.currentTarget.value)}
           value={Object.entries(server.env)
             .map(([key, value]) => `${key}=${value}`)

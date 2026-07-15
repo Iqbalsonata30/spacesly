@@ -178,9 +178,9 @@ pub fn pty_current_directory(
 
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_link(format!("/proc/{pid}/cwd"))
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
             .map(|path| Some(path.to_string_lossy().to_string()))
-            .map_err(|error| format!("Failed to read terminal cwd: {error}"));
+            .map_err(|error| format!("Failed to read terminal cwd: {error}"))
     }
 
     #[cfg(not(target_os = "linux"))]

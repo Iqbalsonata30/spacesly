@@ -1,7 +1,6 @@
 <script lang="ts">
   import TaskCard from "$lib/components/TaskCard.svelte";
   import type { BoardProjection, CardProjection } from "$lib/ipc";
-  import { columnTitle } from "$lib/workspaceChat";
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;

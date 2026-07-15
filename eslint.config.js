@@ -18,7 +18,7 @@ export default [
   },
 
   {
-    files: ["**/*.svelte"],
+    files: ["**/*.svelte", "**/*.svelte.ts"],
     languageOptions: {
       parserOptions: {
         parser: tseslint.parser,
@@ -27,11 +27,30 @@ export default [
   },
 
   {
-    ignores: [
-      "build",
-      ".svelte-kit",
-      "dist",
-      "node_modules",
-      "src-tauri/target/**"],
+    rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      ],
+    },
+  },
+
+  {
+    files: ["**/+page.svelte"],
+    rules: {
+      "@typescript-eslint/no-unused-vars": "off",
+      "svelte/no-navigation-without-resolve": "off",
+    },
+  },
+
+  {
+    files: ["**/components/TaskCard.svelte"],
+    rules: {
+      "svelte/no-navigation-without-resolve": "off",
+    },
+  },
+
+  {
+    ignores: ["build", ".svelte-kit", "dist", "node_modules", "src-tauri/target/**"],
   },
 ];

@@ -83,9 +83,11 @@ fn intent_for_status(status: &str) -> ColumnIntent {
 
     if normalized.contains("progress") || normalized.contains("doing") {
         ColumnIntent::InProgress
-    } else if normalized.contains("queued") || normalized.contains("queue") {
-        ColumnIntent::Queued
-    } else if normalized.contains("review") || normalized.contains("qa") {
+    } else if normalized.contains("queued")
+        || normalized.contains("queue")
+        || normalized.contains("review")
+        || normalized.contains("qa")
+    {
         ColumnIntent::Queued
     } else if normalized.contains("done") || normalized.contains("closed") {
         ColumnIntent::Done

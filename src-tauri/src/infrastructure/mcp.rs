@@ -622,10 +622,7 @@ fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, Stri
             .trim()
             .parse::<usize>()
             .map_err(|error| format!("Invalid MCP content length: {error}"))?;
-        loop {
-            let Some(header) = read_bounded_line(reader, MCP_HEADER_LINE_LIMIT)? else {
-                break;
-            };
+        while let Some(header) = read_bounded_line(reader, MCP_HEADER_LINE_LIMIT)? {
             if header.trim_end_matches(['\r', '\n']).is_empty() {
                 break;
             }

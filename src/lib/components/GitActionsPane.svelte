@@ -265,7 +265,7 @@
               : "Review and commit changes"}
       </h2>
       <div class="source-header-meta">
-        {#each headerMeta as meta}
+        {#each headerMeta as meta, i (i)}
           <span title={meta}>{meta}</span>
         {/each}
       </div>
@@ -325,7 +325,7 @@
                 {#if branchChoices.length === 0}
                   <option value="">No other branches</option>
                 {:else}
-                  {#each branchChoices as branch}
+                  {#each branchChoices as branch (branch)}
                     <option value={branch}>{branch}</option>
                   {/each}
                 {/if}

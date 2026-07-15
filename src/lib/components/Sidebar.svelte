@@ -131,7 +131,7 @@
 <aside class="sidebar" style="width: {sidebarWidth}px">
   <div class="sidebar-inner">
     <div class="workspace-list">
-      {#each groups as group}
+      {#each groups as group (group.key)}
         <div class="group">
           <button class="group-header" onclick={() => toggleGroup(group.key)}>
             <span class="group-chevron" class:expanded={!collapsed.has(group.key)}>

@@ -56,7 +56,7 @@
     onOpenEntry,
     onToggleFolder,
     onFilterChange,
-    onClearFilter,
+    _onClearFilter,
     onCollapseAll,
     onToggleSidebar,
   }: Props = $props();
@@ -64,12 +64,6 @@
   let visibleRows = $derived(flattenFileBrowserRows(fileEntries, expandedFolders, fileFilter));
   let changedByPath = $derived(new Map(changedFiles.map((file) => [file.path, file.status])));
   let currentPath = $derived(fileDirectory ? `${fileRootLabel}/${fileDirectory}` : fileRootLabel);
-
-  function formatBytes(bytes: number): string {
-    if (bytes < 1_024) return `${bytes} B`;
-    if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
-    return `${(bytes / 1_048_576).toFixed(1)} MB`;
-  }
 
   function statusTone(status?: string): "neutral" | "modified" | "added" | "deleted" {
     if (status === "M") return "modified";
@@ -117,7 +111,7 @@
       <nav class="file-breadcrumb" aria-label="Current folder" title={currentPath}>
         <span class="crumb root">{truncateMiddle(fileRootLabel)}</span>
         {#if fileDirectory}
-          {#each fileDirectory.split("/").filter(Boolean) as segment}
+          {#each fileDirectory.split("/").filter(Boolean) as segment, i (i)}
             <span class="crumb-separator">/</span>
             <span class="crumb">{truncateMiddle(segment)}</span>
           {/each}

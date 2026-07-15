@@ -152,7 +152,7 @@
     <section class="agent-output-panel next">
       <p>{view.status === "blocked" ? "What needs attention" : "Next"}</p>
       <ul>
-        {#each view.nextSteps as line}
+        {#each view.nextSteps as line, i (i)}
           <li>{line}</li>
         {/each}
       </ul>
@@ -163,7 +163,7 @@
     <section class="agent-output-panel evidence">
       <p>Evidence</p>
       <ul>
-        {#each view.evidence as line}
+        {#each view.evidence as line, i (i)}
           <li>{line}</li>
         {/each}
       </ul>
@@ -174,7 +174,7 @@
     <section class="agent-output-panel changes">
       <p>What happened</p>
       <ul>
-        {#each view.changes as line}
+        {#each view.changes as line, i (i)}
           <li>{line}</li>
         {/each}
       </ul>

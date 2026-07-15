@@ -38,6 +38,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run format:check
       - run: cargo fmt --check
+        working-directory: src-tauri
 
   lint-ts:
     runs-on: ubuntu-latest
@@ -62,7 +63,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy
+          workspaces: src-tauri
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
 
   test-rust:
     runs-on: ubuntu-latest
@@ -71,13 +74,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
+          workspaces: src-tauri
       - run: cargo test
+        working-directory: src-tauri
 
   audit-rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/rustsec-audit-check@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+        working-directory: src-tauri
 
   audit-js:
     runs-on: ubuntu-latest

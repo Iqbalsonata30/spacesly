@@ -105,7 +105,7 @@
           </div>
         {/if}
         <div class="branch-picker-list">
-          {#each branches as branch}
+          {#each branches as branch (branch)}
             <button
               class:active={branch === gitInfo.current_branch}
               type="button"

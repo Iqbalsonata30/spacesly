@@ -30,7 +30,7 @@
   function handleKeydown(event: KeyboardEvent, index: number) {
     if (items.length === 0) return;
 
-    let nextIndex = index;
+    let nextIndex;
     if (event.key === "ArrowLeft") {
       nextIndex = (index - 1 + items.length) % items.length;
     } else if (event.key === "ArrowRight") {
