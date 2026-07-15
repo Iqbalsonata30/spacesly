@@ -1,9 +1,139 @@
 use super::shell_env::inject_shell_env;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const AGENT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_AGENT_RUNS: usize = 4;
+
+#[derive(Default)]
+struct AgentRunRegistryState {
+    runs: HashMap<String, AgentRunEntry>,
+    scopes: HashMap<String, String>,
+}
+
+struct AgentRunEntry {
+    cancellation: Arc<AtomicBool>,
+    scope: Option<String>,
+    started: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct AgentRunRegistry {
+    state: Arc<Mutex<AgentRunRegistryState>>,
+}
+
+impl AgentRunRegistry {
+    pub fn reserve(&self, run_id: &str, config: &AiWorkerConfig) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.runs.contains_key(run_id) {
+            return Err("Agent run is already active.".to_string());
+        }
+        if state.runs.len() >= MAX_CONCURRENT_AGENT_RUNS {
+            return Err(format!(
+                "Spacesly is already running {MAX_CONCURRENT_AGENT_RUNS} Agent tasks. Wait for one to finish before starting another."
+            ));
+        }
+        let scope = agent_execution_scope(config)?;
+        if let Some(scope) = scope.as_ref() {
+            if let Some(active_run_id) = state.scopes.get(scope) {
+                return Err(format!(
+                    "Another Agent run ({active_run_id}) is already using this workspace. Wait for it to finish before starting another task."
+                ));
+            }
+            state.scopes.insert(scope.clone(), run_id.to_string());
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        state.runs.insert(
+            run_id.to_string(),
+            AgentRunEntry {
+                cancellation,
+                scope,
+                started: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn start(&self, run_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let entry = state
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| "Agent run was not reserved.".to_string())?;
+        if entry.started {
+            return Err("Agent run has already started.".to_string());
+        }
+        entry.started = true;
+        Ok(entry.cancellation.clone())
+    }
+
+    pub fn cancel(&self, run_id: &str) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(entry) = state.runs.get(run_id) {
+            entry.cancellation.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn release_reservation(&self, run_id: &str) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(entry) = state.runs.get(run_id) else {
+            return Ok(false);
+        };
+        if entry.started {
+            return Err("Cannot release an Agent run after execution has started.".to_string());
+        }
+        remove_run(&mut state, run_id);
+        Ok(true)
+    }
+
+    pub fn finish(&self, run_id: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        remove_run(&mut state, run_id);
+        Ok(())
+    }
+}
+
+fn remove_run(state: &mut AgentRunRegistryState, run_id: &str) {
+    if let Some(entry) = state.runs.remove(run_id) {
+        if let Some(scope) = entry.scope {
+            if state
+                .scopes
+                .get(&scope)
+                .is_some_and(|owner| owner == run_id)
+            {
+                state.scopes.remove(&scope);
+            }
+        }
+    }
+}
+
+fn agent_execution_scope(config: &AiWorkerConfig) -> Result<Option<String>, String> {
+    if config.runtime != "opencode" {
+        return Ok(None);
+    }
+    let path = config
+        .opencode_workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?);
+    let normalized = path.canonicalize().unwrap_or(path);
+    Ok(Some(normalized.to_string_lossy().to_string()))
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiWorkerConfig {
@@ -155,9 +285,11 @@ pub fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> 
 pub fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<AiWorkerTaskResult, String> {
+    check_cancelled(&cancellation)?;
     if config.runtime == "opencode" {
-        return execute_opencode_task(config, task);
+        return execute_opencode_task(config, task, cancellation);
     }
 
     validate_config(&config)?;
@@ -177,7 +309,9 @@ pub fn execute_ai_worker_task(
         task.previous_output.as_deref().unwrap_or("none"),
     );
 
+    check_cancelled(&cancellation)?;
     let response = call_model(&config, &system_prompt, &user_prompt, 700)?;
+    check_cancelled(&cancellation)?;
     Ok(result_from_structured_response(response, Some(&task)))
 }
 
@@ -335,8 +469,10 @@ fn test_opencode_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String
 fn execute_opencode_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
+    check_cancelled(&cancellation)?;
     let start_head = git_head(&config);
     let prompt = format!(
         "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the task explicitly asks you to update env/config files or variables, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
@@ -360,12 +496,8 @@ fn execute_opencode_task(
     if config.opencode_auto_approve {
         command.arg("--auto");
     }
-    let output = command
-        .arg("--title")
-        .arg(&task.title)
-        .arg(prompt)
-        .output()
-        .map_err(|error| format!("Failed to run OpenCode Agent: {error}"))?;
+    command.arg("--title").arg(&task.title).arg(prompt);
+    let output = run_cancellable_command(command, cancellation)?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -384,6 +516,102 @@ fn execute_opencode_task(
     let mut result = result_from_response(response, Some(&task));
     enforce_opencode_completion_guards(&mut result, &config, &task, start_head.as_deref());
     Ok(result)
+}
+
+fn run_cancellable_command(
+    mut command: Command,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Output, String> {
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to run Agent process: {error}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Agent process stdout was not captured.".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Agent process stderr was not captured.".to_string())?;
+    let stdout_thread = thread::spawn(move || read_limited(&mut stdout));
+    let stderr_thread = thread::spawn(move || read_limited(&mut stderr));
+
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            terminate_agent_process(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err("Agent run was cancelled.".to_string());
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_thread.join().unwrap_or_else(|_| Ok(Vec::new()))?;
+                let stderr = stderr_thread.join().unwrap_or_else(|_| Ok(Vec::new()))?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                terminate_agent_process(&mut child);
+                return Err(format!("Failed to monitor Agent process: {error}"));
+            }
+        }
+    }
+}
+
+fn terminate_agent_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_limited(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let size = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to read Agent output: {error}"))?;
+        if size == 0 {
+            break;
+        }
+        let remaining = AGENT_OUTPUT_LIMIT.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..size.min(remaining)]);
+        }
+        if size > remaining {
+            truncated = true;
+        }
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[output truncated]");
+    }
+    Ok(output)
+}
+
+fn check_cancelled(cancellation: &Arc<AtomicBool>) -> Result<(), String> {
+    if cancellation.load(Ordering::Acquire) {
+        Err("Agent run was cancelled.".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWorkerTaskResult {
@@ -1241,5 +1469,82 @@ mod tests {
 
         assert!(!task_requires_env_update_commit(&task));
         assert!(!task_requires_push(&task));
+    }
+
+    #[test]
+    fn run_registry_cancels_only_the_requested_run() {
+        let registry = AgentRunRegistry::default();
+        let config = config_with_governance("", "");
+        registry
+            .reserve("run-1", &config)
+            .expect("run should reserve");
+        registry
+            .reserve("run-2", &config)
+            .expect("run should reserve");
+        let first = registry.start("run-1").expect("run should register");
+        let second = registry.start("run-2").expect("run should register");
+
+        assert!(registry.cancel("run-1").expect("cancel should succeed"));
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+        assert!(!registry.cancel("missing").expect("missing run is valid"));
+    }
+
+    #[test]
+    fn run_registry_serializes_opencode_runs_in_the_same_worktree() {
+        let registry = AgentRunRegistry::default();
+        let mut config = config_with_governance("", "");
+        config.runtime = "opencode".to_string();
+        config.opencode_workdir = Some(
+            std::env::current_dir()
+                .expect("current directory should resolve")
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        registry
+            .reserve("run-1", &config)
+            .expect("first run should reserve");
+        let error = registry.reserve("run-2", &config).unwrap_err();
+        assert!(error.contains("already using this workspace"));
+
+        registry.finish("run-1").expect("first run should finish");
+        registry
+            .reserve("run-2", &config)
+            .expect("worktree should be released");
+    }
+
+    #[test]
+    fn run_registry_enforces_global_admission_limit() {
+        let registry = AgentRunRegistry::default();
+        let config = config_with_governance("", "");
+        for index in 0..MAX_CONCURRENT_AGENT_RUNS {
+            registry
+                .reserve(&format!("run-{index}"), &config)
+                .expect("run should fit within admission limit");
+        }
+
+        let error = registry.reserve("run-over-limit", &config).unwrap_err();
+        assert!(error.contains("already running"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_command_terminates_a_running_process() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_request = cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            cancellation_request.store(true, Ordering::Release);
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+
+        let result = run_cancellable_command(command, cancellation);
+        cancel_thread.join().expect("cancel thread should finish");
+
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

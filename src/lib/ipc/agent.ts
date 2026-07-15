@@ -57,11 +57,24 @@ export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStat
 }
 
 export async function executeAiWorkerTask(
+  runId: string,
   config: AiWorkerConfig,
   task: AiWorkerTask,
 ): Promise<AiWorkerTaskResult> {
-  const result = await invokeWithPolicy<unknown>("execute_ai_worker_task", { config, task }, IPC_POLICIES.aiExecution);
+  const result = await invokeWithPolicy<unknown>("execute_ai_worker_task", { runId, config, task }, IPC_POLICIES.aiExecution);
   return validateAiWorkerTaskResult(result);
+}
+
+export async function reserveAiWorkerRun(runId: string, config: AiWorkerConfig): Promise<void> {
+  await invokeWithPolicy<void>("reserve_ai_worker_run", { runId, config }, IPC_POLICIES.pty);
+}
+
+export async function releaseAiWorkerRun(runId: string): Promise<boolean> {
+  return invokeWithPolicy<boolean>("release_ai_worker_run", { runId }, IPC_POLICIES.pty);
+}
+
+export async function cancelAiWorkerTask(runId: string): Promise<boolean> {
+  return invokeWithPolicy<boolean>("cancel_ai_worker_task", { runId }, IPC_POLICIES.pty);
 }
 
 export async function chatAiWorker(

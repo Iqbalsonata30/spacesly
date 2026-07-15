@@ -3419,6 +3419,7 @@ dependencies = [
 name = "spacesly"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portable-pty",
  "reqwest 0.12.28",
  "serde",

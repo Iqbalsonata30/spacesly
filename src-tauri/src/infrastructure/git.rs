@@ -1,8 +1,20 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::files::WorkspaceRoot;
+
+const GIT_STATUS_CACHE_TTL: Duration = Duration::from_millis(500);
+
+struct CachedGitStatus {
+    refreshed_at: Instant,
+    status: GitStatus,
+}
+
+static GIT_STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedGitStatus>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GitWorkspaceInfo {
@@ -83,8 +95,8 @@ pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
     )
     .map(|value| value.trim().to_string())
     .filter(|value| !value.is_empty());
-    let dirty_worktree = git_output(&repo_root, ["status", "--porcelain"])
-        .map(|value| !value.trim().is_empty())
+    let dirty_worktree = git_status_for_repo(&repo_root)
+        .map(|status| !status.staged.is_empty() || !status.unstaged.is_empty())
         .unwrap_or(false);
     let (ahead_count, behind_count) = if upstream_branch.is_some() {
         git_output(
@@ -132,6 +144,7 @@ pub fn checkout_workspace_git_branch(
         return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
     }
 
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root)
 }
 
@@ -145,9 +158,22 @@ pub fn workspace_changed_files(root: &WorkspaceRoot) -> Result<Vec<GitChangedFil
 
 pub fn workspace_git_status(root: &WorkspaceRoot) -> Result<GitStatus, String> {
     let repo_root = workspace_repo_root(root)?;
+    git_status_for_repo(&repo_root)
+}
+
+fn git_status_for_repo(repo_root: &Path) -> Result<GitStatus, String> {
+    let mut cache = git_status_cache()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(cached) = cache.get(repo_root) {
+        if cached.refreshed_at.elapsed() <= GIT_STATUS_CACHE_TTL {
+            return Ok(cached.status.clone());
+        }
+    }
+
     let output = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .current_dir(&repo_root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+        .current_dir(repo_root)
         .output()
         .map_err(|error| format!("Failed to run git status: {error}"))?;
     if !output.status.success() {
@@ -156,15 +182,24 @@ pub fn workspace_git_status(root: &WorkspaceRoot) -> Result<GitStatus, String> {
 
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim_end();
-        if line.len() < 4 {
+    let mut entries = output.stdout.split(|byte| *byte == 0).peekable();
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
             continue;
         }
 
-        let index_status = line.as_bytes()[0] as char;
-        let worktree_status = line.as_bytes()[1] as char;
-        let (path, original_path) = parse_status_path(line[3..].trim());
+        let index_status = entry[0] as char;
+        let worktree_status = entry[1] as char;
+        let path = String::from_utf8_lossy(&entry[3..]).to_string();
+        let original_path =
+            if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+                entries
+                    .next()
+                    .map(|value| String::from_utf8_lossy(value).to_string())
+                    .filter(|value| !value.is_empty())
+            } else {
+                None
+            };
         if path.is_empty() {
             continue;
         }
@@ -197,19 +232,29 @@ pub fn workspace_git_status(root: &WorkspaceRoot) -> Result<GitStatus, String> {
 
     staged.sort_by(|a, b| a.path.cmp(&b.path));
     unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(GitStatus { staged, unstaged })
+    let status = GitStatus { staged, unstaged };
+    cache.insert(
+        repo_root.to_path_buf(),
+        CachedGitStatus {
+            refreshed_at: Instant::now(),
+            status: status.clone(),
+        },
+    );
+    Ok(status)
 }
 
 pub fn stage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<GitStatus, String> {
     let repo_root = workspace_repo_root(root)?;
     let path = normalized_file_path(path)?;
     run_git_dynamic(&repo_root, &["add", "--", &path])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_status(root)
 }
 
 pub fn stage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
     let repo_root = workspace_repo_root(root)?;
     run_git(&repo_root, ["add", "."])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_status(root)
 }
 
@@ -217,18 +262,21 @@ pub fn unstage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<
     let repo_root = workspace_repo_root(root)?;
     let path = normalized_file_path(path)?;
     run_git_dynamic(&repo_root, &["restore", "--staged", "--", &path])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_status(root)
 }
 
 pub fn unstage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
     let repo_root = workspace_repo_root(root)?;
     run_git(&repo_root, ["restore", "--staged", "--", "."])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_status(root)
 }
 
 pub fn pull_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
     let repo_root = workspace_repo_root(root)?;
     run_git(&repo_root, ["pull"])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root)
 }
 
@@ -243,6 +291,7 @@ pub fn commit_workspace_git_changes(
     }
 
     run_git(&repo_root, ["commit", "-m", message])?;
+    invalidate_git_status_for_repo(&repo_root);
     let hash = git_output(&repo_root, ["rev-parse", "HEAD"])
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -257,6 +306,7 @@ pub fn commit_workspace_git_changes(
 pub fn push_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
     let repo_root = workspace_repo_root(root)?;
     run_git(&repo_root, ["push"])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root)
 }
 
@@ -271,6 +321,7 @@ pub fn merge_workspace_git_branch(
     }
 
     run_git(&repo_root, ["merge", branch, "--no-edit"])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root)
 }
 
@@ -285,6 +336,7 @@ pub fn rebase_workspace_git_branch(
     }
 
     run_git(&repo_root, ["rebase", branch])?;
+    invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root)
 }
 
@@ -351,17 +403,6 @@ fn normalized_file_path(path: String) -> Result<String, String> {
     }
 }
 
-fn parse_status_path(value: &str) -> (String, Option<String>) {
-    if let Some((original_path, path)) = value.split_once(" -> ") {
-        (
-            path.trim().to_string(),
-            Some(original_path.trim().to_string()),
-        )
-    } else {
-        (value.trim().to_string(), None)
-    }
-}
-
 fn normalize_git_status(status: char) -> String {
     match status {
         'A' => "A",
@@ -381,6 +422,22 @@ fn workspace_repo_root(root: &WorkspaceRoot) -> Result<PathBuf, String> {
         .ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
 }
 
+pub fn invalidate_workspace_git_status(root: &WorkspaceRoot) -> Result<(), String> {
+    let repo_root = workspace_repo_root(root)?;
+    invalidate_git_status_for_repo(&repo_root);
+    Ok(())
+}
+
+fn git_status_cache() -> &'static Mutex<HashMap<PathBuf, CachedGitStatus>> {
+    GIT_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_git_status_for_repo(repo_root: &Path) {
+    if let Ok(mut cache) = git_status_cache().lock() {
+        cache.remove(repo_root);
+    }
+}
+
 fn normalize_branch_name(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed == "HEAD" {
@@ -395,4 +452,46 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
     let ahead = parts.next()?.parse().ok()?;
     let behind = parts.next()?.parse().ok()?;
     Some((ahead, behind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn status_cache_requires_invalidation_for_immediate_external_changes() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("spacesly-git-cache-{suffix}"));
+        fs::create_dir_all(&repo).expect("temporary repository should be created");
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git should start");
+        assert!(init.success());
+        fs::write(repo.join("new.txt"), "content").expect("test file should be written");
+        fs::write(repo.join("with spaces.txt"), "content").expect("spaced file should be written");
+
+        let first = git_status_for_repo(&repo).expect("status should load");
+        assert_eq!(first.unstaged.len(), 2);
+        assert!(first
+            .unstaged
+            .iter()
+            .any(|file| file.path == "with spaces.txt"));
+        fs::remove_file(repo.join("new.txt")).expect("test file should be removed");
+        fs::remove_file(repo.join("with spaces.txt")).expect("spaced file should be removed");
+        let cached = git_status_for_repo(&repo).expect("cached status should load");
+        assert_eq!(cached.unstaged.len(), 2);
+
+        invalidate_git_status_for_repo(&repo);
+        let refreshed = git_status_for_repo(&repo).expect("status should refresh");
+        assert!(refreshed.unstaged.is_empty());
+
+        let _ = fs::remove_dir_all(repo);
+    }
 }

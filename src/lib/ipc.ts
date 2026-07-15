@@ -10,7 +10,7 @@ export type {
   AiWorkerTask,
   AiWorkerTaskResult,
 } from "$lib/ipc/agent";
-export { chatAiWorker, executeAiWorkerTask, testAiWorker } from "$lib/ipc/agent";
+export { cancelAiWorkerTask, chatAiWorker, executeAiWorkerTask, releaseAiWorkerRun, reserveAiWorkerRun, testAiWorker } from "$lib/ipc/agent";
 export type { FileEntry } from "$lib/ipc/files";
 export {
   listDirectory,

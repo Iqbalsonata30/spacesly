@@ -10,6 +10,7 @@ pub struct CachedWorkspace {
     pub saved_at: u64,
     pub size_bytes: u64,
     pub workspace: Workspace,
+    pub deleted_card_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -17,6 +18,7 @@ pub struct CachedWorkspace {
 struct CachePayload<'a> {
     saved_at: u64,
     workspace: &'a Workspace,
+    deleted_card_ids: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -24,6 +26,8 @@ struct CachePayload<'a> {
 struct StoredCachePayload {
     saved_at: u64,
     workspace: Workspace,
+    #[serde(default)]
+    deleted_card_ids: Vec<String>,
 }
 
 pub fn load_cached_workspace() -> Result<Option<CachedWorkspace>, String> {
@@ -41,10 +45,14 @@ pub fn load_cached_workspace() -> Result<Option<CachedWorkspace>, String> {
         saved_at: payload.saved_at,
         size_bytes: raw.len() as u64,
         workspace: payload.workspace,
+        deleted_card_ids: payload.deleted_card_ids,
     }))
 }
 
-pub fn save_cached_workspace(workspace: Workspace) -> Result<CachedWorkspace, String> {
+pub fn save_cached_workspace(
+    workspace: Workspace,
+    deleted_card_ids: Vec<String>,
+) -> Result<CachedWorkspace, String> {
     let path = cache_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -55,6 +63,7 @@ pub fn save_cached_workspace(workspace: Workspace) -> Result<CachedWorkspace, St
     let payload = CachePayload {
         saved_at,
         workspace: &workspace,
+        deleted_card_ids: &deleted_card_ids,
     };
     let raw = serde_json::to_string(&payload)
         .map_err(|error| format!("Failed to encode workspace cache: {error}"))?;
@@ -65,6 +74,7 @@ pub fn save_cached_workspace(workspace: Workspace) -> Result<CachedWorkspace, St
         saved_at,
         size_bytes: raw.len() as u64,
         workspace,
+        deleted_card_ids,
     })
 }
 

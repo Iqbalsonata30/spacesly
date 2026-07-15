@@ -33,19 +33,23 @@ export function mergeSyncedWorkspace(
   currentColumns: BoardProjection["columns"] | undefined,
   legacySeedCardId: string,
   retainMissingCardMs: number,
+  locallyDeletedCardIds: string[] = [],
 ): WorkspaceProjection {
   const nowMs = Date.now();
+  const deletedIds = new Set(locallyDeletedCardIds);
   const currentEntries = new Map<string, { card: CardProjection; intent: ColumnIntent }>();
   const incomingIds = new Set<string>();
 
   for (const column of currentColumns ?? []) {
     for (const card of column.cards) {
+      if (deletedIds.has(card.id)) continue;
       currentEntries.set(card.id, { card, intent: column.intent });
     }
   }
 
   for (const column of projection.projects[0]?.boards[0]?.columns ?? []) {
     for (const card of column.cards) {
+      if (deletedIds.has(card.id)) continue;
       incomingIds.add(card.id);
     }
   }
@@ -60,8 +64,8 @@ export function mergeSyncedWorkspace(
     retainedIds.add(card.id);
   };
 
-  for (const { card, intent } of currentEntries.values()) {
-    if (card.id === legacySeedCardId) continue;
+    for (const { card, intent } of currentEntries.values()) {
+    if (card.id === legacySeedCardId || deletedIds.has(card.id)) continue;
 
     if (card.source === "local") {
       retainCard({ ...card, syncMissingAt: null }, intent);
@@ -88,7 +92,7 @@ export function mergeSyncedWorkspace(
             ...column,
             cards: [
               ...column.cards
-                .filter((card) => !retainedIds.has(card.id))
+                .filter((card) => !retainedIds.has(card.id) && !deletedIds.has(card.id))
                 .map((card) => {
                   const current = currentEntries.get(card.id)?.card;
                   return {

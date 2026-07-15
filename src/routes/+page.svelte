@@ -12,7 +12,6 @@
   import { displayPath, fileName, normalizeAbsolutePath } from "$lib/filesFeature";
   import { collectAncestorPaths, pruneExpandedFolderTree } from "$lib/fileBrowser";
   import {
-    agentActivity,
     agentActionLabel,
     agentPhaseTimeline,
     canStartAgent,
@@ -63,6 +62,7 @@
   import {
     addJiraComment,
     assignJiraIssue,
+    cancelAiWorkerTask,
     chatAiWorker,
     executeAiWorkerTask,
     getJiraBoards,
@@ -76,6 +76,8 @@
     readFile,
     resizePtyTerminal,
     saveAppSecrets,
+    releaseAiWorkerRun,
+    reserveAiWorkerRun,
     setWorkspaceRoot,
     syncJiraWorkspace,
     testAiWorker,
@@ -115,7 +117,7 @@
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
   import { opencodeModelOptions } from "$lib/opencodeModels";
-  import { cachedWorkspaceSizeBytes, loadCachedWorkspace, saveCachedWorkspace } from "$lib/workspaceCache";
+  import { cachedWorkspaceSizeBytes, loadCachedWorkspace, locallyDeleteCachedCard, locallyDeletedCachedCardIds, saveCachedWorkspace } from "$lib/workspaceCache";
 
   type CodeEditorHandle = {
     getValue: () => string;
@@ -153,9 +155,6 @@
     fileSidebarWidth: number;
     terminalWidth: number;
     agentConsoleWidth: number;
-    agentLogHeight: number;
-    agentOutputHeight: number;
-    agentApprovalHeight: number;
   };
 
   type LayoutResizeDrag = {
@@ -183,9 +182,6 @@
     fileSidebarWidth: 340,
     terminalWidth: 680,
     agentConsoleWidth: 420,
-    agentLogHeight: 170,
-    agentOutputHeight: 220,
-    agentApprovalHeight: 180,
   };
 
   const defaultWorkspaceChatMessages: WorkspaceChatMessage[] = [
@@ -259,6 +255,7 @@
   let connectingJira = $state(false);
   let testingWorker = $state(false);
   let runningWorkerCardIds = $state<Record<string, true>>({});
+  let runningWorkerRunIds = $state<Record<string, string>>({});
   let connectionMessage = $state<string | null>(null);
   let workerStatus = $state<AiWorkerStatus | null>(null);
   let agentConnectionStates = $state<Record<string, AgentConnectionState>>(loadAgentConnectionStates());
@@ -678,11 +675,6 @@
   let visibleAgentRunLogs = $derived(visibleAgentSession?.logs ?? []);
   let visibleAgentTerminalLines = $derived(visibleAgentSession?.terminalLines ?? []);
   let visibleAgentRunTranscript = $derived(visibleAgentSession?.transcript ?? []);
-  let visibleAgentLog = $derived(visibleAgentRunLogs.at(-1) ?? null);
-  let agentActivityView = $derived(agentActivity(visibleAgentRunStatus, visibleAgentRunProgress, visibleAgentLog));
-  let agentActivityTitle = $derived(agentActivityView.title);
-  let agentActivityDetail = $derived(agentActivityView.detail);
-  let agentNextStep = $derived(agentActivityView.next);
   let agentPhases = $derived(agentPhaseTimeline(visibleAgentRunStatus, visibleAgentRunProgress));
   let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
   let latestAgentSession = $derived<AgentRunSession | null>(
@@ -960,13 +952,15 @@
   }
 
   async function commitWorkspaceGitChanges(message: string) {
-    if (!workspaceGitInfo?.is_git_repo) return;
+    if (!workspaceGitInfo?.is_git_repo) return false;
     try {
-      await sourceControl.commit(message);
+      const result = await sourceControl.commit(message);
       syncSourceControlState();
+      return result !== null;
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
       appNotice = { tone: "error", message: workspaceGitError };
+      return false;
     }
   }
 
@@ -1362,9 +1356,6 @@
       fileSidebarWidth: clampNumber(value.fileSidebarWidth, 240, 560, defaultLayoutPrefs.fileSidebarWidth),
       terminalWidth: clampNumber(value.terminalWidth, 420, 1100, defaultLayoutPrefs.terminalWidth),
       agentConsoleWidth: clampNumber(value.agentConsoleWidth, 360, 720, defaultLayoutPrefs.agentConsoleWidth),
-      agentLogHeight: clampNumber(value.agentLogHeight, 110, 320, defaultLayoutPrefs.agentLogHeight),
-      agentOutputHeight: clampNumber(value.agentOutputHeight, 140, 420, defaultLayoutPrefs.agentOutputHeight),
-      agentApprovalHeight: clampNumber(value.agentApprovalHeight, 120, 360, defaultLayoutPrefs.agentApprovalHeight),
     };
   }
 
@@ -2105,6 +2096,7 @@
         activeBoard?.columns,
         LEGACY_SEED_CARD_ID,
         SYNC_RETAIN_MISSING_CARD_MS,
+        locallyDeletedCachedCardIds(),
       );
       workspace = projection;
       cacheSavedAt = Date.now();
@@ -2501,6 +2493,7 @@
       })),
     }))) return false;
 
+    locallyDeleteCachedCard(cardId);
     if (selectedCardId === cardId) selectedCardId = null;
     if (agentRunCardId === cardId) agentRunCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
@@ -3298,20 +3291,38 @@
 
     const card = activeCardById.get(cardId);
     if (!card || card.execution === "running") return;
-    if (!(await requestBacklogStartConfirmation(card))) return;
+    const runId = `agent-${cardId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
+    runningWorkerRunIds = { ...runningWorkerRunIds, [cardId]: runId };
+    if (!(await requestBacklogStartConfirmation(card))) {
+      finishWorkerRun(cardId, runId);
+      return;
+    }
 
     const config = buildAiWorkerConfig();
-    if (!config) return;
+    if (!config) {
+      finishWorkerRun(cardId, runId);
+      return;
+    }
+
+    try {
+      await reserveAiWorkerRun(runId, config);
+    } catch (reason) {
+      finishWorkerRun(cardId, runId);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message };
+      return;
+    }
 
     const issueKey = jiraKey(card);
     const inProgressColumnId = columnIdByIntent("in_progress");
     const doneColumnId = columnIdByIntent("done");
     if (!inProgressColumnId || !doneColumnId) return;
     const existingSession = agentRunSessions[cardId];
-    const isContinuation = existingSession?.status === "blocked";
+    const isContinuation = existingSession?.status === "blocked" || existingSession?.status === "timeout";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
-    runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
+    let backendExecutionStarted = false;
     beginAgentRun(card, isContinuation, null);
     const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
     appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
@@ -3421,7 +3432,8 @@
       setAgentProgressForCard(cardId, 55);
       let result: AiWorkerTaskResult;
       try {
-        result = await executeAiWorkerTask(config, {
+        backendExecutionStarted = true;
+        result = await executeAiWorkerTask(runId, config, {
           key: issueKey,
           title: card.title,
           description: card.description,
@@ -3432,6 +3444,10 @@
         });
       } catch (reason) {
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {
+          const cancelled = await cancelAiWorkerTask(runId).catch(() => false);
+          if (cancelled) {
+            updateCardExecution(cardId, { blocked: { reason: "Agent timed out and was cancelled." } });
+          }
           setAgentRunStatusForCard(cardId, "timeout");
           appendStructuredAgentLogForCard(
             cardId,
@@ -3439,10 +3455,15 @@
             "timeout",
             "Spacesly stopped waiting for the Agent response before a structured result arrived.",
             [reason.message],
-            ["The card is not marked blocked.", "Check the Agent runtime output if it is still running."],
-            ["Continue or retry from the current card once the runtime finishes or becomes available."],
+            [cancelled ? "The Agent process was cancelled." : "Spacesly could not confirm process cancellation."],
+            [cancelled ? "Review the task, then retry when ready." : "Do not retry until the Agent process is confirmed stopped."],
           );
-          appNotice = { tone: "info", message: `${ticketLabel(card)} timed out waiting for the Agent response.` };
+          appNotice = {
+            tone: cancelled ? "info" : "error",
+            message: cancelled
+              ? `${ticketLabel(card)} timed out and the Agent process was cancelled.`
+              : `${ticketLabel(card)} timed out, but process cancellation could not be confirmed.`,
+          };
           return;
         }
 
@@ -3605,9 +3626,19 @@
       );
       appNotice = { tone: "error", message };
     } finally {
-      const { [cardId]: _finished, ...remainingRuns } = runningWorkerCardIds;
-      runningWorkerCardIds = remainingRuns;
+      if (!backendExecutionStarted) {
+        await releaseAiWorkerRun(runId).catch(() => undefined);
+      }
+      finishWorkerRun(cardId, runId);
     }
+  }
+
+  function finishWorkerRun(cardId: string, runId: string) {
+    if (runningWorkerRunIds[cardId] !== runId) return;
+    const { [cardId]: _finishedCard, ...remainingCards } = runningWorkerCardIds;
+    const { [cardId]: _finishedRun, ...remainingRunIds } = runningWorkerRunIds;
+    runningWorkerCardIds = remainingCards;
+    runningWorkerRunIds = remainingRunIds;
   }
 </script>
 
@@ -4444,14 +4475,11 @@
           {#if agentConsoleModule}
             {@const AgentConsolePanel = agentConsoleModule.default}
             <AgentConsolePanel
-              style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}
+              style=""
               title={visibleAgentRunTitle}
               status={visibleAgentRunStatus}
               progress={visibleAgentRunProgress}
-              activityTitle={agentActivityTitle}
-              activityDetail={agentActivityDetail}
-              nextStep={agentNextStep}
-              phases={agentPhases}
+               phases={agentPhases}
               logs={visibleAgentRunLogs}
               transcript={visibleAgentRunTranscript}
               output={visibleAgentRunOutput}
@@ -4461,15 +4489,13 @@
               terminalInput={agentTerminalInput}
               runCardId={agentConsoleCardId}
               onClose={() => (agentConsoleOpen = false)}
-              onResizeLog={(event) => beginLayoutResize(event, "agentLogHeight", 110, 320, "y")}
-              onResizeOutput={(event) => beginLayoutResize(event, "agentOutputHeight", 140, 420, "y")}
               onTerminalInputChange={(value) => (agentTerminalInput = value)}
               onSubmitTerminalInput={submitAgentTerminalInput}
               onOpenCard={(cardId) => (selectedCardId = cardId)}
               onMarkBlockedDone={requestManualDoneConfirmation}
             />
           {:else}
-            <aside class="agent-console" aria-label="Agent run console loading" style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}>
+            <aside class="agent-console" aria-label="Agent run console loading">
               <header>
                 <div>
                   <p>Agent Console</p>

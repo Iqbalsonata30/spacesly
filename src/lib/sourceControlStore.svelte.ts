@@ -93,14 +93,14 @@ export function createSourceControlStore(options: {
     }
   }
 
-  async function run<T>(nextOperation: SourceControlOperation, action: () => Promise<T>, refreshKind: RefreshKind = "state", refreshFiles = false, refreshEditors = false): Promise<T | null> {
+  async function run<T>(nextOperation: SourceControlOperation, action: () => Promise<T>, refreshKind: RefreshKind | null = "state", refreshFiles = false, refreshEditors = false): Promise<T | null> {
     if (operation) return null;
     operation = nextOperation;
     error = null;
 
     try {
       const result = await action();
-      await refresh(refreshKind);
+      if (refreshKind) await refresh(refreshKind);
       await notifyRepositoryChanged(refreshFiles, refreshEditors);
       return result;
     } catch (reason) {
@@ -117,28 +117,28 @@ export function createSourceControlStore(options: {
     await run("stage", async () => {
       status = await stageWorkspaceGitFile(path);
       return null;
-    }, "status");
+    }, null);
   }
 
   async function stageAll() {
     await run("stage-all", async () => {
       status = await stageAllWorkspaceGitFiles();
       return null;
-    }, "status");
+    }, null);
   }
 
   async function unstageFile(path: string) {
     await run("unstage", async () => {
       status = await unstageWorkspaceGitFile(path);
       return null;
-    }, "status");
+    }, null);
   }
 
   async function unstageAll() {
     await run("unstage-all", async () => {
       status = await unstageAllWorkspaceGitFiles();
       return null;
-    }, "status");
+    }, null);
   }
 
   async function checkoutBranch(branch: string) {

@@ -29,7 +29,7 @@
     onUnstageAll: () => Promise<void>;
     onSwitchBranch: (branch: string) => void;
     onPull: () => Promise<void>;
-    onCommit: (message: string) => Promise<void>;
+    onCommit: (message: string) => Promise<boolean>;
     onPush: () => Promise<void>;
     onMerge: (branch: string) => Promise<void>;
     onRebase: (branch: string) => Promise<void>;
@@ -83,7 +83,7 @@
   let stagedCount = $derived(stagedFiles.length);
   let unstagedCount = $derived(unstagedFiles.length);
   let changedCount = $derived(stagedCount + unstagedCount);
-  let repoClean = $derived(changedCount === 0 && !hasDirtyEditors);
+  let repoClean = $derived(hasRepo && changedCount === 0 && !hasDirtyEditors);
   let worktreeDirty = $derived(Boolean(workspaceGitInfo?.dirty_worktree || hasDirtyEditors));
   let currentBranchLabel = $derived(workspaceGitInfo?.current_branch ?? "detached HEAD");
   let commitCharCount = $derived(commitMessage.length);
@@ -97,6 +97,7 @@
   );
 
   let headerMeta = $derived.by(() => {
+    if (workspaceGitLoading && !workspaceGitInfo) return ["Loading repository"];
     const chips: string[] = [];
     if (hasRepo) chips.push(currentBranchLabel);
     if (workspaceGitInfo?.head_commit) chips.push(`HEAD ${workspaceGitInfo.head_commit.slice(0, 7)}`);
@@ -160,16 +161,24 @@
 
   function openContextMenu(kind: "staged" | "unstaged", file: GitChangedFile, event: MouseEvent) {
     event.preventDefault();
-    contextMenu = { kind, file, x: event.clientX, y: event.clientY };
+    const menuWidth = 180;
+    const menuHeight = 92;
+    contextMenu = {
+      kind,
+      file,
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+    };
   }
 
   async function commit() {
     commitTouched = true;
     if (commitValidation) return;
     await runAction("commit", async () => {
-      await onCommit(commitMessage.trim());
-      commitMessage = "";
-      commitTouched = false;
+      if (await onCommit(commitMessage.trim())) {
+        commitMessage = "";
+        commitTouched = false;
+      }
     });
   }
 
@@ -187,17 +196,29 @@
   const syncDisabled = $derived(!hasRepo || worktreeDirty || workspaceGitLoading || switchingWorkspaceBranch || actionBusy !== null);
   const mergeDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
   const rebaseDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
-  const pushDisabled = $derived(!hasRepo || worktreeDirty || switchingWorkspaceBranch || actionBusy !== null);
+  const pushDisabled = $derived(!hasRepo || switchingWorkspaceBranch || actionBusy !== null);
   const refreshDisabled = $derived(!hasRepo || workspaceGitLoading || actionBusy !== null);
   const stageAllDisabled = $derived(!hasRepo || unstagedCount === 0 || actionBusy !== null);
   const unstageAllDisabled = $derived(!hasRepo || stagedCount === 0 || actionBusy !== null);
 </script>
 
+<svelte:window onkeydown={(event) => {
+  if (event.key === "Escape") {
+    contextMenu = null;
+    actionsMenuOpen = false;
+  }
+}} onclick={(event) => {
+  if (!(event.target as HTMLElement).closest(".context-menu, .branch-menu-wrap")) {
+    contextMenu = null;
+    actionsMenuOpen = false;
+  }
+}} />
+
 <aside class="git-actions-pane" aria-label="Source control">
   <header class="source-header">
     <div class="source-header-copy">
       <p>Source control</p>
-      <h2>{repoClean ? "Working tree clean" : "Review and commit changes"}</h2>
+      <h2>{workspaceGitLoading && !workspaceGitInfo ? "Loading repository" : !hasRepo ? "No Git repository" : repoClean ? "Working tree clean" : "Review and commit changes"}</h2>
       <div class="source-header-meta">
         {#each headerMeta as meta}
           <span>{meta}</span>
@@ -318,11 +339,11 @@
         <div class="changes-list">
           {#each stagedFiles as file (fileLabel(file))}
             {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
-            {#snippet rowTrailing()}
-              <button class="row-action" type="button" title="Unstage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("unstage", () => onUnstageFile(file.path)); }}><Minus size={13} /></button>
-            {/snippet}
             <div role="presentation" oncontextmenu={(event) => openContextMenu("staged", file, event)}>
-              <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} trailing={rowTrailing} onClick={() => onOpenFile(file.path)} />
+              <div class="change-row">
+                <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} onClick={() => onOpenFile(file.path)} />
+                <button class="row-action" type="button" title="Unstage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("unstage", () => onUnstageFile(file.path)); }}><Minus size={13} /></button>
+              </div>
             </div>
           {/each}
         </div>
@@ -344,11 +365,11 @@
         <div class="changes-list">
           {#each unstagedFiles as file (fileLabel(file))}
             {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
-            {#snippet rowTrailing()}
-              <button class="row-action" type="button" title="Stage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("stage", () => onStageFile(file.path)); }}><Plus size={13} /></button>
-            {/snippet}
             <div role="presentation" oncontextmenu={(event) => openContextMenu("unstaged", file, event)}>
-              <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} trailing={rowTrailing} onClick={() => onOpenFile(file.path)} />
+              <div class="change-row">
+                <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} onClick={() => onOpenFile(file.path)} />
+                <button class="row-action" type="button" title="Stage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("stage", () => onStageFile(file.path)); }}><Plus size={13} /></button>
+              </div>
             </div>
           {/each}
         </div>
@@ -563,8 +584,15 @@
   .commit-validation { margin: 0 12px; }
   .commit-button { margin: 0 12px; background: linear-gradient(135deg, #7d5cff, #4c7dff); border-color: transparent; color: #fff; }
   .changes-list { display: grid; min-width: 0; }
+  .change-row { position: relative; min-width: 0; }
+  .change-row :global(.workspace-row) { padding-right: 48px; }
   :global(.workspace-row .workspace-row-status) { min-width: 66px; text-align: left; letter-spacing: 0; text-transform: none; }
   .row-action {
+    position: absolute;
+    z-index: 1;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
     display: inline-flex;
     align-items: center;
     justify-content: center;

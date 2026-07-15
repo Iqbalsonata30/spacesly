@@ -5,6 +5,7 @@ export interface CachedWorkspace {
   savedAt: number;
   sizeBytes: number;
   workspace: WorkspaceProjection;
+  deletedCardIds?: string[];
 }
 
 const LEGACY_CACHE_KEY = "spacesly.workspace.cache.v1";
@@ -15,6 +16,7 @@ let pendingCache: WorkspaceProjection | null = null;
 let cacheWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let cacheWriteIdleId: number | null = null;
 let lastCacheSizeBytes = 0;
+let deletedCardIds = new Set<string>();
 
 export async function loadCachedWorkspace(): Promise<CachedWorkspace | null> {
   const cached = normalizeCachedWorkspace(
@@ -60,10 +62,19 @@ export async function flushCachedWorkspace(): Promise<void> {
 
   const cached = await invokeWithPolicy<CachedWorkspace>(
     "save_cached_workspace",
-    { workspace },
+    { workspace: filterDeletedCards(workspace), deletedCardIds: [...deletedCardIds] },
     IPC_POLICIES.workspaceCache,
   );
   rememberCacheSize(cached);
+}
+
+export function locallyDeleteCachedCard(cardId: string): void {
+  if (!cardId) return;
+  deletedCardIds.add(cardId);
+}
+
+export function locallyDeletedCachedCardIds(): string[] {
+  return [...deletedCardIds];
 }
 
 export function cachedWorkspaceSizeBytes(): number {
@@ -72,9 +83,11 @@ export function cachedWorkspaceSizeBytes(): number {
 
 function normalizeCachedWorkspace(value: CachedWorkspace | null): CachedWorkspace | null {
   if (!value?.workspace || !Array.isArray(value.workspace.projects)) return null;
+  deletedCardIds = new Set((value.deletedCardIds ?? []).filter((id) => typeof id === "string" && id.length > 0));
   return {
     ...value,
-    workspace: normalizeWorkspace(value.workspace),
+    deletedCardIds: [...deletedCardIds],
+    workspace: filterDeletedCards(normalizeWorkspace(value.workspace)),
   };
 }
 
@@ -126,7 +139,25 @@ function normalizeWorkspace(workspace: WorkspaceProjection): WorkspaceProjection
 
 function rememberCacheSize(cached: CachedWorkspace): CachedWorkspace {
   lastCacheSizeBytes = cached.sizeBytes;
+  if (cached.deletedCardIds) deletedCardIds = new Set(cached.deletedCardIds);
   return cached;
+}
+
+function filterDeletedCards(workspace: WorkspaceProjection): WorkspaceProjection {
+  if (deletedCardIds.size === 0) return workspace;
+  return {
+    ...workspace,
+    projects: workspace.projects.map((project) => ({
+      ...project,
+      boards: project.boards.map((board) => ({
+        ...board,
+        columns: board.columns.map((column) => ({
+          ...column,
+          cards: column.cards.filter((card) => !deletedCardIds.has(card.id)),
+        })),
+      })),
+    })),
+  };
 }
 
 if (typeof window !== "undefined") {

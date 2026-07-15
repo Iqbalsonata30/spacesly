@@ -9,13 +9,15 @@ use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, execute_ai_worker_task as execute_ai_worker_task_impl,
-    test_ai_worker as test_ai_worker_impl, AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig,
-    AiWorkerStatus, AiWorkerTask, AiWorkerTaskResult,
+    test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiWorkerChatRequest,
+    AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask, AiWorkerTaskResult,
 };
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::git_info_for_path;
-use infrastructure::git::{CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo};
+use infrastructure::git::{
+    invalidate_workspace_git_status, CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo,
+};
 use infrastructure::mcp::{
     JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
@@ -125,13 +127,47 @@ async fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String
 }
 
 #[tauri::command]
+fn reserve_ai_worker_run(
+    run_id: String,
+    config: AiWorkerConfig,
+    agent_runs: State<'_, AgentRunRegistry>,
+) -> Result<(), String> {
+    agent_runs.reserve(&run_id, &config)
+}
+
+#[tauri::command]
 async fn execute_ai_worker_task(
+    run_id: String,
     config: AiWorkerConfig,
     task: AiWorkerTask,
+    agent_runs: State<'_, AgentRunRegistry>,
 ) -> Result<AiWorkerTaskResult, String> {
-    tauri::async_runtime::spawn_blocking(move || execute_ai_worker_task_impl(config, task))
-        .await
-        .map_err(|error| format!("Agent execution task failed: {error}"))?
+    let registry = agent_runs.inner().clone();
+    let cancellation = registry.start(&run_id)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let result = execute_ai_worker_task_impl(config, task, cancellation);
+        let _ = registry.finish(&run_id);
+        result
+    })
+    .await
+    .map_err(|error| format!("Agent execution task failed: {error}"))?;
+    result
+}
+
+#[tauri::command]
+fn release_ai_worker_run(
+    run_id: String,
+    agent_runs: State<'_, AgentRunRegistry>,
+) -> Result<bool, String> {
+    agent_runs.release_reservation(&run_id)
+}
+
+#[tauri::command]
+fn cancel_ai_worker_task(
+    run_id: String,
+    agent_runs: State<'_, AgentRunRegistry>,
+) -> Result<bool, String> {
+    agent_runs.cancel(&run_id)
 }
 
 #[tauri::command]
@@ -181,7 +217,9 @@ async fn write_file(
 ) -> Result<(), String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        FilesService::new(root).write_file(workspace_id, relative_path, content)
+        FilesService::new(root.clone()).write_file(workspace_id, relative_path, content)?;
+        let _ = invalidate_workspace_git_status(&root);
+        Ok(())
     })
     .await
     .map_err(|error| format!("File write task failed: {error}"))?
@@ -235,10 +273,15 @@ async fn load_cached_workspace() -> Result<Option<CachedWorkspace>, String> {
 }
 
 #[tauri::command]
-async fn save_cached_workspace(workspace: Workspace) -> Result<CachedWorkspace, String> {
-    tauri::async_runtime::spawn_blocking(move || save_cached_workspace_impl(workspace))
-        .await
-        .map_err(|error| format!("Save workspace cache task failed: {error}"))?
+async fn save_cached_workspace(
+    workspace: Workspace,
+    deleted_card_ids: Option<Vec<String>>,
+) -> Result<CachedWorkspace, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_cached_workspace_impl(workspace, deleted_card_ids.unwrap_or_default())
+    })
+    .await
+    .map_err(|error| format!("Save workspace cache task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -461,6 +504,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(pty_state)
         .manage(workspace_root)
+        .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -474,7 +518,10 @@ pub fn run() {
             assign_jira_issue,
             add_jira_comment,
             test_ai_worker,
+            reserve_ai_worker_run,
             execute_ai_worker_task,
+            release_ai_worker_run,
+            cancel_ai_worker_task,
             chat_ai_worker,
             list_directory,
             read_file,
