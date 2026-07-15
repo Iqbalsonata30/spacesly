@@ -1,0 +1,63 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Jakarta
+    labels:
+      - dependencies
+      - rust
+    groups:
+      tauri:
+        patterns:
+          - "tauri*"
+      deps:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Jakarta
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      svelte:
+        patterns:
+          - "@sveltejs/*"
+          - "svelte*"
+      codemirror:
+        patterns:
+          - "@codemirror/*"
+          - "codemirror"
+      tauri:
+        patterns:
+          - "@tauri-apps/*"
+      deps:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Jakarta
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5

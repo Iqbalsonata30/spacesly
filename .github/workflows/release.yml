@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to release (must exist)
+        required: true
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      sign: true
+      profile: release
+    secrets: inherit
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release Tag::Releasing $TAG"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: spacesly-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: |
+          sha256sum *.* | tee SHA256SUMS
+
+      - name: Sign combined checksums
+        if: secrets.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        working-directory: release-artifacts
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --detach-sign --armor SHA256SUMS
+
+      - name: Generate SLSA provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: release-artifacts/*
+
+      - name: Create release draft
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Spacesly ${{ steps.tag.outputs.tag }}
+          body_path: CHANGELOG.md
+          draft: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-rc') || contains(steps.tag.outputs.tag, '-beta') || contains(steps.tag.outputs.tag, '-alpha') }}
+          files: release-artifacts/**
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            STATUS="${{ job.status }}"
+            curl -s -X POST -H "Content-type: application/json" \
+              --data "{\"text\":\"Release ${{ github.ref_name }}: $STATUS — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+              "$SLACK_WEBHOOK_URL"
+          fi

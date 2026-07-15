@@ -1,0 +1,133 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      sign:
+        description: Sign built artifacts with platform certificates
+        required: false
+        type: boolean
+        default: false
+      profile:
+        description: Rust build profile (release or debug)
+        required: false
+        type: string
+        default: release
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: Sign built artifacts with platform certificates
+        required: false
+        type: boolean
+        default: false
+      profile:
+        description: Rust build profile (release or debug)
+        required: false
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: windows-latest
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            bundles: msi
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ inputs.profile }}
+          workspaces: src-tauri
+
+      - name: Build and bundle
+        run: bun tauri build --bundles ${{ matrix.bundles }}
+        working-directory: .
+        env:
+          PROFILE: ${{ inputs.profile }}
+
+      - name: Sign Windows bundle
+        if: runner.os == 'Windows' && inputs.sign
+        env:
+          WIN_CERT_PFX: ${{ secrets.WIN_CERT_PFX }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          $pfxPath = "$env:RUNNER_TEMP/cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CERT_PFX))
+
+          $msiPath = Get-ChildItem -Path "src-tauri/target/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+          if (-not $msiPath) {
+            Write-Error "No .msi bundle found"
+            exit 1
+          }
+
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x86\signtool.exe" sign `
+            /fd SHA256 /f $pfxPath /p $env:WIN_CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            $msiPath.FullName
+
+          Remove-Item $pfxPath -Force
+
+      - name: GPG sign Linux bundles
+        if: runner.os == 'Linux' && inputs.sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          BUNDLE_DIR="src-tauri/target/release/bundle"
+          for pattern in "$BUNDLE_DIR/deb/"*.deb "$BUNDLE_DIR/appimage/"*.AppImage; do
+            for f in $pattern; do
+              if [ -f "$f" ]; then
+                gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --detach-sign --armor "$f"
+              fi
+            done
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spacesly-${{ matrix.target }}-${{ inputs.profile }}
+          path: |
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.asc
+          retention-days: 30
