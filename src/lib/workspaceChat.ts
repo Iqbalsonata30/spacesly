@@ -2,7 +2,13 @@ import type { CardProjection, WorkspaceProjection } from "$lib/ipc";
 
 export type WorkspaceChatAction =
   | { type: "create_task"; title: string; description?: string }
-  | { type: "move_card"; card_id?: string; ticket?: string; title?: string; target: "todo" | "queued" | "in_progress" | "done" }
+  | {
+      type: "move_card";
+      card_id?: string;
+      ticket?: string;
+      title?: string;
+      target: "todo" | "queued" | "in_progress" | "done";
+    }
   | { type: "start_agent"; card_id?: string; ticket?: string; title?: string }
   | { type: "select_card"; card_id?: string; ticket?: string; title?: string }
   | { type: "delete_card"; card_id?: string; ticket?: string; title?: string }
@@ -27,24 +33,30 @@ export function chatTargetLabel(target: "todo" | "queued" | "in_progress" | "don
   return "Done";
 }
 
-export function workspaceAgentContext(activeBoard: WorkspaceProjection["projects"][number]["boards"][number] | null): string {
+export function workspaceAgentContext(
+  activeBoard: WorkspaceProjection["projects"][number]["boards"][number] | null,
+): string {
   return [terminalContext(), boardContext(activeBoard)].filter(Boolean).join("\n\n");
 }
 
-export function boardContext(activeBoard: WorkspaceProjection["projects"][number]["boards"][number] | null): string {
+export function boardContext(
+  activeBoard: WorkspaceProjection["projects"][number]["boards"][number] | null,
+): string {
   if (!activeBoard) return "Board context: no active board loaded.";
 
-  const cards = activeBoard.columns.flatMap((column) =>
-    column.cards.slice(0, 20).map((card) => ({
-      id: card.id,
-      ticket: ticketLabel(card),
-      title: card.title,
-      column: columnTitle(column.name),
-      intent: column.intent,
-      execution: executionLabel(card.execution),
-      labels: card.labels.slice(0, 4),
-    })),
-  ).slice(0, 80);
+  const cards = activeBoard.columns
+    .flatMap((column) =>
+      column.cards.slice(0, 20).map((card) => ({
+        id: card.id,
+        ticket: ticketLabel(card),
+        title: card.title,
+        column: columnTitle(column.name),
+        intent: column.intent,
+        execution: executionLabel(card.execution),
+        labels: card.labels.slice(0, 4),
+      })),
+    )
+    .slice(0, 80);
 
   return [
     `Board context: ${activeBoard.name}`,
@@ -92,32 +104,57 @@ export function normalizeWorkspaceAction(value: unknown): WorkspaceChatAction[] 
   const type = typeof action.type === "string" ? action.type : "";
 
   if (type === "create_task" && typeof action.title === "string" && action.title.trim()) {
-    return [{ type, title: action.title.trim(), description: typeof action.description === "string" ? action.description : undefined }];
+    return [
+      {
+        type,
+        title: action.title.trim(),
+        description: typeof action.description === "string" ? action.description : undefined,
+      },
+    ];
   }
 
   if (type === "move_card" && typeof action.target === "string" && isBoardTarget(action.target)) {
-    return [{
-      type,
-      card_id: stringField(action.card_id),
-      ticket: stringField(action.ticket),
-      title: stringField(action.title),
-      target: action.target,
-    }];
+    return [
+      {
+        type,
+        card_id: stringField(action.card_id),
+        ticket: stringField(action.ticket),
+        title: stringField(action.title),
+        target: action.target,
+      },
+    ];
   }
 
   if (type === "start_agent" || type === "select_card") {
-    return [{ type, card_id: stringField(action.card_id), ticket: stringField(action.ticket), title: stringField(action.title) }];
+    return [
+      {
+        type,
+        card_id: stringField(action.card_id),
+        ticket: stringField(action.ticket),
+        title: stringField(action.title),
+      },
+    ];
   }
 
   if (type === "delete_card") {
-    return [{ type, card_id: stringField(action.card_id), ticket: stringField(action.ticket), title: stringField(action.title) }];
+    return [
+      {
+        type,
+        card_id: stringField(action.card_id),
+        ticket: stringField(action.ticket),
+        title: stringField(action.title),
+      },
+    ];
   }
 
   if (type === "sync_jira") return [{ type }];
   return [];
 }
 
-export function fastWorkspaceChatActions(message: string, context?: WorkspaceChatActionContext): WorkspaceChatAction[] {
+export function fastWorkspaceChatActions(
+  message: string,
+  context?: WorkspaceChatActionContext,
+): WorkspaceChatAction[] {
   const text = message.trim();
   const lower = text.toLowerCase();
 
@@ -127,30 +164,45 @@ export function fastWorkspaceChatActions(message: string, context?: WorkspaceCha
   if (createMatch?.[1]) return [{ type: "create_task", title: createMatch[1].trim() }];
 
   const queueMatch = text.match(/^queue\s+(.+)$/i);
-  if (queueMatch?.[1]) return [{ type: "move_card", ...parseCardReference(queueMatch[1], context), target: "queued" }];
+  if (queueMatch?.[1])
+    return [{ type: "move_card", ...parseCardReference(queueMatch[1], context), target: "queued" }];
 
   const moveMatch = text.match(/^move\s+(.+?)\s+to\s+(todo|queue|queued|in[\s_-]?progress|done)$/i);
   if (moveMatch?.[1] && moveMatch[2]) {
-    return [{ type: "move_card", ...parseCardReference(moveMatch[1], context), target: normalizeBoardTarget(moveMatch[2]) }];
+    return [
+      {
+        type: "move_card",
+        ...parseCardReference(moveMatch[1], context),
+        target: normalizeBoardTarget(moveMatch[2]),
+      },
+    ];
   }
 
-  const startMatch = text.match(/^(?:start|run|continue|execute)(?:\s+agent)?(?:\s+(?:on|for|with))?\s+(.+)$/i);
-  if (startMatch?.[1]) return [{ type: "start_agent", ...parseCardReference(startMatch[1], context) }];
+  const startMatch = text.match(
+    /^(?:start|run|continue|execute)(?:\s+agent)?(?:\s+(?:on|for|with))?\s+(.+)$/i,
+  );
+  if (startMatch?.[1])
+    return [{ type: "start_agent", ...parseCardReference(startMatch[1], context) }];
 
   if (/^(?:start|run|continue|execute)(?:\s+it|\s+that|\s+this|\s+again)?$/i.test(text)) {
     return [{ type: "start_agent", ...parseCardReference("it", context) }];
   }
 
   const openMatch = text.match(/^(?:open|show|select)\s+(.+)$/i);
-  if (openMatch?.[1]) return [{ type: "select_card", ...parseCardReference(openMatch[1], context) }];
+  if (openMatch?.[1])
+    return [{ type: "select_card", ...parseCardReference(openMatch[1], context) }];
 
   const deleteMatch = text.match(/^(?:delete|remove)\s+(.+)$/i);
-  if (deleteMatch?.[1]) return [{ type: "delete_card", ...parseCardReference(deleteMatch[1], context) }];
+  if (deleteMatch?.[1])
+    return [{ type: "delete_card", ...parseCardReference(deleteMatch[1], context) }];
 
   return [];
 }
 
-export function parseCardReference(value: string, context?: WorkspaceChatActionContext): { card_id?: string; ticket?: string; title?: string } {
+export function parseCardReference(
+  value: string,
+  context?: WorkspaceChatActionContext,
+): { card_id?: string; ticket?: string; title?: string } {
   const text = value.trim().replace(/^task\s+/i, "");
   const contextualCard = resolveContextCardId(text, context);
   if (contextualCard) return { card_id: contextualCard };
@@ -170,12 +222,16 @@ function resolveContextCardId(value: string, context?: WorkspaceChatActionContex
 
   if (context.activeCardIds?.has(value)) return value;
 
-  const recentCardIds = context.recentCardIds?.filter((cardId) => context.activeCardIds?.has(cardId)) ?? [];
+  const recentCardIds =
+    context.recentCardIds?.filter((cardId) => context.activeCardIds?.has(cardId)) ?? [];
   if (/^(it|that|this|them|again)$/i.test(value)) {
-    if (context.lastCreatedCardId && context.activeCardIds?.has(context.lastCreatedCardId)) return context.lastCreatedCardId;
-    if (context.lastCardId && context.activeCardIds?.has(context.lastCardId)) return context.lastCardId;
+    if (context.lastCreatedCardId && context.activeCardIds?.has(context.lastCreatedCardId))
+      return context.lastCreatedCardId;
+    if (context.lastCardId && context.activeCardIds?.has(context.lastCardId))
+      return context.lastCardId;
     if (recentCardIds[0]) return recentCardIds[0];
-    if (context.selectedCardId && context.activeCardIds?.has(context.selectedCardId)) return context.selectedCardId;
+    if (context.selectedCardId && context.activeCardIds?.has(context.selectedCardId))
+      return context.selectedCardId;
     return null;
   }
 

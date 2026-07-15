@@ -14,7 +14,18 @@
     onClick?: () => void;
   };
 
-  let { label, title, depth = 0, active = false, disabled = false, status, statusTone = "neutral", leading, trailing, onClick }: Props = $props();
+  let {
+    label,
+    title,
+    depth = 0,
+    active = false,
+    disabled = false,
+    status,
+    statusTone = "neutral",
+    leading,
+    trailing,
+    onClick,
+  }: Props = $props();
 
   function truncateMiddle(value: string, max = 34) {
     if (value.length <= max) return value;
@@ -29,7 +40,7 @@
   class="workspace-row"
   style={`--row-depth: ${depth};`}
   title={title ?? label}
-  disabled={disabled}
+  {disabled}
   onclick={() => onClick?.()}
 >
   {#if leading}

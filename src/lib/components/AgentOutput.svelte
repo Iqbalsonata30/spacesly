@@ -21,12 +21,17 @@
 
   let view = $derived(parseAgentOutput(output, result, runStatus));
 
-  function parseAgentOutput(value: string, resultValue: AiWorkerTaskResult | null, statusValue: AgentRunStatus): AgentOutputView {
+  function parseAgentOutput(
+    value: string,
+    resultValue: AiWorkerTaskResult | null,
+    statusValue: AgentRunStatus,
+  ): AgentOutputView {
     if (resultValue) {
       const status = resultValue.completion_status === "completed" ? "complete" : "blocked";
-      const nextSteps = resultValue.next.length > 0
-        ? resultValue.next
-        : nextStepLines(status, resultValue.details, resultValue.evidence);
+      const nextSteps =
+        resultValue.next.length > 0
+          ? resultValue.next
+          : nextStepLines(status, resultValue.details, resultValue.evidence);
 
       return {
         status,
@@ -48,14 +53,21 @@
         status,
         label: statusLabel(status),
         summary: text || "Waiting for Agent output...",
-        outcome: status === "working" ? "The Agent is still preparing or executing this task." : "No structured result is available yet.",
+        outcome:
+          status === "working"
+            ? "The Agent is still preparing or executing this task."
+            : "No structured result is available yet.",
         evidence: [],
         changes: [],
-        nextSteps: status === "working" ? ["Wait for the Agent to return evidence or a blocker."] : [],
+        nextSteps:
+          status === "working" ? ["Wait for the Agent to return evidence or a blocker."] : [],
       };
     }
 
-    const fallbackLines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+    const fallbackLines = text
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
     const status = displayStatus(statusValue);
     const summary = fallbackLines[0] || "No summary returned.";
     const detailLines = fallbackLines.slice(1, 8);
@@ -74,18 +86,32 @@
   }
 
   function isChangeLine(value: string): boolean {
-    return /(changed|updated|created|deleted|patched|deployed|rebuilt|transitioned|commented|verified|committed|pushed|file|jira|bamboo|ocp|pod|deployment)/i.test(value);
+    return /(changed|updated|created|deleted|patched|deployed|rebuilt|transitioned|commented|verified|committed|pushed|file|jira|bamboo|ocp|pod|deployment)/i.test(
+      value,
+    );
   }
 
-  function nextStepLines(status: AgentOutputStatus, details: string[], evidence: string[]): string[] {
-    if (status === "complete") return ["Review the evidence, then keep or sync the completed Jira state."];
-    if (status === "timeout") return ["Check the Agent runtime output, then continue or retry from this card."];
+  function nextStepLines(
+    status: AgentOutputStatus,
+    details: string[],
+    evidence: string[],
+  ): string[] {
+    if (status === "complete")
+      return ["Review the evidence, then keep or sync the completed Jira state."];
+    if (status === "timeout")
+      return ["Check the Agent runtime output, then continue or retry from this card."];
     if (status === "working") return ["Wait for the Agent to return evidence or a blocker."];
 
-    const blockers = [...details, ...evidence].filter((line) => /(need|needs|blocked|approve|approval|missing|failed|cannot|can't|uncommitted|unpushed|permission)/i.test(line));
+    const blockers = [...details, ...evidence].filter((line) =>
+      /(need|needs|blocked|approve|approval|missing|failed|cannot|can't|uncommitted|unpushed|permission)/i.test(
+        line,
+      ),
+    );
     return blockers.length > 0
       ? blockers.slice(0, 3)
-      : ["Add an operator note or approval in the Agent console, then continue the Agent on this card."];
+      : [
+          "Add an operator note or approval in the Agent console, then continue the Agent on this card.",
+        ];
   }
 
   function statusLabel(status: AgentOutputStatus): string {

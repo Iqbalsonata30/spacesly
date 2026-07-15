@@ -67,10 +67,7 @@
 
   <label>
     <span>Connection Name</span>
-    <input
-      value={server.name}
-      oninput={(event) => onUpdate({ name: event.currentTarget.value })}
-    />
+    <input value={server.name} oninput={(event) => onUpdate({ name: event.currentTarget.value })} />
   </label>
 
   <label>
@@ -99,10 +96,9 @@
   <label>
     <span>Arguments</span>
     <textarea
-      placeholder='["--transport", "stdio"]'
+      placeholder="["--transport", "stdio"]"
       oninput={(event) => updateArgs(event.currentTarget.value)}
-      value={JSON.stringify(server.args)}
-    ></textarea>
+      value={JSON.stringify(server.args)}></textarea>
   </label>
 
   <div class="type-config">
@@ -112,7 +108,10 @@
           <p class="section-kicker">Jira Identity</p>
           <h3>Inherited from Jira Sync</h3>
         </div>
-        <p>Jira MCP uses the same account as board sync. Configure credentials once in the Jira tab; Spacesly injects the right environment variables when this MCP server starts.</p>
+        <p>
+          Jira MCP uses the same account as board sync. Configure credentials once in the Jira tab;
+          Spacesly injects the right environment variables when this MCP server starts.
+        </p>
         <div class="inherited-grid">
           <span>
             <strong>Site</strong>
@@ -124,7 +123,13 @@
           </span>
           <span>
             <strong>Auth</strong>
-            <code>{jiraAuthMode === "api_token" ? "API token" : jiraAuthMode === "pat" ? "Personal access token" : "Username + password"}</code>
+            <code
+              >{jiraAuthMode === "api_token"
+                ? "API token"
+                : jiraAuthMode === "pat"
+                  ? "Personal access token"
+                  : "Username + password"}</code
+            >
           </span>
         </div>
       </div>
@@ -196,8 +201,7 @@
           oninput={(event) => updateEnv(event.currentTarget.value)}
           value={Object.entries(server.env)
             .map(([key, value]) => `${key}=${value}`)
-            .join("\n")}
-        ></textarea>
+            .join("\n")}></textarea>
       </label>
     {/if}
   </div>
@@ -250,7 +254,9 @@
     border-radius: 9px;
     padding: 11px 12px;
     background: linear-gradient(180deg, #0b0b10, #09090d);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 1px 0 rgba(0, 0, 0, 0.38);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.025),
+      0 1px 0 rgba(0, 0, 0, 0.38);
     color: #cfc8dc;
     font: inherit;
   }
@@ -278,7 +284,9 @@
   select:focus,
   textarea:focus {
     border-color: rgba(184, 214, 228, 0.42);
-    box-shadow: 0 0 0 3px rgba(184, 214, 228, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    box-shadow:
+      0 0 0 3px rgba(184, 214, 228, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.03);
     outline: none;
   }
 

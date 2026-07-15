@@ -17,7 +17,10 @@ export function flattenFileBrowserRows(
 
     for (const entry of items) {
       const children = expandedFolders[entry.path] ?? [];
-      const selfMatches = !query || entry.name.toLowerCase().includes(query) || entry.path.toLowerCase().includes(query);
+      const selfMatches =
+        !query ||
+        entry.name.toLowerCase().includes(query) ||
+        entry.path.toLowerCase().includes(query);
       const childRows = query
         ? visit(children, depth + 1)
         : expandedFolders[entry.path]
@@ -55,7 +58,9 @@ export function pruneExpandedFolderTree(
 ): Record<string, FileEntry[]> {
   const prefix = `${folderPath}/`;
   return Object.fromEntries(
-    Object.entries(expandedFolders).filter(([path]) => path !== folderPath && !path.startsWith(prefix)),
+    Object.entries(expandedFolders).filter(
+      ([path]) => path !== folderPath && !path.startsWith(prefix),
+    ),
   );
 }
 

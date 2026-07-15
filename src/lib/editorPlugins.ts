@@ -21,7 +21,10 @@ export function registerEditorLanguagePlugin(plugin: EditorLanguagePlugin) {
 
 export function editorLanguagePluginForPath(path: string): EditorLanguagePlugin | null {
   const name = path.toLowerCase();
-  return plugins.find((plugin) => plugin.extensions.some((extension) => name.endsWith(extension))) ?? null;
+  return (
+    plugins.find((plugin) => plugin.extensions.some((extension) => name.endsWith(extension))) ??
+    null
+  );
 }
 
 export function editorFormatterForPath(path: string): EditorLanguagePlugin["formatter"] | null {

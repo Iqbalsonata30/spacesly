@@ -63,15 +63,29 @@ export async function getJiraBoards(config: JiraMcpConfig): Promise<JiraBoard[]>
 }
 
 export async function testJiraMcpConnection(config: JiraMcpConfig): Promise<JiraConnectionStatus> {
-  return invokeWithPolicy<JiraConnectionStatus>("test_jira_mcp_connection", { config }, IPC_POLICIES.jiraTest);
+  return invokeWithPolicy<JiraConnectionStatus>(
+    "test_jira_mcp_connection",
+    { config },
+    IPC_POLICIES.jiraTest,
+  );
 }
 
-export async function testMcpServerConnection(config: JiraMcpServerConfig): Promise<McpConnectionStatus> {
-  return invokeWithPolicy<McpConnectionStatus>("test_mcp_server_connection", { config }, IPC_POLICIES.jiraTest);
+export async function testMcpServerConnection(
+  config: JiraMcpServerConfig,
+): Promise<McpConnectionStatus> {
+  return invokeWithPolicy<McpConnectionStatus>(
+    "test_mcp_server_connection",
+    { config },
+    IPC_POLICIES.jiraTest,
+  );
 }
 
 export async function syncJiraWorkspace(config: JiraMcpConfig): Promise<WorkspaceProjection> {
-  return invokeWithPolicy<WorkspaceProjection>("sync_jira_workspace", { config }, IPC_POLICIES.jiraRead);
+  return invokeWithPolicy<WorkspaceProjection>(
+    "sync_jira_workspace",
+    { config },
+    IPC_POLICIES.jiraRead,
+  );
 }
 
 export async function transitionJiraIssue(
@@ -79,11 +93,19 @@ export async function transitionJiraIssue(
   issueKey: string,
   targetStatus: string,
 ): Promise<void> {
-  return invokeWithPolicy<void>("transition_jira_issue", { config, issueKey, targetStatus }, IPC_POLICIES.jiraMutation);
+  return invokeWithPolicy<void>(
+    "transition_jira_issue",
+    { config, issueKey, targetStatus },
+    IPC_POLICIES.jiraMutation,
+  );
 }
 
 export async function assignJiraIssue(config: JiraMcpConfig, issueKey: string): Promise<void> {
-  return invokeWithPolicy<void>("assign_jira_issue", { config, issueKey }, IPC_POLICIES.jiraMutation);
+  return invokeWithPolicy<void>(
+    "assign_jira_issue",
+    { config, issueKey },
+    IPC_POLICIES.jiraMutation,
+  );
 }
 
 export async function addJiraComment(
@@ -91,5 +113,9 @@ export async function addJiraComment(
   issueKey: string,
   comment: string,
 ): Promise<void> {
-  return invokeWithPolicy<void>("add_jira_comment", { config, issueKey, comment }, IPC_POLICIES.jiraMutation);
+  return invokeWithPolicy<void>(
+    "add_jira_comment",
+    { config, issueKey, comment },
+    IPC_POLICIES.jiraMutation,
+  );
 }

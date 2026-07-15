@@ -11,11 +11,19 @@ export async function listDirectory(
   workspaceId: string,
   relativePath: string = "",
 ): Promise<FileEntry[]> {
-  return invokeWithPolicy<FileEntry[]>("list_directory", { workspaceId, relativePath }, IPC_POLICIES.fileRead);
+  return invokeWithPolicy<FileEntry[]>(
+    "list_directory",
+    { workspaceId, relativePath },
+    IPC_POLICIES.fileRead,
+  );
 }
 
 export async function readFile(workspaceId: string, relativePath: string): Promise<string> {
-  return invokeWithPolicy<string>("read_file", { workspaceId, relativePath }, IPC_POLICIES.fileRead);
+  return invokeWithPolicy<string>(
+    "read_file",
+    { workspaceId, relativePath },
+    IPC_POLICIES.fileRead,
+  );
 }
 
 export async function writeFile(
@@ -23,7 +31,11 @@ export async function writeFile(
   relativePath: string,
   content: string,
 ): Promise<void> {
-  return invokeWithPolicy<void>("write_file", { workspaceId, relativePath, content }, IPC_POLICIES.fileWrite);
+  return invokeWithPolicy<void>(
+    "write_file",
+    { workspaceId, relativePath, content },
+    IPC_POLICIES.fileWrite,
+  );
 }
 
 export async function workspaceRootPath(workspaceId: string): Promise<string> {

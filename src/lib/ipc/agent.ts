@@ -61,7 +61,11 @@ export async function executeAiWorkerTask(
   config: AiWorkerConfig,
   task: AiWorkerTask,
 ): Promise<AiWorkerTaskResult> {
-  const result = await invokeWithPolicy<unknown>("execute_ai_worker_task", { runId, config, task }, IPC_POLICIES.aiExecution);
+  const result = await invokeWithPolicy<unknown>(
+    "execute_ai_worker_task",
+    { runId, config, task },
+    IPC_POLICIES.aiExecution,
+  );
   return validateAiWorkerTaskResult(result);
 }
 
@@ -81,7 +85,11 @@ export async function chatAiWorker(
   config: AiWorkerConfig,
   request: AiWorkerChatRequest,
 ): Promise<AiWorkerChatResult> {
-  return invokeWithPolicy<AiWorkerChatResult>("chat_ai_worker", { config, request }, IPC_POLICIES.aiChat);
+  return invokeWithPolicy<AiWorkerChatResult>(
+    "chat_ai_worker",
+    { config, request },
+    IPC_POLICIES.aiChat,
+  );
 }
 
 function validateAiWorkerTaskResult(result: unknown): AiWorkerTaskResult {
@@ -90,15 +98,17 @@ function validateAiWorkerTaskResult(result: unknown): AiWorkerTaskResult {
   }
 
   const value = result as Partial<AiWorkerTaskResult>;
-  const validStatus = value.completion_status === "completed" || value.completion_status === "blocked";
-  const validShape = typeof value.summary === "string"
-    && Array.isArray(value.evidence)
-    && Array.isArray(value.details)
-    && Array.isArray(value.next)
-    && value.evidence.every((line) => typeof line === "string")
-    && value.details.every((line) => typeof line === "string")
-    && value.next.every((line) => typeof line === "string")
-    && (value.blocked_reason === null || typeof value.blocked_reason === "string");
+  const validStatus =
+    value.completion_status === "completed" || value.completion_status === "blocked";
+  const validShape =
+    typeof value.summary === "string" &&
+    Array.isArray(value.evidence) &&
+    Array.isArray(value.details) &&
+    Array.isArray(value.next) &&
+    value.evidence.every((line) => typeof line === "string") &&
+    value.details.every((line) => typeof line === "string") &&
+    value.next.every((line) => typeof line === "string") &&
+    (value.blocked_reason === null || typeof value.blocked_reason === "string");
 
   if (!validStatus || !validShape) {
     return invalidAiWorkerTaskResult("Agent returned an invalid structured result.");

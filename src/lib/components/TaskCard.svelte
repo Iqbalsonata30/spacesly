@@ -81,7 +81,7 @@
 </script>
 
 <button
-  class:selected={selected}
+  class:selected
   class="task-card"
   style={`--card-min-height: ${minHeight}px;`}
   draggable="true"
@@ -98,7 +98,12 @@
   <p>
     {#each description as part}
       {#if part.url}
-        <a href={part.url} target="_blank" rel="noreferrer" onclick={(event) => event.stopPropagation()}>{part.text}</a>
+        <a
+          href={part.url}
+          target="_blank"
+          rel="noreferrer"
+          onclick={(event) => event.stopPropagation()}>{part.text}</a
+        >
       {:else}
         {part.text}
       {/if}
@@ -129,8 +134,8 @@
             event.preventDefault();
             queueTask(event);
           }
-        }}
-      >{isBlocked ? "Blocked" : isQueued ? "Queued" : "Queue"}</span>
+        }}>{isBlocked ? "Blocked" : isQueued ? "Queued" : "Queue"}</span
+      >
       <span
         class="start"
         class:retry={isBlocked}
@@ -143,8 +148,8 @@
             event.preventDefault();
             startAgent(event);
           }
-        }}
-      >{actionLabel}</span>
+        }}>{actionLabel}</span
+      >
       {#if isBlocked}
         <span
           class="manual-done"
@@ -156,8 +161,8 @@
               event.preventDefault();
               markDone(event);
             }
-          }}
-        >Mark Done</span>
+          }}>Mark Done</span
+        >
       {/if}
       {#if showDelete}
         <span
@@ -171,8 +176,8 @@
               event.preventDefault();
               deleteCard(event);
             }
-          }}
-        >Remove</span>
+          }}>Remove</span
+        >
       {/if}
     </div>
   {/if}
@@ -195,7 +200,11 @@
     font: inherit;
     text-align: left;
     user-select: none;
-    transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, transform 160ms ease;
+    transition:
+      border-color 160ms ease,
+      box-shadow 160ms ease,
+      background 160ms ease,
+      transform 160ms ease;
   }
 
   .task-card:hover {
@@ -315,7 +324,11 @@
     color: #77718a;
     font-weight: 800;
     white-space: nowrap;
-    transition: border-color 140ms ease, background 140ms ease, color 140ms ease, opacity 140ms ease;
+    transition:
+      border-color 140ms ease,
+      background 140ms ease,
+      color 140ms ease,
+      opacity 140ms ease;
   }
 
   .actions .queue {

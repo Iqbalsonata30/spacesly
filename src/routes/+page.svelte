@@ -122,7 +122,13 @@
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
   import { opencodeModelOptions } from "$lib/opencodeModels";
-  import { cachedWorkspaceSizeBytes, loadCachedWorkspace, locallyDeleteCachedCard, locallyDeletedCachedCardIds, saveCachedWorkspace } from "$lib/workspaceCache";
+  import {
+    cachedWorkspaceSizeBytes,
+    loadCachedWorkspace,
+    locallyDeleteCachedCard,
+    locallyDeletedCachedCardIds,
+    saveCachedWorkspace,
+  } from "$lib/workspaceCache";
 
   type CodeEditorHandle = {
     getValue: () => string;
@@ -264,7 +270,9 @@
   let runningWorkerRunIds = $state<Record<string, string>>({});
   let connectionMessage = $state<string | null>(null);
   let workerStatus = $state<AiWorkerStatus | null>(null);
-  let agentConnectionStates = $state<Record<string, AgentConnectionState>>(loadAgentConnectionStates());
+  let agentConnectionStates = $state<Record<string, AgentConnectionState>>(
+    loadAgentConnectionStates(),
+  );
   let mcpConnectionStates = $state<Record<string, McpConnectionState>>({});
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
   let mcpToolsByServer = $state<Record<string, string[]>>({});
@@ -312,18 +320,40 @@
     Terminal: typeof import("@xterm/xterm").Terminal;
     FitAddon: typeof import("@xterm/addon-fit").FitAddon;
   }> | null = null;
-  let editorWorkspaceModule = $state<typeof import("$lib/components/EditorWorkspace.svelte") | null>(null);
-  let editorWorkspaceRuntime: Promise<typeof import("$lib/components/EditorWorkspace.svelte")> | null = null;
-  let fileBrowserModule = $state<typeof import("$lib/components/FileBrowserPane.svelte") | null>(null);
-  let fileBrowserRuntime: Promise<typeof import("$lib/components/FileBrowserPane.svelte")> | null = null;
-  let gitActionsModule = $state<typeof import("$lib/components/GitActionsPane.svelte") | null>(null);
-  let gitActionsRuntime: Promise<typeof import("$lib/components/GitActionsPane.svelte")> | null = null;
-  let workspaceChatModule = $state<typeof import("$lib/components/WorkspaceChatPane.svelte") | null>(null);
-  let workspaceChatRuntime: Promise<typeof import("$lib/components/WorkspaceChatPane.svelte")> | null = null;
-  let mcpConnectionModule = $state<typeof import("$lib/components/McpConnectionSettings.svelte") | null>(null);
-  let mcpConnectionRuntime: Promise<typeof import("$lib/components/McpConnectionSettings.svelte")> | null = null;
-  let agentConsoleModule = $state<typeof import("$lib/components/AgentConsolePanel.svelte") | null>(null);
-  let agentConsoleRuntime: Promise<typeof import("$lib/components/AgentConsolePanel.svelte")> | null = null;
+  let editorWorkspaceModule = $state<
+    typeof import("$lib/components/EditorWorkspace.svelte") | null
+  >(null);
+  let editorWorkspaceRuntime: Promise<
+    typeof import("$lib/components/EditorWorkspace.svelte")
+  > | null = null;
+  let fileBrowserModule = $state<typeof import("$lib/components/FileBrowserPane.svelte") | null>(
+    null,
+  );
+  let fileBrowserRuntime: Promise<typeof import("$lib/components/FileBrowserPane.svelte")> | null =
+    null;
+  let gitActionsModule = $state<typeof import("$lib/components/GitActionsPane.svelte") | null>(
+    null,
+  );
+  let gitActionsRuntime: Promise<typeof import("$lib/components/GitActionsPane.svelte")> | null =
+    null;
+  let workspaceChatModule = $state<
+    typeof import("$lib/components/WorkspaceChatPane.svelte") | null
+  >(null);
+  let workspaceChatRuntime: Promise<
+    typeof import("$lib/components/WorkspaceChatPane.svelte")
+  > | null = null;
+  let mcpConnectionModule = $state<
+    typeof import("$lib/components/McpConnectionSettings.svelte") | null
+  >(null);
+  let mcpConnectionRuntime: Promise<
+    typeof import("$lib/components/McpConnectionSettings.svelte")
+  > | null = null;
+  let agentConsoleModule = $state<typeof import("$lib/components/AgentConsolePanel.svelte") | null>(
+    null,
+  );
+  let agentConsoleRuntime: Promise<
+    typeof import("$lib/components/AgentConsolePanel.svelte")
+  > | null = null;
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
@@ -331,7 +361,9 @@
   let workspaceChatRunning = $state(false);
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
   let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
-  let workspaceChatActiveSessionId = $state<string>(initialUiState.workspaceChatActiveSessionId ?? initialUiState.workspaceChatSession.id);
+  let workspaceChatActiveSessionId = $state<string>(
+    initialUiState.workspaceChatActiveSessionId ?? initialUiState.workspaceChatSession.id,
+  );
   let workspaceChatMessages = $state<WorkspaceChatMessage[]>(initialUiState.workspaceChatMessages);
   let layoutPrefs = $state<LayoutPrefs>(loadLayoutPrefs());
   let layoutResizeDrag: LayoutResizeDrag | null = null;
@@ -532,10 +564,13 @@
     if (!appNotice) return;
 
     const notice = appNotice;
-    appNoticeTimer = setTimeout(() => {
-      if (appNotice === notice) appNotice = null;
-      appNoticeTimer = null;
-    }, notice.tone === "error" ? ERROR_NOTICE_AUTO_DISMISS_MS : NOTICE_AUTO_DISMISS_MS);
+    appNoticeTimer = setTimeout(
+      () => {
+        if (appNotice === notice) appNotice = null;
+        appNoticeTimer = null;
+      },
+      notice.tone === "error" ? ERROR_NOTICE_AUTO_DISMISS_MS : NOTICE_AUTO_DISMISS_MS,
+    );
   });
 
   onDestroy(() => {
@@ -549,9 +584,7 @@
     workspaceTerminal?.dispose();
   });
 
-  let activeBoard = $derived<BoardProjection | null>(
-    workspace?.projects[0]?.boards[0] ?? null,
-  );
+  let activeBoard = $derived<BoardProjection | null>(workspace?.projects[0]?.boards[0] ?? null);
   let displayColumns = $derived<BoardDisplayColumn[]>(
     activeBoard?.columns.map((column) => {
       const cards = visibleCardsForColumn(column);
@@ -559,8 +592,10 @@
         ...column,
         cards,
         totalCardCount: column.cards.length,
-        hiddenLaneCardCount: column.intent === "done" ? 0 : Math.max(0, column.cards.length - cards.length),
-        hiddenDoneCardCount: column.intent === "done" ? Math.max(0, column.cards.length - cards.length) : 0,
+        hiddenLaneCardCount:
+          column.intent === "done" ? 0 : Math.max(0, column.cards.length - cards.length),
+        hiddenDoneCardCount:
+          column.intent === "done" ? Math.max(0, column.cards.length - cards.length) : 0,
       };
     }) ?? [],
   );
@@ -594,13 +629,15 @@
   let activeColumnByIntent = $derived(boardIndex.columnByIntent);
   let cardColumnIntentById = $derived(boardIndex.cardColumnIntentById);
   let selectedCard = $derived<CardProjection | null>(
-    selectedCardId ? activeCardById.get(selectedCardId) ?? null : null,
+    selectedCardId ? (activeCardById.get(selectedCardId) ?? null) : null,
   );
   let selectedCardAgentSession = $derived<AgentRunSession | null>(
-    selectedCardId ? agentRunSessions[selectedCardId] ?? null : null,
+    selectedCardId ? (agentRunSessions[selectedCardId] ?? null) : null,
   );
   let activeEditorFile = $derived<OpenEditorFile | null>(
-    activeEditorPath ? openEditorFiles.find((file) => file.path === activeEditorPath) ?? null : null,
+    activeEditorPath
+      ? (openEditorFiles.find((file) => file.path === activeEditorPath) ?? null)
+      : null,
   );
   let activeEditorReady = $derived(Boolean(activeEditorFile?.editor));
   let activeEditorDirty = $derived(Boolean(activeEditorFile?.dirty));
@@ -617,13 +654,17 @@
             ? `${activeEditorFile.path}${activeEditorFile.dirty ? " • unsaved" : ""}`
             : `${fileEntries.length} item${fileEntries.length === 1 ? "" : "s"}`,
   );
-  let workspaceChangedFiles = $derived([...workspaceGitStatus.staged, ...workspaceGitStatus.unstaged]);
+  let workspaceChangedFiles = $derived([
+    ...workspaceGitStatus.staged,
+    ...workspaceGitStatus.unstaged,
+  ]);
   let sourceControlChangedCount = $derived(workspaceChangedFiles.length);
   let selectedServer = $derived(
-    settings.mcpServers.find((server) => server.id === selectedServerId) ??
-      settings.mcpServers[0],
+    settings.mcpServers.find((server) => server.id === selectedServerId) ?? settings.mcpServers[0],
   );
-  let selectedMcpTools = $derived(selectedServer ? mcpToolsByServer[selectedServer.id] ?? [] : []);
+  let selectedMcpTools = $derived(
+    selectedServer ? (mcpToolsByServer[selectedServer.id] ?? []) : [],
+  );
   let currentDate = $derived(
     now.toLocaleDateString(undefined, {
       weekday: "short",
@@ -638,9 +679,13 @@
       minute: "2-digit",
     }),
   );
-  let cacheStatusLabel = $derived(cacheSavedAt ? `Cached ${relativeTime(cacheSavedAt)}` : "No cached board");
+  let cacheStatusLabel = $derived(
+    cacheSavedAt ? `Cached ${relativeTime(cacheSavedAt)}` : "No cached board",
+  );
   let boardResourceLabel = $derived(`${renderedCardCount}/${activeCards.length} cards rendered`);
-  let cacheSizeLabel = $derived(cacheSavedAt ? `Cache ${formatBytes(cachedWorkspaceSizeBytes())}` : "Cache empty");
+  let cacheSizeLabel = $derived(
+    cacheSavedAt ? `Cache ${formatBytes(cachedWorkspaceSizeBytes())}` : "Cache empty",
+  );
   let syncBudgetLabel = $derived(
     `Fast sync: up to ${settings.jira.pageSize * settings.jira.maxPages} Jira cards (${settings.jira.pageSize}/page × ${settings.jira.maxPages} page${settings.jira.maxPages === 1 ? "" : "s"}).`,
   );
@@ -652,7 +697,7 @@
       ? `${selectedAiProvider.baseUrl}/messages`
       : selectedAiProvider.apiStyle === "openai_responses"
         ? `${selectedAiProvider.baseUrl}/responses`
-      : `${selectedAiProvider.baseUrl}/chat/completions`,
+        : `${selectedAiProvider.baseUrl}/chat/completions`,
   );
   let selectedAgentLabel = $derived(
     settings.aiWorker.runtime === "opencode"
@@ -672,7 +717,7 @@
       : `${selectedAgentLabel} not tested`,
   );
   let visibleAgentSession = $derived<AgentRunSession | null>(
-    agentConsoleCardId ? agentRunSessions[agentConsoleCardId] ?? null : null,
+    agentConsoleCardId ? (agentRunSessions[agentConsoleCardId] ?? null) : null,
   );
   let visibleAgentRunTitle = $derived(visibleAgentSession?.title ?? "No active run");
   let visibleAgentRunStatus = $derived<AgentRunStatus>(visibleAgentSession?.status ?? "idle");
@@ -685,7 +730,7 @@
   let agentPhases = $derived(agentPhaseTimeline(visibleAgentRunStatus, visibleAgentRunProgress));
   let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
   let latestAgentSession = $derived<AgentRunSession | null>(
-    latestAgentSessionId ? agentRunSessions[latestAgentSessionId] ?? null : null,
+    latestAgentSessionId ? (agentRunSessions[latestAgentSessionId] ?? null) : null,
   );
   let settingsTitle = $derived(
     {
@@ -776,7 +821,10 @@
             message: `${interruptedCardIds.length} Agent run${interruptedCardIds.length === 1 ? " was" : "s were"} interrupted when Spacesly closed. Review and retry when ready.`,
           };
         } else {
-          appNotice = { tone: "info", message: "Loaded saved cards. Sync Jira only when you need fresh updates." };
+          appNotice = {
+            tone: "info",
+            message: "Loaded saved cards. Sync Jira only when you need fresh updates.",
+          };
         }
       }
     } catch (reason: unknown) {
@@ -791,7 +839,9 @@
 
   async function persistSettingsAndSecrets(value: AppSettings) {
     const storedSecrets = await loadAppSecrets();
-    const mergedSecrets = hasAnySecret(appSecrets) ? mergeAppSecrets(appSecrets, storedSecrets) : storedSecrets;
+    const mergedSecrets = hasAnySecret(appSecrets)
+      ? mergeAppSecrets(appSecrets, storedSecrets)
+      : storedSecrets;
     await saveAppSecrets(mergedSecrets);
     saveSettings(value);
   }
@@ -813,13 +863,17 @@
           ...workspaceChatSession,
           messages: workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
           activities: workspaceChatSession.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
-          recentCardIds: workspaceChatSession.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
+          recentCardIds: workspaceChatSession.recentCardIds.slice(
+            0,
+            MAX_WORKSPACE_CHAT_RECENT_CARDS,
+          ),
         },
         workspaceChatSessions: workspaceChatSessions.map((session) => ({
           ...session,
-          messages: session.id === workspaceChatSession.id
-            ? workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES)
-            : session.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
+          messages:
+            session.id === workspaceChatSession.id
+              ? workspaceChatMessages.slice(-MAX_WORKSPACE_CHAT_MESSAGES)
+              : session.messages.slice(-MAX_WORKSPACE_CHAT_MESSAGES),
           activities: session.activities.slice(-MAX_WORKSPACE_CHAT_ACTIVITIES),
           recentCardIds: session.recentCardIds.slice(0, MAX_WORKSPACE_CHAT_RECENT_CARDS),
         })),
@@ -1093,7 +1147,12 @@
         return;
       }
 
-      await openFileEntry({ name: fileName(savedActivePath), path: savedActivePath, is_dir: false, size: 0 });
+      await openFileEntry({
+        name: fileName(savedActivePath),
+        path: savedActivePath,
+        is_dir: false,
+        size: 0,
+      });
     }
 
     saveUiState();
@@ -1102,7 +1161,11 @@
   async function openFolderFromDialog() {
     if (!workspace) return;
     workspaceSidebarTab = "explorer";
-    const selected = await openDialogIfAvailable({ directory: true, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    const selected = await openDialogIfAvailable({
+      directory: true,
+      multiple: false,
+      defaultPath: workspaceRoot ?? undefined,
+    });
     if (typeof selected !== "string") return;
 
     await setWorkspaceRoot(selected);
@@ -1124,7 +1187,11 @@
   async function openFileFromDialog() {
     if (!workspace) return;
     workspaceSidebarTab = "explorer";
-    const selected = await openDialogIfAvailable({ directory: false, multiple: false, defaultPath: workspaceRoot ?? undefined });
+    const selected = await openDialogIfAvailable({
+      directory: false,
+      multiple: false,
+      defaultPath: workspaceRoot ?? undefined,
+    });
     if (typeof selected !== "string") return;
 
     const normalized = normalizeAbsolutePath(selected);
@@ -1150,7 +1217,10 @@
   async function createNewFile() {
     if (!workspace) return;
     workspaceSidebarTab = "explorer";
-    const target = window.prompt("New file name", fileDirectory ? `${fileDirectory}/untitled.txt` : "untitled.txt");
+    const target = window.prompt(
+      "New file name",
+      fileDirectory ? `${fileDirectory}/untitled.txt` : "untitled.txt",
+    );
     if (!target) return;
 
     const normalized = target.replace(/^\/+/, "").trim();
@@ -1184,7 +1254,14 @@
       const content = await readFile(workspace.id, entry.path);
       openEditorFiles = [
         ...openEditorFiles,
-        { path: entry.path, name: entry.name, content, savedContent: content, dirty: false, editor: null },
+        {
+          path: entry.path,
+          name: entry.name,
+          content,
+          savedContent: content,
+          dirty: false,
+          editor: null,
+        },
       ];
       await expandFileAncestors(entry.path);
       await tick();
@@ -1237,7 +1314,12 @@
 
     for (const current of collectAncestorPaths(path)) {
       if (expandedFileEntries[current] || expandingFilePaths[current]) continue;
-      const folderEntry: FileEntry = { name: current.split("/").at(-1) ?? current, path: current, is_dir: true, size: 0 };
+      const folderEntry: FileEntry = {
+        name: current.split("/").at(-1) ?? current,
+        path: current,
+        is_dir: true,
+        size: 0,
+      };
       await toggleFileFolder(folderEntry);
     }
   }
@@ -1265,7 +1347,8 @@
     const index = openEditorFiles.findIndex((file) => file.path === path);
     openEditorFiles = openEditorFiles.filter((file) => file.path !== path);
     if (activeEditorPath === path) {
-      activeEditorPath = openEditorFiles[Math.max(0, index - 1)]?.path ?? openEditorFiles[0]?.path ?? null;
+      activeEditorPath =
+        openEditorFiles[Math.max(0, index - 1)]?.path ?? openEditorFiles[0]?.path ?? null;
     }
     saveUiState();
   }
@@ -1345,7 +1428,9 @@
       terminalFrameId = null;
       if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer) return;
       workspaceFitAddon.fit();
-      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(() => {});
+      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(
+        () => {},
+      );
       workspaceTerminal.focus();
     });
   }
@@ -1368,9 +1453,19 @@
     return {
       laneWidth: clampNumber(value.laneWidth, 260, 460, defaultLayoutPrefs.laneWidth),
       cardMinHeight: clampNumber(value.cardMinHeight, 170, 360, defaultLayoutPrefs.cardMinHeight),
-      fileSidebarWidth: clampNumber(value.fileSidebarWidth, 240, 560, defaultLayoutPrefs.fileSidebarWidth),
+      fileSidebarWidth: clampNumber(
+        value.fileSidebarWidth,
+        240,
+        560,
+        defaultLayoutPrefs.fileSidebarWidth,
+      ),
       terminalWidth: clampNumber(value.terminalWidth, 420, 1100, defaultLayoutPrefs.terminalWidth),
-      agentConsoleWidth: clampNumber(value.agentConsoleWidth, 360, 720, defaultLayoutPrefs.agentConsoleWidth),
+      agentConsoleWidth: clampNumber(
+        value.agentConsoleWidth,
+        360,
+        720,
+        defaultLayoutPrefs.agentConsoleWidth,
+      ),
     };
   }
 
@@ -1390,10 +1485,21 @@
     }
   }
 
-  function resizeLayout(key: keyof LayoutPrefs, delta: number, min: number, max: number, invert = false) {
+  function resizeLayout(
+    key: keyof LayoutPrefs,
+    delta: number,
+    min: number,
+    max: number,
+    invert = false,
+  ) {
     layoutPrefs = {
       ...layoutPrefs,
-      [key]: clampNumber(layoutPrefs[key] + (invert ? -delta : delta), min, max, defaultLayoutPrefs[key]),
+      [key]: clampNumber(
+        layoutPrefs[key] + (invert ? -delta : delta),
+        min,
+        max,
+        defaultLayoutPrefs[key],
+      ),
     };
   }
 
@@ -1424,7 +1530,13 @@
     const position = layoutResizeDrag.axis === "x" ? event.clientX : event.clientY;
     const delta = position - layoutResizeDrag.lastPosition;
     layoutResizeDrag.lastPosition = position;
-    resizeLayout(layoutResizeDrag.key, delta, layoutResizeDrag.min, layoutResizeDrag.max, layoutResizeDrag.invert);
+    resizeLayout(
+      layoutResizeDrag.key,
+      delta,
+      layoutResizeDrag.min,
+      layoutResizeDrag.max,
+      layoutResizeDrag.invert,
+    );
   }
 
   function endLayoutResize(event: PointerEvent) {
@@ -1450,11 +1562,16 @@
         Object.entries(parsed).flatMap(([key, value]) => {
           if (!value || typeof value !== "object" || Array.isArray(value)) return [];
           const entry = value as Partial<AgentConnectionState>;
-          return [[key, {
-            connected: entry.connected === true,
-            testedAt: Number(entry.testedAt) || 0,
-            message: String(entry.message ?? ""),
-          }]];
+          return [
+            [
+              key,
+              {
+                connected: entry.connected === true,
+                testedAt: Number(entry.testedAt) || 0,
+                message: String(entry.message ?? ""),
+              },
+            ],
+          ];
         }),
       );
     } catch {
@@ -1517,14 +1634,19 @@
       return column.cards.slice(0, limit);
     }
 
-    const cards = [...column.cards].sort((left, right) => completedSortValue(right) - completedSortValue(left));
+    const cards = [...column.cards].sort(
+      (left, right) => completedSortValue(right) - completedSortValue(left),
+    );
     return doneVisibleLimit === "all" ? cards : cards.slice(0, doneVisibleLimit);
   }
 
   function showMoreLaneCards(column: BoardDisplayColumn) {
     laneVisibleLimits = {
       ...laneVisibleLimits,
-      [column.id]: Math.min(column.totalCardCount, (laneVisibleLimits[column.id] ?? DEFAULT_LANE_VISIBLE_LIMIT) + LANE_VISIBLE_INCREMENT),
+      [column.id]: Math.min(
+        column.totalCardCount,
+        (laneVisibleLimits[column.id] ?? DEFAULT_LANE_VISIBLE_LIMIT) + LANE_VISIBLE_INCREMENT,
+      ),
     };
   }
 
@@ -1547,7 +1669,8 @@
     }
 
     if (settings.jira.authMode !== "pat" && !settings.jira.username.trim()) {
-      syncError = "Open Settings and fill the Jira email/username required by the selected auth method.";
+      syncError =
+        "Open Settings and fill the Jira email/username required by the selected auth method.";
       openSettings("jira");
       return null;
     }
@@ -1595,11 +1718,17 @@
 
     if (effectiveSettings.aiWorker.runtime === "api" && !effectiveApiKey.trim()) {
       openSettings("agent");
-      appNotice = { tone: "error", message: `Open Settings and fill ${effectiveProvider.apiKeyLabel}.` };
+      appNotice = {
+        tone: "error",
+        message: `Open Settings and fill ${effectiveProvider.apiKeyLabel}.`,
+      };
       return null;
     }
 
-    if (effectiveSettings.aiWorker.runtime === "opencode" && !effectiveSettings.aiWorker.opencodeCommand.trim()) {
+    if (
+      effectiveSettings.aiWorker.runtime === "opencode" &&
+      !effectiveSettings.aiWorker.opencodeCommand.trim()
+    ) {
       openSettings("agent");
       appNotice = { tone: "error", message: "Open Settings and fill the OpenCode command." };
       return null;
@@ -1611,7 +1740,10 @@
       base_url: effectiveProvider.baseUrl,
       api_style: effectiveProvider.apiStyle,
       api_key: effectiveApiKey,
-      model: effectiveSettings.aiWorker.runtime === "opencode" ? effectiveSettings.aiWorker.opencodeModel : effectiveModel.id,
+      model:
+        effectiveSettings.aiWorker.runtime === "opencode"
+          ? effectiveSettings.aiWorker.opencodeModel
+          : effectiveModel.id,
       opencode_command: effectiveSettings.aiWorker.opencodeCommand,
       opencode_model: effectiveSettings.aiWorker.opencodeModel,
       opencode_workdir: effectiveSettings.aiWorker.opencodeWorkdir.trim() || null,
@@ -1632,9 +1764,10 @@
       ...workspaceChatSession,
       updatedAt: Date.now(),
       messages: workspaceChatMessages,
-      title: isGenericChatTitle(workspaceChatSession.title) && message.role === "user"
-        ? summarizeChatTitle(message.text)
-        : workspaceChatSession.title,
+      title:
+        isGenericChatTitle(workspaceChatSession.title) && message.role === "user"
+          ? summarizeChatTitle(message.text)
+          : workspaceChatSession.title,
     };
     syncWorkspaceChatSession();
     appendWorkspaceChatActivity({
@@ -1655,7 +1788,10 @@
     workspaceChatSession = {
       ...workspaceChatSession,
       updatedAt: Date.now(),
-      activities: capList([...workspaceChatSession.activities, entry], MAX_WORKSPACE_CHAT_ACTIVITIES),
+      activities: capList(
+        [...workspaceChatSession.activities, entry],
+        MAX_WORKSPACE_CHAT_ACTIVITIES,
+      ),
     };
     syncWorkspaceChatSession();
     saveUiState();
@@ -1670,7 +1806,10 @@
     workspaceChatSession = normalizedSession;
     workspaceChatActiveSessionId = normalizedSession.id;
     workspaceChatSessions = capList(
-      [normalizedSession, ...workspaceChatSessions.filter((session) => session.id !== normalizedSession.id)],
+      [
+        normalizedSession,
+        ...workspaceChatSessions.filter((session) => session.id !== normalizedSession.id),
+      ],
       MAX_CHAT_SESSIONS,
     );
   }
@@ -1703,18 +1842,23 @@
   }
 
   function setWorkspaceChatSessionCard(cardId: string | null, options: { created?: boolean } = {}) {
-    const card = cardId ? activeCardById.get(cardId) ?? null : null;
+    const card = cardId ? (activeCardById.get(cardId) ?? null) : null;
     const recentCardIds = cardId
-      ? capList([cardId, ...workspaceChatSession.recentCardIds.filter((entry) => entry !== cardId)], MAX_WORKSPACE_CHAT_RECENT_CARDS)
+      ? capList(
+          [cardId, ...workspaceChatSession.recentCardIds.filter((entry) => entry !== cardId)],
+          MAX_WORKSPACE_CHAT_RECENT_CARDS,
+        )
       : workspaceChatSession.recentCardIds;
     workspaceChatSession = {
       ...workspaceChatSession,
       updatedAt: Date.now(),
-      title: card && (options.created || isGenericChatTitle(workspaceChatSession.title))
-        ? chatTitleForCard(card)
-        : workspaceChatSession.title,
+      title:
+        card && (options.created || isGenericChatTitle(workspaceChatSession.title))
+          ? chatTitleForCard(card)
+          : workspaceChatSession.title,
       lastCardId: cardId ?? workspaceChatSession.lastCardId,
-      lastCreatedCardId: options.created && cardId ? cardId : workspaceChatSession.lastCreatedCardId,
+      lastCreatedCardId:
+        options.created && cardId ? cardId : workspaceChatSession.lastCreatedCardId,
       recentCardIds,
     };
     syncWorkspaceChatSession();
@@ -1742,8 +1886,12 @@
 
     return [
       chatSessionContext(workspaceChatActionContext()),
-      recentMessages.length > 0 ? ["Recent chat turns:", ...recentMessages].join("\n") : "Recent chat turns: none.",
-      recentActivities.length > 0 ? ["Recent tool activity:", ...recentActivities].join("\n") : "Recent tool activity: none.",
+      recentMessages.length > 0
+        ? ["Recent chat turns:", ...recentMessages].join("\n")
+        : "Recent chat turns: none.",
+      recentActivities.length > 0
+        ? ["Recent tool activity:", ...recentActivities].join("\n")
+        : "Recent tool activity: none.",
     ].join("\n\n");
   }
 
@@ -1810,17 +1958,18 @@
     });
 
     workspaceTerminalResizeObserver = new ResizeObserver(() => {
-      if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer?.offsetHeight) return;
+      if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer?.offsetHeight)
+        return;
       workspaceFitAddon.fit();
-      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(() => {});
+      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(
+        () => {},
+      );
     });
     workspaceTerminalResizeObserver.observe(workspaceTerminalContainer);
 
     try {
-      await openPtyTerminal(
-        workspaceTerminalId,
-        workspaceShellWorkdir.trim() || null,
-        (data) => workspaceTerminal?.write(new Uint8Array(data)),
+      await openPtyTerminal(workspaceTerminalId, workspaceShellWorkdir.trim() || null, (data) =>
+        workspaceTerminal?.write(new Uint8Array(data)),
       );
       await resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols);
     } catch (reason) {
@@ -1837,8 +1986,8 @@
     workspaceTerminalRuntime ??= (async () => {
       await import("@xterm/xterm/css/xterm.css");
       const [terminal, fit] = await Promise.all([
-      import("@xterm/xterm"),
-      import("@xterm/addon-fit"),
+        import("@xterm/xterm"),
+        import("@xterm/addon-fit"),
       ]);
 
       return {
@@ -1850,7 +1999,9 @@
     return workspaceTerminalRuntime;
   }
 
-  async function openDialogIfAvailable(options: Parameters<typeof import("@tauri-apps/plugin-dialog").open>[0]) {
+  async function openDialogIfAvailable(
+    options: Parameters<typeof import("@tauri-apps/plugin-dialog").open>[0],
+  ) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     return open(options);
   }
@@ -1892,10 +2043,12 @@
   }
 
   function loadMcpConnectionRuntime() {
-    mcpConnectionRuntime ??= import("$lib/components/McpConnectionSettings.svelte").then((module) => {
-      mcpConnectionModule = module;
-      return module;
-    });
+    mcpConnectionRuntime ??= import("$lib/components/McpConnectionSettings.svelte").then(
+      (module) => {
+        mcpConnectionModule = module;
+        return module;
+      },
+    );
 
     return mcpConnectionRuntime;
   }
@@ -1944,7 +2097,10 @@
         appendWorkspaceChat({ role: "system", text: actionSummary });
       }
     } catch (reason) {
-      appendWorkspaceChat({ role: "system", text: reason instanceof Error ? reason.message : String(reason) });
+      appendWorkspaceChat({
+        role: "system",
+        text: reason instanceof Error ? reason.message : String(reason),
+      });
     } finally {
       workspaceChatRunning = false;
       focusWorkspaceChatInput();
@@ -1956,7 +2112,10 @@
 
     for (const action of actions.slice(0, 5)) {
       if (action.type === "create_task") {
-        const card = createBoardTask(action.title, action.description ?? "Created by Spacesly Agent chat.");
+        const card = createBoardTask(
+          action.title,
+          action.description ?? "Created by Spacesly Agent chat.",
+        );
         if (card) {
           setWorkspaceChatSessionCard(card.id, { created: true });
           appendWorkspaceChatActivity({
@@ -1965,7 +2124,9 @@
             text: `Created ${ticketLabel(card)}: ${card.title}`,
             cardId: card.id,
           });
-          results.push(`Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.`);
+          results.push(
+            `Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.`,
+          );
         } else {
           results.push(`Could not create task "${action.title}".`);
         }
@@ -1974,8 +2135,14 @@
 
       if (action.type === "sync_jira") {
         await syncJira();
-        appendWorkspaceChatActivity({ kind: "tool", label: "sync_jira", text: "Requested Jira sync from chat." });
-        results.push("Jira sync requested. Watch the board notice for fetched card count or errors.");
+        appendWorkspaceChatActivity({
+          kind: "tool",
+          label: "sync_jira",
+          text: "Requested Jira sync from chat.",
+        });
+        results.push(
+          "Jira sync requested. Watch the board notice for fetched card count or errors.",
+        );
         continue;
       }
 
@@ -1989,23 +2156,46 @@
         selectCard(card);
         setWorkspaceChatSessionCard(card.id);
         setWorkspaceMode("board");
-        appendWorkspaceChatActivity({ kind: "tool", label: "select_card", text: `Opened ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
-        results.push(`Opened ${ticketLabel(card)}: "${card.title}". Current state: ${executionDetail(card.execution)}.`);
+        appendWorkspaceChatActivity({
+          kind: "tool",
+          label: "select_card",
+          text: `Opened ${ticketLabel(card)}: ${card.title}`,
+          cardId: card.id,
+        });
+        results.push(
+          `Opened ${ticketLabel(card)}: "${card.title}". Current state: ${executionDetail(card.execution)}.`,
+        );
         continue;
       }
 
       if (action.type === "delete_card") {
         const removed = removeCard(card.id);
-        appendWorkspaceChatActivity({ kind: "tool", label: "delete_card", text: `${removed ? "Removed" : "Failed to remove"} ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
-        results.push(removed ? `Removed ${ticketLabel(card)} from Spacesly.` : `Could not remove ${ticketLabel(card)}.`);
+        appendWorkspaceChatActivity({
+          kind: "tool",
+          label: "delete_card",
+          text: `${removed ? "Removed" : "Failed to remove"} ${ticketLabel(card)}: ${card.title}`,
+          cardId: card.id,
+        });
+        results.push(
+          removed
+            ? `Removed ${ticketLabel(card)} from Spacesly.`
+            : `Could not remove ${ticketLabel(card)}.`,
+        );
         continue;
       }
 
       if (action.type === "start_agent") {
         setWorkspaceChatSessionCard(card.id);
-        appendWorkspaceChatActivity({ kind: "tool", label: "start_agent", text: `Requested Agent start for ${ticketLabel(card)}: ${card.title}`, cardId: card.id });
+        appendWorkspaceChatActivity({
+          kind: "tool",
+          label: "start_agent",
+          text: `Requested Agent start for ${ticketLabel(card)}: ${card.title}`,
+          cardId: card.id,
+        });
         await startWorkerForCard(card.id);
-        results.push(`Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`);
+        results.push(
+          `Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`,
+        );
         continue;
       }
 
@@ -2017,15 +2207,26 @@
         }
         await moveCardAndSync(card.id, columnId);
         setWorkspaceChatSessionCard(card.id);
-        appendWorkspaceChatActivity({ kind: "tool", label: "move_card", text: `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}.`, cardId: card.id });
-        results.push(`Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}. Jira write-back is attempted only for In Progress and Done.`);
+        appendWorkspaceChatActivity({
+          kind: "tool",
+          label: "move_card",
+          text: `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}.`,
+          cardId: card.id,
+        });
+        results.push(
+          `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}. Jira write-back is attempted only for In Progress and Done.`,
+        );
       }
     }
 
-    return results.length > 0 ? `Command result: ${results.join(" ")}` : "Command result: no board actions were applied.";
+    return results.length > 0
+      ? `Command result: ${results.join(" ")}`
+      : "Command result: no board actions were applied.";
   }
 
-  function columnIdForChatTarget(target: "todo" | "queued" | "in_progress" | "done"): string | null {
+  function columnIdForChatTarget(
+    target: "todo" | "queued" | "in_progress" | "done",
+  ): string | null {
     const intent: ColumnIntent = target === "todo" ? "backlog" : target;
     return activeColumnByIntent.get(intent)?.id ?? null;
   }
@@ -2095,14 +2296,20 @@
     }
 
     if (!config.board_id) {
-      appNotice = { tone: "error", message: "Choose a Jira board first. Open Settings and click Connect Jira." };
+      appNotice = {
+        tone: "error",
+        message: "Choose a Jira board first. Open Settings and click Connect Jira.",
+      };
       openSettings("jira");
       return;
     }
 
     syncing = true;
     syncError = null;
-      appNotice = { tone: "info", message: "Refreshing from Jira. Saved cards stay visible if Jira is slow." };
+    appNotice = {
+      tone: "info",
+      message: "Refreshing from Jira. Saved cards stay visible if Jira is slow.",
+    };
     await tick();
 
     try {
@@ -2116,15 +2323,19 @@
       workspace = projection;
       cacheSavedAt = Date.now();
       saveCachedWorkspace(projection);
-      const syncedCards = projection.projects[0]?.boards[0]?.columns.reduce(
-        (count, column) => count + column.cards.reduce((total, card) => total + (card.source !== "local" ? 1 : 0), 0),
-        0,
-      ) ?? 0;
+      const syncedCards =
+        projection.projects[0]?.boards[0]?.columns.reduce(
+          (count, column) =>
+            count +
+            column.cards.reduce((total, card) => total + (card.source !== "local" ? 1 : 0), 0),
+          0,
+        ) ?? 0;
       appNotice = {
         tone: syncedCards > 0 ? "success" : "info",
-        message: syncedCards > 0
-          ? `Synced ${syncedCards} Jira card${syncedCards === 1 ? "" : "s"} from up to ${settings.jira.maxPages} page${settings.jira.maxPages === 1 ? "" : "s"}.`
-          : "Sync finished, but Jira returned no cards for this board/query.",
+        message:
+          syncedCards > 0
+            ? `Synced ${syncedCards} Jira card${syncedCards === 1 ? "" : "s"} from up to ${settings.jira.maxPages} page${settings.jira.maxPages === 1 ? "" : "s"}.`
+            : "Sync finished, but Jira returned no cards for this board/query.",
       };
     } catch (reason) {
       syncError = reason instanceof Error ? reason.message : String(reason);
@@ -2154,9 +2365,10 @@
     try {
       const status = await testJiraMcpConnection(config);
       rememberMcpTools(serverId, status.tools);
-      connectionMessage = status.board_count > 0 || status.issue_count > 0
-        ? `Jira connected. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
-        : `MCP connected with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
+      connectionMessage =
+        status.board_count > 0 || status.issue_count > 0
+          ? `Jira connected. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
+          : `MCP connected with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
       rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
@@ -2182,13 +2394,14 @@
     if (!selectedServer) return;
     const serverId = selectedServer.id;
 
-    const serverConfig = selectedServer.kind === "jira"
-      ? buildJiraConfig()?.server
-      : {
-          command: selectedServer.command,
-          args: selectedServer.args,
-          env: selectedServer.env,
-        };
+    const serverConfig =
+      selectedServer.kind === "jira"
+        ? buildJiraConfig()?.server
+        : {
+            command: selectedServer.command,
+            args: selectedServer.args,
+            env: selectedServer.env,
+          };
     if (!serverConfig) return;
 
     testingConnection = true;
@@ -2269,7 +2482,8 @@
       const boards = await getJiraBoards(config);
       const selectedBoard = boards.find((board) => board.id === settings.jira.boardId) ?? boards[0];
       if (!selectedBoard) {
-        connectionMessage = "Connected to Jira, but no boards were returned for this account/filter.";
+        connectionMessage =
+          "Connected to Jira, but no boards were returned for this account/filter.";
         appNotice = { tone: "error", message: connectionMessage };
         return;
       }
@@ -2351,7 +2565,15 @@
     selectedServerId = remaining[0].id;
   }
 
-  function updateSelectedServer(values: Partial<{ name: string; kind: AppSettings["mcpServers"][number]["kind"]; command: string; args: string[]; env: Record<string, string> }>) {
+  function updateSelectedServer(
+    values: Partial<{
+      name: string;
+      kind: AppSettings["mcpServers"][number]["kind"];
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+    }>,
+  ) {
     if (!selectedServer) return;
 
     settings = {
@@ -2434,9 +2656,7 @@
     };
   }
 
-  function updateActiveBoard(
-    transform: (board: BoardProjection) => BoardProjection,
-  ): boolean {
+  function updateActiveBoard(transform: (board: BoardProjection) => BoardProjection): boolean {
     if (!workspace) return false;
 
     const [project, ...otherProjects] = workspace.projects;
@@ -2457,7 +2677,12 @@
     return true;
   }
 
-  function moveCard(cardId: string, targetColumnId: string, execution?: ExecutionState, announce = true) {
+  function moveCard(
+    cardId: string,
+    targetColumnId: string,
+    execution?: ExecutionState,
+    announce = true,
+  ) {
     const movedCard = activeCardById.get(cardId);
     if (!movedCard) return;
 
@@ -2470,15 +2695,18 @@
       ...(execution !== undefined ? { execution } : {}),
     };
 
-    if (!updateActiveBoard((board) => ({
-      ...board,
-      columns: board.columns.map((column) => {
-        const cards = column.cards.filter((card) => card.id !== cardId);
-        return column.id === targetColumnId
-          ? { ...column, cards: [...cards, cardForTarget] }
-          : { ...column, cards };
-      }),
-    }))) return;
+    if (
+      !updateActiveBoard((board) => ({
+        ...board,
+        columns: board.columns.map((column) => {
+          const cards = column.cards.filter((card) => card.id !== cardId);
+          return column.id === targetColumnId
+            ? { ...column, cards: [...cards, cardForTarget] }
+            : { ...column, cards };
+        }),
+      }))
+    )
+      return;
 
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace!);
@@ -2501,13 +2729,16 @@
       return false;
     }
 
-    if (!updateActiveBoard((board) => ({
-      ...board,
-      columns: board.columns.map((column) => ({
-        ...column,
-        cards: column.cards.filter((entry) => entry.id !== cardId),
-      })),
-    }))) return false;
+    if (
+      !updateActiveBoard((board) => ({
+        ...board,
+        columns: board.columns.map((column) => ({
+          ...column,
+          cards: column.cards.filter((entry) => entry.id !== cardId),
+        })),
+      }))
+    )
+      return false;
 
     locallyDeleteCachedCard(cardId);
     if (selectedCardId === cardId) selectedCardId = null;
@@ -2515,8 +2746,10 @@
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
     if (latestAgentSessionId === cardId) {
-      latestAgentSessionId = Object.values(remainingSessions)
-        .sort((left, right) => sessionActivityAt(right) - sessionActivityAt(left))[0]?.cardId ?? null;
+      latestAgentSessionId =
+        Object.values(remainingSessions).sort(
+          (left, right) => sessionActivityAt(right) - sessionActivityAt(left),
+        )[0]?.cardId ?? null;
     }
     if (agentConsoleCardId === cardId) {
       const fallback = Object.values(remainingSessions)[0] ?? null;
@@ -2527,9 +2760,10 @@
     saveCachedWorkspace(workspace!);
     appNotice = {
       tone: "success",
-      message: card.source === "local"
-        ? `Removed ${card.title}.`
-        : `Removed ${ticketLabel(card)} from Spacesly. Jira issue was not deleted.`,
+      message:
+        card.source === "local"
+          ? `Removed ${card.title}.`
+          : `Removed ${ticketLabel(card)} from Spacesly. Jira issue was not deleted.`,
     };
     return true;
   }
@@ -2552,12 +2786,15 @@
       execution: "idle",
     };
 
-    if (!updateActiveBoard((board) => ({
-      ...board,
-      columns: board.columns.map((column) =>
-        column.intent === "backlog" ? { ...column, cards: [...column.cards, card] } : column,
-      ),
-    }))) return null;
+    if (
+      !updateActiveBoard((board) => ({
+        ...board,
+        columns: board.columns.map((column) =>
+          column.intent === "backlog" ? { ...column, cards: [...column.cards, card] } : column,
+        ),
+      }))
+    )
+      return null;
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace!);
     return card;
@@ -2572,35 +2809,55 @@
     newTaskTitle = "";
     newTaskDescription = "";
     newTaskOpen = false;
-    appNotice = { tone: "success", message: "Task created. Queue it or click Start when you want the Agent to run it." };
+    appNotice = {
+      tone: "success",
+      message: "Task created. Queue it or click Start when you want the Agent to run it.",
+    };
   }
 
-  function beginAgentRun(card: CardProjection, continuation = false, gitSnapshot: AgentRunGitSnapshot | null = gitSnapshotFromInfo(workspaceGitInfo)) {
+  function beginAgentRun(
+    card: CardProjection,
+    continuation = false,
+    gitSnapshot: AgentRunGitSnapshot | null = gitSnapshotFromInfo(workspaceGitInfo),
+  ) {
     const previousSession = agentRunSessions[card.id];
     agentRunCardId = card.id;
     agentRunTitle = card.title;
     agentRunStatus = "running";
     agentRunProgress = continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5;
-    agentRunOutput = continuation && previousSession?.output ? previousSession.output : "Waiting for Agent output...";
+    agentRunOutput =
+      continuation && previousSession?.output
+        ? previousSession.output
+        : "Waiting for Agent output...";
     agentRunResult = continuation && previousSession?.result ? previousSession.result : null;
     agentRunLogs = continuation && previousSession ? previousSession.logs : [];
-    agentRunGitSnapshot = continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot;
-    agentRunTranscript = continuation && previousSession
-      ? (previousSession.transcript ?? [])
-      : [createAgentSessionEvent("system", "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.")];
-    agentTerminalLines = continuation && previousSession
-      ? previousSession.terminalLines
-      : [
-          {
-            id: `term-${Date.now().toString(36)}`,
-            prompt: "system",
-            text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
-          },
-        ];
+    agentRunGitSnapshot =
+      continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot;
+    agentRunTranscript =
+      continuation && previousSession
+        ? (previousSession.transcript ?? [])
+        : [
+            createAgentSessionEvent(
+              "system",
+              "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+            ),
+          ];
+    agentTerminalLines =
+      continuation && previousSession
+        ? previousSession.terminalLines
+        : [
+            {
+              id: `term-${Date.now().toString(36)}`,
+              prompt: "system",
+              text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+            },
+          ];
     appendStructuredAgentLog(
       "info",
       continuation ? "continue" : "start",
-      continuation ? `Agent continuation started for ${ticketLabel(card)}.` : `Agent run started for ${ticketLabel(card)}.`,
+      continuation
+        ? `Agent continuation started for ${ticketLabel(card)}.`
+        : `Agent run started for ${ticketLabel(card)}.`,
       [
         `Work item: ${ticketLabel(card)} · ${card.title}`,
         `Continuation: ${continuation ? "yes" : "no"}`,
@@ -2655,11 +2912,14 @@
 
   function agentSessionForCard(cardId: string): AgentRunSession | null {
     return agentRunCardId === cardId
-      ? activeAgentSession() ?? agentRunSessions[cardId] ?? null
-      : agentRunSessions[cardId] ?? null;
+      ? (activeAgentSession() ?? agentRunSessions[cardId] ?? null)
+      : (agentRunSessions[cardId] ?? null);
   }
 
-  function updateAgentSessionForCard(cardId: string, transform: (session: AgentRunSession) => AgentRunSession) {
+  function updateAgentSessionForCard(
+    cardId: string,
+    transform: (session: AgentRunSession) => AgentRunSession,
+  ) {
     const session = agentSessionForCard(cardId);
     if (!session) return;
 
@@ -2670,15 +2930,18 @@
     if (agentRunCardId === cardId) applyAgentSessionToConsole(nextSession);
   }
 
-  function retainAgentSessions(sessions: Record<string, AgentRunSession>): Record<string, AgentRunSession> {
+  function retainAgentSessions(
+    sessions: Record<string, AgentRunSession>,
+  ): Record<string, AgentRunSession> {
     const entries = Object.entries(sessions);
     if (entries.length <= MAX_RETAINED_AGENT_SESSIONS) return sessions;
 
     const candidates = entries
-      .filter(([cardId, session]) =>
-        session.status !== "running"
-        && cardId !== agentConsoleCardId
-        && cardId !== agentRunCardId,
+      .filter(
+        ([cardId, session]) =>
+          session.status !== "running" &&
+          cardId !== agentConsoleCardId &&
+          cardId !== agentRunCardId,
       )
       .sort(([, left], [, right]) => sessionActivityAt(left) - sessionActivityAt(right));
 
@@ -2703,7 +2966,11 @@
     persistActiveAgentRun();
   }
 
-  function appendAgentSessionTranscriptForCard(cardId: string, type: AgentSessionEvent["type"], text: string) {
+  function appendAgentSessionTranscriptForCard(
+    cardId: string,
+    type: AgentSessionEvent["type"],
+    text: string,
+  ) {
     updateAgentSessionForCard(cardId, (session) => ({
       ...session,
       transcript: appendAgentSessionEvent(
@@ -2727,7 +2994,10 @@
   function openAgentRunForCard(card: CardProjection) {
     const session = agentRunSessions[card.id];
     if (!session) {
-      appNotice = { tone: "info", message: "This card does not have an Agent terminal session yet." };
+      appNotice = {
+        tone: "info",
+        message: "This card does not have an Agent terminal session yet.",
+      };
       return;
     }
 
@@ -2773,7 +3043,10 @@
   }
 
   function setAgentRunOutputForCard(cardId: string, output: string) {
-    updateAgentSessionForCard(cardId, (session) => ({ ...session, output: capText(output, MAX_AGENT_OUTPUT_CHARS) }));
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      output: capText(output, MAX_AGENT_OUTPUT_CHARS),
+    }));
   }
 
   function setAgentRunResultForCard(cardId: string, result: AiWorkerTaskResult | null) {
@@ -2802,32 +3075,51 @@
   }
 
   function appendAgentLog(tone: AgentRunLog["tone"], label: string, message: string) {
-    agentRunLogs = capList([
-      ...agentRunLogs,
-      {
-        id: `run-${Date.now().toString(36)}-${agentRunLogs.length}`,
-        at: new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-        tone,
-        label,
-        message,
-      },
-    ], MAX_AGENT_LOGS);
-    persistActiveAgentRun();
-  }
-
-  function appendAgentLogForCard(cardId: string, tone: AgentRunLog["tone"], label: string, message: string) {
-    updateAgentSessionForCard(cardId, (session) => ({
-      ...session,
-      logs: capList([
-        ...session.logs,
+    agentRunLogs = capList(
+      [
+        ...agentRunLogs,
         {
-          id: `run-${Date.now().toString(36)}-${session.logs.length}`,
-          at: new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          id: `run-${Date.now().toString(36)}-${agentRunLogs.length}`,
+          at: new Date().toLocaleTimeString(undefined, {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
           tone,
           label,
           message,
         },
-      ], MAX_AGENT_LOGS),
+      ],
+      MAX_AGENT_LOGS,
+    );
+    persistActiveAgentRun();
+  }
+
+  function appendAgentLogForCard(
+    cardId: string,
+    tone: AgentRunLog["tone"],
+    label: string,
+    message: string,
+  ) {
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      logs: capList(
+        [
+          ...session.logs,
+          {
+            id: `run-${Date.now().toString(36)}-${session.logs.length}`,
+            at: new Date().toLocaleTimeString(undefined, {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            }),
+            tone,
+            label,
+            message,
+          },
+        ],
+        MAX_AGENT_LOGS,
+      ),
     }));
   }
 
@@ -2886,14 +3178,18 @@
     operatorNotes: string | null,
     previousOutput: string | null,
   ): string {
-    const runtimeLabel = config.runtime === "opencode"
-      ? `OpenCode ${config.opencode_model}`
-      : `${config.provider_name} ${config.model}`;
+    const runtimeLabel =
+      config.runtime === "opencode"
+        ? `OpenCode ${config.opencode_model}`
+        : `${config.provider_name} ${config.model}`;
     const description = card.description.trim();
-    const clippedDescription = description.length > 320 ? `${description.slice(0, 320)}…` : description;
+    const clippedDescription =
+      description.length > 320 ? `${description.slice(0, 320)}…` : description;
     const transcript = previousOutput?.trim() ? previousOutput : null;
     const clippedPreviousOutput = transcript
-      ? (transcript.length > 1200 ? `${transcript.slice(-1200)}…` : transcript)
+      ? transcript.length > 1200
+        ? `${transcript.slice(-1200)}…`
+        : transcript
       : "None";
 
     return [
@@ -2916,28 +3212,34 @@
   }
 
   function appendTerminalLine(prompt: string, text: string) {
-    agentTerminalLines = capList([
-      ...agentTerminalLines,
-      {
-        id: `term-${Date.now().toString(36)}-${agentTerminalLines.length}`,
-        prompt,
-        text,
-      },
-    ], MAX_AGENT_TERMINAL_LINES);
+    agentTerminalLines = capList(
+      [
+        ...agentTerminalLines,
+        {
+          id: `term-${Date.now().toString(36)}-${agentTerminalLines.length}`,
+          prompt,
+          text,
+        },
+      ],
+      MAX_AGENT_TERMINAL_LINES,
+    );
     persistActiveAgentRun();
   }
 
   function appendTerminalLineForCard(cardId: string, prompt: string, text: string) {
     updateAgentSessionForCard(cardId, (session) => ({
       ...session,
-      terminalLines: capList([
-        ...session.terminalLines,
-        {
-          id: `term-${Date.now().toString(36)}-${session.terminalLines.length}`,
-          prompt,
-          text,
-        },
-      ], MAX_AGENT_TERMINAL_LINES),
+      terminalLines: capList(
+        [
+          ...session.terminalLines,
+          {
+            id: `term-${Date.now().toString(36)}-${session.terminalLines.length}`,
+            prompt,
+            text,
+          },
+        ],
+        MAX_AGENT_TERMINAL_LINES,
+      ),
     }));
   }
 
@@ -2951,7 +3253,11 @@
     }
 
     appendTerminalLineForCard(cardId, "operator", input);
-    appendAgentSessionTranscriptForCard(cardId, isApprovalText(input) ? "approval" : "operator_note", input);
+    appendAgentSessionTranscriptForCard(
+      cardId,
+      isApprovalText(input) ? "approval" : "operator_note",
+      input,
+    );
     appendStructuredAgentLogForCard(
       cardId,
       "info",
@@ -2971,14 +3277,19 @@
         ["The blocked session can continue."],
         ["Continue the Agent to finish remaining work."],
       );
-      appNotice = { tone: "info", message: "Approval recorded. Continue the Agent on this card when ready." };
+      appNotice = {
+        tone: "info",
+        message: "Approval recorded. Continue the Agent on this card when ready.",
+      };
     }
     agentTerminalInput = "";
   }
 
   function isApprovalText(value: string): boolean {
     const text = value.toLowerCase();
-    return text.includes("approve") || text.includes("approved") || text.includes("approval granted");
+    return (
+      text.includes("approve") || text.includes("approved") || text.includes("approval granted")
+    );
   }
 
   function operatorNotesForCard(cardId: string): string | null {
@@ -2995,11 +3306,16 @@
 
   function previousOutputForCard(cardId: string): string | null {
     const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
-    const transcript = agentSessionReplay(session?.transcript ?? [], MAX_AGENT_SESSION_REPLAY_CHARS);
+    const transcript = agentSessionReplay(
+      session?.transcript ?? [],
+      MAX_AGENT_SESSION_REPLAY_CHARS,
+    );
     if (transcript) return transcript;
 
     const output = session?.output?.trim();
-    return output && output !== "Waiting for Agent output..." && output !== "Agent is processing the task context..."
+    return output &&
+      output !== "Waiting for Agent output..." &&
+      output !== "Agent is processing the task context..."
       ? output
       : null;
   }
@@ -3036,15 +3352,25 @@
     return sections.join("\n");
   }
 
-  function agentJiraComment(result: AiWorkerTaskResult, config: AiWorkerConfig, gitInfo: GitWorkspaceInfo | null = null): string {
+  function agentJiraComment(
+    result: AiWorkerTaskResult,
+    config: AiWorkerConfig,
+    gitInfo: GitWorkspaceInfo | null = null,
+  ): string {
     const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
     const model = config.runtime === "opencode" ? config.opencode_model : config.model;
-    const verification = result.evidence.length > 0
-      ? uniqueLines(result.evidence.map(userFacingVerification).filter(Boolean)).slice(0, 4)
-      : ["Verification was not reported."];
+    const verification =
+      result.evidence.length > 0
+        ? uniqueLines(result.evidence.map(userFacingVerification).filter(Boolean)).slice(0, 4)
+        : ["Verification was not reported."];
     const nextSteps = result.next
       .map((line) => singleLine(line, 300))
-      .filter((line) => line && !/^review the (result|evidence)/i.test(line) && !/^keep or sync the completed/i.test(line));
+      .filter(
+        (line) =>
+          line &&
+          !/^review the (result|evidence)/i.test(line) &&
+          !/^keep or sync the completed/i.test(line),
+      );
     const operationalDetails = [
       `Runtime: ${runtime}`,
       `Model: ${model}`,
@@ -3055,10 +3381,21 @@
     ];
     const evidence = [
       `Completion status: ${result.completion_status}`,
-      ...(result.evidence.length > 0 ? ["Verification evidence:", ...result.evidence.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
-      ...(result.details.length > 0 ? ["Execution details:", ...result.details.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
-      ...(result.blocked_reason ? [`Blocked reason: ${jiraWikiText(result.blocked_reason, 900)}`] : []),
-      ...(result.next.length > 0 ? ["Reported follow-up:", ...result.next.map((line) => `* ${jiraWikiText(line, 900)}`)] : []),
+      ...(result.evidence.length > 0
+        ? [
+            "Verification evidence:",
+            ...result.evidence.map((line) => `* ${jiraWikiText(line, 900)}`),
+          ]
+        : []),
+      ...(result.details.length > 0
+        ? ["Execution details:", ...result.details.map((line) => `* ${jiraWikiText(line, 900)}`)]
+        : []),
+      ...(result.blocked_reason
+        ? [`Blocked reason: ${jiraWikiText(result.blocked_reason, 900)}`]
+        : []),
+      ...(result.next.length > 0
+        ? ["Reported follow-up:", ...result.next.map((line) => `* ${jiraWikiText(line, 900)}`)]
+        : []),
     ];
 
     return [
@@ -3085,10 +3422,13 @@
   function userFacingVerification(value: string): string {
     const line = singleLine(value, 300);
     const normalized = line.toLowerCase();
-    if (/(bamboo|pipeline|build)/i.test(normalized)) return "Build pipeline completed successfully.";
-    if (/(openshift|kubernetes|ocp|pod|deployment|rollout)/i.test(normalized)) return "Deployment health was verified.";
+    if (/(bamboo|pipeline|build)/i.test(normalized))
+      return "Build pipeline completed successfully.";
+    if (/(openshift|kubernetes|ocp|pod|deployment|rollout)/i.test(normalized))
+      return "Deployment health was verified.";
     if (/(test|lint|check|typecheck|compile)/i.test(normalized)) return "Automated checks passed.";
-    if (/(commit|push|upstream|branch)/i.test(normalized)) return "Repository changes were committed and synchronized.";
+    if (/(commit|push|upstream|branch)/i.test(normalized))
+      return "Repository changes were committed and synchronized.";
     return line;
   }
 
@@ -3101,13 +3441,11 @@
   }
 
   function agentWritebackRequiresPushedCommit(card: CardProjection): boolean {
-    const text = [
-      card.title,
-      card.description,
-      card.labels.join(" "),
-    ].join("\n").toLowerCase();
+    const text = [card.title, card.description, card.labels.join(" ")].join("\n").toLowerCase();
 
-    const hasUpdateVerb = ["update", "change", "modify", "edit", "add", "remove", "set"].some((needle) => text.includes(needle));
+    const hasUpdateVerb = ["update", "change", "modify", "edit", "add", "remove", "set"].some(
+      (needle) => text.includes(needle),
+    );
     const hasEnvTarget = [
       ".env",
       "env variable",
@@ -3128,25 +3466,37 @@
     return hasUpdateVerb && hasEnvTarget;
   }
 
-  async function verifyAgentJiraDoneGate(card: CardProjection, config: AiWorkerConfig): Promise<GitWorkspaceInfo | null> {
+  async function verifyAgentJiraDoneGate(
+    card: CardProjection,
+    config: AiWorkerConfig,
+  ): Promise<GitWorkspaceInfo | null> {
     if (!agentWritebackRequiresPushedCommit(card)) return null;
 
-    const gitPath = config.opencode_workdir?.trim() || workspaceRoot || workspaceGitInfo?.repo_root || null;
+    const gitPath =
+      config.opencode_workdir?.trim() || workspaceRoot || workspaceGitInfo?.repo_root || null;
     if (!gitPath) {
-      throw new Error("Jira Done blocked: Spacesly cannot determine the git workdir for this Helm/env/template change.");
+      throw new Error(
+        "Jira Done blocked: Spacesly cannot determine the git workdir for this Helm/env/template change.",
+      );
     }
 
-    const info = config.opencode_workdir?.trim() ? await getPathGitInfo(gitPath) : await getWorkspaceGitInfo();
+    const info = config.opencode_workdir?.trim()
+      ? await getPathGitInfo(gitPath)
+      : await getWorkspaceGitInfo();
     workspaceGitInfo = info.is_git_repo ? info : null;
     selectedWorkspaceBranch = info.current_branch ?? "";
 
     if (!info.is_git_repo) {
-      throw new Error("Jira Done blocked: Spacesly cannot verify a git repository for this Helm/env/template change.");
+      throw new Error(
+        "Jira Done blocked: Spacesly cannot verify a git repository for this Helm/env/template change.",
+      );
     }
 
     const runSnapshot = agentSessionForCard(card.id)?.gitSnapshot ?? null;
     if (!runSnapshot?.head_commit) {
-      throw new Error("Jira Done blocked: Spacesly did not capture the starting commit for this Agent run.");
+      throw new Error(
+        "Jira Done blocked: Spacesly did not capture the starting commit for this Agent run.",
+      );
     }
 
     if (!info.head_commit) {
@@ -3154,7 +3504,9 @@
     }
 
     if (info.head_commit === runSnapshot.head_commit) {
-      throw new Error("Jira Done blocked: no new commit was created for this Helm/env/template change.");
+      throw new Error(
+        "Jira Done blocked: no new commit was created for this Helm/env/template change.",
+      );
     }
 
     if (info.dirty_worktree) {
@@ -3173,28 +3525,42 @@
   }
 
   function singleLine(value: string, maxChars: number): string {
-    const cleaned = value.replace(/```[\s\S]*?```/g, "").replace(/\s+/g, " ").trim();
+    const cleaned = value
+      .replace(/```[\s\S]*?```/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
     if (cleaned.length <= maxChars) return cleaned;
     return `${cleaned.slice(0, maxChars - 3).trim()}...`;
   }
 
   function updateCardExecution(cardId: string, execution: ExecutionState) {
     if (!workspace) return;
-    const completedAt = typeof execution === "object" && "completed" in execution ? Date.now() : null;
+    const completedAt =
+      typeof execution === "object" && "completed" in execution ? Date.now() : null;
 
-    if (!updateActiveBoard((board) => ({
-      ...board,
-      columns: board.columns.map((column) => ({
-        ...column,
-        cards: column.cards.map((card) => card.id === cardId ? { ...card, execution, completedAt } : card),
-      })),
-    }))) return;
+    if (
+      !updateActiveBoard((board) => ({
+        ...board,
+        columns: board.columns.map((column) => ({
+          ...column,
+          cards: column.cards.map((card) =>
+            card.id === cardId ? { ...card, execution, completedAt } : card,
+          ),
+        })),
+      }))
+    )
+      return;
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace!);
   }
 
-  function resolveActionCard(action: { card_id?: string; ticket?: string; title?: string }): CardProjection | null {
-    if (action.card_id && activeCardById.has(action.card_id)) return activeCardById.get(action.card_id) ?? null;
+  function resolveActionCard(action: {
+    card_id?: string;
+    ticket?: string;
+    title?: string;
+  }): CardProjection | null {
+    if (action.card_id && activeCardById.has(action.card_id))
+      return activeCardById.get(action.card_id) ?? null;
 
     const ticket = action.ticket?.toLowerCase();
     if (ticket) {
@@ -3208,7 +3574,7 @@
     }
 
     const sessionCardId = resolveSessionCardId();
-    return sessionCardId ? activeCardById.get(sessionCardId) ?? null : null;
+    return sessionCardId ? (activeCardById.get(sessionCardId) ?? null) : null;
   }
 
   function columnIdByIntent(intent: "queued" | "in_progress" | "done"): string | null {
@@ -3263,7 +3629,10 @@
     const card = activeCardById.get(cardId);
     if (!card) return;
     if (!isBlocked(card.execution) && agentSessionForCard(cardId)?.status !== "blocked") {
-      appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
+      appNotice = {
+        tone: "error",
+        message: "Manual Done is only available for blocked Agent sessions.",
+      };
       return;
     }
 
@@ -3283,7 +3652,10 @@
     const doneColumnId = columnIdByIntent("done");
     if (!card || !doneColumnId) return;
     if (!isBlocked(card.execution) && agentSessionForCard(cardId)?.status !== "blocked") {
-      appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
+      appNotice = {
+        tone: "error",
+        message: "Manual Done is only available for blocked Agent sessions.",
+      };
       return;
     }
 
@@ -3353,7 +3725,10 @@
     const config = buildJiraConfig();
     if (!config) {
       rollback();
-      appNotice = { tone: "error", message: `Could not sync ${issueKey} to Jira. Configure Jira before moving this issue.` };
+      appNotice = {
+        tone: "error",
+        message: `Could not sync ${issueKey} to Jira. Configure Jira before moving this issue.`,
+      };
       return;
     }
 
@@ -3364,9 +3739,10 @@
       await transitionJiraIssue(config, issueKey, targetStatus);
       appNotice = {
         tone: "success",
-        message: targetStatus === "In Progress"
-          ? `${issueKey} assigned to you and moved to ${targetStatus} in Jira.`
-          : `${issueKey} moved to ${targetStatus} in Jira.`,
+        message:
+          targetStatus === "In Progress"
+            ? `${issueKey} assigned to you and moved to ${targetStatus} in Jira.`
+            : `${issueKey} moved to ${targetStatus} in Jira.`,
       };
     } catch (reason) {
       rollback();
@@ -3388,7 +3764,10 @@
     const inProgressColumnId = columnIdByIntent("in_progress");
     const doneColumnId = columnIdByIntent("done");
     if (!inProgressColumnId || !doneColumnId) {
-      appNotice = { tone: "error", message: "Agent cannot start because this board is missing an In Progress or Done column." };
+      appNotice = {
+        tone: "error",
+        message: "Agent cannot start because this board is missing an In Progress or Done column.",
+      };
       return;
     }
     const runId = `agent-${cardId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3413,19 +3792,30 @@
       appNotice = { tone: "error", message };
       return;
     }
-    markActiveAgentRun(typeof localStorage === "undefined" ? undefined : localStorage, cardId, runId);
+    markActiveAgentRun(
+      typeof localStorage === "undefined" ? undefined : localStorage,
+      cardId,
+      runId,
+    );
 
     const issueKey = jiraKey(card);
     const existingSession = agentRunSessions[cardId];
-    const isContinuation = existingSession?.status === "blocked" || existingSession?.status === "timeout";
+    const isContinuation =
+      existingSession?.status === "blocked" || existingSession?.status === "timeout";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
     let backendExecutionStarted = false;
 
     try {
       beginAgentRun(card, isContinuation, null);
-      const runtimeLabel = config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`;
-      appNotice = { tone: "info", message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.` };
+      const runtimeLabel =
+        config.runtime === "opencode"
+          ? `OpenCode ${config.opencode_model}`
+          : `${config.provider_name} ${config.model}`;
+      appNotice = {
+        tone: "info",
+        message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.`,
+      };
 
       if (config.runtime === "opencode") {
         const runGitInfo = config.opencode_workdir?.trim()
@@ -3453,8 +3843,12 @@
         cardId,
         "info",
         "model",
-        config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${config.provider_name} / ${config.model}.`,
-        [`Runtime selected: ${config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`}`],
+        config.runtime === "opencode"
+          ? `Using OpenCode / ${config.opencode_model}.`
+          : `Using ${config.provider_name} / ${config.model}.`,
+        [
+          `Runtime selected: ${config.runtime === "opencode" ? `OpenCode ${config.opencode_model}` : `${config.provider_name} ${config.model}`}`,
+        ],
         [`Model configuration validated for this run.`],
         ["Wait for the execution result before marking progress."],
       );
@@ -3527,7 +3921,10 @@
         ],
         ["Pass the exported context to the runtime and wait for evidence."],
       );
-      setAgentRunOutputForCard(cardId, buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput));
+      setAgentRunOutputForCard(
+        cardId,
+        buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput),
+      );
       setAgentProgressForCard(cardId, 55);
       let result: AiWorkerTaskResult;
       try {
@@ -3545,7 +3942,9 @@
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {
           const cancelled = await cancelAiWorkerTask(runId).catch(() => false);
           if (cancelled) {
-            updateCardExecution(cardId, { blocked: { reason: "Agent timed out and was cancelled." } });
+            updateCardExecution(cardId, {
+              blocked: { reason: "Agent timed out and was cancelled." },
+            });
           }
           setAgentRunStatusForCard(cardId, "timeout");
           appendStructuredAgentLogForCard(
@@ -3554,8 +3953,16 @@
             "timeout",
             "Spacesly stopped waiting for the Agent response before a structured result arrived.",
             [reason.message],
-            [cancelled ? "The Agent process was cancelled." : "Spacesly could not confirm process cancellation."],
-            [cancelled ? "Review the task, then retry when ready." : "Do not retry until the Agent process is confirmed stopped."],
+            [
+              cancelled
+                ? "The Agent process was cancelled."
+                : "Spacesly could not confirm process cancellation.",
+            ],
+            [
+              cancelled
+                ? "Review the task, then retry when ready."
+                : "Do not retry until the Agent process is confirmed stopped.",
+            ],
           );
           appNotice = {
             tone: cancelled ? "info" : "error",
@@ -3577,10 +3984,7 @@
           `Completion status: ${result.completion_status}`,
           `Blocked reason: ${result.blocked_reason ?? "none"}`,
         ],
-        [
-          `Evidence lines: ${result.evidence.length}`,
-          `Detail lines: ${result.details.length}`,
-        ],
+        [`Evidence lines: ${result.evidence.length}`, `Detail lines: ${result.details.length}`],
         result.completion_status === "completed"
           ? ["Review the result, then write back to board and Jira."]
           : ["Inspect the blocker, add notes if needed, and continue."],
@@ -3588,7 +3992,11 @@
       setAgentRunResultForCard(cardId, result);
       setAgentRunOutputForCard(cardId, agentResultText(result));
       appendTerminalLineForCard(cardId, "agent", agentResultText(result));
-      appendAgentSessionTranscriptForCard(cardId, result.completion_status === "completed" ? "agent_output" : "blocker", agentResultText(result));
+      appendAgentSessionTranscriptForCard(
+        cardId,
+        result.completion_status === "completed" ? "agent_output" : "blocker",
+        agentResultText(result),
+      );
       setAgentProgressForCard(cardId, 75);
 
       if (result.completion_status !== "completed") {
@@ -3601,10 +4009,7 @@
           "error",
           "blocked",
           "Agent did not complete and verify the requested work. Card will not move to Done.",
-          [
-            `Completion status: ${result.completion_status}`,
-            `Blocked reason: ${reason}`,
-          ],
+          [`Completion status: ${result.completion_status}`, `Blocked reason: ${reason}`],
           [
             `Card execution remains blocked until the issue is resolved.`,
             `No Done transition will occur for this run.`,
@@ -3641,15 +4046,14 @@
         "success",
         "board",
         "Stored Agent summary on card and moved card to Done locally.",
-        [
-          `Card: ${ticketLabel(card)}`,
-          `Board target: Done`,
-        ],
+        [`Card: ${ticketLabel(card)}`, `Board target: Done`],
         [
           `Local workspace projection updated with the verified summary.`,
           `Completed timestamp stored for the card.`,
         ],
-        issueKey ? ["Write Jira completion state and add the completion comment."] : ["No Jira issue linked; board write-back is complete."],
+        issueKey
+          ? ["Write Jira completion state and add the completion comment."]
+          : ["No Jira issue linked; board write-back is complete."],
       );
       moveCard(cardId, doneColumnId, { completed: { summary: result.summary } });
       setAgentProgressForCard(cardId, 82);
@@ -3662,10 +4066,7 @@
             "info",
             "jira",
             `Moving ${issueKey} to Done.`,
-            [
-              `Issue: ${issueKey}`,
-              `Transition target: Done`,
-            ],
+            [`Issue: ${issueKey}`, `Transition target: Done`],
             ["Posting board completion back to Jira."],
             ["Wait for the Jira transition result before finalizing the run."],
           );
@@ -3690,7 +4091,11 @@
             [`Wait for comment confirmation before final completion.`],
           );
           setAgentProgressForCard(cardId, 94);
-          await addJiraComment(jiraConfig, issueKey, agentJiraComment(result, config, gitWritebackInfo));
+          await addJiraComment(
+            jiraConfig,
+            issueKey,
+            agentJiraComment(result, config, gitWritebackInfo),
+          );
           appendStructuredAgentLogForCard(
             cardId,
             "success",
@@ -3705,7 +4110,10 @@
 
       setAgentRunStatusForCard(cardId, "completed");
       setAgentProgressForCard(cardId, 100);
-      appNotice = { tone: "success", message: `${ticketLabel(card)} completed by Agent and moved to Done.` };
+      appNotice = {
+        tone: "success",
+        message: `${ticketLabel(card)} completed by Agent and moved to Done.`,
+      };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       updateCardExecution(cardId, { blocked: { reason: message } });
@@ -3725,7 +4133,11 @@
       );
       appNotice = { tone: "error", message };
     } finally {
-      clearActiveAgentRun(typeof localStorage === "undefined" ? undefined : localStorage, cardId, runId);
+      clearActiveAgentRun(
+        typeof localStorage === "undefined" ? undefined : localStorage,
+        cardId,
+        runId,
+      );
       if (!backendExecutionStarted) {
         await releaseAiWorkerRun(runId).catch(() => undefined);
       }
@@ -3754,12 +4166,29 @@
         <span>⌄</span>
       </div>
 
-      <button class="icon-button" type="button" aria-label="Settings" onclick={() => openSettings()}>Settings</button>
+      <button class="icon-button" type="button" aria-label="Settings" onclick={() => openSettings()}
+        >Settings</button
+      >
 
       <nav class="mode-switch" aria-label="Workspace mode">
-        <button class:active={workspaceMode === "board"} type="button" aria-label="Board view" onclick={() => setWorkspaceMode("board")}>Board</button>
-        <button class:active={workspaceMode === "files"} type="button" aria-label="Files view" onclick={() => setWorkspaceMode("files")}>Files</button>
-        <button class:active={workspaceMode === "term"} type="button" aria-label="Terminal view" onclick={openTermWorkspace}>Term</button>
+        <button
+          class:active={workspaceMode === "board"}
+          type="button"
+          aria-label="Board view"
+          onclick={() => setWorkspaceMode("board")}>Board</button
+        >
+        <button
+          class:active={workspaceMode === "files"}
+          type="button"
+          aria-label="Files view"
+          onclick={() => setWorkspaceMode("files")}>Files</button
+        >
+        <button
+          class:active={workspaceMode === "term"}
+          type="button"
+          aria-label="Terminal view"
+          onclick={openTermWorkspace}>Term</button
+        >
       </nav>
 
       <button
@@ -3776,7 +4205,6 @@
       <button class="sync-button" type="button" disabled={syncing} onclick={syncJira}>
         {syncing ? "Syncing Jira" : settings.jira.boardId ? "Sync Jira board" : "Sync Jira"}
       </button>
-
     </header>
 
     {#if settingsOpen}
@@ -3792,56 +4220,85 @@
 
           <div class:mcp={settingsTab === "mcp"} class="settings-grid">
             <aside class="settings-nav" aria-label="Settings navigation">
-              <button class:active={settingsTab === "agent"} type="button" onclick={() => switchSettingsTab("agent")}>
+              <button
+                class:active={settingsTab === "agent"}
+                type="button"
+                onclick={() => switchSettingsTab("agent")}
+              >
                 <strong>Agent</strong>
                 <span>Model and worker runtime</span>
               </button>
-              <button class:active={settingsTab === "rules"} type="button" onclick={() => switchSettingsTab("rules")}>
+              <button
+                class:active={settingsTab === "rules"}
+                type="button"
+                onclick={() => switchSettingsTab("rules")}
+              >
                 <strong>Rules</strong>
                 <span>Operating guardrails</span>
               </button>
-              <button class:active={settingsTab === "skills"} type="button" onclick={() => switchSettingsTab("skills")}>
+              <button
+                class:active={settingsTab === "skills"}
+                type="button"
+                onclick={() => switchSettingsTab("skills")}
+              >
                 <strong>Skills</strong>
                 <span>Reusable playbooks</span>
               </button>
-              <button class:active={settingsTab === "mcp"} type="button" onclick={() => switchSettingsTab("mcp")}>
+              <button
+                class:active={settingsTab === "mcp"}
+                type="button"
+                onclick={() => switchSettingsTab("mcp")}
+              >
                 <strong>MCP</strong>
                 <span>Tools and server connections</span>
               </button>
-              <button class:active={settingsTab === "jira"} type="button" onclick={() => switchSettingsTab("jira")}>
+              <button
+                class:active={settingsTab === "jira"}
+                type="button"
+                onclick={() => switchSettingsTab("jira")}
+              >
                 <strong>Jira</strong>
                 <span>Board sync and credentials</span>
               </button>
-              <button class:active={settingsTab === "theme"} type="button" onclick={() => switchSettingsTab("theme")}>
+              <button
+                class:active={settingsTab === "theme"}
+                type="button"
+                onclick={() => switchSettingsTab("theme")}
+              >
                 <strong>Theme</strong>
                 <span>Appearance preferences</span>
               </button>
             </aside>
 
             {#if settingsTab === "mcp"}
-            <aside class="server-list">
-              {#each settings.mcpServers as server (server.id)}
-                <button
-                  class:active={server.id === selectedServerId}
-                  type="button"
-                  onclick={() => {
-                    selectedServerId = server.id;
-                    if (server.kind === "jira") {
-                      settings = { ...settings, jira: { ...settings.jira, serverId: server.id } };
-                    }
-                  }}
-                >
-                  <strong>{server.name || "Unnamed MCP"}</strong>
-                  <span>{server.kind.toUpperCase()} · {server.command || "No command configured"}</span>
-                  <small class={`mcp-status ${mcpConnectionState(server.id)?.status ?? "unknown"}`}>
-                    <i></i>
-                    {mcpConnectionLabel(server.id)}
-                  </small>
-                  <em>{mcpConnectionDetail(server.id)}</em>
-                </button>
-              {/each}
-              <button class="add-server" type="button" onclick={addMcpServer}>＋ Add MCP</button>
-            </aside>
+              <aside class="server-list">
+                {#each settings.mcpServers as server (server.id)}
+                  <button
+                    class:active={server.id === selectedServerId}
+                    type="button"
+                    onclick={() => {
+                      selectedServerId = server.id;
+                      if (server.kind === "jira") {
+                        settings = { ...settings, jira: { ...settings.jira, serverId: server.id } };
+                      }
+                    }}
+                  >
+                    <strong>{server.name || "Unnamed MCP"}</strong>
+                    <span
+                      >{server.kind.toUpperCase()} · {server.command ||
+                        "No command configured"}</span
+                    >
+                    <small
+                      class={`mcp-status ${mcpConnectionState(server.id)?.status ?? "unknown"}`}
+                    >
+                      <i></i>
+                      {mcpConnectionLabel(server.id)}
+                    </small>
+                    <em>{mcpConnectionDetail(server.id)}</em>
+                  </button>
+                {/each}
+                <button class="add-server" type="button" onclick={addMcpServer}>＋ Add MCP</button>
+              </aside>
             {/if}
 
             {#if selectedServer}
@@ -3863,216 +4320,253 @@
                         <p class="section-kicker">MCP Connection</p>
                         <h3>Loading connection settings</h3>
                       </div>
-                      <p class="field-help">Preparing MCP controls only when this settings tab is opened.</p>
+                      <p class="field-help">
+                        Preparing MCP controls only when this settings tab is opened.
+                      </p>
                     </section>
                   {/if}
                 {/if}
 
                 {#if settingsTab === "agent"}
-                <div class="settings-section worker-section">
-                  <div>
-                    <p class="section-kicker">Agent</p>
-                    <h3>Model runtime</h3>
-                  </div>
-                  <p class="field-help">Choose a supported provider and model. Spacesly configures the endpoint automatically and only asks for the credential that provider requires.</p>
+                  <div class="settings-section worker-section">
+                    <div>
+                      <p class="section-kicker">Agent</p>
+                      <h3>Model runtime</h3>
+                    </div>
+                    <p class="field-help">
+                      Choose a supported provider and model. Spacesly configures the endpoint
+                      automatically and only asks for the credential that provider requires.
+                    </p>
 
-                  <div class="runtime-options" aria-label="Agent runtime">
-                    <button
-                      class:active={settings.aiWorker.runtime === "api"}
-                      type="button"
-                      onclick={() => {
-                        settings = { ...settings, aiWorker: { ...settings.aiWorker, runtime: "api" } };
-                        workerStatus = null;
-                      }}
-                    >
-                      <strong>Direct API</strong>
-                      <span>Use provider API keys stored per provider.</span>
-                    </button>
-                    <button
-                      class:active={settings.aiWorker.runtime === "opencode"}
-                      type="button"
-                      onclick={() => {
-                        settings = { ...settings, aiWorker: { ...settings.aiWorker, runtime: "opencode" } };
-                        workerStatus = null;
-                      }}
-                    >
-                      <strong>OpenCode OAuth</strong>
-                      <span>Use local opencode auth, including OpenAI OAuth.</span>
-                    </button>
-                  </div>
-
-                  {#if settings.aiWorker.runtime === "api"}
-                    <div class="field-row">
-                    <label>
-                      <span>Provider</span>
-                      <select
-                        value={settings.aiWorker.providerId}
-                        oninput={(event) => {
-                          const providerId = event.currentTarget.value;
-                          const modelId = settings.aiWorker.modelIds[providerId] ?? defaultModelForProvider(providerId);
+                    <div class="runtime-options" aria-label="Agent runtime">
+                      <button
+                        class:active={settings.aiWorker.runtime === "api"}
+                        type="button"
+                        onclick={() => {
                           settings = {
                             ...settings,
-                            aiWorker: {
-                              ...settings.aiWorker,
-                              providerId,
-                              modelId,
-                            },
+                            aiWorker: { ...settings.aiWorker, runtime: "api" },
                           };
                           workerStatus = null;
                         }}
                       >
-                        {#each aiProviders as provider (provider.id)}
-                          <option value={provider.id}>{provider.label}</option>
-                        {/each}
-                      </select>
-                    </label>
-                    <label>
-                      <span>Model</span>
-                      <select
-                        value={settings.aiWorker.modelId}
-                        oninput={(event) => {
-                          const modelId = event.currentTarget.value;
-                          (settings = {
+                        <strong>Direct API</strong>
+                        <span>Use provider API keys stored per provider.</span>
+                      </button>
+                      <button
+                        class:active={settings.aiWorker.runtime === "opencode"}
+                        type="button"
+                        onclick={() => {
+                          settings = {
                             ...settings,
-                            aiWorker: {
-                              ...settings.aiWorker,
-                              modelId,
-                              modelIds: {
-                                ...settings.aiWorker.modelIds,
-                                [selectedAiProvider.id]: modelId,
-                              },
-                            },
-                          });
+                            aiWorker: { ...settings.aiWorker, runtime: "opencode" },
+                          };
                           workerStatus = null;
                         }}
                       >
-                        {#each selectedAiProvider.models as model (model.id)}
-                          <option value={model.id}>{model.label} · {model.description}</option>
-                        {/each}
-                      </select>
-                    </label>
+                        <strong>OpenCode OAuth</strong>
+                        <span>Use local opencode auth, including OpenAI OAuth.</span>
+                      </button>
                     </div>
 
-                    <div class="endpoint-card">
-                      <span>Endpoint</span>
-                      <code>{selectedAiEndpoint}</code>
-                    </div>
-
-                    <div class="field-row">
-                    <label>
-                      <span>{selectedAiProvider.apiKeyLabel}</span>
-                      <input
-                        type="password"
-                        placeholder={selectedAiProvider.apiKeyPlaceholder}
-                        value={selectedAiApiKey}
-                        oninput={(event) =>
-                          (appSecrets = {
-                            ...appSecrets,
-                            ai_api_keys: {
-                              ...appSecrets.ai_api_keys,
-                              [selectedAiProvider.id]: event.currentTarget.value,
-                            },
-                          })}
-                      />
-                    </label>
-                    <label>
-                      <span>Temperature</span>
-                      <input
-                        type="number"
-                        min="0"
-                        max="2"
-                        step="0.1"
-                        value={settings.aiWorker.temperature}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            aiWorker: { ...settings.aiWorker, temperature: Number(event.currentTarget.value) },
-                          })}
-                      />
-                    </label>
-                    </div>
-                  {:else}
-                    <div class="endpoint-card">
-                      <span>Runtime</span>
-                      <code>{settings.aiWorker.opencodeCommand} run --model {settings.aiWorker.opencodeModel}</code>
-                    </div>
-                    <div class="field-row">
-                      <label>
-                        <span>OpenCode command</span>
-                        <input
-                          placeholder="opencode"
-                          value={settings.aiWorker.opencodeCommand}
-                          oninput={(event) => {
-                            settings = {
-                              ...settings,
-                              aiWorker: { ...settings.aiWorker, opencodeCommand: event.currentTarget.value },
-                            };
-                            workerStatus = null;
-                          }}
-                        />
-                      </label>
-                    </div>
-                    <div class="opencode-model-picker" aria-label="OpenCode model">
-                      <div class="opencode-model-header">
-                        <span>OpenCode model</span>
-                        <strong>{settings.aiWorker.opencodeModel}</strong>
-                      </div>
-                      <div class="opencode-model-grid">
-                        {#each opencodeModelOptions as model (model.id)}
-                          <button
-                            class:active={settings.aiWorker.opencodeModel === model.id}
-                            type="button"
-                            onclick={() => {
+                    {#if settings.aiWorker.runtime === "api"}
+                      <div class="field-row">
+                        <label>
+                          <span>Provider</span>
+                          <select
+                            value={settings.aiWorker.providerId}
+                            oninput={(event) => {
+                              const providerId = event.currentTarget.value;
+                              const modelId =
+                                settings.aiWorker.modelIds[providerId] ??
+                                defaultModelForProvider(providerId);
                               settings = {
                                 ...settings,
-                                aiWorker: { ...settings.aiWorker, opencodeModel: model.id },
+                                aiWorker: {
+                                  ...settings.aiWorker,
+                                  providerId,
+                                  modelId,
+                                },
                               };
                               workerStatus = null;
                             }}
                           >
-                            <span class={`model-badge ${model.badge.toLowerCase()}`}>{model.badge}</span>
-                            <strong>{model.label}</strong>
-                            <small>{model.provider}</small>
-                            <em>{model.description}</em>
-                            <code>{model.id}</code>
-                          </button>
-                        {/each}
+                            {#each aiProviders as provider (provider.id)}
+                              <option value={provider.id}>{provider.label}</option>
+                            {/each}
+                          </select>
+                        </label>
+                        <label>
+                          <span>Model</span>
+                          <select
+                            value={settings.aiWorker.modelId}
+                            oninput={(event) => {
+                              const modelId = event.currentTarget.value;
+                              settings = {
+                                ...settings,
+                                aiWorker: {
+                                  ...settings.aiWorker,
+                                  modelId,
+                                  modelIds: {
+                                    ...settings.aiWorker.modelIds,
+                                    [selectedAiProvider.id]: modelId,
+                                  },
+                                },
+                              };
+                              workerStatus = null;
+                            }}
+                          >
+                            {#each selectedAiProvider.models as model (model.id)}
+                              <option value={model.id}>{model.label} · {model.description}</option>
+                            {/each}
+                          </select>
+                        </label>
                       </div>
-                    </div>
-                    <label>
-                      <span>Working directory</span>
-                      <input
-                        placeholder="Optional. Defaults to Spacesly current process directory."
-                        value={settings.aiWorker.opencodeWorkdir}
-                        oninput={(event) => {
-                          settings = {
-                            ...settings,
-                            aiWorker: { ...settings.aiWorker, opencodeWorkdir: event.currentTarget.value },
-                          };
-                        }}
-                      />
-                    </label>
-                    <label class="check-row">
-                      <input
-                        type="checkbox"
-                        checked={settings.aiWorker.opencodeAutoApprove}
-                        oninput={(event) => {
-                          settings = {
-                            ...settings,
-                            aiWorker: { ...settings.aiWorker, opencodeAutoApprove: event.currentTarget.checked },
-                          };
-                        }}
-                      />
-                      <span>Allow OpenCode to auto-approve execution requests for file and shell changes.</span>
-                    </label>
-                    <p class="field-help">Run <code>opencode auth login</code> in your terminal first. Spacesly uses the same local OpenCode credential store and does not need your OpenAI API key for this runtime.</p>
-                  {/if}
 
-                  <div class="worker-status">
-                    <span class:connected={workerConnected}></span>
-                    <strong>{workerStatusLabel}</strong>
+                      <div class="endpoint-card">
+                        <span>Endpoint</span>
+                        <code>{selectedAiEndpoint}</code>
+                      </div>
+
+                      <div class="field-row">
+                        <label>
+                          <span>{selectedAiProvider.apiKeyLabel}</span>
+                          <input
+                            type="password"
+                            placeholder={selectedAiProvider.apiKeyPlaceholder}
+                            value={selectedAiApiKey}
+                            oninput={(event) =>
+                              (appSecrets = {
+                                ...appSecrets,
+                                ai_api_keys: {
+                                  ...appSecrets.ai_api_keys,
+                                  [selectedAiProvider.id]: event.currentTarget.value,
+                                },
+                              })}
+                          />
+                        </label>
+                        <label>
+                          <span>Temperature</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max="2"
+                            step="0.1"
+                            value={settings.aiWorker.temperature}
+                            oninput={(event) =>
+                              (settings = {
+                                ...settings,
+                                aiWorker: {
+                                  ...settings.aiWorker,
+                                  temperature: Number(event.currentTarget.value),
+                                },
+                              })}
+                          />
+                        </label>
+                      </div>
+                    {:else}
+                      <div class="endpoint-card">
+                        <span>Runtime</span>
+                        <code
+                          >{settings.aiWorker.opencodeCommand} run --model {settings.aiWorker
+                            .opencodeModel}</code
+                        >
+                      </div>
+                      <div class="field-row">
+                        <label>
+                          <span>OpenCode command</span>
+                          <input
+                            placeholder="opencode"
+                            value={settings.aiWorker.opencodeCommand}
+                            oninput={(event) => {
+                              settings = {
+                                ...settings,
+                                aiWorker: {
+                                  ...settings.aiWorker,
+                                  opencodeCommand: event.currentTarget.value,
+                                },
+                              };
+                              workerStatus = null;
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div class="opencode-model-picker" aria-label="OpenCode model">
+                        <div class="opencode-model-header">
+                          <span>OpenCode model</span>
+                          <strong>{settings.aiWorker.opencodeModel}</strong>
+                        </div>
+                        <div class="opencode-model-grid">
+                          {#each opencodeModelOptions as model (model.id)}
+                            <button
+                              class:active={settings.aiWorker.opencodeModel === model.id}
+                              type="button"
+                              onclick={() => {
+                                settings = {
+                                  ...settings,
+                                  aiWorker: { ...settings.aiWorker, opencodeModel: model.id },
+                                };
+                                workerStatus = null;
+                              }}
+                            >
+                              <span class={`model-badge ${model.badge.toLowerCase()}`}
+                                >{model.badge}</span
+                              >
+                              <strong>{model.label}</strong>
+                              <small>{model.provider}</small>
+                              <em>{model.description}</em>
+                              <code>{model.id}</code>
+                            </button>
+                          {/each}
+                        </div>
+                      </div>
+                      <label>
+                        <span>Working directory</span>
+                        <input
+                          placeholder="Optional. Defaults to Spacesly current process directory."
+                          value={settings.aiWorker.opencodeWorkdir}
+                          oninput={(event) => {
+                            settings = {
+                              ...settings,
+                              aiWorker: {
+                                ...settings.aiWorker,
+                                opencodeWorkdir: event.currentTarget.value,
+                              },
+                            };
+                          }}
+                        />
+                      </label>
+                      <label class="check-row">
+                        <input
+                          type="checkbox"
+                          checked={settings.aiWorker.opencodeAutoApprove}
+                          oninput={(event) => {
+                            settings = {
+                              ...settings,
+                              aiWorker: {
+                                ...settings.aiWorker,
+                                opencodeAutoApprove: event.currentTarget.checked,
+                              },
+                            };
+                          }}
+                        />
+                        <span
+                          >Allow OpenCode to auto-approve execution requests for file and shell
+                          changes.</span
+                        >
+                      </label>
+                      <p class="field-help">
+                        Run <code>opencode auth login</code> in your terminal first. Spacesly uses the
+                        same local OpenCode credential store and does not need your OpenAI API key for
+                        this runtime.
+                      </p>
+                    {/if}
+
+                    <div class="worker-status">
+                      <span class:connected={workerConnected}></span>
+                      <strong>{workerStatusLabel}</strong>
+                    </div>
                   </div>
-                </div>
                 {/if}
 
                 {#if settingsTab === "rules"}
@@ -4081,7 +4575,10 @@
                       <div>
                         <p class="section-kicker">Agent Governance</p>
                         <h3>Rules that every run must follow</h3>
-                        <span>Keep these short, explicit, and enforceable. They are injected into Agent tasks and chat before user instructions.</span>
+                        <span
+                          >Keep these short, explicit, and enforceable. They are injected into Agent
+                          tasks and chat before user instructions.</span
+                        >
                       </div>
                       <strong>Always on</strong>
                     </div>
@@ -4110,8 +4607,7 @@
                         spellcheck="false"
                         placeholder="Never mark a task done unless it was actually executed and verified.&#10;Do not touch secrets unless explicitly requested.&#10;Block instead of guessing when tools or access are missing."
                         value={settings.aiWorker.agentRules}
-                        onblur={commitAgentRulesDraft}
-                      ></textarea>
+                        onblur={commitAgentRulesDraft}></textarea>
                     </label>
 
                     <div class="guidance-examples">
@@ -4128,7 +4624,10 @@
                       <div>
                         <p class="section-kicker">Agent Playbooks</p>
                         <h3>Skills the Agent can reuse</h3>
-                        <span>Describe repeatable work patterns for your domain. The Agent applies them only when relevant to a task.</span>
+                        <span
+                          >Describe repeatable work patterns for your domain. The Agent applies them
+                          only when relevant to a task.</span
+                        >
                       </div>
                       <strong>Contextual</strong>
                     </div>
@@ -4136,11 +4635,15 @@
                     <div class="skill-template-grid" aria-label="Skill examples">
                       <div>
                         <strong>Bamboo diagnostics</strong>
-                        <span>Check latest build, fetch logs, identify failing job, summarize evidence.</span>
+                        <span
+                          >Check latest build, fetch logs, identify failing job, summarize evidence.</span
+                        >
                       </div>
                       <div>
                         <strong>OCP troubleshooting</strong>
-                        <span>Inspect pods, events, logs, and resource usage before proposing fixes.</span>
+                        <span
+                          >Inspect pods, events, logs, and resource usage before proposing fixes.</span
+                        >
                       </div>
                     </div>
 
@@ -4153,296 +4656,330 @@
                         spellcheck="false"
                         placeholder="Skill: Bamboo diagnostics&#10;Check latest build status, fetch logs, identify failing job, summarize evidence.&#10;&#10;Skill: OCP troubleshooting&#10;Check pod status, recent events, logs, and resource usage before guessing."
                         value={settings.aiWorker.agentSkills}
-                        onblur={commitAgentSkillsDraft}
-                      ></textarea>
+                        onblur={commitAgentSkillsDraft}></textarea>
                     </label>
                   </div>
                 {/if}
 
                 {#if settingsTab === "jira"}
-                <div class="jira-section settings-section">
-                  <div>
-                    <p class="section-kicker">Jira Integration</p>
-                    <h3>Jira account</h3>
-                  </div>
-                  <p class="field-help">Configure Jira once. These credentials power board sync, card transitions, Jira comments, and the selected Jira MCP connection.</p>
+                  <div class="jira-section settings-section">
+                    <div>
+                      <p class="section-kicker">Jira Integration</p>
+                      <h3>Jira account</h3>
+                    </div>
+                    <p class="field-help">
+                      Configure Jira once. These credentials power board sync, card transitions,
+                      Jira comments, and the selected Jira MCP connection.
+                    </p>
 
-                  <label>
-                    <span>Jira MCP Runtime</span>
-                    <select
-                      value={settings.jira.serverId}
-                      oninput={(event) => {
-                        selectedServerId = event.currentTarget.value;
-                        settings = { ...settings, jira: { ...settings.jira, serverId: event.currentTarget.value } };
-                      }}
-                    >
-                      {#each settings.mcpServers as server (server.id)}
-                        <option value={server.id}>{server.name || "Unnamed MCP"} ({server.kind})</option>
-                      {/each}
-                    </select>
-                  </label>
-                  <p class="field-help">Only the MCP command lives in the MCP tab. Its Jira identity is inherited from this page so credentials do not drift.</p>
-
-                  <h3>Credentials</h3>
-                  <label>
-                    <span>Authentication Method</span>
-                    <select
-                      value={settings.jira.authMode}
-                      oninput={(event) =>
-                        (settings = {
-                          ...settings,
-                          jira: {
-                            ...settings.jira,
-                            authMode: event.currentTarget.value as AppSettings["jira"]["authMode"],
-                          },
-                        })}
-                    >
-                      <option value="api_token">Email + API token</option>
-                      <option value="pat">Personal access token</option>
-                      <option value="password">Username + password</option>
-                    </select>
-                  </label>
-
-                  <div class="field-row">
                     <label>
-                      <span>Jira URL</span>
-                      <input
-                        placeholder="https://company.atlassian.net"
-                        value={settings.jira.baseUrl}
+                      <span>Jira MCP Runtime</span>
+                      <select
+                        value={settings.jira.serverId}
+                        oninput={(event) => {
+                          selectedServerId = event.currentTarget.value;
+                          settings = {
+                            ...settings,
+                            jira: { ...settings.jira, serverId: event.currentTarget.value },
+                          };
+                        }}
+                      >
+                        {#each settings.mcpServers as server (server.id)}
+                          <option value={server.id}
+                            >{server.name || "Unnamed MCP"} ({server.kind})</option
+                          >
+                        {/each}
+                      </select>
+                    </label>
+                    <p class="field-help">
+                      Only the MCP command lives in the MCP tab. Its Jira identity is inherited from
+                      this page so credentials do not drift.
+                    </p>
+
+                    <h3>Credentials</h3>
+                    <label>
+                      <span>Authentication Method</span>
+                      <select
+                        value={settings.jira.authMode}
                         oninput={(event) =>
                           (settings = {
                             ...settings,
-                            jira: { ...settings.jira, baseUrl: event.currentTarget.value },
+                            jira: {
+                              ...settings.jira,
+                              authMode: event.currentTarget
+                                .value as AppSettings["jira"]["authMode"],
+                            },
                           })}
-                      />
+                      >
+                        <option value="api_token">Email + API token</option>
+                        <option value="pat">Personal access token</option>
+                        <option value="password">Username + password</option>
+                      </select>
                     </label>
-                    {#if settings.jira.authMode !== "pat"}
+
+                    <div class="field-row">
                       <label>
-                        <span>{settings.jira.authMode === "password" ? "Username" : "Email"}</span>
+                        <span>Jira URL</span>
                         <input
-                          placeholder={settings.jira.authMode === "password" ? "jira-user" : "you@company.com"}
-                          value={settings.jira.username}
+                          placeholder="https://company.atlassian.net"
+                          value={settings.jira.baseUrl}
                           oninput={(event) =>
                             (settings = {
                               ...settings,
-                              jira: { ...settings.jira, username: event.currentTarget.value },
+                              jira: { ...settings.jira, baseUrl: event.currentTarget.value },
+                            })}
+                        />
+                      </label>
+                      {#if settings.jira.authMode !== "pat"}
+                        <label>
+                          <span>{settings.jira.authMode === "password" ? "Username" : "Email"}</span
+                          >
+                          <input
+                            placeholder={settings.jira.authMode === "password"
+                              ? "jira-user"
+                              : "you@company.com"}
+                            value={settings.jira.username}
+                            oninput={(event) =>
+                              (settings = {
+                                ...settings,
+                                jira: { ...settings.jira, username: event.currentTarget.value },
+                              })}
+                          />
+                        </label>
+                      {/if}
+                    </div>
+
+                    {#if settings.jira.authMode === "api_token"}
+                      <label>
+                        <span>Jira API Token</span>
+                        <input
+                          type="password"
+                          placeholder="Paste API token here"
+                          value={appSecrets.jira_api_token}
+                          oninput={(event) =>
+                            (appSecrets = {
+                              ...appSecrets,
+                              jira_api_token: event.currentTarget.value,
+                            })}
+                        />
+                      </label>
+                    {:else if settings.jira.authMode === "pat"}
+                      <label>
+                        <span>Personal Access Token</span>
+                        <input
+                          type="password"
+                          placeholder="Paste PAT here"
+                          value={appSecrets.jira_personal_access_token}
+                          oninput={(event) =>
+                            (appSecrets = {
+                              ...appSecrets,
+                              jira_personal_access_token: event.currentTarget.value,
+                            })}
+                        />
+                      </label>
+                    {:else}
+                      <label>
+                        <span>Password</span>
+                        <input
+                          type="password"
+                          placeholder="Jira password"
+                          value={appSecrets.jira_password}
+                          oninput={(event) =>
+                            (appSecrets = {
+                              ...appSecrets,
+                              jira_password: event.currentTarget.value,
                             })}
                         />
                       </label>
                     {/if}
-                  </div>
 
-                  {#if settings.jira.authMode === "api_token"}
-                    <label>
-                      <span>Jira API Token</span>
-                      <input
-                        type="password"
-                        placeholder="Paste API token here"
-                        value={appSecrets.jira_api_token}
-                        oninput={(event) =>
-                          (appSecrets = {
-                            ...appSecrets,
-                            jira_api_token: event.currentTarget.value,
-                          })}
-                      />
-                    </label>
-                  {:else if settings.jira.authMode === "pat"}
-                    <label>
-                      <span>Personal Access Token</span>
-                      <input
-                        type="password"
-                        placeholder="Paste PAT here"
-                        value={appSecrets.jira_personal_access_token}
-                        oninput={(event) =>
-                          (appSecrets = {
-                            ...appSecrets,
-                            jira_personal_access_token: event.currentTarget.value,
-                          })}
-                      />
-                    </label>
-                  {:else}
-                    <label>
-                      <span>Password</span>
-                      <input
-                        type="password"
-                        placeholder="Jira password"
-                        value={appSecrets.jira_password}
-                        oninput={(event) =>
-                          (appSecrets = {
-                            ...appSecrets,
-                            jira_password: event.currentTarget.value,
-                          })}
-                      />
-                    </label>
-                  {/if}
-
-                  <h3>Board sync</h3>
-                  <div class="field-row board-picker-row">
-                    <label>
-                      <span>Jira Board</span>
-                      <select
-                        value={settings.jira.boardId}
-                        oninput={(event) => {
-                          const board = settings.jira.boards.find(
-                            (entry) => entry.id === event.currentTarget.value,
-                          );
-                          settings = {
-                            ...settings,
-                            jira: {
-                              ...settings.jira,
-                              boardId: event.currentTarget.value,
-                              boardName: board?.name ?? settings.jira.boardName,
-                            },
-                          };
-                        }}
-                      >
-                        <option value="">Use JQL only</option>
-                        {#each settings.jira.boards as board (board.id)}
-                          <option value={board.id}>{board.name} ({board.board_type})</option>
-                        {/each}
-                      </select>
-                    </label>
-                    <button type="button" onclick={loadJiraBoards} disabled={loadingBoards}>
-                      {loadingBoards ? "Loading..." : "Load Jira boards"}
-                    </button>
-                  </div>
-
-                  <div class="field-row">
-                    <label>
-                      <span>Project Key Filter</span>
-                      <input
-                        placeholder="PROJ"
-                        value={settings.jira.projectKey}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, projectKey: event.currentTarget.value },
-                          })}
-                      />
-                    </label>
-                    <label>
-                      <span>Board Name Filter</span>
-                      <input
-                        placeholder="Team Kanban"
-                        value={settings.jira.boardNameFilter}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, boardNameFilter: event.currentTarget.value },
-                          })}
-                      />
-                    </label>
-                  </div>
-
-                  <label>
-                    <span>Manual Jira Board ID</span>
-                    <input
-                      placeholder="Only needed if board loading fails"
-                      value={settings.jira.boardId}
-                      oninput={(event) =>
-                        (settings = {
-                          ...settings,
-                          jira: { ...settings.jira, boardId: event.currentTarget.value },
-                        })}
-                    />
-                  </label>
-
-                  <label>
-                    <span>Workspace / Board Name</span>
-                    <input
-                      placeholder="My Jira work"
-                      value={settings.jira.boardName}
-                      oninput={(event) =>
-                        (settings = {
-                          ...settings,
-                          jira: { ...settings.jira, boardName: event.currentTarget.value },
-                        })}
-                    />
-                  </label>
-
-                  <div class="field-row">
-                    <label>
-                      <span>Cards Per Sync Page</span>
-                      <input
-                        type="number"
-                        min="1"
-                        max="100"
-                        value={settings.jira.pageSize}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, pageSize: Number(event.currentTarget.value) },
-                          })}
-                      />
-                    </label>
-                    <label>
-                      <span>Max Pages Per Sync</span>
-                      <input
-                        type="number"
-                        min="1"
-                        max="20"
-                        value={settings.jira.maxPages}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, maxPages: Number(event.currentTarget.value) },
-                          })}
-                      />
-                    </label>
-                  </div>
-                  <p class="field-help">{syncBudgetLabel} Keep this small for daily use; use a narrower JQL instead of fetching many pages.</p>
-                  <label>
-                    <span>MCP Tool Name</span>
-                    <input
-                      value={settings.jira.toolName}
-                      oninput={(event) =>
-                        (settings = {
-                          ...settings,
-                          jira: { ...settings.jira, toolName: event.currentTarget.value },
-                        })}
-                    />
-                  </label>
-                  <div class="field-row advanced-tools">
-                    <label>
-                      <span>Board List Tool</span>
-                      <input
-                        value={settings.jira.boardToolName}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, boardToolName: event.currentTarget.value },
-                          })}
-                      />
-                    </label>
-                    <label>
-                      <span>Board Issues Tool</span>
-                      <input
-                        value={settings.jira.boardIssuesToolName}
-                        oninput={(event) =>
-                          (settings = {
-                            ...settings,
-                            jira: { ...settings.jira, boardIssuesToolName: event.currentTarget.value },
-                          })}
-                      />
-                    </label>
-                  </div>
-                  <label>
-                    <span>JQL</span>
-                    <div class="jql-presets">
-                      <button type="button" onclick={() => applyJqlPreset("assigned")}>Assigned to me</button>
-                      <button type="button" onclick={() => applyJqlPreset("unassigned_todo")}>Todo + unassigned</button>
-                      <button type="button" onclick={() => applyJqlPreset("unresolved")}>All unresolved</button>
+                    <h3>Board sync</h3>
+                    <div class="field-row board-picker-row">
+                      <label>
+                        <span>Jira Board</span>
+                        <select
+                          value={settings.jira.boardId}
+                          oninput={(event) => {
+                            const board = settings.jira.boards.find(
+                              (entry) => entry.id === event.currentTarget.value,
+                            );
+                            settings = {
+                              ...settings,
+                              jira: {
+                                ...settings.jira,
+                                boardId: event.currentTarget.value,
+                                boardName: board?.name ?? settings.jira.boardName,
+                              },
+                            };
+                          }}
+                        >
+                          <option value="">Use JQL only</option>
+                          {#each settings.jira.boards as board (board.id)}
+                            <option value={board.id}>{board.name} ({board.board_type})</option>
+                          {/each}
+                        </select>
+                      </label>
+                      <button type="button" onclick={loadJiraBoards} disabled={loadingBoards}>
+                        {loadingBoards ? "Loading..." : "Load Jira boards"}
+                      </button>
                     </div>
-                    <textarea
-                      value={settings.jira.jql}
-                      oninput={(event) =>
-                        (settings = {
-                          ...settings,
-                          jira: { ...settings.jira, jql: event.currentTarget.value },
-                        })}
-                    ></textarea>
-                  </label>
-                </div>
+
+                    <div class="field-row">
+                      <label>
+                        <span>Project Key Filter</span>
+                        <input
+                          placeholder="PROJ"
+                          value={settings.jira.projectKey}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: { ...settings.jira, projectKey: event.currentTarget.value },
+                            })}
+                        />
+                      </label>
+                      <label>
+                        <span>Board Name Filter</span>
+                        <input
+                          placeholder="Team Kanban"
+                          value={settings.jira.boardNameFilter}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: {
+                                ...settings.jira,
+                                boardNameFilter: event.currentTarget.value,
+                              },
+                            })}
+                        />
+                      </label>
+                    </div>
+
+                    <label>
+                      <span>Manual Jira Board ID</span>
+                      <input
+                        placeholder="Only needed if board loading fails"
+                        value={settings.jira.boardId}
+                        oninput={(event) =>
+                          (settings = {
+                            ...settings,
+                            jira: { ...settings.jira, boardId: event.currentTarget.value },
+                          })}
+                      />
+                    </label>
+
+                    <label>
+                      <span>Workspace / Board Name</span>
+                      <input
+                        placeholder="My Jira work"
+                        value={settings.jira.boardName}
+                        oninput={(event) =>
+                          (settings = {
+                            ...settings,
+                            jira: { ...settings.jira, boardName: event.currentTarget.value },
+                          })}
+                      />
+                    </label>
+
+                    <div class="field-row">
+                      <label>
+                        <span>Cards Per Sync Page</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="100"
+                          value={settings.jira.pageSize}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: {
+                                ...settings.jira,
+                                pageSize: Number(event.currentTarget.value),
+                              },
+                            })}
+                        />
+                      </label>
+                      <label>
+                        <span>Max Pages Per Sync</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="20"
+                          value={settings.jira.maxPages}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: {
+                                ...settings.jira,
+                                maxPages: Number(event.currentTarget.value),
+                              },
+                            })}
+                        />
+                      </label>
+                    </div>
+                    <p class="field-help">
+                      {syncBudgetLabel} Keep this small for daily use; use a narrower JQL instead of fetching
+                      many pages.
+                    </p>
+                    <label>
+                      <span>MCP Tool Name</span>
+                      <input
+                        value={settings.jira.toolName}
+                        oninput={(event) =>
+                          (settings = {
+                            ...settings,
+                            jira: { ...settings.jira, toolName: event.currentTarget.value },
+                          })}
+                      />
+                    </label>
+                    <div class="field-row advanced-tools">
+                      <label>
+                        <span>Board List Tool</span>
+                        <input
+                          value={settings.jira.boardToolName}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: { ...settings.jira, boardToolName: event.currentTarget.value },
+                            })}
+                        />
+                      </label>
+                      <label>
+                        <span>Board Issues Tool</span>
+                        <input
+                          value={settings.jira.boardIssuesToolName}
+                          oninput={(event) =>
+                            (settings = {
+                              ...settings,
+                              jira: {
+                                ...settings.jira,
+                                boardIssuesToolName: event.currentTarget.value,
+                              },
+                            })}
+                        />
+                      </label>
+                    </div>
+                    <label>
+                      <span>JQL</span>
+                      <div class="jql-presets">
+                        <button type="button" onclick={() => applyJqlPreset("assigned")}
+                          >Assigned to me</button
+                        >
+                        <button type="button" onclick={() => applyJqlPreset("unassigned_todo")}
+                          >Todo + unassigned</button
+                        >
+                        <button type="button" onclick={() => applyJqlPreset("unresolved")}
+                          >All unresolved</button
+                        >
+                      </div>
+                      <textarea
+                        value={settings.jira.jql}
+                        oninput={(event) =>
+                          (settings = {
+                            ...settings,
+                            jira: { ...settings.jira, jql: event.currentTarget.value },
+                          })}></textarea>
+                    </label>
+                  </div>
                 {/if}
 
                 {#if settingsTab === "theme"}
@@ -4453,7 +4990,10 @@
                     </div>
                     <div class="theme-card">
                       <strong>Dark command center</strong>
-                      <span>Current Spacesly theme. Future color, density, and typography controls will live here instead of crowding integration settings.</span>
+                      <span
+                        >Current Spacesly theme. Future color, density, and typography controls will
+                        live here instead of crowding integration settings.</span
+                      >
                     </div>
                   </div>
                 {/if}
@@ -4479,27 +5019,47 @@
 
                 <footer>
                   {#if settingsTab === "mcp"}
-                  <button type="button" onclick={removeSelectedServer} disabled={settings.mcpServers.length <= 1}>
-                    Remove
-                  </button>
-                  <button type="button" onclick={testSelectedMcpConnection} disabled={testingConnection}>
-                    {testingConnection ? "Testing..." : "Test connection"}
-                  </button>
+                    <button
+                      type="button"
+                      onclick={removeSelectedServer}
+                      disabled={settings.mcpServers.length <= 1}
+                    >
+                      Remove
+                    </button>
+                    <button
+                      type="button"
+                      onclick={testSelectedMcpConnection}
+                      disabled={testingConnection}
+                    >
+                      {testingConnection ? "Testing..." : "Test connection"}
+                    </button>
                   {/if}
                   {#if settingsTab === "jira"}
-                  <button class="connect-jira" type="button" onclick={connectJira} disabled={connectingJira}>
-                    {connectingJira ? "Connecting..." : "Connect Jira"}
-                  </button>
-                  <button type="button" onclick={testJiraConnection} disabled={testingConnection}>
-                    {testingConnection ? "Testing..." : "Test connection"}
-                  </button>
+                    <button
+                      class="connect-jira"
+                      type="button"
+                      onclick={connectJira}
+                      disabled={connectingJira}
+                    >
+                      {connectingJira ? "Connecting..." : "Connect Jira"}
+                    </button>
+                    <button type="button" onclick={testJiraConnection} disabled={testingConnection}>
+                      {testingConnection ? "Testing..." : "Test connection"}
+                    </button>
                   {/if}
                   {#if settingsTab === "agent"}
-                  <button class="connect-jira" type="button" onclick={testWorkerConnection} disabled={testingWorker}>
-                    {testingWorker ? "Testing Agent..." : "Test Agent"}
-                  </button>
+                    <button
+                      class="connect-jira"
+                      type="button"
+                      onclick={testWorkerConnection}
+                      disabled={testingWorker}
+                    >
+                      {testingWorker ? "Testing Agent..." : "Test Agent"}
+                    </button>
                   {/if}
-                  <button class="save-settings" type="button" onclick={persistSettings}>Save settings</button>
+                  <button class="save-settings" type="button" onclick={persistSettings}
+                    >Save settings</button
+                  >
                 </footer>
               </form>
             {/if}
@@ -4513,7 +5073,7 @@
         <strong>Unable to load workspace</strong>
         <p>{error}</p>
       </section>
-        {:else if activeBoard}
+    {:else if activeBoard}
       <section class="board-shell">
         <NotificationStack notice={appNotice} {syncError} onDismissNotice={dismissAppNotice} />
 
@@ -4521,104 +5081,111 @@
           class:with-console={agentConsoleOpen && hasAgentConsoleSession}
           class:is-hidden={workspaceMode !== "board"}
           class="workspace-body"
-          style={agentConsoleOpen && hasAgentConsoleSession ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;` : `--lane-width: ${layoutPrefs.laneWidth}px;`}
+          style={agentConsoleOpen && hasAgentConsoleSession
+            ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;`
+            : `--lane-width: ${layoutPrefs.laneWidth}px;`}
         >
-        <BoardWorkspace
-          {displayColumns}
-          {selectedCardId}
-          {draggedCardId}
-          {runningWorkerCardIds}
-          cardMinHeight={layoutPrefs.cardMinHeight}
-          {doneVisibleLimit}
-          {hasAgentConsoleSession}
-          {agentConsoleOpen}
-          agentRunStatus={visibleAgentRunStatus}
-          agentRunProgress={visibleAgentRunProgress}
-          onResizeLane={(event) => beginLayoutResize(event, "laneWidth", 260, 460, "x")}
-          onResizeCard={(event) => beginLayoutResize(event, "cardMinHeight", 170, 360, "y")}
-          onOpenAgentConsole={openAgentConsole}
-          onDropCard={(cardId, columnId) => void moveCardAndSync(cardId, columnId)}
-          onSelectCard={selectCard}
-           onQueueCard={queueCard}
-           onStartAgent={(cardId) => void startWorkerForCard(cardId)}
-           onMarkDone={requestManualDoneConfirmation}
-           onDeleteCard={removeCard}
-          onDragStartCard={(cardId) => {
-            draggedCardId = cardId;
-          }}
-          onDragEndCard={() => {
-            draggedCardId = null;
-          }}
-          onSetDoneVisibleLimit={setDoneVisibleLimit}
-          onShowMoreLaneCards={showMoreLaneCards}
-          onShowAllLaneCards={showAllLaneCards}
-          onOpenNewTask={() => (newTaskOpen = true)}
-          canStartAgent={canStartAgent}
-          agentActionLabel={agentActionLabel}
-          executionLabel={executionLabel}
-          ticketLabel={ticketLabel}
-          isBlocked={isBlocked}
-          operatorNotesForCard={operatorNotesForCard}
-        />
+          <BoardWorkspace
+            {displayColumns}
+            {selectedCardId}
+            {draggedCardId}
+            {runningWorkerCardIds}
+            cardMinHeight={layoutPrefs.cardMinHeight}
+            {doneVisibleLimit}
+            {hasAgentConsoleSession}
+            {agentConsoleOpen}
+            agentRunStatus={visibleAgentRunStatus}
+            agentRunProgress={visibleAgentRunProgress}
+            onResizeLane={(event) => beginLayoutResize(event, "laneWidth", 260, 460, "x")}
+            onResizeCard={(event) => beginLayoutResize(event, "cardMinHeight", 170, 360, "y")}
+            onOpenAgentConsole={openAgentConsole}
+            onDropCard={(cardId, columnId) => void moveCardAndSync(cardId, columnId)}
+            onSelectCard={selectCard}
+            onQueueCard={queueCard}
+            onStartAgent={(cardId) => void startWorkerForCard(cardId)}
+            onMarkDone={requestManualDoneConfirmation}
+            onDeleteCard={removeCard}
+            onDragStartCard={(cardId) => {
+              draggedCardId = cardId;
+            }}
+            onDragEndCard={() => {
+              draggedCardId = null;
+            }}
+            onSetDoneVisibleLimit={setDoneVisibleLimit}
+            onShowMoreLaneCards={showMoreLaneCards}
+            onShowAllLaneCards={showAllLaneCards}
+            onOpenNewTask={() => (newTaskOpen = true)}
+            {canStartAgent}
+            {agentActionLabel}
+            {executionLabel}
+            {ticketLabel}
+            {isBlocked}
+            {operatorNotesForCard}
+          />
 
-        {#if agentConsoleOpen && hasAgentConsoleSession}
-          <div class="grid-resize-handle">
-            <span
-              class="drag-handle horizontal"
-              role="separator"
-              aria-orientation="horizontal"
-              onpointerdown={(event) => beginLayoutResize(event, "agentConsoleWidth", 360, 720, "x", true)}
-              onpointermove={moveLayoutResize}
-              onpointerup={endLayoutResize}
-              onpointercancel={endLayoutResize}
-            ></span>
-          </div>
-          {#if agentConsoleModule}
-            {@const AgentConsolePanel = agentConsoleModule.default}
-            <AgentConsolePanel
-              style=""
-              title={visibleAgentRunTitle}
-              status={visibleAgentRunStatus}
-              progress={visibleAgentRunProgress}
-               phases={agentPhases}
-              logs={visibleAgentRunLogs}
-              transcript={visibleAgentRunTranscript}
-              output={visibleAgentRunOutput}
-              result={visibleAgentRunResult}
-              runStatus={visibleAgentRunStatus}
-              terminalLines={visibleAgentTerminalLines}
-              terminalInput={agentTerminalInput}
-              runCardId={agentConsoleCardId}
-              onClose={() => (agentConsoleOpen = false)}
-              onTerminalInputChange={(value) => (agentTerminalInput = value)}
-              onSubmitTerminalInput={submitAgentTerminalInput}
-              onOpenCard={(cardId) => (selectedCardId = cardId)}
-              onMarkBlockedDone={requestManualDoneConfirmation}
-            />
-          {:else}
-            <aside class="agent-console" aria-label="Agent run console loading">
-              <header>
-                <div>
-                  <p>Agent Console</p>
-                  <h3>{visibleAgentRunTitle}</h3>
-                </div>
-                <div class={`run-state ${visibleAgentRunStatus}`}>{visibleAgentRunStatus}</div>
-                <button type="button" aria-label="Close Agent console" onclick={() => (agentConsoleOpen = false)}>×</button>
-              </header>
-              <div class="console-progress" aria-label="Agent run progress">
-                <div class="agent-progress-head">
+          {#if agentConsoleOpen && hasAgentConsoleSession}
+            <div class="grid-resize-handle">
+              <span
+                class="drag-handle horizontal"
+                role="separator"
+                aria-orientation="horizontal"
+                onpointerdown={(event) =>
+                  beginLayoutResize(event, "agentConsoleWidth", 360, 720, "x", true)}
+                onpointermove={moveLayoutResize}
+                onpointerup={endLayoutResize}
+                onpointercancel={endLayoutResize}
+              ></span>
+            </div>
+            {#if agentConsoleModule}
+              {@const AgentConsolePanel = agentConsoleModule.default}
+              <AgentConsolePanel
+                style=""
+                title={visibleAgentRunTitle}
+                status={visibleAgentRunStatus}
+                progress={visibleAgentRunProgress}
+                phases={agentPhases}
+                logs={visibleAgentRunLogs}
+                transcript={visibleAgentRunTranscript}
+                output={visibleAgentRunOutput}
+                result={visibleAgentRunResult}
+                runStatus={visibleAgentRunStatus}
+                terminalLines={visibleAgentTerminalLines}
+                terminalInput={agentTerminalInput}
+                runCardId={agentConsoleCardId}
+                onClose={() => (agentConsoleOpen = false)}
+                onTerminalInputChange={(value) => (agentTerminalInput = value)}
+                onSubmitTerminalInput={submitAgentTerminalInput}
+                onOpenCard={(cardId) => (selectedCardId = cardId)}
+                onMarkBlockedDone={requestManualDoneConfirmation}
+              />
+            {:else}
+              <aside class="agent-console" aria-label="Agent run console loading">
+                <header>
                   <div>
-                    <span>Now</span>
-                    <strong>Loading console</strong>
+                    <p>Agent Console</p>
+                    <h3>{visibleAgentRunTitle}</h3>
                   </div>
-                  <strong>{visibleAgentRunProgress}%</strong>
+                  <div class={`run-state ${visibleAgentRunStatus}`}>{visibleAgentRunStatus}</div>
+                  <button
+                    type="button"
+                    aria-label="Close Agent console"
+                    onclick={() => (agentConsoleOpen = false)}>×</button
+                  >
+                </header>
+                <div class="console-progress" aria-label="Agent run progress">
+                  <div class="agent-progress-head">
+                    <div>
+                      <span>Now</span>
+                      <strong>Loading console</strong>
+                    </div>
+                    <strong>{visibleAgentRunProgress}%</strong>
+                  </div>
+                  <progress max="100" value={visibleAgentRunProgress}></progress>
+                  <p>Preparing the Agent console only when opened.</p>
                 </div>
-                <progress max="100" value={visibleAgentRunProgress}></progress>
-                <p>Preparing the Agent console only when opened.</p>
-              </div>
-            </aside>
+              </aside>
+            {/if}
           {/if}
-        {/if}
         </div>
         {#if workspaceMode === "board" && newTaskOpen}
           <NewTaskPopover
@@ -4633,7 +5200,12 @@
 
         {#if workspaceMode === "board" && selectedCard}
           <aside class="detail-popover" aria-label="Selected task detail">
-            <button class="close-detail" type="button" aria-label="Close" onclick={() => (selectedCardId = null)}>×</button>
+            <button
+              class="close-detail"
+              type="button"
+              aria-label="Close"
+              onclick={() => (selectedCardId = null)}>×</button
+            >
             <div class="task-status waiting">
               <span></span>
               <strong>{executionLabel(selectedCard.execution)}</strong>
@@ -4653,7 +5225,9 @@
                 <dt>Ticket</dt>
                 <dd>
                   {#if selectedCard.url}
-                    <a href={selectedCard.url} target="_blank" rel="noreferrer">{ticketLabel(selectedCard)}</a>
+                    <a href={selectedCard.url} target="_blank" rel="noreferrer"
+                      >{ticketLabel(selectedCard)}</a
+                    >
                   {:else}
                     {ticketLabel(selectedCard)}
                   {/if}
@@ -4678,14 +5252,25 @@
                 {#if isBlocked(selectedCard.execution)}
                   <button
                     type="button"
-                    disabled={!canStartAgent(selectedCard, Boolean(runningWorkerCardIds[selectedCard.id]))}
+                    disabled={!canStartAgent(
+                      selectedCard,
+                      Boolean(runningWorkerCardIds[selectedCard.id]),
+                    )}
                     onclick={() => void startWorkerForCard(selectedCard.id)}
                   >
-                    {agentActionLabel(selectedCard, Boolean(runningWorkerCardIds[selectedCard.id]), Boolean(operatorNotesForCard(selectedCard.id)))}
+                    {agentActionLabel(
+                      selectedCard,
+                      Boolean(runningWorkerCardIds[selectedCard.id]),
+                      Boolean(operatorNotesForCard(selectedCard.id)),
+                    )}
                   </button>
                 {/if}
                 {#if selectedCardAgentSession}
-                  <button type="button" class="open-console-action" onclick={() => openAgentConsole(selectedCard)}>
+                  <button
+                    type="button"
+                    class="open-console-action"
+                    onclick={() => openAgentConsole(selectedCard)}
+                  >
                     Open Agent Console
                   </button>
                 {/if}
@@ -4695,216 +5280,249 @@
           </aside>
         {/if}
 
-          <div
-            class:collapsed={fileSidebarCollapsed}
-            class:is-hidden={workspaceMode !== "files"}
-            class="files-workspace"
-            style={`--file-sidebar-width: ${layoutPrefs.fileSidebarWidth}px;`}
-          >
-            <div class="files-sidebar">
-              <SegmentedControl
-                ariaLabel="Workspace sidebar tabs"
-                activeValue={workspaceSidebarTab}
-                items={[
-                  { value: "explorer", label: "Explorer" },
-                  { value: "source-control", label: "Source Control", badge: sourceControlChangedCount > 0 ? sourceControlChangedCount : undefined },
-                ]}
-                onSelect={(value) => (workspaceSidebarTab = value as typeof workspaceSidebarTab)}
-              />
+        <div
+          class:collapsed={fileSidebarCollapsed}
+          class:is-hidden={workspaceMode !== "files"}
+          class="files-workspace"
+          style={`--file-sidebar-width: ${layoutPrefs.fileSidebarWidth}px;`}
+        >
+          <div class="files-sidebar">
+            <SegmentedControl
+              ariaLabel="Workspace sidebar tabs"
+              activeValue={workspaceSidebarTab}
+              items={[
+                { value: "explorer", label: "Explorer" },
+                {
+                  value: "source-control",
+                  label: "Source Control",
+                  badge: sourceControlChangedCount > 0 ? sourceControlChangedCount : undefined,
+                },
+              ]}
+              onSelect={(value) => (workspaceSidebarTab = value as typeof workspaceSidebarTab)}
+            />
 
-              {#if workspaceSidebarTab === "explorer"}
-                {#if fileBrowserModule}
-                  {@const FileBrowserPane = fileBrowserModule.default}
-                  <FileBrowserPane
-                    {fileRootLabel}
-                    {fileDirectory}
-                    {fileLoading}
-                    {fileError}
-                    {fileEntries}
-                    {fileFilter}
-                    changedFiles={workspaceChangedFiles}
-                    expandedFolders={expandedFileEntries}
-                    expandingFolders={expandingFilePaths}
-                    {activeEditorPath}
-                    onOpenFolder={() => void openFolderFromDialog()}
-                    onOpenFile={() => void openFileFromDialog()}
-                    onCreateFile={() => void createNewFile()}
-                    onRefreshDirectory={() => void refreshFileDirectory("")}
-                    onOpenEntry={(entry) => void openFileEntry(entry)}
-                    onToggleFolder={(entry) => void toggleFileFolder(entry)}
-                    onFilterChange={(filter) => (fileFilter = filter)}
-                    onClearFilter={clearFileFilter}
-                    onCollapseAll={collapseAllFileFolders}
-                    onToggleSidebar={toggleFileSidebar}
-                  />
-                {:else}
-                  <aside class="file-browser-pane" aria-label="Workspace files loading">
-                    <header>
-                      <div>
-                        <p>Explorer</p>
-                        <h2>Loading browser</h2>
-                      </div>
-                    </header>
-                    <div class="file-empty">Preparing file browser only when Files mode is used.</div>
-                  </aside>
-                {/if}
+            {#if workspaceSidebarTab === "explorer"}
+              {#if fileBrowserModule}
+                {@const FileBrowserPane = fileBrowserModule.default}
+                <FileBrowserPane
+                  {fileRootLabel}
+                  {fileDirectory}
+                  {fileLoading}
+                  {fileError}
+                  {fileEntries}
+                  {fileFilter}
+                  changedFiles={workspaceChangedFiles}
+                  expandedFolders={expandedFileEntries}
+                  expandingFolders={expandingFilePaths}
+                  {activeEditorPath}
+                  onOpenFolder={() => void openFolderFromDialog()}
+                  onOpenFile={() => void openFileFromDialog()}
+                  onCreateFile={() => void createNewFile()}
+                  onRefreshDirectory={() => void refreshFileDirectory("")}
+                  onOpenEntry={(entry) => void openFileEntry(entry)}
+                  onToggleFolder={(entry) => void toggleFileFolder(entry)}
+                  onFilterChange={(filter) => (fileFilter = filter)}
+                  onClearFilter={clearFileFilter}
+                  onCollapseAll={collapseAllFileFolders}
+                  onToggleSidebar={toggleFileSidebar}
+                />
               {:else}
-                {#if gitActionsModule}
-                  {@const GitActionsPane = gitActionsModule.default}
-                  <GitActionsPane
-                    {workspaceGitInfo}
-                    {workspaceGitLoading}
-                    {workspaceGitError}
-                    {switchingWorkspaceBranch}
-                    hasDirtyEditors={hasDirtyEditorFiles}
-                    stagedFiles={workspaceGitStatus.staged}
-                    unstagedFiles={workspaceGitStatus.unstaged}
-                    onStageFile={stageWorkspaceGitPath}
-                    onStageAll={stageAllWorkspaceGitPaths}
-                    onUnstageFile={unstageWorkspaceGitPath}
-                    onUnstageAll={unstageAllWorkspaceGitPaths}
-                    onSwitchBranch={(branch) => void switchWorkspaceBranch(branch)}
-                    onPull={pullWorkspaceGitChanges}
-                    onCommit={commitWorkspaceGitChanges}
-                    onPush={pushWorkspaceGitChanges}
-                    onMerge={mergeWorkspaceGitBranch}
-                    onRebase={rebaseWorkspaceGitBranch}
-                    onRefresh={() => refreshWorkspaceGitState()}
-                    onOpenFile={(path) => void openFileEntry({ name: fileName(path), path, is_dir: false, size: 0 })}
-                  />
-                {:else}
-                  <aside class="git-actions-pane git-actions-loading" aria-label="Git actions loading">
-                    <header>
-                      <div>
-                        <p>Source control</p>
-                        <h2>Loading actions</h2>
-                      </div>
-                    </header>
-                    <div class="git-empty">Preparing git actions only when Files mode is used.</div>
-                  </aside>
-                {/if}
+                <aside class="file-browser-pane" aria-label="Workspace files loading">
+                  <header>
+                    <div>
+                      <p>Explorer</p>
+                      <h2>Loading browser</h2>
+                    </div>
+                  </header>
+                  <div class="file-empty">Preparing file browser only when Files mode is used.</div>
+                </aside>
               {/if}
-            </div>
-
-            {#if fileSidebarCollapsed}
-              <button class="file-sidebar-rail" type="button" onclick={toggleFileSidebar} aria-label="Show file browser">
-                &gt;
-              </button>
             {:else}
-              <div class="grid-resize-handle file-resize-handle">
-                <span
-                  class="drag-handle horizontal"
-                  role="separator"
-                  aria-orientation="horizontal"
-                  onpointerdown={(event) => beginLayoutResize(event, "fileSidebarWidth", 240, 560, "x")}
-                  onpointermove={moveLayoutResize}
-                  onpointerup={endLayoutResize}
-                  onpointercancel={endLayoutResize}
-                ></span>
-              </div>
-            {/if}
-
-            {#if editorWorkspaceModule}
-              {@const EditorWorkspace = editorWorkspaceModule.default}
-              <EditorWorkspace
-                {openEditorFiles}
-                {activeEditorPath}
-                {activeEditorFile}
-                {activeEditorReady}
-                {activeEditorDirty}
-                {formattingFilePath}
-                {savingFilePath}
-                {editorDiagnostic}
-                {fileStatusLabel}
-                onFormatActiveFile={() => void formatActiveFile()}
-                onSaveActiveFile={() => void saveActiveFile()}
-                onSelectEditorTab={selectEditorTab}
-                onCloseEditorTab={closeEditorTab}
-                onSetEditorDirty={setEditorDirty}
-              />
-            {:else}
-              <section class="code-editor-pane editor-loading" aria-label="Code editor loading">
-                <header>
-                  <div>
-                    <p>Editor</p>
-                    <h2>Loading editor</h2>
-                  </div>
-                </header>
-                <div class="editor-empty">
-                  <strong>Preparing workspace editor</strong>
-                  <span>The editing bundle loads only when Files mode is used.</span>
-                </div>
-              </section>
+              {#if gitActionsModule}
+                {@const GitActionsPane = gitActionsModule.default}
+                <GitActionsPane
+                  {workspaceGitInfo}
+                  {workspaceGitLoading}
+                  {workspaceGitError}
+                  {switchingWorkspaceBranch}
+                  hasDirtyEditors={hasDirtyEditorFiles}
+                  stagedFiles={workspaceGitStatus.staged}
+                  unstagedFiles={workspaceGitStatus.unstaged}
+                  onStageFile={stageWorkspaceGitPath}
+                  onStageAll={stageAllWorkspaceGitPaths}
+                  onUnstageFile={unstageWorkspaceGitPath}
+                  onUnstageAll={unstageAllWorkspaceGitPaths}
+                  onSwitchBranch={(branch) => void switchWorkspaceBranch(branch)}
+                  onPull={pullWorkspaceGitChanges}
+                  onCommit={commitWorkspaceGitChanges}
+                  onPush={pushWorkspaceGitChanges}
+                  onMerge={mergeWorkspaceGitBranch}
+                  onRebase={rebaseWorkspaceGitBranch}
+                  onRefresh={() => refreshWorkspaceGitState()}
+                  onOpenFile={(path) =>
+                    void openFileEntry({ name: fileName(path), path, is_dir: false, size: 0 })}
+                />
+              {:else}
+                <aside
+                  class="git-actions-pane git-actions-loading"
+                  aria-label="Git actions loading"
+                >
+                  <header>
+                    <div>
+                      <p>Source control</p>
+                      <h2>Loading actions</h2>
+                    </div>
+                  </header>
+                  <div class="git-empty">Preparing git actions only when Files mode is used.</div>
+                </aside>
+              {/if}
             {/if}
           </div>
 
-          <div class:is-hidden={workspaceMode !== "term"} class="term-workspace" style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}>
-            <TerminalWorkspace
-              workdir={workspaceShellWorkdir}
-              opened={workspaceTerminalOpened}
-              onWorkdirChange={(workdir) => {
-                workspaceShellWorkdir = workdir;
-                saveUiState();
-              }}
-              onContainerReady={(container) => {
-                workspaceTerminalContainer = container;
-              }}
-            />
-
-            <div class="grid-resize-handle">
+          {#if fileSidebarCollapsed}
+            <button
+              class="file-sidebar-rail"
+              type="button"
+              onclick={toggleFileSidebar}
+              aria-label="Show file browser"
+            >
+              &gt;
+            </button>
+          {:else}
+            <div class="grid-resize-handle file-resize-handle">
               <span
                 class="drag-handle horizontal"
                 role="separator"
                 aria-orientation="horizontal"
-                onpointerdown={(event) => beginLayoutResize(event, "terminalWidth", 420, 1100, "x")}
+                onpointerdown={(event) =>
+                  beginLayoutResize(event, "fileSidebarWidth", 240, 560, "x")}
                 onpointermove={moveLayoutResize}
                 onpointerup={endLayoutResize}
                 onpointercancel={endLayoutResize}
               ></span>
             </div>
+          {/if}
 
-            {#if workspaceChatModule}
-              {@const WorkspaceChatPane = workspaceChatModule.default}
-              <WorkspaceChatPane
-                title={settings.aiWorker.runtime === "opencode" ? settings.aiWorker.opencodeModel : selectedAiModel.label}
-                onOpenRuntimeSettings={() => openSettings("agent")}
-                sessions={workspaceChatSessions}
-                activeSessionId={workspaceChatActiveSessionId}
-                onNewSession={startWorkspaceChatSession}
-                onSwitchSession={activateWorkspaceChatSession}
-                messages={workspaceChatMessages}
-                running={workspaceChatRunning}
-                onTextareaReady={(element) => {
-                  workspaceChatTextarea = element;
-                }}
-                onEndReady={(element) => {
-                  workspaceChatEnd = element;
-                }}
-                onSubmit={() => void sendWorkspaceChat()}
-                onKeydown={handleWorkspaceChatKeydown}
-              />
-            {:else}
-              <section class="workspace-chat-pane" aria-label="Agent chat loading">
-                <header>
-                  <div>
-                    <p>Agent Chat</p>
-                    <h2>Loading chat</h2>
-                  </div>
-                </header>
-                <div class="chat-empty">Preparing chat only when Terminal mode is used.</div>
-              </section>
-            {/if}
+          {#if editorWorkspaceModule}
+            {@const EditorWorkspace = editorWorkspaceModule.default}
+            <EditorWorkspace
+              {openEditorFiles}
+              {activeEditorPath}
+              {activeEditorFile}
+              {activeEditorReady}
+              {activeEditorDirty}
+              {formattingFilePath}
+              {savingFilePath}
+              {editorDiagnostic}
+              {fileStatusLabel}
+              onFormatActiveFile={() => void formatActiveFile()}
+              onSaveActiveFile={() => void saveActiveFile()}
+              onSelectEditorTab={selectEditorTab}
+              onCloseEditorTab={closeEditorTab}
+              onSetEditorDirty={setEditorDirty}
+            />
+          {:else}
+            <section class="code-editor-pane editor-loading" aria-label="Code editor loading">
+              <header>
+                <div>
+                  <p>Editor</p>
+                  <h2>Loading editor</h2>
+                </div>
+              </header>
+              <div class="editor-empty">
+                <strong>Preparing workspace editor</strong>
+                <span>The editing bundle loads only when Files mode is used.</span>
+              </div>
+            </section>
+          {/if}
+        </div>
+
+        <div
+          class:is-hidden={workspaceMode !== "term"}
+          class="term-workspace"
+          style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}
+        >
+          <TerminalWorkspace
+            workdir={workspaceShellWorkdir}
+            opened={workspaceTerminalOpened}
+            onWorkdirChange={(workdir) => {
+              workspaceShellWorkdir = workdir;
+              saveUiState();
+            }}
+            onContainerReady={(container) => {
+              workspaceTerminalContainer = container;
+            }}
+          />
+
+          <div class="grid-resize-handle">
+            <span
+              class="drag-handle horizontal"
+              role="separator"
+              aria-orientation="horizontal"
+              onpointerdown={(event) => beginLayoutResize(event, "terminalWidth", 420, 1100, "x")}
+              onpointermove={moveLayoutResize}
+              onpointerup={endLayoutResize}
+              onpointercancel={endLayoutResize}
+            ></span>
+          </div>
+
+          {#if workspaceChatModule}
+            {@const WorkspaceChatPane = workspaceChatModule.default}
+            <WorkspaceChatPane
+              title={settings.aiWorker.runtime === "opencode"
+                ? settings.aiWorker.opencodeModel
+                : selectedAiModel.label}
+              onOpenRuntimeSettings={() => openSettings("agent")}
+              sessions={workspaceChatSessions}
+              activeSessionId={workspaceChatActiveSessionId}
+              onNewSession={startWorkspaceChatSession}
+              onSwitchSession={activateWorkspaceChatSession}
+              messages={workspaceChatMessages}
+              running={workspaceChatRunning}
+              onTextareaReady={(element) => {
+                workspaceChatTextarea = element;
+              }}
+              onEndReady={(element) => {
+                workspaceChatEnd = element;
+              }}
+              onSubmit={() => void sendWorkspaceChat()}
+              onKeydown={handleWorkspaceChatKeydown}
+            />
+          {:else}
+            <section class="workspace-chat-pane" aria-label="Agent chat loading">
+              <header>
+                <div>
+                  <p>Agent Chat</p>
+                  <h2>Loading chat</h2>
+                </div>
+              </header>
+              <div class="chat-empty">Preparing chat only when Terminal mode is used.</div>
+            </section>
+          {/if}
         </div>
       </section>
       {#if backlogStartConfirmation}
-        <div class="confirm-backdrop" role="presentation" onclick={() => resolveBacklogStartConfirmation(false)}></div>
-        <div class="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirm-backlog-start-title">
+        <div
+          class="confirm-backdrop"
+          role="presentation"
+          onclick={() => resolveBacklogStartConfirmation(false)}
+        ></div>
+        <div
+          class="confirm-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-backlog-start-title"
+        >
           <header>
             <div>
               <p>Confirm start</p>
               <h2 id="confirm-backlog-start-title">Start backlog task?</h2>
             </div>
-            <button type="button" aria-label="Close confirmation" onclick={() => resolveBacklogStartConfirmation(false)}>×</button>
+            <button
+              type="button"
+              aria-label="Close confirmation"
+              onclick={() => resolveBacklogStartConfirmation(false)}>×</button
+            >
           </header>
           <div class="confirm-body">
             <p>
@@ -4914,20 +5532,39 @@
             <p>This will create a running task immediately. Continue?</p>
           </div>
           <footer>
-            <button type="button" onclick={() => resolveBacklogStartConfirmation(false)}>Cancel</button>
-            <button class="confirm-primary" type="button" onclick={() => resolveBacklogStartConfirmation(true)}>Start Agent</button>
+            <button type="button" onclick={() => resolveBacklogStartConfirmation(false)}
+              >Cancel</button
+            >
+            <button
+              class="confirm-primary"
+              type="button"
+              onclick={() => resolveBacklogStartConfirmation(true)}>Start Agent</button
+            >
           </footer>
         </div>
       {/if}
       {#if manualDoneConfirmation}
-        <div class="confirm-backdrop" role="presentation" onclick={() => void confirmManualDone(false)}></div>
-        <div class="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirm-manual-done-title">
+        <div
+          class="confirm-backdrop"
+          role="presentation"
+          onclick={() => void confirmManualDone(false)}
+        ></div>
+        <div
+          class="confirm-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-manual-done-title"
+        >
           <header>
             <div>
               <p>Confirm manual completion</p>
               <h2 id="confirm-manual-done-title">Mark task Done?</h2>
             </div>
-            <button type="button" aria-label="Close confirmation" onclick={() => void confirmManualDone(false)}>×</button>
+            <button
+              type="button"
+              aria-label="Close confirmation"
+              onclick={() => void confirmManualDone(false)}>×</button
+            >
           </header>
           <div class="confirm-body">
             <p>
@@ -4938,7 +5575,11 @@
           </div>
           <footer>
             <button type="button" onclick={() => void confirmManualDone(false)}>Cancel</button>
-            <button class="confirm-primary" type="button" onclick={() => void confirmManualDone(true)}>Done</button>
+            <button
+              class="confirm-primary"
+              type="button"
+              onclick={() => void confirmManualDone(true)}>Done</button
+            >
           </footer>
         </div>
       {/if}

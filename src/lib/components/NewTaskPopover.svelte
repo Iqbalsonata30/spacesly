@@ -8,7 +8,8 @@
     onCreate: () => void;
   };
 
-  let { title, description, onTitleChange, onDescriptionChange, onClose, onCreate }: Props = $props();
+  let { title, description, onTitleChange, onDescriptionChange, onClose, onCreate }: Props =
+    $props();
 </script>
 
 <aside class="new-task-popover" aria-label="Create new task">
@@ -19,15 +20,18 @@
   </div>
   <label>
     <span>Task title</span>
-    <input placeholder="What should the Agent do?" value={title} oninput={(event) => onTitleChange(event.currentTarget.value)} />
+    <input
+      placeholder="What should the Agent do?"
+      value={title}
+      oninput={(event) => onTitleChange(event.currentTarget.value)}
+    />
   </label>
   <label>
     <span>Description</span>
     <textarea
       placeholder="Add context, expected outcome, links, constraints, or anything the Agent should know."
       value={description}
-      oninput={(event) => onDescriptionChange(event.currentTarget.value)}
-    ></textarea>
+      oninput={(event) => onDescriptionChange(event.currentTarget.value)}></textarea>
   </label>
   <footer>
     <span>This creates a local Spacesly card. It can run without Jira.</span>

@@ -191,17 +191,18 @@ export function secretsFromSettings(settings: AppSettings): AppSecrets {
 
 export function hasAnySecret(secrets: AppSecrets): boolean {
   return Boolean(
-    secrets.jira_api_token
-      || secrets.jira_personal_access_token
-      || secrets.jira_password
-      || Object.values(secrets.ai_api_keys).some((value) => value.trim()),
+    secrets.jira_api_token ||
+    secrets.jira_personal_access_token ||
+    secrets.jira_password ||
+    Object.values(secrets.ai_api_keys).some((value) => value.trim()),
   );
 }
 
 export function mergeAppSecrets(localSecrets: AppSecrets, storedSecrets: AppSecrets): AppSecrets {
   return {
     jira_api_token: localSecrets.jira_api_token || storedSecrets.jira_api_token,
-    jira_personal_access_token: localSecrets.jira_personal_access_token || storedSecrets.jira_personal_access_token,
+    jira_personal_access_token:
+      localSecrets.jira_personal_access_token || storedSecrets.jira_personal_access_token,
     jira_password: localSecrets.jira_password || storedSecrets.jira_password,
     ai_api_keys: { ...storedSecrets.ai_api_keys, ...localSecrets.ai_api_keys },
   };
@@ -255,9 +256,7 @@ export function parseEnvText(value: string): Record<string, string> {
       throw new Error("Env JSON must be an object.");
     }
 
-    return Object.fromEntries(
-      Object.entries(parsed).map(([key, entry]) => [key, String(entry)]),
-    );
+    return Object.fromEntries(Object.entries(parsed).map(([key, entry]) => [key, String(entry)]));
   }
 
   return Object.fromEntries(
@@ -290,13 +289,26 @@ function normalizeSettings(value: unknown): AppSettings {
       modelId: aiModelId,
       modelIds: aiModelIds,
       apiKeys: aiApiKeys,
-      opencodeCommand: stringOrFallback(candidate.aiWorker?.opencodeCommand, fallback.aiWorker.opencodeCommand),
-      opencodeModel: normalizeOpencodeModel(candidate.aiWorker?.opencodeModel, fallback.aiWorker.opencodeModel),
-      opencodeWorkdir: String(candidate.aiWorker?.opencodeWorkdir ?? fallback.aiWorker.opencodeWorkdir),
+      opencodeCommand: stringOrFallback(
+        candidate.aiWorker?.opencodeCommand,
+        fallback.aiWorker.opencodeCommand,
+      ),
+      opencodeModel: normalizeOpencodeModel(
+        candidate.aiWorker?.opencodeModel,
+        fallback.aiWorker.opencodeModel,
+      ),
+      opencodeWorkdir: String(
+        candidate.aiWorker?.opencodeWorkdir ?? fallback.aiWorker.opencodeWorkdir,
+      ),
       opencodeAutoApprove: candidate.aiWorker?.opencodeAutoApprove === true,
       agentRules: String(candidate.aiWorker?.agentRules ?? fallback.aiWorker.agentRules),
       agentSkills: String(candidate.aiWorker?.agentSkills ?? fallback.aiWorker.agentSkills),
-      temperature: boundedFloat(candidate.aiWorker?.temperature, fallback.aiWorker.temperature, 0, 2),
+      temperature: boundedFloat(
+        candidate.aiWorker?.temperature,
+        fallback.aiWorker.temperature,
+        0,
+        2,
+      ),
     },
     jira: {
       serverId: candidate.jira?.serverId ?? fallback.jira.serverId,
@@ -332,27 +344,38 @@ function normalizeAiModelIds(
   providerId: string,
   modelId: string,
 ): Record<string, string> {
-  const modelIds = value?.modelIds && typeof value.modelIds === "object"
-    ? Object.fromEntries(
-        Object.entries(value.modelIds).filter(([key, entry]) => {
-          const provider = providerById(key);
-          return provider.id === key && typeof entry === "string" && provider.models.some((model) => model.id === entry);
-        }),
-      )
-    : {};
+  const modelIds =
+    value?.modelIds && typeof value.modelIds === "object"
+      ? Object.fromEntries(
+          Object.entries(value.modelIds).filter(([key, entry]) => {
+            const provider = providerById(key);
+            return (
+              provider.id === key &&
+              typeof entry === "string" &&
+              provider.models.some((model) => model.id === entry)
+            );
+          }),
+        )
+      : {};
 
   modelIds[providerId] = modelId;
   return modelIds;
 }
 
-function normalizeAiApiKeys(value: Partial<AiWorkerSettings> | undefined, providerId: string): Record<string, string> {
-  const legacy = value as Partial<AiWorkerSettings> & { apiKey?: string } | undefined;
-  const apiKeys = value?.apiKeys && typeof value.apiKeys === "object"
-    ? Object.fromEntries(
-        Object.entries(value.apiKeys)
-          .filter(([key, entry]) => aiProviders.some((provider) => provider.id === key) && typeof entry === "string"),
-      )
-    : {};
+function normalizeAiApiKeys(
+  value: Partial<AiWorkerSettings> | undefined,
+  providerId: string,
+): Record<string, string> {
+  const legacy = value as (Partial<AiWorkerSettings> & { apiKey?: string }) | undefined;
+  const apiKeys =
+    value?.apiKeys && typeof value.apiKeys === "object"
+      ? Object.fromEntries(
+          Object.entries(value.apiKeys).filter(
+            ([key, entry]) =>
+              aiProviders.some((provider) => provider.id === key) && typeof entry === "string",
+          ),
+        )
+      : {};
 
   if (!apiKeys[providerId] && legacy?.apiKey) {
     apiKeys[providerId] = legacy.apiKey;
@@ -362,20 +385,25 @@ function normalizeAiApiKeys(value: Partial<AiWorkerSettings> | undefined, provid
 }
 
 function normalizeProviderId(value: Partial<AiWorkerSettings> | undefined): string {
-  const legacy = value as Partial<AiWorkerSettings> & { providerName?: string; baseUrl?: string } | undefined;
+  const legacy = value as
+    (Partial<AiWorkerSettings> & { providerName?: string; baseUrl?: string }) | undefined;
   const explicit = String(value?.providerId ?? "");
   if (aiProviders.some((provider) => provider.id === explicit)) return explicit;
 
   const baseUrl = legacy?.baseUrl ?? "";
   const providerName = (legacy?.providerName ?? "").toLowerCase();
   const matched = aiProviders.find(
-    (provider) => provider.baseUrl === baseUrl || providerName.includes(provider.label.toLowerCase()),
+    (provider) =>
+      provider.baseUrl === baseUrl || providerName.includes(provider.label.toLowerCase()),
   );
   return matched?.id ?? defaultSettings.aiWorker.providerId;
 }
 
-function normalizeModelId(value: Partial<AiWorkerSettings> | undefined, providerId: string): string {
-  const legacy = value as Partial<AiWorkerSettings> & { model?: string } | undefined;
+function normalizeModelId(
+  value: Partial<AiWorkerSettings> | undefined,
+  providerId: string,
+): string {
+  const legacy = value as (Partial<AiWorkerSettings> & { model?: string }) | undefined;
   const provider = providerById(providerId);
   const modelId = String(value?.modelId ?? legacy?.model ?? "");
   if (provider.models.some((model) => model.id === modelId)) return modelId;
@@ -456,9 +484,10 @@ function normalizeServer(value: unknown): McpServerSettings {
     kind: normalizeKind(server.kind),
     command: String(server.command ?? ""),
     args: Array.isArray(server.args) ? server.args.map(String) : [],
-    env: server.env && typeof server.env === "object" && !Array.isArray(server.env)
-      ? Object.fromEntries(Object.entries(server.env).map(([key, entry]) => [key, String(entry)]))
-      : {},
+    env:
+      server.env && typeof server.env === "object" && !Array.isArray(server.env)
+        ? Object.fromEntries(Object.entries(server.env).map(([key, entry]) => [key, String(entry)]))
+        : {},
   };
 }
 

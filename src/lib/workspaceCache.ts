@@ -20,7 +20,11 @@ let deletedCardIds = new Set<string>();
 
 export async function loadCachedWorkspace(): Promise<CachedWorkspace | null> {
   const cached = normalizeCachedWorkspace(
-    await invokeWithPolicy<CachedWorkspace | null>("load_cached_workspace", undefined, IPC_POLICIES.workspaceCache),
+    await invokeWithPolicy<CachedWorkspace | null>(
+      "load_cached_workspace",
+      undefined,
+      IPC_POLICIES.workspaceCache,
+    ),
   );
   if (cached) return rememberCacheSize(cached);
 
@@ -44,10 +48,13 @@ export function saveCachedWorkspace(workspace: WorkspaceProjection): void {
   cacheWriteTimer = setTimeout(() => {
     cacheWriteTimer = null;
     if ("requestIdleCallback" in window) {
-      cacheWriteIdleId = window.requestIdleCallback(() => {
-        cacheWriteIdleId = null;
-        void flushCachedWorkspace();
-      }, { timeout: 1_000 });
+      cacheWriteIdleId = window.requestIdleCallback(
+        () => {
+          cacheWriteIdleId = null;
+          void flushCachedWorkspace();
+        },
+        { timeout: 1_000 },
+      );
       return;
     }
 
@@ -83,7 +90,9 @@ export function cachedWorkspaceSizeBytes(): number {
 
 function normalizeCachedWorkspace(value: CachedWorkspace | null): CachedWorkspace | null {
   if (!value?.workspace || !Array.isArray(value.workspace.projects)) return null;
-  deletedCardIds = new Set((value.deletedCardIds ?? []).filter((id) => typeof id === "string" && id.length > 0));
+  deletedCardIds = new Set(
+    (value.deletedCardIds ?? []).filter((id) => typeof id === "string" && id.length > 0),
+  );
   return {
     ...value,
     deletedCardIds: [...deletedCardIds],
@@ -123,9 +132,15 @@ function normalizeWorkspace(workspace: WorkspaceProjection): WorkspaceProjection
       boards: project.boards.map((board) => ({
         ...board,
         columns: board.columns.map((column) => {
-          const migratedColumn = String(column.intent) === "ready"
-            ? { ...column, id: column.id === "column-ready" ? "column-queued" : column.id, name: "Queued", intent: "queued" as const }
-            : column;
+          const migratedColumn =
+            String(column.intent) === "ready"
+              ? {
+                  ...column,
+                  id: column.id === "column-ready" ? "column-queued" : column.id,
+                  name: "Queued",
+                  intent: "queued" as const,
+                }
+              : column;
 
           return {
             ...migratedColumn,

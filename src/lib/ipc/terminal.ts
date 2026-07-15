@@ -29,8 +29,14 @@ export async function runShellCommand(request: ShellCommandRequest): Promise<She
   return invoke<ShellCommandResult>("run_shell_command", { request });
 }
 
-export async function completeShellInput(request: ShellCompletionRequest): Promise<ShellCompletionResult> {
-  return invokeWithPolicy<ShellCompletionResult>("complete_shell_input", { request }, IPC_POLICIES.shellCompletion);
+export async function completeShellInput(
+  request: ShellCompletionRequest,
+): Promise<ShellCompletionResult> {
+  return invokeWithPolicy<ShellCompletionResult>(
+    "complete_shell_input",
+    { request },
+    IPC_POLICIES.shellCompletion,
+  );
 }
 
 export async function openPtyTerminal(
@@ -40,7 +46,11 @@ export async function openPtyTerminal(
 ): Promise<void> {
   const channel = new Channel<number[]>();
   channel.onmessage = onData;
-  return invokeWithPolicy<void>("open_pty_terminal", { terminalId, workdir, onData: channel }, IPC_POLICIES.pty);
+  return invokeWithPolicy<void>(
+    "open_pty_terminal",
+    { terminalId, workdir, onData: channel },
+    IPC_POLICIES.pty,
+  );
 }
 
 export async function closePtyTerminal(terminalId: string): Promise<void> {
@@ -51,8 +61,16 @@ export async function writePtyTerminal(terminalId: string, data: number[]): Prom
   return invokeWithPolicy<void>("write_pty_terminal", { terminalId, data }, IPC_POLICIES.pty);
 }
 
-export async function resizePtyTerminal(terminalId: string, rows: number, cols: number): Promise<void> {
-  return invokeWithPolicy<void>("resize_pty_terminal", { terminalId, rows, cols }, IPC_POLICIES.pty);
+export async function resizePtyTerminal(
+  terminalId: string,
+  rows: number,
+  cols: number,
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "resize_pty_terminal",
+    { terminalId, rows, cols },
+    IPC_POLICIES.pty,
+  );
 }
 
 export async function ptyCurrentDirectory(terminalId: string): Promise<string | null> {

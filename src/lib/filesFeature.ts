@@ -32,13 +32,17 @@ export function directoryBreadcrumbs(path: string): Array<{ label: string; path:
   return crumbs;
 }
 
-export function filesRestoreTarget(state: UiState): { root: string; directory: string; activePath: string | null } {
+export function filesRestoreTarget(state: UiState): {
+  root: string;
+  directory: string;
+  activePath: string | null;
+} {
   const root = normalizeAbsolutePath(state.workspaceFilesRoot);
   const directory = state.workspaceFilesDirectory || "";
   const activePath = state.workspaceFilesActivePath;
   return {
     root,
-    directory: directory || (activePath ? parentDirectory(activePath) ?? "" : ""),
+    directory: directory || (activePath ? (parentDirectory(activePath) ?? "") : ""),
     activePath,
   };
 }

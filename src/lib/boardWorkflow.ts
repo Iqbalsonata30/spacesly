@@ -22,8 +22,12 @@ export type AgentPhase = {
   state: "pending" | "active" | "done" | "blocked" | "timeout";
 };
 
-export function withCompletionMetadata(card: CardProjection, columnIntent: ColumnIntent): CardProjection {
-  if (columnIntent === "done") return { ...card, completedAt: card.completedAt ?? Date.now(), syncMissingAt: null };
+export function withCompletionMetadata(
+  card: CardProjection,
+  columnIntent: ColumnIntent,
+): CardProjection {
+  if (columnIntent === "done")
+    return { ...card, completedAt: card.completedAt ?? Date.now(), syncMissingAt: null };
   if (card.completedAt == null) return card;
   return { ...card, completedAt: null, syncMissingAt: null };
 }
@@ -34,7 +38,8 @@ export function recoverInterruptedAgentRuns(
 ): WorkspaceProjection {
   if (interruptedCardIds.length === 0) return workspace;
   const interrupted = new Set(interruptedCardIds);
-  const reason = "Agent execution was interrupted when Spacesly closed. Review the task, then retry when ready.";
+  const reason =
+    "Agent execution was interrupted when Spacesly closed. Review the task, then retry when ready.";
 
   return {
     ...workspace,
@@ -91,7 +96,7 @@ export function mergeSyncedWorkspace(
     retainedIds.add(card.id);
   };
 
-    for (const { card, intent } of currentEntries.values()) {
+  for (const { card, intent } of currentEntries.values()) {
     if (card.id === legacySeedCardId || deletedIds.has(card.id)) continue;
 
     if (card.source === "local") {
@@ -101,7 +106,7 @@ export function mergeSyncedWorkspace(
 
     if (intent !== "in_progress" && intent !== "done") continue;
 
-    const missingAt = incomingIds.has(card.id) ? null : card.syncMissingAt ?? nowMs;
+    const missingAt = incomingIds.has(card.id) ? null : (card.syncMissingAt ?? nowMs);
     if (missingAt !== null && nowMs - missingAt > retainMissingCardMs) continue;
 
     retainCard({ ...card, syncMissingAt: missingAt }, intent);
@@ -176,7 +181,9 @@ export function agentActivity(
   if (status === "timeout") {
     return {
       title: "Response timed out",
-      detail: log?.message ?? "Spacesly stopped waiting for the Agent response before a structured result arrived.",
+      detail:
+        log?.message ??
+        "Spacesly stopped waiting for the Agent response before a structured result arrived.",
       next: "Check the Agent runtime output, then continue or retry from this card.",
     };
   }
@@ -236,7 +243,10 @@ export function agentActivity(
   };
 }
 
-export function agentPhaseTimeline(status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed", progress: number): AgentPhase[] {
+export function agentPhaseTimeline(
+  status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed",
+  progress: number,
+): AgentPhase[] {
   const phases: Array<Omit<AgentPhase, "state"> & { threshold: number }> = [
     { key: "prepare", label: "Prepare", threshold: 5 },
     { key: "jira", label: "Jira", threshold: 25 },
@@ -252,13 +262,14 @@ export function agentPhaseTimeline(status: "idle" | "queued" | "running" | "time
     return {
       key: phase.key,
       label: phase.label,
-      state: (status === "blocked" || status === "timeout") && active
-        ? status
-        : progress >= phase.threshold && (!next || progress >= next.threshold)
-          ? "done"
-          : active
-            ? "active"
-            : "pending",
+      state:
+        (status === "blocked" || status === "timeout") && active
+          ? status
+          : progress >= phase.threshold && (!next || progress >= next.threshold)
+            ? "done"
+            : active
+              ? "active"
+              : "pending",
     };
   });
 }
@@ -271,7 +282,11 @@ export function canStartAgent(card: CardProjection, running: boolean): boolean {
   return !running && card.execution !== "running";
 }
 
-export function agentActionLabel(card: CardProjection, running: boolean, hasOperatorNotes: boolean): string {
+export function agentActionLabel(
+  card: CardProjection,
+  running: boolean,
+  hasOperatorNotes: boolean,
+): string {
   if (running || card.execution === "running") return "Running";
   if (isBlocked(card.execution)) return hasOperatorNotes ? "↻ Continue Agent" : "↻ Retry Agent";
   return "▷ Start";

@@ -34,7 +34,9 @@
     if (!dragging) return;
     dragging = false;
     const target = e.currentTarget as HTMLElement;
-    try { target.releasePointerCapture(e.pointerId); } catch {}
+    try {
+      target.releasePointerCapture(e.pointerId);
+    } catch {}
     onResizeEnd?.();
   }
 </script>

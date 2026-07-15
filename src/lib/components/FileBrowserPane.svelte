@@ -1,6 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ChevronsLeft, File as FileIcon, FilePlus2, FileSearch, Folder, FolderOpen, Loader2, RefreshCw } from "lucide-svelte";
+  import {
+    ChevronsLeft,
+    File as FileIcon,
+    FilePlus2,
+    FileSearch,
+    Folder,
+    FolderOpen,
+    Loader2,
+    RefreshCw,
+  } from "lucide-svelte";
   import WorkspaceRow from "$lib/components/WorkspaceRow.svelte";
   import type { FileEntry } from "$lib/ipc";
   import type { GitChangedFile } from "$lib/ipc/git";
@@ -115,25 +124,60 @@
         {/if}
       </nav>
     </div>
-    <button class="file-collapse-button" type="button" onclick={onToggleSidebar} aria-label="Hide sidebar">
+    <button
+      class="file-collapse-button"
+      type="button"
+      onclick={onToggleSidebar}
+      aria-label="Hide sidebar"
+    >
       <ChevronsLeft size={15} />
     </button>
   </header>
 
   <div class="file-toolbar">
-    <button type="button" disabled={fileLoading} onclick={onOpenFolder} aria-label="Open folder (Ctrl+Shift+O)" title="Open folder (Ctrl+Shift+O)">
+    <button
+      type="button"
+      disabled={fileLoading}
+      onclick={onOpenFolder}
+      aria-label="Open folder (Ctrl+Shift+O)"
+      title="Open folder (Ctrl+Shift+O)"
+    >
       <FolderOpen size={15} />
     </button>
-    <button type="button" disabled={fileLoading} onclick={onOpenFile} aria-label="Open file" title="Open file (Ctrl+O)">
+    <button
+      type="button"
+      disabled={fileLoading}
+      onclick={onOpenFile}
+      aria-label="Open file"
+      title="Open file (Ctrl+O)"
+    >
       <FileSearch size={15} />
     </button>
-    <button type="button" disabled={fileLoading} onclick={handleCreateFile} aria-label="New file" title="New file">
+    <button
+      type="button"
+      disabled={fileLoading}
+      onclick={handleCreateFile}
+      aria-label="New file"
+      title="New file"
+    >
       <FilePlus2 size={15} />
     </button>
-    <button type="button" disabled={fileLoading} onclick={onRefreshDirectory} aria-label="Refresh" title="Refresh root">
+    <button
+      type="button"
+      disabled={fileLoading}
+      onclick={onRefreshDirectory}
+      aria-label="Refresh"
+      title="Refresh root"
+    >
       <RefreshCw size={15} />
     </button>
-    <button type="button" disabled={fileLoading} onclick={onCollapseAll} aria-label="Collapse all" title="Collapse all">
+    <button
+      type="button"
+      disabled={fileLoading}
+      onclick={onCollapseAll}
+      aria-label="Collapse all"
+      title="Collapse all"
+    >
       <ChevronsLeft size={15} />
     </button>
   </div>
@@ -155,7 +199,9 @@
   <div class="file-list" role="list">
     {#each visibleRows as row (row.entry.path)}
       {@const status = changedByPath.get(row.entry.path)}
-      {@const disclosure = row.entry.is_dir ? folderDisclosureState(expandedFolders, expandingFolders, row.entry.path) : null}
+      {@const disclosure = row.entry.is_dir
+        ? folderDisclosureState(expandedFolders, expandingFolders, row.entry.path)
+        : null}
       {#snippet rowLeading()}
         {#if row.entry.is_dir}
           {#if disclosure === "loading"}
@@ -178,10 +224,11 @@
         statusTone={statusTone(status)}
         leading={rowLeading}
         onClick={() => (row.entry.is_dir ? onToggleFolder(row.entry) : onOpenEntry(row.entry))}
-      >
-      </WorkspaceRow>
+      ></WorkspaceRow>
     {:else}
-      <div class="file-empty">{fileFilter.trim() ? "No matching files." : "No files in this folder."}</div>
+      <div class="file-empty">
+        {fileFilter.trim() ? "No matching files." : "No files in this folder."}
+      </div>
     {/each}
   </div>
 </aside>
@@ -324,7 +371,11 @@
   }
 
   @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

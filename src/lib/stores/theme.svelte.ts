@@ -1,4 +1,11 @@
-import { themes, defaultThemeId, type ThemeId, type ThemeDefinition, type TerminalColors, type EditorColors } from "$lib/themes";
+import {
+  themes,
+  defaultThemeId,
+  type ThemeId,
+  type ThemeDefinition,
+  type TerminalColors,
+  type EditorColors,
+} from "$lib/themes";
 
 const STORAGE_KEY = "spacesly-theme";
 const MODE_STORAGE_KEY = "spacesly-color-mode";
@@ -81,12 +88,22 @@ function isDark(): boolean {
 }
 
 const ANSI_KEY_MAP: Record<string, string> = {
-  black: "ansi-black", red: "ansi-red", green: "ansi-green", yellow: "ansi-yellow",
-  blue: "ansi-blue", magenta: "ansi-magenta", cyan: "ansi-cyan", white: "ansi-white",
-  brightBlack: "ansi-bright-black", brightRed: "ansi-bright-red",
-  brightGreen: "ansi-bright-green", brightYellow: "ansi-bright-yellow",
-  brightBlue: "ansi-bright-blue", brightMagenta: "ansi-bright-magenta",
-  brightCyan: "ansi-bright-cyan", brightWhite: "ansi-bright-white",
+  black: "ansi-black",
+  red: "ansi-red",
+  green: "ansi-green",
+  yellow: "ansi-yellow",
+  blue: "ansi-blue",
+  magenta: "ansi-magenta",
+  cyan: "ansi-cyan",
+  white: "ansi-white",
+  brightBlack: "ansi-bright-black",
+  brightRed: "ansi-bright-red",
+  brightGreen: "ansi-bright-green",
+  brightYellow: "ansi-bright-yellow",
+  brightBlue: "ansi-bright-blue",
+  brightMagenta: "ansi-bright-magenta",
+  brightCyan: "ansi-bright-cyan",
+  brightWhite: "ansi-bright-white",
 };
 
 function applyCssVars(): void {

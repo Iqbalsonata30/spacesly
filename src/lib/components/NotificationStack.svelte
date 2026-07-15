@@ -18,7 +18,13 @@
     {#if notice}
       <div class={`notification-card app-notice ${notice.tone}`} role="status">
         <div>
-          <strong>{notice.tone === "error" ? "Action failed" : notice.tone === "success" ? "Success" : "Notice"}</strong>
+          <strong
+            >{notice.tone === "error"
+              ? "Action failed"
+              : notice.tone === "success"
+                ? "Success"
+                : "Notice"}</strong
+          >
           <span>{notice.message}</span>
         </div>
         <button type="button" aria-label="Dismiss notification" onclick={onDismissNotice}>×</button>

@@ -66,7 +66,9 @@
       </span>
       <span class="branch-button-copy">
         <small>{switching ? "Switching branch" : "Current branch"}</small>
-        <strong title={gitInfo.current_branch ?? "detached"}>{gitInfo.current_branch ?? "detached"}</strong>
+        <strong title={gitInfo.current_branch ?? "detached"}
+          >{gitInfo.current_branch ?? "detached"}</strong
+        >
       </span>
       <span class="branch-button-indicator">
         <ChevronDown size={14} class="open" />
@@ -75,17 +77,32 @@
 
     {#if open}
       <div class="branch-picker-backdrop" role="presentation" onclick={() => (open = false)}></div>
-      <div class="branch-picker" role="dialog" aria-label="Switch git branch" aria-modal="true" tabindex="-1">
+      <div
+        class="branch-picker"
+        role="dialog"
+        aria-label="Switch git branch"
+        aria-modal="true"
+        tabindex="-1"
+      >
         <header>
           <div>
             <p>Switch Branch</p>
             <h3>{gitInfo.current_branch ?? "Detached HEAD"}</h3>
           </div>
-          <button type="button" onclick={() => (open = false)} aria-label="Close branch picker">×</button>
+          <button type="button" onclick={() => (open = false)} aria-label="Close branch picker"
+            >×</button
+          >
         </header>
-        <input aria-label="Filter branches" placeholder="Filter branches" bind:this={filterInput} bind:value={filter} />
+        <input
+          aria-label="Filter branches"
+          placeholder="Filter branches"
+          bind:this={filterInput}
+          bind:value={filter}
+        />
         {#if dirty}
-          <div class="branch-picker-warning">Save or close unsaved files before switching branches.</div>
+          <div class="branch-picker-warning">
+            Save or close unsaved files before switching branches.
+          </div>
         {/if}
         <div class="branch-picker-list">
           {#each branches as branch}
@@ -96,7 +113,9 @@
               onclick={() => switchBranch(branch)}
             >
               <strong>{branch}</strong>
-              <small>{branch === gitInfo.current_branch ? "current branch" : "switch to branch"}</small>
+              <small
+                >{branch === gitInfo.current_branch ? "current branch" : "switch to branch"}</small
+              >
             </button>
           {:else}
             <div class="branch-picker-empty">No branches match.</div>
@@ -147,7 +166,9 @@
     border-color: #52606a;
     background: linear-gradient(180deg, #2a3038, #20262d);
     color: #f1edf5;
-    box-shadow: 0 0 0 3px rgba(184, 214, 228, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    box-shadow:
+      0 0 0 3px rgba(184, 214, 228, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
   }
 
   .branch-button:active:not(:disabled) {

@@ -34,10 +34,12 @@ type RefreshKind = "state" | "info" | "status";
 
 const emptyStatus: GitStatus = { staged: [], unstaged: [] };
 
-export function createSourceControlStore(options: {
-  onRepositoryChanged?: (refreshFiles: boolean, refreshEditors: boolean) => Promise<void> | void;
-  onNotice?: (tone: "info" | "success" | "error", message: string) => void;
-} = {}) {
+export function createSourceControlStore(
+  options: {
+    onRepositoryChanged?: (refreshFiles: boolean, refreshEditors: boolean) => Promise<void> | void;
+    onNotice?: (tone: "info" | "success" | "error", message: string) => void;
+  } = {},
+) {
   let info = $state<GitWorkspaceInfo | null>(null);
   let status = $state<GitStatus>(emptyStatus);
   let loading = $state(false);
@@ -93,7 +95,13 @@ export function createSourceControlStore(options: {
     }
   }
 
-  async function run<T>(nextOperation: SourceControlOperation, action: () => Promise<T>, refreshKind: RefreshKind | null = "state", refreshFiles = false, refreshEditors = false): Promise<T | null> {
+  async function run<T>(
+    nextOperation: SourceControlOperation,
+    action: () => Promise<T>,
+    refreshKind: RefreshKind | null = "state",
+    refreshFiles = false,
+    refreshEditors = false,
+  ): Promise<T | null> {
     if (operation) return null;
     operation = nextOperation;
     error = null;
@@ -114,35 +122,57 @@ export function createSourceControlStore(options: {
   }
 
   async function stageFile(path: string) {
-    await run("stage", async () => {
-      status = await stageWorkspaceGitFile(path);
-      return null;
-    }, null);
+    await run(
+      "stage",
+      async () => {
+        status = await stageWorkspaceGitFile(path);
+        return null;
+      },
+      null,
+    );
   }
 
   async function stageAll() {
-    await run("stage-all", async () => {
-      status = await stageAllWorkspaceGitFiles();
-      return null;
-    }, null);
+    await run(
+      "stage-all",
+      async () => {
+        status = await stageAllWorkspaceGitFiles();
+        return null;
+      },
+      null,
+    );
   }
 
   async function unstageFile(path: string) {
-    await run("unstage", async () => {
-      status = await unstageWorkspaceGitFile(path);
-      return null;
-    }, null);
+    await run(
+      "unstage",
+      async () => {
+        status = await unstageWorkspaceGitFile(path);
+        return null;
+      },
+      null,
+    );
   }
 
   async function unstageAll() {
-    await run("unstage-all", async () => {
-      status = await unstageAllWorkspaceGitFiles();
-      return null;
-    }, null);
+    await run(
+      "unstage-all",
+      async () => {
+        status = await unstageAllWorkspaceGitFiles();
+        return null;
+      },
+      null,
+    );
   }
 
   async function checkoutBranch(branch: string) {
-    const nextInfo = await run("checkout", async () => checkoutWorkspaceGitBranch(branch), "state", true, true);
+    const nextInfo = await run(
+      "checkout",
+      async () => checkoutWorkspaceGitBranch(branch),
+      "state",
+      true,
+      true,
+    );
     if (nextInfo) info = nextInfo;
   }
 
@@ -168,7 +198,8 @@ export function createSourceControlStore(options: {
 
   async function commit(message: string): Promise<CommitResult | null> {
     const result = await run("commit", async () => gitCommit(message), "state", false, false);
-    if (result) options.onNotice?.("success", `Committed ${(result as CommitResult).hash.slice(0, 7)}`);
+    if (result)
+      options.onNotice?.("success", `Committed ${(result as CommitResult).hash.slice(0, 7)}`);
     return result as CommitResult | null;
   }
 

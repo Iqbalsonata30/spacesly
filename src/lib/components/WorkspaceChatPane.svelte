@@ -46,14 +46,20 @@
     sessions.filter((session) => {
       const query = sessionFilter.trim().toLowerCase();
       if (!query) return true;
-      return [session.title, new Date(session.updatedAt).toLocaleString(), `${session.messages.length}`]
+      return [
+        session.title,
+        new Date(session.updatedAt).toLocaleString(),
+        `${session.messages.length}`,
+      ]
         .join(" ")
         .toLowerCase()
         .includes(query);
     }),
   );
   let highlightedSession = $derived(
-    filteredSessions.find((session) => session.id === highlightedSessionId) ?? filteredSessions[0] ?? null,
+    filteredSessions.find((session) => session.id === highlightedSessionId) ??
+      filteredSessions[0] ??
+      null,
   );
 
   $effect(() => {
@@ -74,10 +80,14 @@
       return;
     }
 
-    if (!highlightedSessionId || !filteredSessions.some((session) => session.id === highlightedSessionId)) {
-      highlightedSessionId = activeSessionId && filteredSessions.some((session) => session.id === activeSessionId)
-        ? activeSessionId
-        : filteredSessions[0].id;
+    if (
+      !highlightedSessionId ||
+      !filteredSessions.some((session) => session.id === highlightedSessionId)
+    ) {
+      highlightedSessionId =
+        activeSessionId && filteredSessions.some((session) => session.id === activeSessionId)
+          ? activeSessionId
+          : filteredSessions[0].id;
     }
   });
 
@@ -85,7 +95,9 @@
     if (!sessionPickerOpen || !highlightedSessionId) return;
 
     void tick().then(() => {
-      const element = sessionPickerRoot?.querySelector<HTMLElement>(`[data-session-id="${highlightedSessionId}"]`);
+      const element = sessionPickerRoot?.querySelector<HTMLElement>(
+        `[data-session-id="${highlightedSessionId}"]`,
+      );
       element?.scrollIntoView({ block: "nearest" });
     });
   });
@@ -136,10 +148,13 @@
   function moveSessionHighlight(offset: number) {
     if (filteredSessions.length === 0) return;
 
-    const currentIndex = filteredSessions.findIndex((session) => session.id === highlightedSessionId);
-    const nextIndex = currentIndex < 0
-      ? 0
-      : Math.max(0, Math.min(filteredSessions.length - 1, currentIndex + offset));
+    const currentIndex = filteredSessions.findIndex(
+      (session) => session.id === highlightedSessionId,
+    );
+    const nextIndex =
+      currentIndex < 0
+        ? 0
+        : Math.max(0, Math.min(filteredSessions.length - 1, currentIndex + offset));
     highlightedSessionId = filteredSessions[nextIndex]?.id ?? null;
   }
 
@@ -251,7 +266,11 @@
                   >
                     <div class="workspace-chat-session-main">
                       <strong>{session.title}</strong>
-                      <span>{session.messages.length} message{session.messages.length === 1 ? "" : "s"}</span>
+                      <span
+                        >{session.messages.length} message{session.messages.length === 1
+                          ? ""
+                          : "s"}</span
+                      >
                     </div>
                     <div class="workspace-chat-session-meta">
                       <span>{new Date(session.updatedAt).toLocaleString()}</span>
@@ -290,8 +309,7 @@
       placeholder="Enter sends. Shift+Enter for multiline. Try: queue ABC-123, start agent on ABC-123, sync Jira..."
       disabled={running}
       rows="2"
-      onkeydown={onKeydown}
-    ></textarea>
+      onkeydown={onKeydown}></textarea>
     <button type="submit" disabled={running}>{running ? "Working" : "Run"}</button>
   </form>
 </section>
@@ -405,7 +423,10 @@
     color: #f1edf5;
     font: inherit;
     outline: none;
-    transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+    transition:
+      border-color 120ms ease,
+      box-shadow 120ms ease,
+      background 120ms ease;
   }
 
   .workspace-chat-session-search input::placeholder {
@@ -464,7 +485,11 @@
     background: #111017;
     color: #e8e2ef;
     text-align: left;
-    transition: border-color 120ms ease, background 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+    transition:
+      border-color 120ms ease,
+      background 120ms ease,
+      transform 120ms ease,
+      box-shadow 120ms ease;
   }
 
   .workspace-chat-session-list button:hover,

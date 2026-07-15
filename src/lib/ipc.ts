@@ -10,7 +10,14 @@ export type {
   AiWorkerTask,
   AiWorkerTaskResult,
 } from "$lib/ipc/agent";
-export { cancelAiWorkerTask, chatAiWorker, executeAiWorkerTask, releaseAiWorkerRun, reserveAiWorkerRun, testAiWorker } from "$lib/ipc/agent";
+export {
+  cancelAiWorkerTask,
+  chatAiWorker,
+  executeAiWorkerTask,
+  releaseAiWorkerRun,
+  reserveAiWorkerRun,
+  testAiWorker,
+} from "$lib/ipc/agent";
 export type { FileEntry } from "$lib/ipc/files";
 export {
   listDirectory,
@@ -220,10 +227,7 @@ export async function listGhProfiles(): Promise<GhProfile[]> {
   return invoke<GhProfile[]>("list_gh_profiles");
 }
 
-export async function setRepoProfile(
-  repoId: string,
-  profile: string | null,
-): Promise<void> {
+export async function setRepoProfile(repoId: string, profile: string | null): Promise<void> {
   return invoke("set_repo_profile", { repoId, profile });
 }
 
@@ -255,10 +259,7 @@ export interface GhRepoEntry {
   updated_at: string;
 }
 
-export async function listGhRepos(
-  profile: string,
-  search?: string,
-): Promise<GhRepoEntry[]> {
+export async function listGhRepos(profile: string, search?: string): Promise<GhRepoEntry[]> {
   return invoke<GhRepoEntry[]>("list_gh_repos", {
     profile,
     search: search ?? null,
@@ -293,10 +294,7 @@ export async function createGhRepo(
   return invoke<RepoDetail>("create_gh_repo", { options, profile });
 }
 
-export async function checkRepoGhAccess(
-  path: string,
-  profiles: string[],
-): Promise<string | null> {
+export async function checkRepoGhAccess(path: string, profiles: string[]): Promise<string | null> {
   return invoke<string | null>("check_repo_gh_access", { path, profiles });
 }
 
@@ -336,9 +334,7 @@ export async function removeWorkspace(workspaceId: string): Promise<void> {
   return invoke("remove_workspace", { workspaceId });
 }
 
-export async function listWorkspaces(
-  repoId: string,
-): Promise<WorkspaceInfo[]> {
+export async function listWorkspaces(repoId: string): Promise<WorkspaceInfo[]> {
   return invoke<WorkspaceInfo[]>("list_workspaces", { repoId });
 }
 
@@ -399,10 +395,7 @@ export async function grepWorkspace(
   });
 }
 
-export async function readWorkspaceFile(
-  workspaceId: string,
-  filePath: string,
-): Promise<string> {
+export async function readWorkspaceFile(workspaceId: string, filePath: string): Promise<string> {
   return invoke<string>("read_workspace_file", {
     workspaceId,
     filePath,
@@ -411,10 +404,7 @@ export async function readWorkspaceFile(
 
 // ── Repo-level File Search / Grep / Read ─────────────────────────────
 
-export async function searchRepoFiles(
-  repoId: string,
-  query: string,
-): Promise<FileSearchResult[]> {
+export async function searchRepoFiles(repoId: string, query: string): Promise<FileSearchResult[]> {
   return invoke<FileSearchResult[]>("search_repo_files", {
     repoId,
     query,
@@ -435,10 +425,7 @@ export async function grepRepo(
   });
 }
 
-export async function readRepoFile(
-  repoId: string,
-  relativePath: string,
-): Promise<string> {
+export async function readRepoFile(repoId: string, relativePath: string): Promise<string> {
   return invoke<string>("read_repo_file", { repoId, relativePath });
 }
 
@@ -518,7 +505,14 @@ export async function sendMessage(
 ): Promise<void> {
   const channel = new Channel<AgentEvent>();
   channel.onmessage = onEvent;
-  return invoke("send_message", { workspaceId, prompt, onEvent: channel, planMode, thinkingMode, model: model || null });
+  return invoke("send_message", {
+    workspaceId,
+    prompt,
+    onEvent: channel,
+    planMode,
+    thinkingMode,
+    model: model || null,
+  });
 }
 
 export async function stopAgent(workspaceId: string): Promise<void> {
@@ -527,10 +521,7 @@ export async function stopAgent(workspaceId: string): Promise<void> {
 
 // ── Branch ──────────────────────────────────────────────────────────
 
-export async function renameBranch(
-  workspaceId: string,
-  newName: string,
-): Promise<WorkspaceInfo> {
+export async function renameBranch(workspaceId: string, newName: string): Promise<WorkspaceInfo> {
   return invoke<WorkspaceInfo>("rename_branch", { workspaceId, newName });
 }
 
@@ -547,16 +538,11 @@ export interface ChangedFile {
   deletions: number;
 }
 
-export async function getChangedFiles(
-  workspaceId: string,
-): Promise<ChangedFile[]> {
+export async function getChangedFiles(workspaceId: string): Promise<ChangedFile[]> {
   return invoke<ChangedFile[]>("get_changed_files", { workspaceId });
 }
 
-export async function getDiff(
-  workspaceId: string,
-  filePath?: string,
-): Promise<string> {
+export async function getDiff(workspaceId: string, filePath?: string): Promise<string> {
   return invoke<string>("get_diff", { workspaceId, filePath });
 }
 
@@ -566,9 +552,7 @@ export interface BaseUpdateStatus {
   behind_by: number;
 }
 
-export async function checkBaseUpdates(
-  workspaceId: string,
-): Promise<BaseUpdateStatus> {
+export async function checkBaseUpdates(workspaceId: string): Promise<BaseUpdateStatus> {
   return invoke<BaseUpdateStatus>("check_base_updates", { workspaceId });
 }
 
@@ -586,16 +570,11 @@ export async function syncMain(repoId: string): Promise<void> {
   return invoke("sync_main", { repoId });
 }
 
-export async function ghPrMerge(
-  workspaceId: string,
-  prNumber: number,
-): Promise<void> {
+export async function ghPrMerge(workspaceId: string, prNumber: number): Promise<void> {
   return invoke("gh_pr_merge", { workspaceId, prNumber });
 }
 
-export async function generateCommitMessage(
-  workspaceId: string,
-): Promise<string> {
+export async function generateCommitMessage(workspaceId: string): Promise<string> {
   return invoke<string>("generate_commit_message", { workspaceId });
 }
 
@@ -628,10 +607,7 @@ export async function resizeTerminal(
   return invoke("resize_terminal", { workspaceId, terminalId, rows, cols });
 }
 
-export async function closeTerminal(
-  workspaceId: string,
-  terminalId: string,
-): Promise<void> {
+export async function closeTerminal(workspaceId: string, terminalId: string): Promise<void> {
   return invoke("close_terminal", { workspaceId, terminalId });
 }
 
@@ -664,40 +640,27 @@ export async function resizeRepoTerminal(
   return invoke("resize_repo_terminal", { repoId, terminalId, rows, cols });
 }
 
-export async function closeRepoTerminal(
-  repoId: string,
-  terminalId: string,
-): Promise<void> {
+export async function closeRepoTerminal(repoId: string, terminalId: string): Promise<void> {
   return invoke("close_repo_terminal", { repoId, terminalId });
 }
 
 // ── Messages ────────────────────────────────────────────────────────
 
-export async function saveMessages(
-  workspaceId: string,
-  messages: unknown[],
-): Promise<void> {
+export async function saveMessages(workspaceId: string, messages: unknown[]): Promise<void> {
   return invoke("save_messages", { workspaceId, messages });
 }
 
-export async function loadMessages(
-  workspaceId: string,
-): Promise<unknown[]> {
+export async function loadMessages(workspaceId: string): Promise<unknown[]> {
   return invoke<unknown[]>("load_messages", { workspaceId });
 }
 
 // ── Todos ────────────────────────────────────────────────────────────
 
-export async function saveTodos(
-  repoId: string,
-  todos: unknown[],
-): Promise<void> {
+export async function saveTodos(repoId: string, todos: unknown[]): Promise<void> {
   return invoke("save_todos", { repoId, todos });
 }
 
-export async function loadTodos(
-  repoId: string,
-): Promise<unknown[]> {
+export async function loadTodos(repoId: string): Promise<unknown[]> {
   return invoke<unknown[]>("load_todos", { repoId });
 }
 
@@ -799,10 +762,7 @@ export async function getRepoSettings(repoId: string): Promise<RepoSettings> {
   return invoke<RepoSettings>("get_repo_settings", { repoId });
 }
 
-export async function saveRepoSettings(
-  repoId: string,
-  settings: RepoSettings,
-): Promise<void> {
+export async function saveRepoSettings(repoId: string, settings: RepoSettings): Promise<void> {
   return invoke("save_repo_settings", { repoId, settings });
 }
 
@@ -828,12 +788,18 @@ export async function lspStopServer(repoId: string, serverId: string): Promise<v
 }
 
 /** Stop and restart a single LSP server. Needs workspaceId to resolve worktree path. */
-export async function lspRestartServer(repoId: string, serverId: string, workspaceId: string): Promise<void> {
+export async function lspRestartServer(
+  repoId: string,
+  serverId: string,
+  workspaceId: string,
+): Promise<void> {
   return invoke("lsp_restart_server", { repoId, serverId, workspaceId });
 }
 
 /** Query current LSP server status (for populating status bar on mount). */
-export async function lspGetStatus(): Promise<{ repo_id: string; server_id: string; status: string }[]> {
+export async function lspGetStatus(): Promise<
+  { repo_id: string; server_id: string; status: string }[]
+> {
   return invoke("lsp_get_status");
 }
 
@@ -873,7 +839,12 @@ export async function lspGotoDefinition(
   line: number,
   character: number,
 ): Promise<LspLocation | null> {
-  return invoke<LspLocation | null>("lsp_goto_definition", { workspaceId, filePath, line, character });
+  return invoke<LspLocation | null>("lsp_goto_definition", {
+    workspaceId,
+    filePath,
+    line,
+    character,
+  });
 }
 
 export async function lspDiagnostics(
@@ -901,9 +872,7 @@ export async function lspRename(
 
 // ── Script Runner ───────────────────────────────────────────────────
 
-export type ScriptEvent =
-  | { type: "output"; data: string }
-  | { type: "exit"; code: number | null };
+export type ScriptEvent = { type: "output"; data: string } | { type: "exit"; code: number | null };
 
 export async function runScript(
   workspaceId: string,
@@ -935,15 +904,11 @@ export async function stopRepoScript(repoId: string): Promise<void> {
 
 // ── Events ───────────────────────────────────────────────────────────
 
-export function onAgentStatus(
-  callback: (event: AgentStatusEvent) => void,
-): Promise<UnlistenFn> {
+export function onAgentStatus(callback: (event: AgentStatusEvent) => void): Promise<UnlistenFn> {
   return listen<AgentStatusEvent>("agent-status", (e) => callback(e.payload));
 }
 
-export function onWorkspaceUpdated(
-  callback: (ws: WorkspaceInfo) => void,
-): Promise<UnlistenFn> {
+export function onWorkspaceUpdated(callback: (ws: WorkspaceInfo) => void): Promise<UnlistenFn> {
   return listen<WorkspaceInfo>("workspace-updated", (e) => callback(e.payload));
 }
 
@@ -1097,10 +1062,7 @@ export async function updateKnowledgeBaseIncremental(
   return invoke("update_knowledge_base_incremental", { repoId, onEvent: channel });
 }
 
-export async function readContextFile(
-  repoId: string,
-  filename: string,
-): Promise<string> {
+export async function readContextFile(repoId: string, filename: string): Promise<string> {
   return invoke<string>("read_context_file", { repoId, filename });
 }
 

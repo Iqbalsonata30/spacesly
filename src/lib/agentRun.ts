@@ -17,9 +17,13 @@ export type AgentTerminalLine = {
   text: string;
 };
 
-export type AgentRunGitSnapshot = Pick<GitWorkspaceInfo, "repo_root" | "current_branch" | "head_commit">;
+export type AgentRunGitSnapshot = Pick<
+  GitWorkspaceInfo,
+  "repo_root" | "current_branch" | "head_commit"
+>;
 
-export type AgentSessionEventType = "system" | "operator_note" | "approval" | "agent_output" | "blocker" | "error";
+export type AgentSessionEventType =
+  "system" | "operator_note" | "approval" | "agent_output" | "blocker" | "error";
 
 export type AgentSessionEvent = {
   id: string;
@@ -55,15 +59,17 @@ export function loadActiveAgentRunCardIds(storage: Storage | undefined): string[
   try {
     const parsed = JSON.parse(storage.getItem(ACTIVE_AGENT_RUNS_KEY) ?? "[]") as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(isActiveAgentRunMarker)
-      .map((marker) => marker.cardId);
+    return parsed.filter(isActiveAgentRunMarker).map((marker) => marker.cardId);
   } catch {
     return [];
   }
 }
 
-export function markActiveAgentRun(storage: Storage | undefined, cardId: string, runId: string): void {
+export function markActiveAgentRun(
+  storage: Storage | undefined,
+  cardId: string,
+  runId: string,
+): void {
   if (!storage || !cardId || !runId) return;
   try {
     const markers = readActiveAgentRunMarkers(storage).filter((marker) => marker.cardId !== cardId);
@@ -74,10 +80,16 @@ export function markActiveAgentRun(storage: Storage | undefined, cardId: string,
   }
 }
 
-export function clearActiveAgentRun(storage: Storage | undefined, cardId: string, runId: string): void {
+export function clearActiveAgentRun(
+  storage: Storage | undefined,
+  cardId: string,
+  runId: string,
+): void {
   if (!storage) return;
   try {
-    const markers = readActiveAgentRunMarkers(storage).filter((marker) => marker.cardId !== cardId || marker.runId !== runId);
+    const markers = readActiveAgentRunMarkers(storage).filter(
+      (marker) => marker.cardId !== cardId || marker.runId !== runId,
+    );
     if (markers.length === 0) storage.removeItem(ACTIVE_AGENT_RUNS_KEY);
     else storage.setItem(ACTIVE_AGENT_RUNS_KEY, JSON.stringify(markers));
   } catch {
@@ -106,11 +118,13 @@ function readActiveAgentRunMarkers(storage: Storage): ActiveAgentRunMarker[] {
 function isActiveAgentRunMarker(value: unknown): value is ActiveAgentRunMarker {
   if (!value || typeof value !== "object") return false;
   const marker = value as Partial<ActiveAgentRunMarker>;
-  return typeof marker.cardId === "string"
-    && marker.cardId.length > 0
-    && typeof marker.runId === "string"
-    && marker.runId.length > 0
-    && typeof marker.startedAt === "number";
+  return (
+    typeof marker.cardId === "string" &&
+    marker.cardId.length > 0 &&
+    typeof marker.runId === "string" &&
+    marker.runId.length > 0 &&
+    typeof marker.startedAt === "number"
+  );
 }
 
 export function createAgentRunSession(
@@ -139,7 +153,11 @@ export function createAgentRunSession(
   };
 }
 
-export function createAgentSessionEvent(type: AgentSessionEventType, text: string, at = Date.now()): AgentSessionEvent {
+export function createAgentSessionEvent(
+  type: AgentSessionEventType,
+  text: string,
+  at = Date.now(),
+): AgentSessionEvent {
   return {
     id: `evt-${at.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     type,
@@ -156,7 +174,10 @@ export function appendAgentSessionEvent(
   return [...transcript, event].slice(-maxEvents);
 }
 
-export function agentSessionReplay(transcript: AgentSessionEvent[], maxChars: number): string | null {
+export function agentSessionReplay(
+  transcript: AgentSessionEvent[],
+  maxChars: number,
+): string | null {
   const lines = transcript
     .map((event) => {
       const label = event.type.replace("_", " ").toUpperCase();

@@ -14,7 +14,12 @@
 
   let { items, activeValue, ariaLabel, onSelect }: Props = $props();
 
-  let activeIndex = $derived(Math.max(0, items.findIndex((item) => item.value === activeValue)));
+  let activeIndex = $derived(
+    Math.max(
+      0,
+      items.findIndex((item) => item.value === activeValue),
+    ),
+  );
   let segmentCount = $derived(Math.max(1, items.length));
 
   function selectIndex(index: number) {
@@ -43,7 +48,13 @@
   }
 </script>
 
-<div class="segmented-control" role="tablist" aria-orientation="horizontal" aria-label={ariaLabel} style={`--segment-count: ${segmentCount}; --segment-index: ${activeIndex};`}>
+<div
+  class="segmented-control"
+  role="tablist"
+  aria-orientation="horizontal"
+  aria-label={ariaLabel}
+  style={`--segment-count: ${segmentCount}; --segment-index: ${activeIndex};`}
+>
   <div class="segmented-indicator" aria-hidden="true"></div>
   {#each items as item, index (item.value)}
     <button
@@ -132,7 +143,9 @@
 
   button:focus-visible {
     outline: none;
-    box-shadow: inset 0 0 0 1px rgba(184, 214, 228, 0.25), 0 0 0 3px rgba(184, 214, 228, 0.18);
+    box-shadow:
+      inset 0 0 0 1px rgba(184, 214, 228, 0.25),
+      0 0 0 3px rgba(184, 214, 228, 0.18);
   }
 
   .segmented-label {

@@ -50,7 +50,6 @@
     onCloseEditorTab,
     onSetEditorDirty,
   }: Props = $props();
-
 </script>
 
 <section class="code-editor-pane" aria-label="Code editor">
@@ -63,12 +62,20 @@
   {#if openEditorFiles.length > 0}
     <div class="editor-tabs" role="tablist" aria-label="Open files">
       {#each openEditorFiles as file (file.path)}
-        <div class:active={file.path === activeEditorPath} class:dirty={file.dirty} class="editor-tab">
+        <div
+          class:active={file.path === activeEditorPath}
+          class:dirty={file.dirty}
+          class="editor-tab"
+        >
           <button type="button" onclick={() => onSelectEditorTab(file.path)}>
             <span>{file.name}</span>
             <small>{file.dirty ? "•" : ""}</small>
           </button>
-          <button type="button" aria-label={`Close ${file.name}`} onclick={() => onCloseEditorTab(file.path)}>×</button>
+          <button
+            type="button"
+            aria-label={`Close ${file.name}`}
+            onclick={() => onCloseEditorTab(file.path)}>×</button
+          >
         </div>
       {/each}
     </div>
@@ -76,7 +83,11 @@
   <div class="editor-stage">
     {#if activeEditorFile}
       {#each openEditorFiles as file (file.path)}
-        <section class:active={file.path === activeEditorPath} class="editor-panel" aria-hidden={file.path !== activeEditorPath}>
+        <section
+          class:active={file.path === activeEditorPath}
+          class="editor-panel"
+          aria-hidden={file.path !== activeEditorPath}
+        >
           <CodeEditor
             bind:this={file.editor}
             initialValue={file.savedContent}
@@ -90,7 +101,10 @@
     {:else}
       <div class="editor-empty">
         <strong>Open a file to start editing</strong>
-        <span>Browse the workspace on the left. Text files up to 1 MB are supported in this first editor pass.</span>
+        <span
+          >Browse the workspace on the left. Text files up to 1 MB are supported in this first
+          editor pass.</span
+        >
       </div>
     {/if}
   </div>
@@ -105,11 +119,21 @@
       <span>{fileStatusLabel}</span>
     </div>
     <div class="editor-actions">
-      <span class:dirty={activeEditorDirty}>{activeEditorDirty ? "Unsaved" : activeEditorFile ? "Saved" : "Idle"}</span>
-      <button type="button" disabled={!activeEditorReady || formattingFilePath !== null} onclick={() => onFormatActiveFile()}>
+      <span class:dirty={activeEditorDirty}
+        >{activeEditorDirty ? "Unsaved" : activeEditorFile ? "Saved" : "Idle"}</span
+      >
+      <button
+        type="button"
+        disabled={!activeEditorReady || formattingFilePath !== null}
+        onclick={() => onFormatActiveFile()}
+      >
         {formattingFilePath ? "Formatting" : "Format"}
       </button>
-      <button type="button" disabled={!activeEditorReady || savingFilePath !== null} onclick={() => onSaveActiveFile()}>
+      <button
+        type="button"
+        disabled={!activeEditorReady || savingFilePath !== null}
+        onclick={() => onSaveActiveFile()}
+      >
         {savingFilePath ? "Saving" : "Save"}
       </button>
       <span>Vim · Ctrl/Cmd+S saves · Ctrl/Cmd+Shift+F formats</span>

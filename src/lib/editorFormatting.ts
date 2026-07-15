@@ -2,7 +2,10 @@ import { formatCode } from "$lib/ipc";
 import { editorFormatterForPath } from "$lib/editorPlugins";
 
 type PrettierModules = {
-  format: (source: string, options: { parser: string; plugins: Array<string | URL | object> }) => Promise<string>;
+  format: (
+    source: string,
+    options: { parser: string; plugins: Array<string | URL | object> },
+  ) => Promise<string>;
   plugins: Array<string | URL | object>;
 };
 
@@ -11,11 +14,29 @@ let prettierModulesPromise: Promise<PrettierModules> | null = null;
 export function prettierParserForPath(path: string): string | null {
   const name = path.toLowerCase();
   if (editorFormatterForPath(path) && editorFormatterForPath(path) !== "prettier") return null;
-  if (name.endsWith(".ts") || name.endsWith(".tsx") || name.endsWith(".mts") || name.endsWith(".cts")) return "typescript";
-  if (name.endsWith(".js") || name.endsWith(".jsx") || name.endsWith(".mjs") || name.endsWith(".cjs")) return "babel";
+  if (
+    name.endsWith(".ts") ||
+    name.endsWith(".tsx") ||
+    name.endsWith(".mts") ||
+    name.endsWith(".cts")
+  )
+    return "typescript";
+  if (
+    name.endsWith(".js") ||
+    name.endsWith(".jsx") ||
+    name.endsWith(".mjs") ||
+    name.endsWith(".cjs")
+  )
+    return "babel";
   if (name.endsWith(".svelte")) return null;
   if (name.endsWith(".html")) return "html";
-  if (name.endsWith(".css") || name.endsWith(".scss") || name.endsWith(".sass") || name.endsWith(".less")) return "css";
+  if (
+    name.endsWith(".css") ||
+    name.endsWith(".scss") ||
+    name.endsWith(".sass") ||
+    name.endsWith(".less")
+  )
+    return "css";
   if (name.endsWith(".json") || name.endsWith(".jsonc")) return "json";
   if (name.endsWith(".md") || name.endsWith(".mdx")) return "markdown";
   if (name.endsWith(".yml") || name.endsWith(".yaml")) return "yaml";
@@ -61,7 +82,9 @@ function loadPrettierModules(): Promise<PrettierModules> {
     import("prettier/plugins/yaml"),
   ]).then(([prettier, babel, estree, html, markdown, postcss, typescript, yaml]) => ({
     format: (source, options) => prettier.default.format(source, options),
-    plugins: [babel, estree, html, markdown, postcss, typescript, yaml] as Array<string | URL | object>,
+    plugins: [babel, estree, html, markdown, postcss, typescript, yaml] as Array<
+      string | URL | object
+    >,
   }));
   return prettierModulesPromise;
 }

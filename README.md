@@ -90,12 +90,12 @@ Jira credentials, AI provider keys, and MCP server configurations are stored loc
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Desktop Shell | Tauri v2 |
-| Frontend | SvelteKit 5, Svelte 5 runes |
-| Editor | CodeMirror 6 |
-| Terminal | xterm.js + portable-pty |
-| Icons | Lucide Svelte |
-| Backend | Rust (tokio, reqwest, serde) |
-| AI | OpenAI/Anthropic-compatible API + opencode CLI |
+| Layer         | Technology                                     |
+| ------------- | ---------------------------------------------- |
+| Desktop Shell | Tauri v2                                       |
+| Frontend      | SvelteKit 5, Svelte 5 runes                    |
+| Editor        | CodeMirror 6                                   |
+| Terminal      | xterm.js + portable-pty                        |
+| Icons         | Lucide Svelte                                  |
+| Backend       | Rust (tokio, reqwest, serde)                   |
+| AI            | OpenAI/Anthropic-compatible API + opencode CLI |

@@ -52,10 +52,20 @@
       if (!host) return;
 
       try {
-        const [{ basicSetup, EditorState, EditorView, keymap, indentWithTab, HighlightStyle, syntaxHighlighting, tags, vim }, language] = await Promise.all([
-          loadRuntime(),
-          loadLanguage(path),
-        ]);
+        const [
+          {
+            basicSetup,
+            EditorState,
+            EditorView,
+            keymap,
+            indentWithTab,
+            HighlightStyle,
+            syntaxHighlighting,
+            tags,
+            vim,
+          },
+          language,
+        ] = await Promise.all([loadRuntime(), loadLanguage(path)]);
         if (cancelled || !host) return;
 
         view = new EditorView({
@@ -89,55 +99,58 @@
                 currentValue = update.state.doc.toString();
                 updateDirty();
               }),
-              EditorView.theme({
-                "&": {
-                  height: "100%",
-                  backgroundColor: "#191820",
-                  color: "#d8d2e4",
-                  fontSize: "13px",
+              EditorView.theme(
+                {
+                  "&": {
+                    height: "100%",
+                    backgroundColor: "#191820",
+                    color: "#d8d2e4",
+                    fontSize: "13px",
+                  },
+                  ".cm-scroller": {
+                    fontFamily: "var(--font-mono)",
+                    lineHeight: "1.55",
+                  },
+                  ".cm-content": {
+                    padding: "18px 0",
+                  },
+                  ".cm-line": {
+                    padding: "0 20px",
+                  },
+                  ".cm-gutters": {
+                    backgroundColor: "#15141b",
+                    borderRight: "1px solid #282631",
+                    color: "#706a84",
+                  },
+                  ".cm-activeLine": {
+                    backgroundColor: "rgba(80, 74, 96, 0.22)",
+                  },
+                  ".cm-activeLineGutter": {
+                    backgroundColor: "rgba(80, 74, 96, 0.28)",
+                    color: "#a99bd6",
+                  },
+                  ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
+                    backgroundColor: "rgba(153, 131, 196, 0.26)",
+                  },
+                  "&.cm-focused": {
+                    outline: "none",
+                  },
+                  ".cm-panels-bottom": {
+                    borderTop: "1px solid #282631",
+                    backgroundColor: "#111016",
+                    color: "#a99bd6",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "11px",
+                    fontWeight: "800",
+                  },
+                  ".cm-vim-panel input": {
+                    backgroundColor: "transparent",
+                    color: "#d8d2e4",
+                    font: "inherit",
+                  },
                 },
-                ".cm-scroller": {
-                  fontFamily: "var(--font-mono)",
-                  lineHeight: "1.55",
-                },
-                ".cm-content": {
-                  padding: "18px 0",
-                },
-                ".cm-line": {
-                  padding: "0 20px",
-                },
-                ".cm-gutters": {
-                  backgroundColor: "#15141b",
-                  borderRight: "1px solid #282631",
-                  color: "#706a84",
-                },
-                ".cm-activeLine": {
-                  backgroundColor: "rgba(80, 74, 96, 0.22)",
-                },
-                ".cm-activeLineGutter": {
-                  backgroundColor: "rgba(80, 74, 96, 0.28)",
-                  color: "#a99bd6",
-                },
-                ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
-                  backgroundColor: "rgba(153, 131, 196, 0.26)",
-                },
-                "&.cm-focused": {
-                  outline: "none",
-                },
-                ".cm-panels-bottom": {
-                  borderTop: "1px solid #282631",
-                  backgroundColor: "#111016",
-                  color: "#a99bd6",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: "11px",
-                  fontWeight: "800",
-                },
-                ".cm-vim-panel input": {
-                  backgroundColor: "transparent",
-                  color: "#d8d2e4",
-                  font: "inherit",
-                },
-              }, { dark: true }),
+                { dark: true },
+              ),
             ],
           }),
         });
@@ -219,27 +232,38 @@
     return runtimePromise;
   }
 
-  function softDraculaHighlight(runtime: Pick<Runtime, "HighlightStyle" | "syntaxHighlighting" | "tags">): Extension {
+  function softDraculaHighlight(
+    runtime: Pick<Runtime, "HighlightStyle" | "syntaxHighlighting" | "tags">,
+  ): Extension {
     const { HighlightStyle, syntaxHighlighting, tags } = runtime;
 
-    return syntaxHighlighting(HighlightStyle.define([
-      { tag: tags.keyword, color: "#b89adf" },
-      { tag: [tags.atom, tags.bool, tags.null], color: "#c9a7e8" },
-      { tag: [tags.string, tags.special(tags.string)], color: "#9dbb83" },
-      { tag: [tags.number, tags.integer, tags.float], color: "#d8a789" },
-      { tag: [tags.comment, tags.lineComment, tags.blockComment], color: "#6f7386", fontStyle: "italic" },
-      { tag: tags.docComment, color: "#858aa0", fontStyle: "italic" },
-      { tag: tags.variableName, color: "#d8d2e4" },
-      { tag: tags.definition(tags.variableName), color: "#e2ddee" },
-      { tag: tags.function(tags.variableName), color: "#8db9d6" },
-      { tag: [tags.propertyName, tags.attributeName], color: "#91c3d0" },
-      { tag: [tags.className, tags.typeName, tags.namespace], color: "#d9c58d" },
-      { tag: [tags.operator, tags.compareOperator, tags.logicOperator, tags.arithmeticOperator], color: "#aaa4bb" },
-      { tag: [tags.punctuation, tags.separator, tags.bracket], color: "#8f89a0" },
-      { tag: tags.link, color: "#8db9d6", textDecoration: "underline" },
-      { tag: tags.heading, color: "#b89adf", fontWeight: "700" },
-      { tag: tags.invalid, color: "#e58a8a", backgroundColor: "rgba(229, 138, 138, 0.12)" },
-    ]));
+    return syntaxHighlighting(
+      HighlightStyle.define([
+        { tag: tags.keyword, color: "#b89adf" },
+        { tag: [tags.atom, tags.bool, tags.null], color: "#c9a7e8" },
+        { tag: [tags.string, tags.special(tags.string)], color: "#9dbb83" },
+        { tag: [tags.number, tags.integer, tags.float], color: "#d8a789" },
+        {
+          tag: [tags.comment, tags.lineComment, tags.blockComment],
+          color: "#6f7386",
+          fontStyle: "italic",
+        },
+        { tag: tags.docComment, color: "#858aa0", fontStyle: "italic" },
+        { tag: tags.variableName, color: "#d8d2e4" },
+        { tag: tags.definition(tags.variableName), color: "#e2ddee" },
+        { tag: tags.function(tags.variableName), color: "#8db9d6" },
+        { tag: [tags.propertyName, tags.attributeName], color: "#91c3d0" },
+        { tag: [tags.className, tags.typeName, tags.namespace], color: "#d9c58d" },
+        {
+          tag: [tags.operator, tags.compareOperator, tags.logicOperator, tags.arithmeticOperator],
+          color: "#aaa4bb",
+        },
+        { tag: [tags.punctuation, tags.separator, tags.bracket], color: "#8f89a0" },
+        { tag: tags.link, color: "#8db9d6", textDecoration: "underline" },
+        { tag: tags.heading, color: "#b89adf", fontWeight: "700" },
+        { tag: tags.invalid, color: "#e58a8a", backgroundColor: "rgba(229, 138, 138, 0.12)" },
+      ]),
+    );
   }
 
   async function loadLanguage(filePath: string): Promise<Extension | null> {
@@ -271,15 +295,18 @@
         if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
           event.preventDefault();
           onSave();
-        } else if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "f") {
+        } else if (
+          (event.metaKey || event.ctrlKey) &&
+          event.shiftKey &&
+          event.key.toLowerCase() === "f"
+        ) {
           event.preventDefault();
           onFormat();
         } else if (event.key === "Tab") {
           event.preventDefault();
           insertFallbackIndent(event.currentTarget, event.shiftKey);
         }
-      }}
-    ></textarea>
+      }}></textarea>
   {/if}
 </div>
 

@@ -19,8 +19,20 @@
     stagingMergedCount?: number;
   }
 
-  let { workspaces, selectedWsId, creatingWsId = null, prStatusMap, reviewingWsIds = new Set(), onSelect, onRename, onRemove, stagingWsId = null, stagingError = null, rebuildingStaging = false, stagingMergedCount = 0 }: Props =
-    $props();
+  let {
+    workspaces,
+    selectedWsId,
+    creatingWsId = null,
+    prStatusMap,
+    reviewingWsIds = new Set(),
+    onSelect,
+    onRename,
+    onRemove,
+    stagingWsId = null,
+    stagingError = null,
+    rebuildingStaging = false,
+    stagingMergedCount = 0,
+  }: Props = $props();
 
   let menuOpenId = $state<string | null>(null);
 
@@ -40,7 +52,9 @@
   }
 
   let activeWorkspaces = $derived(
-    [...workspaces].filter((ws) => ws.id !== stagingWsId).sort((a, b) => a.created_at - b.created_at),
+    [...workspaces]
+      .filter((ws) => ws.id !== stagingWsId)
+      .sort((a, b) => a.created_at - b.created_at),
   );
 
   type GroupKey = "active" | "review" | "done";
@@ -127,64 +141,79 @@
             <span class="group-count">{group.items.length}</span>
           </button>
           {#if !collapsed.has(group.key)}
-          {#each group.items as ws (ws.id)}
-          <div class="ws-item-wrap">
-            <button
-              class="ws-item"
-              class:active={ws.id === selectedWsId}
-              onclick={() => onSelect(ws.id)}
-              ondblclick={() => ws.id !== creatingWsId && startEdit(ws)}
-            >
-              <span
-                class="ws-dot"
-                class:creating={ws.id === creatingWsId}
-                class:running={ws.id !== creatingWsId && ws.status === "running" && (!prStatusMap.get(ws.id) || prStatusMap.get(ws.id)?.state === "none")}
-                class:waiting={ws.id !== creatingWsId && ws.status === "waiting" && (!prStatusMap.get(ws.id) || prStatusMap.get(ws.id)?.state === "none")}
-                class:pr-open={prStatusMap.get(ws.id)?.state === "open" && prStatusMap.get(ws.id)?.mergeable !== "conflicting" && prStatusMap.get(ws.id)?.checks !== "failing"}
-                class:pr-fail={prStatusMap.get(ws.id)?.state === "open" && (prStatusMap.get(ws.id)?.checks === "failing" || prStatusMap.get(ws.id)?.mergeable === "conflicting")}
-                class:pr-merge={prStatusMap.get(ws.id)?.state === "open" && prStatusMap.get(ws.id)?.mergeable === "mergeable" && prStatusMap.get(ws.id)?.checks === "passing"}
-              ></span>
-              {#if editingId === ws.id}
-                <!-- svelte-ignore a11y_autofocus -->
-                <input
-                  class="ws-rename-input"
-                  bind:value={editValue}
-                  onblur={() => commitEdit(ws.id)}
-                  onkeydown={(e) => handleEditKeydown(e, ws.id)}
-                  onclick={(e) => e.stopPropagation()}
-                  autofocus
-                />
-              {:else}
-                {#if ws.task_title}
-                  <span class="ws-info" class:creating-name={ws.id === creatingWsId}>
-                    <span class="ws-title">{ws.task_title}</span>
-                    <span class="ws-branch">{ws.name}</span>
-                  </span>
-                {:else}
-                  <span class="ws-name" class:creating-name={ws.id === creatingWsId}>{ws.name}</span>
+            {#each group.items as ws (ws.id)}
+              <div class="ws-item-wrap">
+                <button
+                  class="ws-item"
+                  class:active={ws.id === selectedWsId}
+                  onclick={() => onSelect(ws.id)}
+                  ondblclick={() => ws.id !== creatingWsId && startEdit(ws)}
+                >
+                  <span
+                    class="ws-dot"
+                    class:creating={ws.id === creatingWsId}
+                    class:running={ws.id !== creatingWsId &&
+                      ws.status === "running" &&
+                      (!prStatusMap.get(ws.id) || prStatusMap.get(ws.id)?.state === "none")}
+                    class:waiting={ws.id !== creatingWsId &&
+                      ws.status === "waiting" &&
+                      (!prStatusMap.get(ws.id) || prStatusMap.get(ws.id)?.state === "none")}
+                    class:pr-open={prStatusMap.get(ws.id)?.state === "open" &&
+                      prStatusMap.get(ws.id)?.mergeable !== "conflicting" &&
+                      prStatusMap.get(ws.id)?.checks !== "failing"}
+                    class:pr-fail={prStatusMap.get(ws.id)?.state === "open" &&
+                      (prStatusMap.get(ws.id)?.checks === "failing" ||
+                        prStatusMap.get(ws.id)?.mergeable === "conflicting")}
+                    class:pr-merge={prStatusMap.get(ws.id)?.state === "open" &&
+                      prStatusMap.get(ws.id)?.mergeable === "mergeable" &&
+                      prStatusMap.get(ws.id)?.checks === "passing"}
+                  ></span>
+                  {#if editingId === ws.id}
+                    <!-- svelte-ignore a11y_autofocus -->
+                    <input
+                      class="ws-rename-input"
+                      bind:value={editValue}
+                      onblur={() => commitEdit(ws.id)}
+                      onkeydown={(e) => handleEditKeydown(e, ws.id)}
+                      onclick={(e) => e.stopPropagation()}
+                      autofocus
+                    />
+                  {:else}
+                    {#if ws.task_title}
+                      <span class="ws-info" class:creating-name={ws.id === creatingWsId}>
+                        <span class="ws-title">{ws.task_title}</span>
+                        <span class="ws-branch">{ws.name}</span>
+                      </span>
+                    {:else}
+                      <span class="ws-name" class:creating-name={ws.id === creatingWsId}
+                        >{ws.name}</span
+                      >
+                    {/if}
+                    {#if ws.id !== creatingWsId && reviewingWsIds.has(ws.id)}
+                      <span class="ws-reviewing"><Eye size={11} /></span>
+                    {:else if ws.id !== creatingWsId && ws.status === "running"}
+                      <span class="ws-spinner"></span>
+                    {/if}
+                  {/if}
+                </button>
+                {#if ws.id !== creatingWsId}
+                  <button
+                    class="ws-ellipsis"
+                    class:open={menuOpenId === ws.id}
+                    onclick={(e) => toggleMenu(e, ws.id)}>⋯</button
+                  >
+                  {#if menuOpenId === ws.id}
+                    <div class="ws-menu">
+                      <button
+                        class="ws-menu-item remove"
+                        onclick={(e) => handleRemoveClick(e, ws.id)}>Remove</button
+                      >
+                    </div>
+                  {/if}
                 {/if}
-                {#if ws.id !== creatingWsId && reviewingWsIds.has(ws.id)}
-                  <span class="ws-reviewing"><Eye size={11} /></span>
-                {:else if ws.id !== creatingWsId && ws.status === "running"}
-                  <span class="ws-spinner"></span>
-                {/if}
-              {/if}
-            </button>
-            {#if ws.id !== creatingWsId}
-              <button
-                class="ws-ellipsis"
-                class:open={menuOpenId === ws.id}
-                onclick={(e) => toggleMenu(e, ws.id)}
-              >⋯</button>
-              {#if menuOpenId === ws.id}
-                <div class="ws-menu">
-                  <button class="ws-menu-item remove" onclick={(e) => handleRemoveClick(e, ws.id)}>Remove</button>
-                </div>
-              {/if}
-            {/if}
-          </div>
-        {/each}
-        {/if}
+              </div>
+            {/each}
+          {/if}
         </div>
       {/each}
     </div>
@@ -449,8 +478,13 @@
   }
 
   @keyframes pulse-review {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.3;
+    }
   }
 
   .ws-spinner {
@@ -465,7 +499,9 @@
   }
 
   @keyframes spin {
-    to { transform: rotate(360deg); }
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .ws-info {
@@ -572,5 +608,4 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-
 </style>

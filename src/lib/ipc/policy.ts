@@ -82,7 +82,9 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, command: string)
 
   return new Promise<T>((resolve, reject) => {
     timeoutId = setTimeout(() => {
-      reject(new IpcPolicyError(command, "timeout", `${command} timed out after ${timeoutMs}ms.`, true));
+      reject(
+        new IpcPolicyError(command, "timeout", `${command} timed out after ${timeoutMs}ms.`, true),
+      );
     }, timeoutMs);
 
     promise.then(
@@ -138,14 +140,16 @@ function parseJsonObject(value: string): unknown {
 }
 
 function isIpcErrorCategory(value: unknown): value is IpcErrorCategory {
-  return value === "timeout"
-    || value === "transient"
-    || value === "auth"
-    || value === "permission"
-    || value === "validation"
-    || value === "not_found"
-    || value === "cancelled"
-    || value === "unknown";
+  return (
+    value === "timeout" ||
+    value === "transient" ||
+    value === "auth" ||
+    value === "permission" ||
+    value === "validation" ||
+    value === "not_found" ||
+    value === "cancelled" ||
+    value === "unknown"
+  );
 }
 
 function backoffMs(baseDelayMs: number, attempt: number): number {
