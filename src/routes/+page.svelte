@@ -58,21 +58,15 @@
     type WorkspaceChatAction,
     type WorkspaceChatActionContext,
   } from "$lib/workspaceChat";
+  import { createSourceControlStore } from "$lib/sourceControlStore.svelte";
   import "./page.css";
   import {
     addJiraComment,
     assignJiraIssue,
-    checkoutWorkspaceGitBranch,
     chatAiWorker,
     executeAiWorkerTask,
     getJiraBoards,
     getPathGitInfo,
-    getWorkspaceChangedFiles,
-    gitCommit,
-    gitMergeBranch,
-    gitPull,
-    gitPush,
-    gitRebaseBranch,
     getWorkspaceGitInfo,
     getWorkspace,
     listDirectory,
@@ -99,7 +93,7 @@
     type ColumnIntent,
     type ExecutionState,
     type FileEntry,
-    type GitChangedFile,
+    type GitStatus,
     type GitWorkspaceInfo,
     type AiWorkerTaskResult,
     type JiraMcpConfig,
@@ -290,6 +284,7 @@
   let newTaskTitle = $state("");
   let newTaskDescription = $state("");
   let agentConsoleOpen = $state(false);
+  let agentConsoleCardId = $state<string | null>(null);
   let agentRunCardId = $state<string | null>(null);
   let agentRunTitle = $state("No active run");
   let agentRunStatus = $state<AgentRunStatus>("idle");
@@ -361,15 +356,25 @@
   let workspaceGitInfo = $state<GitWorkspaceInfo | null>(null);
   let workspaceGitLoading = $state(false);
   let workspaceGitError = $state<string | null>(null);
-  let workspaceChangedFiles = $state<GitChangedFile[]>([]);
+  let workspaceGitStatus = $state<GitStatus>({ staged: [], unstaged: [] });
   let selectedWorkspaceBranch = $state("");
   let switchingWorkspaceBranch = $state(false);
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceGitInfoRequestId = 0;
-  let workspaceChangedFilesRequestId = 0;
+  let workspaceGitStatusRequestId = 0;
   let backlogStartConfirmation = $state<{ cardId: string; title: string } | null>(null);
   let backlogStartConfirmationResolve: ((confirmed: boolean) => void) | null = null;
   let manualDoneConfirmation = $state<{ cardId: string; title: string } | null>(null);
+  const sourceControl = createSourceControlStore({
+    onRepositoryChanged: async (refreshFiles, refreshEditors) => {
+      if (refreshFiles) await refreshFileDirectory(fileDirectory);
+      if (refreshEditors) await refreshOpenEditorFilesFromDisk();
+      syncSourceControlState();
+    },
+    onNotice: (tone, message) => {
+      appNotice = { tone, message };
+    },
+  });
 
   onMount(() => {
     void hydrateCachedWorkspace();
@@ -426,6 +431,13 @@
   });
 
   $effect(() => {
+    if (!agentConsoleCardId || agentRunSessions[agentConsoleCardId]) return;
+    const fallback = latestAgentSession;
+    agentConsoleCardId = fallback?.cardId ?? null;
+    if (!fallback) agentConsoleOpen = false;
+  });
+
+  $effect(() => {
     if (workspaceMode === "files" && workspace && fileEntries.length === 0 && !fileLoading) {
       void refreshFileDirectory(fileDirectory);
     }
@@ -449,7 +461,7 @@
       workspaceGitInfo = null;
       workspaceGitError = null;
       workspaceGitLoading = false;
-      workspaceChangedFiles = [];
+      workspaceGitStatus = { staged: [], unstaged: [] };
       selectedWorkspaceBranch = "";
       return;
     }
@@ -467,43 +479,32 @@
     }
 
     const requestId = ++workspaceGitInfoRequestId;
-    workspaceGitLoading = true;
-    workspaceGitError = null;
-
-    try {
-      const info = await getWorkspaceGitInfo();
-      if (requestId !== workspaceGitInfoRequestId) return;
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      selectedWorkspaceBranch = info.current_branch ?? "";
-    } catch (reason: unknown) {
-      if (requestId !== workspaceGitInfoRequestId) return;
-      workspaceGitInfo = null;
-      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
-    } finally {
-      if (requestId !== workspaceGitInfoRequestId) return;
-      workspaceGitLoading = false;
-    }
+    await sourceControl.refresh("info");
+    if (requestId === workspaceGitInfoRequestId) syncSourceControlState();
   }
 
-  async function refreshWorkspaceChangedFiles() {
+  async function refreshWorkspaceGitStatus() {
     if (!workspaceRoot) {
-      workspaceChangedFiles = [];
+      workspaceGitStatus = { staged: [], unstaged: [] };
       return;
     }
 
-    const requestId = ++workspaceChangedFilesRequestId;
-    try {
-      const files = await getWorkspaceChangedFiles();
-      if (requestId !== workspaceChangedFilesRequestId) return;
-      workspaceChangedFiles = files;
-    } catch {
-      if (requestId !== workspaceChangedFilesRequestId) return;
-      workspaceChangedFiles = [];
-    }
+    const requestId = ++workspaceGitStatusRequestId;
+    await sourceControl.refresh("status");
+    if (requestId === workspaceGitStatusRequestId) syncSourceControlState();
   }
 
   async function refreshWorkspaceGitState() {
-    await Promise.all([refreshWorkspaceGitInfo(), refreshWorkspaceChangedFiles()]);
+    await sourceControl.refresh("state");
+    syncSourceControlState();
+  }
+
+  function syncSourceControlState() {
+    workspaceGitInfo = sourceControl.info;
+    workspaceGitStatus = sourceControl.status;
+    workspaceGitError = sourceControl.error;
+    workspaceGitLoading = sourceControl.loading;
+    selectedWorkspaceBranch = sourceControl.info?.current_branch ?? "";
   }
 
   $effect(() => {
@@ -612,6 +613,8 @@
             ? `${activeEditorFile.path}${activeEditorFile.dirty ? " • unsaved" : ""}`
             : `${fileEntries.length} item${fileEntries.length === 1 ? "" : "s"}`,
   );
+  let workspaceChangedFiles = $derived([...workspaceGitStatus.staged, ...workspaceGitStatus.unstaged]);
+  let sourceControlChangedCount = $derived(workspaceChangedFiles.length);
   let selectedServer = $derived(
     settings.mcpServers.find((server) => server.id === selectedServerId) ??
       settings.mcpServers[0],
@@ -664,13 +667,31 @@
       ? `${selectedAgentLabel} connected · ${relativeTime(selectedAgentConnection?.testedAt ?? Date.now())}`
       : `${selectedAgentLabel} not tested`,
   );
-  let currentAgentLog = $derived(agentRunLogs.at(-1) ?? null);
-  let agentActivityView = $derived(agentActivity(agentRunStatus, agentRunProgress, currentAgentLog));
+  let visibleAgentSession = $derived<AgentRunSession | null>(
+    agentConsoleCardId ? agentRunSessions[agentConsoleCardId] ?? null : null,
+  );
+  let visibleAgentRunTitle = $derived(visibleAgentSession?.title ?? "No active run");
+  let visibleAgentRunStatus = $derived<AgentRunStatus>(visibleAgentSession?.status ?? "idle");
+  let visibleAgentRunProgress = $derived(visibleAgentSession?.progress ?? 0);
+  let visibleAgentRunOutput = $derived(visibleAgentSession?.output ?? "");
+  let visibleAgentRunResult = $derived(visibleAgentSession?.result ?? null);
+  let visibleAgentRunLogs = $derived(visibleAgentSession?.logs ?? []);
+  let visibleAgentTerminalLines = $derived(visibleAgentSession?.terminalLines ?? []);
+  let visibleAgentRunTranscript = $derived(visibleAgentSession?.transcript ?? []);
+  let visibleAgentLog = $derived(visibleAgentRunLogs.at(-1) ?? null);
+  let agentActivityView = $derived(agentActivity(visibleAgentRunStatus, visibleAgentRunProgress, visibleAgentLog));
   let agentActivityTitle = $derived(agentActivityView.title);
   let agentActivityDetail = $derived(agentActivityView.detail);
   let agentNextStep = $derived(agentActivityView.next);
-  let agentPhases = $derived(agentPhaseTimeline(agentRunStatus, agentRunProgress));
-  let hasAgentConsoleSession = $derived(Boolean(agentRunCardId && agentRunLogs.length > 0));
+  let agentPhases = $derived(agentPhaseTimeline(visibleAgentRunStatus, visibleAgentRunProgress));
+  let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
+  let latestAgentSession = $derived<AgentRunSession | null>(
+    Object.values(agentRunSessions).sort((left, right) => {
+      const leftLog = left.logs.at(-1)?.id ?? "";
+      const rightLog = right.logs.at(-1)?.id ?? "";
+      return rightLog.localeCompare(leftLog);
+    })[0] ?? null,
+  );
   let settingsTitle = $derived(
     {
       agent: "Agent",
@@ -897,16 +918,6 @@
     await validateActiveEditorSyntax();
   }
 
-  async function refreshWorkspaceAfterGitAction(refreshFiles = true, refreshEditors = true) {
-    await refreshWorkspaceGitState();
-    if (refreshFiles) {
-      await refreshFileDirectory(fileDirectory);
-    }
-    if (refreshEditors) {
-      await refreshOpenEditorFilesFromDisk();
-    }
-  }
-
   async function switchWorkspaceBranch(branch: string) {
     if (!workspaceGitInfo?.is_git_repo || switchingWorkspaceBranch) return;
     if (openEditorFiles.some((file) => file.dirty)) {
@@ -922,10 +933,9 @@
     workspaceGitError = null;
     fileError = null;
     try {
-      const info = await checkoutWorkspaceGitBranch(branch);
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      selectedWorkspaceBranch = info.current_branch ?? branch;
-      await refreshWorkspaceAfterGitAction();
+      await sourceControl.checkoutBranch(branch);
+      syncSourceControlState();
+      if (sourceControl.error) return;
       appNotice = { tone: "success", message: `Switched to ${selectedWorkspaceBranch || branch}` };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -939,9 +949,9 @@
   async function pullWorkspaceGitChanges() {
     if (!workspaceGitInfo?.is_git_repo) return;
     try {
-      const info = await gitPull();
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      await refreshWorkspaceAfterGitAction();
+      await sourceControl.pull();
+      syncSourceControlState();
+      if (sourceControl.error) return;
       appNotice = { tone: "success", message: "Pulled latest changes." };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -952,21 +962,68 @@
   async function commitWorkspaceGitChanges(message: string) {
     if (!workspaceGitInfo?.is_git_repo) return;
     try {
-      const result = await gitCommit(message);
-      await refreshWorkspaceAfterGitAction(false, false);
-      appNotice = { tone: "success", message: `Committed ${result.hash.slice(0, 7)}` };
+      await sourceControl.commit(message);
+      syncSourceControlState();
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
       appNotice = { tone: "error", message: workspaceGitError };
     }
   }
 
+  async function stageWorkspaceGitPath(path: string) {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      await sourceControl.stageFile(path);
+      syncSourceControlState();
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+      await refreshWorkspaceGitState();
+    }
+  }
+
+  async function stageAllWorkspaceGitPaths() {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      await sourceControl.stageAll();
+      syncSourceControlState();
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+      await refreshWorkspaceGitState();
+    }
+  }
+
+  async function unstageWorkspaceGitPath(path: string) {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      await sourceControl.unstageFile(path);
+      syncSourceControlState();
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+      await refreshWorkspaceGitState();
+    }
+  }
+
+  async function unstageAllWorkspaceGitPaths() {
+    if (!workspaceGitInfo?.is_git_repo) return;
+    try {
+      await sourceControl.unstageAll();
+      syncSourceControlState();
+    } catch (reason: unknown) {
+      workspaceGitError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: workspaceGitError };
+      await refreshWorkspaceGitState();
+    }
+  }
+
   async function pushWorkspaceGitChanges() {
     if (!workspaceGitInfo?.is_git_repo) return;
     try {
-      const info = await gitPush();
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      await refreshWorkspaceAfterGitAction(false, false);
+      await sourceControl.push();
+      syncSourceControlState();
+      if (sourceControl.error) return;
       appNotice = { tone: "success", message: "Pushed changes." };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -977,9 +1034,9 @@
   async function mergeWorkspaceGitBranch(branch: string) {
     if (!workspaceGitInfo?.is_git_repo) return;
     try {
-      const info = await gitMergeBranch(branch);
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      await refreshWorkspaceAfterGitAction();
+      await sourceControl.merge(branch);
+      syncSourceControlState();
+      if (sourceControl.error) return;
       appNotice = { tone: "success", message: `Merged ${branch}` };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -990,9 +1047,9 @@
   async function rebaseWorkspaceGitBranch(branch: string) {
     if (!workspaceGitInfo?.is_git_repo) return;
     try {
-      const info = await gitRebaseBranch(branch);
-      workspaceGitInfo = info.is_git_repo ? info : null;
-      await refreshWorkspaceAfterGitAction();
+      await sourceControl.rebase(branch);
+      syncSourceControlState();
+      if (sourceControl.error) return;
       appNotice = { tone: "success", message: `Rebased onto ${branch}` };
     } catch (reason: unknown) {
       workspaceGitError = reason instanceof Error ? reason.message : String(reason);
@@ -2445,9 +2502,14 @@
     }))) return false;
 
     if (selectedCardId === cardId) selectedCardId = null;
-    if (agentRunCardId === cardId) agentConsoleOpen = false;
+    if (agentRunCardId === cardId) agentRunCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
+    if (agentConsoleCardId === cardId) {
+      const fallback = Object.values(remainingSessions)[0] ?? null;
+      agentConsoleCardId = fallback?.cardId ?? null;
+      if (!fallback) agentConsoleOpen = false;
+    }
     cacheSavedAt = Date.now();
     saveCachedWorkspace(workspace!);
     appNotice = {
@@ -2565,33 +2627,7 @@
     );
   }
 
-  function appendAgentSessionTranscript(type: AgentSessionEvent["type"], text: string) {
-    agentRunTranscript = appendAgentSessionEvent(
-      agentRunTranscript,
-      createAgentSessionEvent(type, text),
-      MAX_AGENT_SESSION_EVENTS,
-    );
-    persistActiveAgentRun();
-  }
-
-  function persistActiveAgentRun() {
-    const session = activeAgentSession();
-    if (!session) return;
-
-    agentRunSessions = {
-      ...agentRunSessions,
-      [session.cardId]: session,
-    };
-  }
-
-  function openAgentRunForCard(card: CardProjection) {
-    const session = agentRunSessions[card.id];
-    if (!session) {
-      appNotice = { tone: "info", message: "This card does not have an Agent terminal session yet." };
-      return;
-    }
-
-    agentConsoleOpen = true;
+  function applyAgentSessionToConsole(session: AgentRunSession) {
     agentRunCardId = session.cardId;
     agentRunTitle = session.title;
     agentRunStatus = session.status;
@@ -2602,6 +2638,67 @@
     agentTerminalLines = session.terminalLines;
     agentRunGitSnapshot = session.gitSnapshot;
     agentRunTranscript = session.transcript ?? [];
+  }
+
+  function agentSessionForCard(cardId: string): AgentRunSession | null {
+    return agentRunCardId === cardId
+      ? activeAgentSession() ?? agentRunSessions[cardId] ?? null
+      : agentRunSessions[cardId] ?? null;
+  }
+
+  function updateAgentSessionForCard(cardId: string, transform: (session: AgentRunSession) => AgentRunSession) {
+    const session = agentSessionForCard(cardId);
+    if (!session) return;
+
+    const nextSession = transform(session);
+    agentRunSessions = {
+      ...agentRunSessions,
+      [cardId]: nextSession,
+    };
+    if (agentRunCardId === cardId) applyAgentSessionToConsole(nextSession);
+  }
+
+  function appendAgentSessionTranscript(type: AgentSessionEvent["type"], text: string) {
+    agentRunTranscript = appendAgentSessionEvent(
+      agentRunTranscript,
+      createAgentSessionEvent(type, text),
+      MAX_AGENT_SESSION_EVENTS,
+    );
+    persistActiveAgentRun();
+  }
+
+  function appendAgentSessionTranscriptForCard(cardId: string, type: AgentSessionEvent["type"], text: string) {
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      transcript: appendAgentSessionEvent(
+        session.transcript ?? [],
+        createAgentSessionEvent(type, text),
+        MAX_AGENT_SESSION_EVENTS,
+      ),
+    }));
+  }
+
+  function persistActiveAgentRun() {
+    const session = activeAgentSession();
+    if (!session) return;
+
+    agentRunSessions = {
+      ...agentRunSessions,
+      [session.cardId]: session,
+    };
+    agentConsoleCardId ??= session.cardId;
+  }
+
+  function openAgentRunForCard(card: CardProjection) {
+    const session = agentRunSessions[card.id];
+    if (!session) {
+      appNotice = { tone: "info", message: "This card does not have an Agent terminal session yet." };
+      return;
+    }
+
+    agentConsoleOpen = true;
+    agentConsoleCardId = session.cardId;
+    applyAgentSessionToConsole(session);
     agentTerminalInput = "";
   }
 
@@ -2611,8 +2708,11 @@
       return;
     }
 
-    if (hasAgentConsoleSession) {
+    const session = visibleAgentSession ?? latestAgentSession;
+    if (session) {
       agentConsoleOpen = true;
+      agentConsoleCardId = session.cardId;
+      applyAgentSessionToConsole(session);
       return;
     }
 
@@ -2628,9 +2728,21 @@
     persistActiveAgentRun();
   }
 
+  function setAgentRunStatusForCard(cardId: string, status: AgentRunStatus) {
+    updateAgentSessionForCard(cardId, (session) => ({ ...session, status }));
+  }
+
   function setAgentRunOutput(output: string) {
     agentRunOutput = capText(output, MAX_AGENT_OUTPUT_CHARS);
     persistActiveAgentRun();
+  }
+
+  function setAgentRunOutputForCard(cardId: string, output: string) {
+    updateAgentSessionForCard(cardId, (session) => ({ ...session, output: capText(output, MAX_AGENT_OUTPUT_CHARS) }));
+  }
+
+  function setAgentRunResultForCard(cardId: string, result: AiWorkerTaskResult | null) {
+    updateAgentSessionForCard(cardId, (session) => ({ ...session, result }));
   }
 
   function setAgentRunGitSnapshot(snapshot: AgentRunGitSnapshot | null) {
@@ -2638,9 +2750,20 @@
     persistActiveAgentRun();
   }
 
+  function setAgentRunGitSnapshotForCard(cardId: string, snapshot: AgentRunGitSnapshot | null) {
+    updateAgentSessionForCard(cardId, (session) => ({ ...session, gitSnapshot: snapshot }));
+  }
+
   function setAgentProgress(value: number) {
     agentRunProgress = Math.max(agentRunProgress, Math.min(100, value));
     persistActiveAgentRun();
+  }
+
+  function setAgentProgressForCard(cardId: string, value: number) {
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      progress: Math.max(session.progress, Math.min(100, value)),
+    }));
   }
 
   function appendAgentLog(tone: AgentRunLog["tone"], label: string, message: string) {
@@ -2657,6 +2780,22 @@
     persistActiveAgentRun();
   }
 
+  function appendAgentLogForCard(cardId: string, tone: AgentRunLog["tone"], label: string, message: string) {
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      logs: capList([
+        ...session.logs,
+        {
+          id: `run-${Date.now().toString(36)}-${session.logs.length}`,
+          at: new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          tone,
+          label,
+          message,
+        },
+      ], MAX_AGENT_LOGS),
+    }));
+  }
+
   function appendStructuredAgentLog(
     tone: AgentRunLog["tone"],
     label: string,
@@ -2666,6 +2805,31 @@
     next: string[],
   ) {
     appendAgentLog(
+      tone,
+      label,
+      [
+        `STATUS: ${tone === "success" ? "Complete" : tone === "error" ? "Blocked" : "Running"}`,
+        `SUMMARY: ${summary}`,
+        "EVIDENCE:",
+        ...evidence.map((line) => `- ${line}`),
+        "DETAILS:",
+        ...details.map((line) => `- ${line}`),
+        ...(next.length > 0 ? ["NEXT:", ...next.map((line) => `- ${line}`)] : []),
+      ].join("\n"),
+    );
+  }
+
+  function appendStructuredAgentLogForCard(
+    cardId: string,
+    tone: AgentRunLog["tone"],
+    label: string,
+    summary: string,
+    evidence: string[],
+    details: string[],
+    next: string[],
+  ) {
+    appendAgentLogForCard(
+      cardId,
       tone,
       label,
       [
@@ -2728,13 +2892,33 @@
     persistActiveAgentRun();
   }
 
+  function appendTerminalLineForCard(cardId: string, prompt: string, text: string) {
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      terminalLines: capList([
+        ...session.terminalLines,
+        {
+          id: `term-${Date.now().toString(36)}-${session.terminalLines.length}`,
+          prompt,
+          text,
+        },
+      ], MAX_AGENT_TERMINAL_LINES),
+    }));
+  }
+
   function submitAgentTerminalInput() {
     const input = agentTerminalInput.trim();
     if (!input) return;
+    const cardId = agentConsoleCardId;
+    if (!cardId || !agentRunSessions[cardId]) {
+      appNotice = { tone: "error", message: "No Agent console session is selected." };
+      return;
+    }
 
-    appendTerminalLine("operator", input);
-    appendAgentSessionTranscript(isApprovalText(input) ? "approval" : "operator_note", input);
-    appendStructuredAgentLog(
+    appendTerminalLineForCard(cardId, "operator", input);
+    appendAgentSessionTranscriptForCard(cardId, isApprovalText(input) ? "approval" : "operator_note", input);
+    appendStructuredAgentLogForCard(
+      cardId,
       "info",
       "operator",
       "Operator note recorded for the running session.",
@@ -2742,8 +2926,9 @@
       ["Operator note saved to the running session."],
       ["Continue the Agent with the updated guidance."],
     );
-    if (agentRunStatus === "blocked" && isApprovalText(input)) {
-      appendStructuredAgentLog(
+    if (agentSessionForCard(cardId)?.status === "blocked" && isApprovalText(input)) {
+      appendStructuredAgentLogForCard(
+        cardId,
         "success",
         "approval",
         "Operator approval recorded for this card session.",
@@ -2841,35 +3026,36 @@
     ].join("\n");
   }
 
-  function agentWritebackRequiresPushedCommit(card: CardProjection, result: AiWorkerTaskResult): boolean {
+  function agentWritebackRequiresPushedCommit(card: CardProjection): boolean {
     const text = [
       card.title,
       card.description,
       card.labels.join(" "),
-      result.summary,
-      result.evidence.join(" "),
-      result.details.join(" "),
     ].join("\n").toLowerCase();
 
-    return [
-      "helm",
-      "chart",
+    const hasUpdateVerb = ["update", "change", "modify", "edit", "add", "remove", "set"].some((needle) => text.includes(needle));
+    const hasEnvTarget = [
+      ".env",
+      "env variable",
+      "environment variable",
+      "environment config",
+      "env config",
       "values.yaml",
       "values yml",
+      "helm values",
       "deployment template",
       "deployment-config",
       "deployment config",
-      "qcash-deployment",
-      "env variable",
-      "environment variable",
       "configmap",
       "secret.yaml",
       "secret yml",
     ].some((needle) => text.includes(needle));
+
+    return hasUpdateVerb && hasEnvTarget;
   }
 
-  async function verifyAgentJiraDoneGate(card: CardProjection, result: AiWorkerTaskResult, config: AiWorkerConfig): Promise<GitWorkspaceInfo | null> {
-    if (!agentWritebackRequiresPushedCommit(card, result)) return null;
+  async function verifyAgentJiraDoneGate(card: CardProjection, config: AiWorkerConfig): Promise<GitWorkspaceInfo | null> {
+    if (!agentWritebackRequiresPushedCommit(card)) return null;
 
     const gitPath = config.opencode_workdir?.trim() || workspaceRoot || workspaceGitInfo?.repo_root || null;
     if (!gitPath) {
@@ -2884,7 +3070,8 @@
       throw new Error("Jira Done blocked: Spacesly cannot verify a git repository for this Helm/env/template change.");
     }
 
-    if (!agentRunGitSnapshot?.head_commit) {
+    const runSnapshot = agentSessionForCard(card.id)?.gitSnapshot ?? null;
+    if (!runSnapshot?.head_commit) {
       throw new Error("Jira Done blocked: Spacesly did not capture the starting commit for this Agent run.");
     }
 
@@ -2892,7 +3079,7 @@
       throw new Error("Jira Done blocked: Spacesly cannot read the current git HEAD commit.");
     }
 
-    if (info.head_commit === agentRunGitSnapshot.head_commit) {
+    if (info.head_commit === runSnapshot.head_commit) {
       throw new Error("Jira Done blocked: no new commit was created for this Helm/env/template change.");
     }
 
@@ -3001,7 +3188,7 @@
   function requestManualDoneConfirmation(cardId: string) {
     const card = activeCardById.get(cardId);
     if (!card) return;
-    if (agentRunStatus !== "blocked") {
+    if (agentSessionForCard(cardId)?.status !== "blocked") {
       appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
       return;
     }
@@ -3021,7 +3208,7 @@
     const card = activeCardById.get(cardId);
     const doneColumnId = columnIdByIntent("done");
     if (!card || !doneColumnId) return;
-    if (agentRunStatus !== "blocked") {
+    if (agentSessionForCard(cardId)?.status !== "blocked") {
       appNotice = { tone: "error", message: "Manual Done is only available for blocked Agent sessions." };
       return;
     }
@@ -3029,10 +3216,11 @@
     const summary = "Marked Done manually by operator after resolving the blocked Agent task.";
     moveCard(cardId, doneColumnId, { completed: { summary } });
     updateCardExecution(cardId, { completed: { summary } });
-    setAgentRunStatus("completed");
-    setAgentProgress(100);
-    appendAgentSessionTranscript("approval", summary);
-    appendStructuredAgentLog(
+    setAgentRunStatusForCard(cardId, "completed");
+    setAgentProgressForCard(cardId, 100);
+    appendAgentSessionTranscriptForCard(cardId, "approval", summary);
+    appendStructuredAgentLogForCard(
+      cardId,
       "success",
       "manual-done",
       summary,
@@ -3133,11 +3321,12 @@
         const runGitInfo = config.opencode_workdir?.trim()
           ? await getPathGitInfo(config.opencode_workdir.trim())
           : await getWorkspaceGitInfo();
-        setAgentRunGitSnapshot(gitSnapshotFromInfo(runGitInfo));
+        setAgentRunGitSnapshotForCard(cardId, gitSnapshotFromInfo(runGitInfo));
       }
 
       if (cardColumnIntent(cardId) !== "in_progress") {
-        appendStructuredAgentLog(
+        appendStructuredAgentLogForCard(
+          cardId,
           "info",
           "board",
           "Moved card to In Progress locally.",
@@ -3149,8 +3338,9 @@
       } else {
         updateCardExecution(cardId, "running");
       }
-      setAgentProgress(15);
-      appendStructuredAgentLog(
+      setAgentProgressForCard(cardId, 15);
+      appendStructuredAgentLogForCard(
+        cardId,
         "info",
         "model",
         config.runtime === "opencode" ? `Using OpenCode / ${config.opencode_model}.` : `Using ${config.provider_name} / ${config.model}.`,
@@ -3162,7 +3352,8 @@
       if (issueKey && !isContinuation) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "info",
             "jira",
             `Assigning ${issueKey} and moving Jira to In Progress.`,
@@ -3170,10 +3361,11 @@
             [`Jira transition target: In Progress`],
             ["Wait for the Jira transition confirmation before execution."],
           );
-          setAgentProgress(25);
+          setAgentProgressForCard(cardId, 25);
           await assignJiraIssue(jiraConfig, issueKey);
           await transitionJiraIssue(jiraConfig, issueKey, "In Progress");
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "success",
             "jira",
             `${issueKey} is In Progress in Jira.`,
@@ -3181,10 +3373,11 @@
             [`Jira state now mirrors the local run state.`],
             ["Proceed with the exported task context."],
           );
-          setAgentProgress(35);
+          setAgentProgressForCard(cardId, 35);
         }
       } else {
-        appendStructuredAgentLog(
+        appendStructuredAgentLogForCard(
+          cardId,
           "info",
           "local",
           "Local Spacesly task. Jira sync is not required.",
@@ -3192,10 +3385,11 @@
           [`The run will stay local and update only the board state.`],
           ["Proceed with the exported task context."],
         );
-        setAgentProgress(35);
+        setAgentProgressForCard(cardId, 35);
       }
       if (issueKey && isContinuation) {
-        appendStructuredAgentLog(
+        appendStructuredAgentLogForCard(
+          cardId,
           "info",
           "jira",
           `${issueKey} is already in execution. Skipping duplicate Jira In Progress transition.`,
@@ -3203,10 +3397,11 @@
           [`Continuation run detected.`],
           ["Proceed with the exported task context."],
         );
-        setAgentProgress(35);
+        setAgentProgressForCard(cardId, 35);
       }
 
-      appendStructuredAgentLog(
+      appendStructuredAgentLogForCard(
+        cardId,
         "info",
         "context",
         `Exported structured context for ${ticketLabel(card)}.`,
@@ -3222,8 +3417,8 @@
         ],
         ["Pass the exported context to the runtime and wait for evidence."],
       );
-      setAgentRunOutput(buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput));
-      setAgentProgress(55);
+      setAgentRunOutputForCard(cardId, buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput));
+      setAgentProgressForCard(cardId, 55);
       let result: AiWorkerTaskResult;
       try {
         result = await executeAiWorkerTask(config, {
@@ -3237,8 +3432,9 @@
         });
       } catch (reason) {
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {
-          setAgentRunStatus("timeout");
-          appendStructuredAgentLog(
+          setAgentRunStatusForCard(cardId, "timeout");
+          appendStructuredAgentLogForCard(
+            cardId,
             "error",
             "timeout",
             "Spacesly stopped waiting for the Agent response before a structured result arrived.",
@@ -3252,7 +3448,8 @@
 
         throw reason;
       }
-      appendStructuredAgentLog(
+      appendStructuredAgentLogForCard(
+        cardId,
         result.completion_status === "completed" ? "success" : "error",
         "agent",
         result.summary,
@@ -3268,18 +3465,19 @@
           ? ["Review the result, then write back to board and Jira."]
           : ["Inspect the blocker, add notes if needed, and continue."],
       );
-      agentRunResult = result;
-      setAgentRunOutput(agentResultText(result));
-      appendTerminalLine("agent", agentResultText(result));
-      appendAgentSessionTranscript(result.completion_status === "completed" ? "agent_output" : "blocker", agentResultText(result));
-      setAgentProgress(75);
+      setAgentRunResultForCard(cardId, result);
+      setAgentRunOutputForCard(cardId, agentResultText(result));
+      appendTerminalLineForCard(cardId, "agent", agentResultText(result));
+      appendAgentSessionTranscriptForCard(cardId, result.completion_status === "completed" ? "agent_output" : "blocker", agentResultText(result));
+      setAgentProgressForCard(cardId, 75);
 
       if (result.completion_status !== "completed") {
         const reason = result.blocked_reason ?? result.summary;
         updateCardExecution(cardId, { blocked: { reason } });
-        setAgentRunStatus("blocked");
-        appendAgentSessionTranscript("blocker", reason);
-        appendStructuredAgentLog(
+        setAgentRunStatusForCard(cardId, "blocked");
+        appendAgentSessionTranscriptForCard(cardId, "blocker", reason);
+        appendStructuredAgentLogForCard(
+          cardId,
           "error",
           "blocked",
           "Agent did not complete and verify the requested work. Card will not move to Done.",
@@ -3299,13 +3497,14 @@
 
       let gitWritebackInfo: GitWorkspaceInfo | null = null;
       try {
-        gitWritebackInfo = await verifyAgentJiraDoneGate(card, result, config);
+        gitWritebackInfo = await verifyAgentJiraDoneGate(card, config);
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : String(reason);
         updateCardExecution(cardId, { blocked: { reason: message } });
-        setAgentRunStatus("blocked");
-        appendAgentSessionTranscript("blocker", message);
-        appendStructuredAgentLog(
+        setAgentRunStatusForCard(cardId, "blocked");
+        appendAgentSessionTranscriptForCard(cardId, "blocker", message);
+        appendStructuredAgentLogForCard(
+          cardId,
           "error",
           "blocked",
           message,
@@ -3317,7 +3516,8 @@
         return;
       }
 
-      appendStructuredAgentLog(
+      appendStructuredAgentLogForCard(
+        cardId,
         "success",
         "board",
         "Stored Agent summary on card and moved card to Done locally.",
@@ -3332,12 +3532,13 @@
         issueKey ? ["Write Jira completion state and add the completion comment."] : ["No Jira issue linked; board write-back is complete."],
       );
       moveCard(cardId, doneColumnId, { completed: { summary: result.summary } });
-      setAgentProgress(82);
+      setAgentProgressForCard(cardId, 82);
 
       if (issueKey) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "info",
             "jira",
             `Moving ${issueKey} to Done.`,
@@ -3348,9 +3549,10 @@
             ["Posting board completion back to Jira."],
             ["Wait for the Jira transition result before finalizing the run."],
           );
-          setAgentProgress(88);
+          setAgentProgressForCard(cardId, 88);
           await transitionJiraIssue(jiraConfig, issueKey, "Done");
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "success",
             "jira",
             `${issueKey} is Done in Jira.`,
@@ -3358,7 +3560,8 @@
             [`Jira state now matches the local board state.`],
             [`Post the completion comment with evidence.`],
           );
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "info",
             "jira",
             `Posting Spacesly completion comment to ${issueKey}.`,
@@ -3366,9 +3569,10 @@
             [`Comment includes summary and verification evidence.`],
             [`Wait for comment confirmation before final completion.`],
           );
-          setAgentProgress(94);
+          setAgentProgressForCard(cardId, 94);
           await addJiraComment(jiraConfig, issueKey, agentJiraComment(result, config, gitWritebackInfo));
-          appendStructuredAgentLog(
+          appendStructuredAgentLogForCard(
+            cardId,
             "success",
             "jira",
             `Spacesly completion comment posted to ${issueKey}.`,
@@ -3379,18 +3583,19 @@
         }
       }
 
-      setAgentRunStatus("completed");
-      setAgentProgress(100);
+      setAgentRunStatusForCard(cardId, "completed");
+      setAgentProgressForCard(cardId, 100);
       appNotice = { tone: "success", message: `${ticketLabel(card)} completed by Agent and moved to Done.` };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       updateCardExecution(cardId, { blocked: { reason: message } });
-      setAgentRunStatus("blocked");
-      agentRunResult = null;
-      setAgentRunOutput(message);
-      appendTerminalLine("error", message);
-      appendAgentSessionTranscript("error", message);
-      appendStructuredAgentLog(
+      setAgentRunStatusForCard(cardId, "blocked");
+      setAgentRunResultForCard(cardId, null);
+      setAgentRunOutputForCard(cardId, message);
+      appendTerminalLineForCard(cardId, "error", message);
+      appendAgentSessionTranscriptForCard(cardId, "error", message);
+      appendStructuredAgentLogForCard(
+        cardId,
         "error",
         "blocked",
         message,
@@ -4196,8 +4401,8 @@
           {doneVisibleLimit}
           {hasAgentConsoleSession}
           {agentConsoleOpen}
-          {agentRunStatus}
-          {agentRunProgress}
+          agentRunStatus={visibleAgentRunStatus}
+          agentRunProgress={visibleAgentRunProgress}
           onResizeLane={(event) => beginLayoutResize(event, "laneWidth", 260, 460, "x")}
           onResizeCard={(event) => beginLayoutResize(event, "cardMinHeight", 170, 360, "y")}
           onOpenAgentConsole={openAgentConsole}
@@ -4240,21 +4445,21 @@
             {@const AgentConsolePanel = agentConsoleModule.default}
             <AgentConsolePanel
               style={`--agent-log-height: ${layoutPrefs.agentLogHeight}px; --agent-output-height: ${layoutPrefs.agentOutputHeight}px; --agent-approval-height: ${layoutPrefs.agentApprovalHeight}px;`}
-              title={agentRunTitle}
-              status={agentRunStatus}
-              progress={agentRunProgress}
+              title={visibleAgentRunTitle}
+              status={visibleAgentRunStatus}
+              progress={visibleAgentRunProgress}
               activityTitle={agentActivityTitle}
               activityDetail={agentActivityDetail}
               nextStep={agentNextStep}
               phases={agentPhases}
-              logs={agentRunLogs}
-              transcript={agentRunTranscript}
-              output={agentRunOutput}
-              result={agentRunResult}
-              runStatus={agentRunStatus}
-              terminalLines={agentTerminalLines}
+              logs={visibleAgentRunLogs}
+              transcript={visibleAgentRunTranscript}
+              output={visibleAgentRunOutput}
+              result={visibleAgentRunResult}
+              runStatus={visibleAgentRunStatus}
+              terminalLines={visibleAgentTerminalLines}
               terminalInput={agentTerminalInput}
-              runCardId={agentRunCardId}
+              runCardId={agentConsoleCardId}
               onClose={() => (agentConsoleOpen = false)}
               onResizeLog={(event) => beginLayoutResize(event, "agentLogHeight", 110, 320, "y")}
               onResizeOutput={(event) => beginLayoutResize(event, "agentOutputHeight", 140, 420, "y")}
@@ -4268,9 +4473,9 @@
               <header>
                 <div>
                   <p>Agent Console</p>
-                  <h3>{agentRunTitle}</h3>
+                  <h3>{visibleAgentRunTitle}</h3>
                 </div>
-                <div class={`run-state ${agentRunStatus}`}>{agentRunStatus}</div>
+                <div class={`run-state ${visibleAgentRunStatus}`}>{visibleAgentRunStatus}</div>
                 <button type="button" aria-label="Close Agent console" onclick={() => (agentConsoleOpen = false)}>×</button>
               </header>
               <div class="console-progress" aria-label="Agent run progress">
@@ -4279,9 +4484,9 @@
                     <span>Now</span>
                     <strong>Loading console</strong>
                   </div>
-                  <strong>{agentRunProgress}%</strong>
+                  <strong>{visibleAgentRunProgress}%</strong>
                 </div>
-                <progress max="100" value={agentRunProgress}></progress>
+                <progress max="100" value={visibleAgentRunProgress}></progress>
                 <p>Preparing the Agent console only when opened.</p>
               </div>
             </aside>
@@ -4375,7 +4580,7 @@
                 activeValue={workspaceSidebarTab}
                 items={[
                   { value: "explorer", label: "Explorer" },
-                  { value: "source-control", label: "Source Control", badge: workspaceChangedFiles.length > 0 ? workspaceChangedFiles.length : undefined },
+                  { value: "source-control", label: "Source Control", badge: sourceControlChangedCount > 0 ? sourceControlChangedCount : undefined },
                 ]}
                 onSelect={(value) => (workspaceSidebarTab = value as typeof workspaceSidebarTab)}
               />
@@ -4425,7 +4630,12 @@
                     {workspaceGitError}
                     {switchingWorkspaceBranch}
                     hasDirtyEditors={hasDirtyEditorFiles}
-                    changedFiles={workspaceChangedFiles}
+                    stagedFiles={workspaceGitStatus.staged}
+                    unstagedFiles={workspaceGitStatus.unstaged}
+                    onStageFile={stageWorkspaceGitPath}
+                    onStageAll={stageAllWorkspaceGitPaths}
+                    onUnstageFile={unstageWorkspaceGitPath}
+                    onUnstageAll={unstageAllWorkspaceGitPaths}
                     onSwitchBranch={(branch) => void switchWorkspaceBranch(branch)}
                     onPull={pullWorkspaceGitChanges}
                     onCommit={commitWorkspaceGitChanges}

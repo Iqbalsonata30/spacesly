@@ -21,6 +21,13 @@ pub struct GitWorkspaceInfo {
 pub struct GitChangedFile {
     pub path: String,
     pub status: String,
+    pub original_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GitStatus {
+    pub staged: Vec<GitChangedFile>,
+    pub unstaged: Vec<GitChangedFile>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -129,6 +136,14 @@ pub fn checkout_workspace_git_branch(
 }
 
 pub fn workspace_changed_files(root: &WorkspaceRoot) -> Result<Vec<GitChangedFile>, String> {
+    let status = workspace_git_status(root)?;
+    let mut files = status.staged;
+    files.extend(status.unstaged);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+pub fn workspace_git_status(root: &WorkspaceRoot) -> Result<GitStatus, String> {
     let repo_root = workspace_repo_root(root)?;
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=normal"])
@@ -139,36 +154,76 @@ pub fn workspace_changed_files(root: &WorkspaceRoot) -> Result<Vec<GitChangedFil
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let mut files = Vec::new();
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-      let line = line.trim_end();
-      if line.len() < 4 {
-          continue;
-      }
+        let line = line.trim_end();
+        if line.len() < 4 {
+            continue;
+        }
 
-      let raw_status = &line[0..2];
-      let status = if raw_status.starts_with("??") {
-          "U".to_string()
-      } else if raw_status.contains('D') {
-          "D".to_string()
-      } else if raw_status.contains('A') {
-          "A".to_string()
-      } else {
-          "M".to_string()
-      };
+        let index_status = line.as_bytes()[0] as char;
+        let worktree_status = line.as_bytes()[1] as char;
+        let (path, original_path) = parse_status_path(line[3..].trim());
+        if path.is_empty() {
+            continue;
+        }
 
-      let mut path = line[3..].trim().to_string();
-      if let Some((_, renamed_path)) = path.split_once(" -> ") {
-          path = renamed_path.trim().to_string();
-      }
+        if index_status == '?' && worktree_status == '?' {
+            unstaged.push(GitChangedFile {
+                path,
+                status: "U".to_string(),
+                original_path,
+            });
+            continue;
+        }
 
-      if !path.is_empty() {
-          files.push(GitChangedFile { path, status });
-      }
+        if index_status != ' ' {
+            staged.push(GitChangedFile {
+                path: path.clone(),
+                status: normalize_git_status(index_status),
+                original_path: original_path.clone(),
+            });
+        }
+
+        if worktree_status != ' ' {
+            unstaged.push(GitChangedFile {
+                path,
+                status: normalize_git_status(worktree_status),
+                original_path,
+            });
+        }
     }
 
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+    staged.sort_by(|a, b| a.path.cmp(&b.path));
+    unstaged.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(GitStatus { staged, unstaged })
+}
+
+pub fn stage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let path = normalized_file_path(path)?;
+    run_git_dynamic(&repo_root, &["add", "--", &path])?;
+    workspace_git_status(root)
+}
+
+pub fn stage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root)?;
+    run_git(&repo_root, ["add", "."])?;
+    workspace_git_status(root)
+}
+
+pub fn unstage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root)?;
+    let path = normalized_file_path(path)?;
+    run_git_dynamic(&repo_root, &["restore", "--staged", "--", &path])?;
+    workspace_git_status(root)
+}
+
+pub fn unstage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root)?;
+    run_git(&repo_root, ["restore", "--staged", "--", "."])?;
+    workspace_git_status(root)
 }
 
 pub fn pull_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
@@ -187,7 +242,6 @@ pub fn commit_workspace_git_changes(
         return Err("Commit message is required.".to_string());
     }
 
-    run_git(&repo_root, ["add", "-A"])?;
     run_git(&repo_root, ["commit", "-m", message])?;
     let hash = git_output(&repo_root, ["rev-parse", "HEAD"])
         .map(|value| value.trim().to_string())
@@ -275,9 +329,56 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
     }
 }
 
+fn run_git_dynamic(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("Failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn normalized_file_path(path: String) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        Err("File path is required.".to_string())
+    } else {
+        Ok(path.to_string())
+    }
+}
+
+fn parse_status_path(value: &str) -> (String, Option<String>) {
+    if let Some((original_path, path)) = value.split_once(" -> ") {
+        (
+            path.trim().to_string(),
+            Some(original_path.trim().to_string()),
+        )
+    } else {
+        (value.trim().to_string(), None)
+    }
+}
+
+fn normalize_git_status(status: char) -> String {
+    match status {
+        'A' => "A",
+        'D' => "D",
+        'R' => "R",
+        'C' => "A",
+        'U' => "U",
+        '?' => "U",
+        _ => "M",
+    }
+    .to_string()
+}
+
 fn workspace_repo_root(root: &WorkspaceRoot) -> Result<PathBuf, String> {
     let workspace_root = root.path()?;
-    git_repo_root(&workspace_root)?.ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
+    git_repo_root(&workspace_root)?
+        .ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
 }
 
 fn normalize_branch_name(value: &str) -> Option<String> {

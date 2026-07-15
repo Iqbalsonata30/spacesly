@@ -121,10 +121,10 @@
   </header>
 
   <div class="file-toolbar">
-    <button type="button" disabled={fileLoading} onclick={onOpenFolder} aria-label="Open folder" title="Open folder">
+    <button type="button" disabled={fileLoading} onclick={onOpenFolder} aria-label="Open folder (Ctrl+Shift+O)" title="Open folder (Ctrl+Shift+O)">
       <FolderOpen size={15} />
     </button>
-    <button type="button" disabled={fileLoading} onclick={onOpenFile} aria-label="Open file" title="Open file (Cmd+O)">
+    <button type="button" disabled={fileLoading} onclick={onOpenFile} aria-label="Open file" title="Open file (Ctrl+O)">
       <FileSearch size={15} />
     </button>
     <button type="button" disabled={fileLoading} onclick={handleCreateFile} aria-label="New file" title="New file">

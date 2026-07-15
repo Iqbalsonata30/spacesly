@@ -50,11 +50,11 @@ export const opencodeModelOptions: OpencodeModelOption[] = [
     description: "Free OpenRouter coding option when OpenRouter is configured in OpenCode.",
   },
   {
-    id: "openrouter/deepseek/deepseek-chat-v3-0324:free",
-    label: "DeepSeek V3 Free",
-    provider: "OpenRouter",
+    id: "opencode/deepseek-v4-flash-free",
+    label: "DeepSeek V4 Flash Free",
+    provider: "OpenCode",
     badge: "Free",
-    description: "Free OpenRouter general coding model for lighter tasks.",
+    description: "Free Opencode general coding model for lighter tasks.",
   },
   {
     id: "anthropic/claude-sonnet-4-20250514",

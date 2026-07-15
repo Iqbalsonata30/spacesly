@@ -22,9 +22,11 @@ type StructuredIpcError = {
   retryable?: boolean;
 };
 
+const TEN_MINUTES_MS = 10 * 60_000;
+
 export const IPC_POLICIES = {
   aiChat: { timeoutMs: 120_000, retries: 0 },
-  aiExecution: { timeoutMs: 30 * 60_000, retries: 0 },
+  aiExecution: { timeoutMs: TEN_MINUTES_MS, retries: 0 },
   aiTest: { timeoutMs: 30_000, retries: 1, retryDelayMs: 750 },
   fileRead: { timeoutMs: 15_000, retries: 0 },
   fileWrite: { timeoutMs: 20_000, retries: 0 },

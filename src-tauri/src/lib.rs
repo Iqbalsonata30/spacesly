@@ -15,7 +15,7 @@ use infrastructure::ai_worker::{
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::git_info_for_path;
-use infrastructure::git::{CommitResult, GitChangedFile, GitWorkspaceInfo};
+use infrastructure::git::{CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo};
 use infrastructure::mcp::{
     JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
@@ -279,6 +279,58 @@ async fn get_workspace_changed_files(
 }
 
 #[tauri::command]
+async fn get_workspace_git_status(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitStatus, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).status())
+        .await
+        .map_err(|error| format!("Workspace git status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn stage_workspace_git_file(
+    path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitStatus, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).stage_file(path))
+        .await
+        .map_err(|error| format!("Stage git file task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn stage_all_workspace_git_files(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitStatus, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).stage_all())
+        .await
+        .map_err(|error| format!("Stage all git files task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn unstage_workspace_git_file(
+    path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitStatus, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).unstage_file(path))
+        .await
+        .map_err(|error| format!("Unstage git file task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn unstage_all_workspace_git_files(
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<GitStatus, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || GitService::new(root).unstage_all())
+        .await
+        .map_err(|error| format!("Unstage all git files task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn checkout_workspace_git_branch(
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
@@ -437,6 +489,11 @@ pub fn run() {
             get_workspace_git_info,
             get_path_git_info,
             get_workspace_changed_files,
+            get_workspace_git_status,
+            stage_workspace_git_file,
+            stage_all_workspace_git_files,
+            unstage_workspace_git_file,
+            unstage_all_workspace_git_files,
             checkout_workspace_git_branch,
             pull_workspace_git_changes,
             commit_workspace_git_changes,

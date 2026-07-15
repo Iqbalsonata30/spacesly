@@ -1,5 +1,16 @@
 <script lang="ts">
-  import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, FileText, GitMerge, Loader2, RefreshCw } from "lucide-svelte";
+  import {
+    ArrowDownToLine,
+    ArrowUpFromLine,
+    CheckCircle2,
+    ChevronDown,
+    FileText,
+    GitMerge,
+    Loader2,
+    Minus,
+    Plus,
+    RefreshCw,
+  } from "lucide-svelte";
   import GitBranchPicker from "$lib/components/GitBranchPicker.svelte";
   import WorkspaceRow from "$lib/components/WorkspaceRow.svelte";
   import type { GitChangedFile, GitWorkspaceInfo } from "$lib/ipc/git";
@@ -10,7 +21,12 @@
     workspaceGitError: string | null;
     switchingWorkspaceBranch: boolean;
     hasDirtyEditors: boolean;
-    changedFiles: GitChangedFile[];
+    stagedFiles: GitChangedFile[];
+    unstagedFiles: GitChangedFile[];
+    onStageFile: (path: string) => Promise<void>;
+    onStageAll: () => Promise<void>;
+    onUnstageFile: (path: string) => Promise<void>;
+    onUnstageAll: () => Promise<void>;
     onSwitchBranch: (branch: string) => void;
     onPull: () => Promise<void>;
     onCommit: (message: string) => Promise<void>;
@@ -21,7 +37,8 @@
     onOpenFile: (path: string) => void;
   };
 
-  type GitActionName = "pull" | "commit" | "push" | "merge" | "rebase" | "refresh";
+  type GitActionName = "pull" | "commit" | "push" | "merge" | "rebase" | "refresh" | "stage" | "stage-all" | "unstage" | "unstage-all";
+  type ContextMenuState = { file: GitChangedFile; kind: "staged" | "unstaged"; x: number; y: number } | null;
 
   let {
     workspaceGitInfo,
@@ -29,7 +46,12 @@
     workspaceGitError,
     switchingWorkspaceBranch,
     hasDirtyEditors,
-    changedFiles,
+    stagedFiles,
+    unstagedFiles,
+    onStageFile,
+    onStageAll,
+    onUnstageFile,
+    onUnstageAll,
     onSwitchBranch,
     onPull,
     onCommit,
@@ -41,9 +63,11 @@
   }: Props = $props();
 
   let commitMessage = $state("");
+  let commitTouched = $state(false);
   let mergeBranch = $state("");
   let actionsMenuOpen = $state(false);
   let actionBusy = $state<GitActionName | null>(null);
+  let contextMenu = $state<ContextMenuState>(null);
 
   let branchChoices = $derived(
     (workspaceGitInfo?.branches ?? []).filter((branch) => branch !== workspaceGitInfo?.current_branch),
@@ -56,19 +80,32 @@
   });
 
   let hasRepo = $derived(Boolean(workspaceGitInfo?.is_git_repo));
+  let stagedCount = $derived(stagedFiles.length);
+  let unstagedCount = $derived(unstagedFiles.length);
+  let changedCount = $derived(stagedCount + unstagedCount);
+  let repoClean = $derived(changedCount === 0 && !hasDirtyEditors);
   let worktreeDirty = $derived(Boolean(workspaceGitInfo?.dirty_worktree || hasDirtyEditors));
-  let changedCount = $derived(changedFiles.length);
-  let currentBranchLabel = $derived(workspaceGitInfo?.current_branch ?? "detached");
+  let currentBranchLabel = $derived(workspaceGitInfo?.current_branch ?? "detached HEAD");
   let commitCharCount = $derived(commitMessage.length);
+  let commitMessageEmpty = $derived(commitMessage.trim().length === 0);
+  let commitValidation = $derived(
+    stagedCount === 0
+      ? "Stage at least one file before committing."
+      : commitMessageEmpty
+        ? "Enter a commit message."
+        : null,
+  );
 
   let headerMeta = $derived.by(() => {
     const chips: string[] = [];
     if (hasRepo) chips.push(currentBranchLabel);
+    if (workspaceGitInfo?.head_commit) chips.push(`HEAD ${workspaceGitInfo.head_commit.slice(0, 7)}`);
     if (changedCount > 0) chips.push(`${changedCount} change${changedCount === 1 ? "" : "s"}`);
     if (workspaceGitInfo?.ahead_count) chips.push(`${workspaceGitInfo.ahead_count} ahead`);
     if (workspaceGitInfo?.behind_count) chips.push(`${workspaceGitInfo.behind_count} behind`);
-    if (worktreeDirty) chips.push("Unsaved edits");
+    if (hasDirtyEditors) chips.push("Unsaved editors");
     if (!hasRepo) chips.push("Not a git repository");
+    if (repoClean) chips.push("Working tree clean");
     return chips;
   });
 
@@ -79,22 +116,20 @@
     merge: "Merging...",
     rebase: "Rebasing...",
     refresh: "Refreshing...",
+    stage: "Staging...",
+    "stage-all": "Staging...",
+    unstage: "Unstaging...",
+    "unstage-all": "Unstaging...",
   };
 
-  function statusTone(status: string): "neutral" | "modified" | "added" | "deleted" {
-    if (status === "M") return "modified";
-    if (status === "A" || status === "U") return "added";
-    if (status === "D") return "deleted";
-    return "neutral";
-  }
-
   function actionLabel(base: GitActionName) {
-    return actionBusy === base ? busyLabels[base] : base[0].toUpperCase() + base.slice(1);
+    return actionBusy === base ? busyLabels[base] : base[0].toUpperCase() + base.slice(1).replace("-", " ");
   }
 
   async function runAction(name: GitActionName, handler: () => Promise<void>) {
     if (actionBusy) return;
     actionBusy = name;
+    contextMenu = null;
     try {
       await handler();
     } finally {
@@ -102,39 +137,71 @@
     }
   }
 
-  const commitDisabled = $derived(!hasRepo || worktreeDirty || !changedCount || !commitMessage.trim() || actionBusy !== null);
-  const syncDisabled = $derived(!hasRepo || worktreeDirty || workspaceGitLoading || switchingWorkspaceBranch || actionBusy !== null);
-  const mergeDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
-  const rebaseDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
-  const pushDisabled = $derived(!hasRepo || worktreeDirty || switchingWorkspaceBranch || actionBusy !== null);
-  const refreshDisabled = $derived(!hasRepo || workspaceGitLoading || actionBusy !== null);
+  function statusTone(status: string): "neutral" | "modified" | "added" | "deleted" {
+    if (status === "M" || status === "R") return "modified";
+    if (status === "A" || status === "U") return "added";
+    if (status === "D") return "deleted";
+    return "neutral";
+  }
 
-  function closeMenu() {
-    actionsMenuOpen = false;
+  function statusLabel(status: string) {
+    return {
+      M: "Modified",
+      A: "Added",
+      D: "Deleted",
+      R: "Renamed",
+      U: "Untracked",
+    }[status] ?? status;
+  }
+
+  function fileLabel(file: GitChangedFile) {
+    return file.original_path ? `${file.original_path} -> ${file.path}` : file.path;
+  }
+
+  function openContextMenu(kind: "staged" | "unstaged", file: GitChangedFile, event: MouseEvent) {
+    event.preventDefault();
+    contextMenu = { kind, file, x: event.clientX, y: event.clientY };
+  }
+
+  async function commit() {
+    commitTouched = true;
+    if (commitValidation) return;
+    await runAction("commit", async () => {
+      await onCommit(commitMessage.trim());
+      commitMessage = "";
+      commitTouched = false;
+    });
   }
 
   async function runMergeOrRebase(kind: "merge" | "rebase") {
     if (!mergeBranch) return;
-    closeMenu();
+    actionsMenuOpen = false;
     if (kind === "merge") {
       await runAction("merge", () => onMerge(mergeBranch));
     } else {
       await runAction("rebase", () => onRebase(mergeBranch));
     }
   }
+
+  const commitDisabled = $derived(!hasRepo || stagedCount === 0 || commitMessageEmpty || actionBusy !== null);
+  const syncDisabled = $derived(!hasRepo || worktreeDirty || workspaceGitLoading || switchingWorkspaceBranch || actionBusy !== null);
+  const mergeDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
+  const rebaseDisabled = $derived(!hasRepo || worktreeDirty || !mergeBranch || switchingWorkspaceBranch || actionBusy !== null);
+  const pushDisabled = $derived(!hasRepo || worktreeDirty || switchingWorkspaceBranch || actionBusy !== null);
+  const refreshDisabled = $derived(!hasRepo || workspaceGitLoading || actionBusy !== null);
+  const stageAllDisabled = $derived(!hasRepo || unstagedCount === 0 || actionBusy !== null);
+  const unstageAllDisabled = $derived(!hasRepo || stagedCount === 0 || actionBusy !== null);
 </script>
 
 <aside class="git-actions-pane" aria-label="Source control">
   <header class="source-header">
     <div class="source-header-copy">
       <p>Source control</p>
-      <h2>Manage branches and changes</h2>
+      <h2>{repoClean ? "Working tree clean" : "Review and commit changes"}</h2>
       <div class="source-header-meta">
-        {#if headerMeta.length > 0}
-          {#each headerMeta as meta}
-            <span>{meta}</span>
-          {/each}
-        {/if}
+        {#each headerMeta as meta}
+          <span>{meta}</span>
+        {/each}
       </div>
     </div>
 
@@ -142,20 +209,16 @@
       <GitBranchPicker gitInfo={workspaceGitInfo} loading={workspaceGitLoading} switching={switchingWorkspaceBranch} dirty={worktreeDirty} onSwitch={onSwitchBranch} />
 
       <div class="branch-menu-wrap">
-        <button type="button" class="branch-menu-button" disabled={!hasRepo || switchingWorkspaceBranch || actionBusy !== null} aria-haspopup="dialog" aria-expanded={actionsMenuOpen} onclick={() => (actionsMenuOpen = !actionsMenuOpen)}>
-          <span class="branch-menu-button-icon">
-            <GitMerge size={14} />
-          </span>
+        <button type="button" class="branch-menu-button" disabled={!hasRepo || switchingWorkspaceBranch || actionBusy !== null} aria-haspopup="dialog" aria-expanded={actionsMenuOpen} onclick={(event) => { event.stopPropagation(); actionsMenuOpen = !actionsMenuOpen; }}>
+          <span class="branch-menu-button-icon"><GitMerge size={14} /></span>
           <span class="branch-menu-button-copy">
             <small>Target branch</small>
             <strong>{mergeBranch || branchChoices[0] || "Choose branch"}</strong>
           </span>
-          <span class="branch-menu-button-indicator">
-            <ChevronDown size={14} class="open" />
-          </span>
+          <span class="branch-menu-button-indicator"><ChevronDown size={14} /></span>
         </button>
         {#if actionsMenuOpen}
-          <div class="branch-menu" role="dialog" aria-label="Merge or rebase target branch" aria-modal="false">
+          <div class="branch-menu" role="dialog" aria-label="Merge or rebase target branch" aria-modal="false" tabindex="-1">
             <div class="branch-menu-copy">
               <p>Merge / rebase</p>
               <strong>Choose a target branch</strong>
@@ -192,11 +255,13 @@
       <div class="card-label-row">
         <div>
           <span>Quick actions</span>
-          <h3>Sync the workspace</h3>
+          <h3>Sync and staging</h3>
         </div>
-        <small>{worktreeDirty ? "Review changes before syncing" : "Ready"}</small>
+        <small>{actionBusy ? busyLabels[actionBusy] : repoClean ? "Clean" : "Ready"}</small>
       </div>
       <div class="source-toolbar">
+        <button type="button" disabled={stageAllDisabled} onclick={() => void runAction("stage-all", onStageAll)}><Plus size={14} /> Stage All</button>
+        <button type="button" disabled={unstageAllDisabled} onclick={() => void runAction("unstage-all", onUnstageAll)}><Minus size={14} /> Unstage All</button>
         <button type="button" disabled={syncDisabled} onclick={() => void runAction("pull", onPull)}><ArrowDownToLine size={14} /> {actionLabel("pull")}</button>
         <button type="button" disabled={pushDisabled} onclick={() => void runAction("push", onPush)}><ArrowUpFromLine size={14} /> {actionLabel("push")}</button>
         <button type="button" disabled={refreshDisabled} onclick={() => void runAction("refresh", onRefresh)}><RefreshCw size={14} /> {actionLabel("refresh")}</button>
@@ -207,71 +272,109 @@
       <div class="card-label-row">
         <div>
           <span>Commit</span>
-          <h3>Summarize the change</h3>
+          <h3>{stagedCount > 0 ? `${stagedCount} staged file${stagedCount === 1 ? "" : "s"}` : "Nothing staged"}</h3>
         </div>
         <small>{commitCharCount} chars</small>
       </div>
 
       <label class="commit-box">
-        <textarea bind:value={commitMessage} placeholder={changedCount > 0 ? "Describe what changed and why" : "No changes yet"} rows="6" disabled={!hasRepo || actionBusy !== null}></textarea>
+        <textarea
+          bind:value={commitMessage}
+          placeholder={stagedCount > 0 ? "Message (Ctrl+Enter to commit)" : "Stage changes to enable commit"}
+          rows="5"
+          disabled={!hasRepo || actionBusy !== null}
+          oninput={() => (commitTouched = true)}
+          onkeydown={(event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+              event.preventDefault();
+              void commit();
+            }
+          }}
+        ></textarea>
       </label>
 
-      <div class="commit-helper">
-        {#if changedCount > 0}
-          <span>Use a short, specific message. The first line becomes the summary.</span>
-        {:else}
-          <span>Make a change to unlock commit creation.</span>
-        {/if}
+      {#if commitTouched && commitValidation}
+        <div class="commit-validation" role="status">{commitValidation}</div>
+      {:else}
+        <div class="commit-helper"><span>Commit uses staged changes only. Unstaged files stay in your working tree.</span></div>
+      {/if}
+
+      <button type="button" class="commit-button" disabled={commitDisabled} onclick={() => void commit()}>
+        {#if actionBusy === "commit"}<Loader2 size={15} />{/if}
+        {actionBusy === "commit" ? "Committing..." : stagedCount > 0 ? `Commit ${stagedCount} staged` : "No staged changes"}
+      </button>
+    </section>
+
+    <section class="source-card changes-card" aria-label="Staged changes">
+      <div class="card-label-row">
+        <div>
+          <span>Staged Changes</span>
+          <h3>{stagedCount > 0 ? `${stagedCount} file${stagedCount === 1 ? "" : "s"}` : "No staged files"}</h3>
+        </div>
+        {#if stagedCount > 0}<strong>{stagedCount}</strong>{/if}
       </div>
 
-      <button type="button" class="commit-button" disabled={commitDisabled} onclick={() => void runAction("commit", () => onCommit(commitMessage.trim()))}>
-        {#if actionBusy === "commit"}
-          <Loader2 size={15} />
-        {/if}
-        {actionBusy === "commit" ? "Committing..." : changedCount > 0 ? `Commit ${changedCount} ${changedCount === 1 ? "change" : "changes"}` : "No changes to commit"}
-      </button>
+      {#if stagedFiles.length > 0}
+        <div class="changes-list">
+          {#each stagedFiles as file (fileLabel(file))}
+            {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
+            {#snippet rowTrailing()}
+              <button class="row-action" type="button" title="Unstage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("unstage", () => onUnstageFile(file.path)); }}><Minus size={13} /></button>
+            {/snippet}
+            <div role="presentation" oncontextmenu={(event) => openContextMenu("staged", file, event)}>
+              <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} trailing={rowTrailing} onClick={() => onOpenFile(file.path)} />
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="empty-state"><div class="empty-icon"><FileText size={18} /></div><strong>No staged changes</strong><span>Use + on a file or Stage All to prepare a commit.</span></div>
+      {/if}
     </section>
 
     <section class="source-card changes-card" aria-label="Changes">
       <div class="card-label-row">
         <div>
           <span>Changes</span>
-          <h3>{changedCount > 0 ? `${changedCount} file${changedCount === 1 ? "" : "s"}` : "Working tree clean"}</h3>
+          <h3>{unstagedCount > 0 ? `${unstagedCount} file${unstagedCount === 1 ? "" : "s"}` : repoClean ? "Working tree clean" : "No unstaged changes"}</h3>
         </div>
-        {#if changedCount > 0}
-          <strong>{changedCount}</strong>
-        {/if}
+        {#if unstagedCount > 0}<strong>{unstagedCount}</strong>{/if}
       </div>
 
-      {#if changedFiles.length > 0}
+      {#if unstagedFiles.length > 0}
         <div class="changes-list">
-          {#each changedFiles as file (file.path)}
-            {#snippet rowLeading()}
-              <FileText size={14} class="row-icon" />
+          {#each unstagedFiles as file (fileLabel(file))}
+            {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
+            {#snippet rowTrailing()}
+              <button class="row-action" type="button" title="Stage file" disabled={actionBusy !== null} onclick={(event) => { event.stopPropagation(); void runAction("stage", () => onStageFile(file.path)); }}><Plus size={13} /></button>
             {/snippet}
-            <WorkspaceRow
-              label={file.path}
-              title={file.path}
-              status={file.status}
-              statusTone={statusTone(file.status)}
-              leading={rowLeading}
-              onClick={() => onOpenFile(file.path)}
-            />
+            <div role="presentation" oncontextmenu={(event) => openContextMenu("unstaged", file, event)}>
+              <WorkspaceRow label={file.path} title={fileLabel(file)} status={statusLabel(file.status)} statusTone={statusTone(file.status)} leading={rowLeading} trailing={rowTrailing} onClick={() => onOpenFile(file.path)} />
+            </div>
           {/each}
         </div>
+      {:else if repoClean}
+        <div class="empty-state clean"><div class="empty-icon"><CheckCircle2 size={18} /></div><strong>Working tree clean</strong><span>No modified, added, deleted, renamed, or untracked files.</span></div>
       {:else}
-        <div class="empty-state">
-          <div class="empty-icon"><FileText size={18} /></div>
-          <strong>Working tree clean</strong>
-          <span>Modified, added, and deleted files will appear here.</span>
-        </div>
+        <div class="empty-state"><div class="empty-icon"><FileText size={18} /></div><strong>No unstaged changes</strong><span>All current changes are staged for commit.</span></div>
       {/if}
     </section>
   </div>
+
+  {#if contextMenu}
+    <div class="context-menu" role="menu" tabindex="-1" style={`left: ${contextMenu.x}px; top: ${contextMenu.y}px;`}>
+      <button type="button" role="menuitem" onclick={() => { onOpenFile(contextMenu!.file.path); contextMenu = null; }}>Open File</button>
+      {#if contextMenu.kind === "unstaged"}
+        <button type="button" role="menuitem" disabled={actionBusy !== null} onclick={() => void runAction("stage", () => onStageFile(contextMenu!.file.path))}>Stage File</button>
+      {:else}
+        <button type="button" role="menuitem" disabled={actionBusy !== null} onclick={() => void runAction("unstage", () => onUnstageFile(contextMenu!.file.path))}>Unstage File</button>
+      {/if}
+    </div>
+  {/if}
 </aside>
 
 <style>
   .git-actions-pane {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -287,42 +390,33 @@
     gap: 12px;
     align-items: start;
     border-bottom: 1px solid #25232d;
-    padding: 14px 14px 15px;
+    padding: 14px;
     background: linear-gradient(180deg, #1c1b21, #17161c);
   }
 
-  .source-header-copy {
-    min-width: 0;
-  }
-
+  .source-header-copy { min-width: 0; }
   .source-header-copy p,
-  .source-header-copy h2 {
-    margin: 0;
-  }
-
-  .source-header-copy p {
+  .source-header-copy h2 { margin: 0; }
+  .source-header-copy p,
+  .card-label-row span {
     color: #8f88a8;
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.14em;
     text-transform: uppercase;
   }
-
   .source-header-copy h2 {
     margin-top: 6px;
     color: #f1edf5;
     font-size: 13px;
     font-weight: 900;
-    letter-spacing: -0.01em;
   }
-
   .source-header-meta {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 10px;
   }
-
   .source-header-meta span,
   .card-label-row small,
   .commit-helper span,
@@ -331,17 +425,13 @@
     font-size: 11px;
     font-weight: 800;
   }
-
   .source-header-meta span {
-    display: inline-flex;
-    align-items: center;
     min-height: 24px;
     padding: 0 9px;
     border: 1px solid #2f2d37;
     border-radius: 999px;
     background: rgba(31, 30, 39, 0.8);
   }
-
   .source-header-controls {
     display: grid;
     justify-self: end;
@@ -350,365 +440,183 @@
     gap: 12px;
     min-width: 0;
   }
-
-  .branch-menu-wrap {
-    position: relative;
-  }
-
+  .branch-menu-wrap { position: relative; }
   .branch-menu-button,
+  .source-toolbar button,
+  .commit-button,
+  .branch-menu-actions button,
+  .row-action,
+  .context-menu button {
+    border: 1px solid #33313d;
+    background: #1c1b23;
+    color: #e9e4ef;
+  }
+  .branch-menu-button {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 9px;
+    align-items: center;
+    width: 100%;
+    padding: 9px;
+    border-radius: 12px;
+    text-align: left;
+  }
+  .branch-menu-button-copy { display: grid; min-width: 0; gap: 3px; }
+  .branch-menu-button-copy small { color: #8f88a8; font-size: 10px; font-weight: 900; text-transform: uppercase; }
+  .branch-menu-button-copy strong { overflow: hidden; color: #f1edf5; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+  .branch-menu-button-icon,
+  .branch-menu-button-indicator { display: inline-flex; color: #9d8cff; }
+  .branch-menu {
+    position: absolute;
+    z-index: 20;
+    right: 0;
+    top: calc(100% + 8px);
+    width: min(280px, 76vw);
+    border: 1px solid #34313e;
+    border-radius: 14px;
+    padding: 12px;
+    background: #181720;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+  }
+  .branch-menu-copy p,
+  .branch-menu-copy strong,
+  .branch-menu-copy span { display: block; margin: 0; }
+  .branch-menu-copy p { color: #8f88a8; font-size: 10px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; }
+  .branch-menu-copy strong { margin-top: 5px; color: #f1edf5; font-size: 13px; }
+  .branch-menu-copy span { margin-top: 4px; color: #8f88a8; font-size: 11px; }
+  .branch-menu label { display: grid; gap: 6px; margin-top: 12px; color: #8f88a8; font-size: 11px; font-weight: 900; text-transform: uppercase; }
+  .branch-menu select,
+  .commit-box textarea {
+    border: 1px solid #2f2d37;
+    border-radius: 12px;
+    background: #111018;
+    color: #f1edf5;
+  }
+  .branch-menu select { padding: 9px 10px; }
+  .branch-menu-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+  .branch-menu-actions button,
   .source-toolbar button,
   .commit-button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    min-height: 36px;
-    border: 1px solid #34313d;
+    gap: 7px;
+    min-height: 34px;
     border-radius: 10px;
-    background: #1f1e27;
-    color: #b8d6e4;
-    font: inherit;
-    font-size: 12px;
-    font-weight: 900;
-    cursor: pointer;
-    transition:
-      border-color 180ms ease,
-      background-color 180ms ease,
-      color 180ms ease,
-      box-shadow 180ms ease,
-      transform 180ms ease;
-  }
-
-  .branch-menu-button {
-    display: flex;
-    justify-content: space-between;
-    width: 100%;
-    min-width: 0;
-    min-height: 40px;
-    padding: 0 10px 0 8px;
-    border-radius: 12px;
-    background: linear-gradient(180deg, #22212a, #1b1a21);
-  }
-
-  .branch-menu-button-copy {
-    display: grid;
-    min-width: 0;
-    gap: 0;
-    text-align: left;
-  }
-
-  .branch-menu-button-copy small {
-    color: #8f88a8;
-    font-size: 8px;
-    font-weight: 900;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-  }
-
-  .branch-menu-button-copy strong {
-    overflow: hidden;
-    font-family: var(--font-mono);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-    font-weight: 900;
-    color: #f1edf5;
-  }
-
-  .branch-menu-button-icon,
-  .branch-menu-button-indicator {
-    display: inline-grid;
-    place-items: center;
-    flex: 0 0 auto;
-    width: 24px;
-    height: 24px;
-    border-radius: 8px;
-    background: rgba(31, 30, 39, 0.9);
-    color: #b8d6e4;
-  }
-
-  .branch-menu-button-indicator {
-    width: 22px;
-    height: 22px;
-    border-radius: 7px;
-    color: #8f88a8;
-  }
-
-  .branch-menu-button:hover:not(:disabled),
-  .branch-menu-button:focus-visible:not(:disabled),
-  .source-toolbar button:hover:not(:disabled),
-  .source-toolbar button:focus-visible:not(:disabled),
-  .commit-button:hover:not(:disabled),
-  .commit-button:focus-visible:not(:disabled) {
-    border-color: #52606a;
-    background: #28313a;
-    color: #f1edf5;
-    box-shadow: 0 0 0 3px rgba(184, 214, 228, 0.08);
-  }
-
-  .branch-menu-button:active:not(:disabled),
-  .source-toolbar button:active:not(:disabled),
-  .commit-button:active:not(:disabled) {
-    transform: translateY(1px);
-  }
-
-  .branch-menu-button:disabled,
-  .source-toolbar button:disabled,
-  .commit-button:disabled,
-  .commit-box textarea:disabled,
-  .branch-menu select:disabled {
-    cursor: not-allowed;
-    opacity: 0.68;
-  }
-
-  .branch-menu {
-    position: absolute;
-    top: calc(100% + 8px);
-    right: 0;
-    z-index: 20;
-    display: grid;
-    gap: 12px;
-    width: min(320px, calc(100vw - 32px));
-    border: 1px solid #34313d;
-    border-radius: 13px;
-    padding: 12px;
-    background: linear-gradient(180deg, #1d1c23, #181720);
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
-  }
-
-  .branch-menu-copy {
-    display: grid;
-    gap: 4px;
-  }
-
-  .branch-menu-copy p,
-  .branch-menu-copy strong {
-    margin: 0;
-  }
-
-  .branch-menu-copy p {
-    color: #8f88a8;
-    font-size: 9px;
-    font-weight: 900;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-  }
-
-  .branch-menu-copy strong {
-    color: #f1edf5;
-    font-size: 13px;
-    font-weight: 900;
-  }
-
-  .branch-menu-copy span {
-    color: #8f88a8;
-    font-size: 11px;
-    font-weight: 800;
-  }
-
-  .branch-menu label {
-    display: grid;
-    gap: 6px;
-    color: #8f88a8;
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-
-  .branch-menu select {
-    min-height: 32px;
-    border: 1px solid #34313d;
-    border-radius: 8px;
-    background: #1f1e27;
-    color: #f1edf5;
-    font: inherit;
     padding: 0 10px;
-  }
-
-  .branch-menu-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .branch-menu-actions button {
-    min-height: 36px;
-    border: 1px solid #34313d;
-    border-radius: 9px;
-    background: #20262d;
-    color: #b8d6e4;
-    font: inherit;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 900;
   }
-
-  .branch-menu-actions button:first-child {
-    background: #223140;
-    color: #f1edf5;
-  }
-
-  .branch-menu-actions button:first-child:hover:not(:disabled),
-  .branch-menu-actions button:first-child:focus-visible:not(:disabled) {
-    border-color: #52606a;
-    background: #2b3b4d;
-  }
-
-  .git-error {
-    border-bottom: 1px solid #3d2930;
-    padding: 10px 16px;
-    background: rgba(124, 73, 82, 0.18);
-    color: #f0b0aa;
+  button:disabled { opacity: 0.46; cursor: not-allowed; }
+  .git-error,
+  .commit-validation {
+    border: 1px solid rgba(216, 122, 122, 0.35);
+    border-radius: 12px;
+    background: rgba(216, 122, 122, 0.1);
+    color: #efaaaa;
     font-size: 12px;
     font-weight: 800;
   }
-
+  .git-error { margin: 12px 12px 0; padding: 10px 12px; }
+  .commit-validation { padding: 8px 10px; }
   .source-body {
     display: grid;
-    gap: 16px;
+    gap: 12px;
     min-height: 0;
-    padding: 16px 14px 16px;
     overflow: auto;
-    scrollbar-gutter: stable;
+    padding: 12px;
   }
-
   .source-card {
-    display: grid;
-    gap: 14px;
-    min-width: 0;
-    border: 1px solid #25232d;
-    border-radius: 15px;
-    padding: 15px;
-    background: #111016;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    overflow: hidden;
+    border: 1px solid #272530;
+    border-radius: 14px;
+    background: #15141c;
   }
-
   .card-label-row {
     display: flex;
     align-items: start;
     justify-content: space-between;
     gap: 12px;
+    padding: 12px;
+    border-bottom: 1px solid #24222d;
   }
-
-  .card-label-row span {
-    color: #8f88a8;
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-  }
-
-  .card-label-row h3 {
-    margin: 4px 0 0;
-    color: #f1edf5;
-    font-size: 13px;
-    font-weight: 900;
-  }
-
-  .card-label-row strong {
-    color: #b8d6e4;
-    font-size: 12px;
-    font-weight: 900;
-  }
-
+  .card-label-row h3 { margin: 4px 0 0; color: #f1edf5; font-size: 13px; font-weight: 900; }
+  .card-label-row strong { color: #c7b8ff; font-size: 12px; }
   .source-toolbar {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 9px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px;
   }
-
-  .source-toolbar button {
-    min-width: 0;
-    padding: 0 10px;
-    justify-content: center;
-  }
-
-  .commit-box {
-    display: grid;
-    min-width: 0;
-  }
-
+  .commit-card { display: grid; gap: 10px; padding-bottom: 12px; }
+  .commit-box { padding: 0 12px; }
   .commit-box textarea {
-    resize: vertical;
-    min-height: 114px;
-    border: 1px solid #34313d;
-    border-radius: 12px;
-    background: #1f1e27;
-    color: #f1edf5;
-    font: inherit;
-    line-height: 1.45;
-    padding: 12px 13px;
-    transition:
-      border-color 180ms ease,
-      box-shadow 180ms ease,
-      background-color 180ms ease;
-  }
-
-  .commit-box textarea::placeholder {
-    color: #706980;
-  }
-
-  .commit-box textarea:focus-visible {
-    outline: none;
-    border-color: #52606a;
-    box-shadow: 0 0 0 3px rgba(184, 214, 228, 0.1);
-    background: #23212b;
-  }
-
-  .commit-helper {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .commit-button {
     width: 100%;
-    min-height: 48px;
-    border-color: #e0ddd7;
-    background: #f4f2ee;
-    color: #111016;
-    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.14);
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 92px;
+    padding: 11px 12px;
+    font: inherit;
+    line-height: 1.35;
   }
-
-  .commit-button:hover:not(:disabled),
-  .commit-button:focus-visible:not(:disabled) {
-    border-color: #f4f2ee;
-    background: #ffffff;
-    color: #111016;
-    box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18), 0 0 0 3px rgba(244, 242, 238, 0.15);
+  .commit-helper,
+  .commit-validation { margin: 0 12px; }
+  .commit-button { margin: 0 12px; background: linear-gradient(135deg, #7d5cff, #4c7dff); border-color: transparent; color: #fff; }
+  .changes-list { display: grid; min-width: 0; }
+  :global(.workspace-row .workspace-row-status) { min-width: 66px; text-align: left; letter-spacing: 0; text-transform: none; }
+  .row-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    color: #cfc7e8;
   }
-
-  .changes-list {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    overflow: auto;
-    scrollbar-gutter: stable;
-    padding: 2px 6px 2px 0;
-  }
-
+  .row-action:not(:disabled):hover { border-color: #7d5cff; color: #fff; }
   .empty-state {
     display: grid;
-    justify-items: center;
+    place-items: center;
     gap: 8px;
-    padding: 20px 14px 22px;
+    min-height: 112px;
+    padding: 18px;
+    color: #f1edf5;
     text-align: center;
   }
-
+  .empty-state strong { font-size: 13px; }
+  .empty-state.clean .empty-icon { color: #7bc67b; border-color: rgba(123, 198, 123, 0.35); }
   .empty-icon {
-    display: grid;
-    place-items: center;
-    width: 40px;
-    height: 40px;
-    border: 1px solid #2f2d37;
+    display: inline-flex;
+    width: 36px;
+    height: 36px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid #312f3b;
     border-radius: 12px;
-    background: #1f1e27;
-    color: #8f88a8;
+    color: #9d8cff;
+    background: #1b1a22;
   }
-
-  .empty-state strong {
-    color: #f1edf5;
-    font-size: 13px;
-    font-weight: 900;
+  :global(.row-icon) { color: #9d8cff; }
+  .context-menu {
+    position: fixed;
+    z-index: 200;
+    display: grid;
+    min-width: 160px;
+    overflow: hidden;
+    border: 1px solid #34313e;
+    border-radius: 12px;
+    background: #181720;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
   }
+  .context-menu button {
+    border: 0;
+    border-bottom: 1px solid #24222d;
+    border-radius: 0;
+    padding: 10px 12px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 850;
+  }
+  .context-menu button:last-child { border-bottom: 0; }
+  .context-menu button:not(:disabled):hover { background: #242331; }
 </style>

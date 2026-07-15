@@ -69,7 +69,7 @@
     display: grid;
     grid-template-columns: repeat(var(--segment-count), minmax(0, 1fr));
     gap: 0;
-    width: 100%;
+    width: 97%;
     min-height: 48px;
     padding: 5px;
     border: 1px solid var(--border);

@@ -339,7 +339,7 @@ fn execute_opencode_task(
     validate_opencode_config(&config)?;
     let start_head = git_head(&config);
     let prompt = format!(
-        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, .env, Helm, chart, values, deployment template, or deployment config changes are approval-sensitive and must be committed and pushed before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence for any repository-changing task.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
+        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the task explicitly asks you to update env/config files or variables, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
         governance_context(&config, true),
         task.key.as_deref().unwrap_or("local"),
         task.title,
@@ -576,7 +576,7 @@ fn enforce_opencode_completion_guards(
         return;
     }
 
-    if task_requires_repo_write(task) {
+    if task_requires_env_update_commit(task) {
         if let Some(reason) = dirty_worktree_reason(config) {
             block_result(result, reason);
             return;
@@ -588,7 +588,7 @@ fn enforce_opencode_completion_guards(
         }
     }
 
-    if task_requires_repo_write(task) || task_requires_push(task) {
+    if task_requires_env_update_commit(task) || task_requires_push(task) {
         if let Some(reason) = unpushed_commits_reason(config) {
             block_result(result, reason);
         }
@@ -608,10 +608,10 @@ fn task_requires_push(task: &AiWorkerTask) -> bool {
     text.contains("push")
         || text.contains("merge request")
         || text.contains("pull request")
-        || task_requires_deployment_template_change(task)
+        || task_requires_env_update_commit(task)
 }
 
-fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
+fn task_requires_env_update_commit(task: &AiWorkerTask) -> bool {
     let text = format!(
         "{}\n{}\n{}",
         task.title,
@@ -620,53 +620,30 @@ fn task_requires_repo_write(task: &AiWorkerTask) -> bool {
     )
     .to_lowercase();
 
-    task_requires_sensitive_approval(task)
-        || task_requires_push(task)
-        || task_requires_deployment_template_change(task)
-        || [
-            "commit",
-            "code change",
-            "change code",
-            "modify code",
-            "edit file",
-            "update file",
-            "add file",
-            "delete file",
-            "refactor",
-            "fix bug",
-            "implement",
-            "migration",
-        ]
+    let has_update_verb = ["update", "change", "modify", "edit", "add", "remove", "set"]
         .iter()
-        .any(|needle| text.contains(needle))
-}
+        .any(|needle| text.contains(needle));
 
-fn task_requires_deployment_template_change(task: &AiWorkerTask) -> bool {
-    let text = format!(
-        "{}\n{}\n{}",
-        task.title,
-        task.description,
-        task.labels.join(" ")
-    )
-    .to_lowercase();
-
-    [
-        "helm",
-        "chart",
+    let has_env_target = [
+        ".env",
+        "env variable",
+        "environment variable",
+        "environment config",
+        "env config",
         "values.yaml",
         "values yml",
+        "helm values",
         "deployment template",
         "deployment-config",
         "deployment config",
-        "qcash-deployment",
-        "env variable",
-        "environment variable",
         "configmap",
         "secret.yaml",
         "secret yml",
     ]
     .iter()
-    .any(|needle| text.contains(needle))
+    .any(|needle| text.contains(needle));
+
+    has_update_verb && has_env_target
 }
 
 fn dirty_worktree_reason(config: &AiWorkerConfig) -> Option<String> {
@@ -1219,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn helm_env_template_tasks_require_commit_and_push() {
+    fn env_update_tasks_require_commit_and_push() {
         let task = AiWorkerTask {
             key: Some("QCASH-1".to_string()),
             title: "Update env variable in qcash-deployment Helm template".to_string(),
@@ -1230,9 +1207,24 @@ mod tests {
             previous_output: None,
         };
 
-        assert!(task_requires_deployment_template_change(&task));
-        assert!(task_requires_repo_write(&task));
+        assert!(task_requires_env_update_commit(&task));
         assert!(task_requires_push(&task));
+    }
+
+    #[test]
+    fn redeploy_only_tasks_do_not_require_commit_or_push() {
+        let task = AiWorkerTask {
+            key: Some("QCASH-2".to_string()),
+            title: "Redeploy service".to_string(),
+            description: "Redeploy qcash-deployment after the release is available.".to_string(),
+            labels: vec!["deployment".to_string()],
+            url: None,
+            operator_notes: None,
+            previous_output: None,
+        };
+
+        assert!(!task_requires_env_update_commit(&task));
+        assert!(!task_requires_push(&task));
     }
 
     #[test]
@@ -1247,8 +1239,7 @@ mod tests {
             previous_output: None,
         };
 
-        assert!(!task_requires_deployment_template_change(&task));
-        assert!(!task_requires_repo_write(&task));
+        assert!(!task_requires_env_update_commit(&task));
         assert!(!task_requires_push(&task));
     }
 }

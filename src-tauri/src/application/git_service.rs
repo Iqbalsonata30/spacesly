@@ -1,9 +1,12 @@
 use crate::infrastructure::files::WorkspaceRoot;
-use crate::infrastructure::git::{checkout_workspace_git_branch, workspace_git_info, GitWorkspaceInfo};
+use crate::infrastructure::git::{
+    checkout_workspace_git_branch, workspace_git_info, GitWorkspaceInfo,
+};
 use crate::infrastructure::git::{
     commit_workspace_git_changes, merge_workspace_git_branch, pull_workspace_git_changes,
-    push_workspace_git_changes, rebase_workspace_git_branch, workspace_changed_files, CommitResult,
-    GitChangedFile,
+    push_workspace_git_changes, rebase_workspace_git_branch, stage_all_workspace_git_files,
+    stage_workspace_git_file, unstage_all_workspace_git_files, unstage_workspace_git_file,
+    workspace_changed_files, workspace_git_status, CommitResult, GitChangedFile, GitStatus,
 };
 
 #[derive(Clone)]
@@ -22,6 +25,26 @@ impl GitService {
 
     pub fn changed_files(&self) -> Result<Vec<GitChangedFile>, String> {
         workspace_changed_files(&self.root)
+    }
+
+    pub fn status(&self) -> Result<GitStatus, String> {
+        workspace_git_status(&self.root)
+    }
+
+    pub fn stage_file(&self, path: String) -> Result<GitStatus, String> {
+        stage_workspace_git_file(&self.root, path)
+    }
+
+    pub fn stage_all(&self) -> Result<GitStatus, String> {
+        stage_all_workspace_git_files(&self.root)
+    }
+
+    pub fn unstage_file(&self, path: String) -> Result<GitStatus, String> {
+        unstage_workspace_git_file(&self.root, path)
+    }
+
+    pub fn unstage_all(&self) -> Result<GitStatus, String> {
+        unstage_all_workspace_git_files(&self.root)
     }
 
     pub fn checkout_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {

@@ -19,8 +19,23 @@ export {
   workspaceRootPath,
   writeFile,
 } from "$lib/ipc/files";
-export type { GitChangedFile, GitWorkspaceInfo } from "$lib/ipc/git";
-export { checkoutWorkspaceGitBranch, getPathGitInfo, getWorkspaceChangedFiles, getWorkspaceGitInfo } from "$lib/ipc/git";
+export type { CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo } from "$lib/ipc/git";
+export {
+  checkoutWorkspaceGitBranch,
+  gitCommit,
+  gitMergeBranch,
+  gitPull,
+  gitPush,
+  gitRebaseBranch,
+  getPathGitInfo,
+  getWorkspaceChangedFiles,
+  getWorkspaceGitInfo,
+  getWorkspaceGitStatus,
+  stageAllWorkspaceGitFiles,
+  stageWorkspaceGitFile,
+  unstageAllWorkspaceGitFiles,
+  unstageWorkspaceGitFile,
+} from "$lib/ipc/git";
 export type {
   JiraBoard,
   JiraConnectionStatus,
@@ -562,31 +577,6 @@ export async function updateFromBase(workspaceId: string): Promise<void> {
 }
 
 // ── Direct Git/GH Operations ────────────────────────────────────────
-
-export interface CommitResult {
-  hash: string;
-  message: string;
-}
-
-export async function gitCommit(message: string): Promise<CommitResult> {
-  return invoke<CommitResult>("commit_workspace_git_changes", { message });
-}
-
-export async function gitPush(): Promise<GitWorkspaceInfo> {
-  return invoke<GitWorkspaceInfo>("push_workspace_git_changes");
-}
-
-export async function gitPull(): Promise<GitWorkspaceInfo> {
-  return invoke<GitWorkspaceInfo>("pull_workspace_git_changes");
-}
-
-export async function gitMergeBranch(branch: string): Promise<GitWorkspaceInfo> {
-  return invoke<GitWorkspaceInfo>("merge_workspace_git_branch", { branch });
-}
-
-export async function gitRebaseBranch(branch: string): Promise<GitWorkspaceInfo> {
-  return invoke<GitWorkspaceInfo>("rebase_workspace_git_branch", { branch });
-}
 
 export async function checkMainBehind(repoId: string): Promise<number> {
   return invoke<number>("check_main_behind", { repoId });
