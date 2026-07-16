@@ -35,6 +35,7 @@ const emptyStatus: GitStatus = { staged: [], unstaged: [] };
 
 export function createSourceControlStore(
   options: {
+    workspaceId?: () => string | null | undefined;
     onRepositoryChanged?: (refreshFiles: boolean, refreshEditors: boolean) => Promise<void> | void;
     onNotice?: (tone: "info" | "success" | "error", message: string) => void;
   } = {},
@@ -57,23 +58,24 @@ export function createSourceControlStore(
 
   async function refresh(kind: RefreshKind = "state") {
     const currentRequestId = ++requestId;
+    const workspaceId = options.workspaceId?.();
     loading = true;
     error = null;
 
     try {
       if (kind === "info") {
-        const nextInfo = await getWorkspaceGitInfo();
+        const nextInfo = await getWorkspaceGitInfo(workspaceId ?? undefined);
         if (currentRequestId === requestId) info = nextInfo.is_git_repo ? nextInfo : null;
         return;
       }
 
       if (kind === "status") {
-        const nextStatus = await getWorkspaceGitStatus();
+        const nextStatus = await getWorkspaceGitStatus(workspaceId ?? undefined);
         if (currentRequestId === requestId) status = nextStatus;
         return;
       }
 
-      const nextInfo = await getWorkspaceGitInfo();
+      const nextInfo = await getWorkspaceGitInfo(workspaceId ?? undefined);
       if (currentRequestId !== requestId) return;
 
       if (!nextInfo.is_git_repo) {
@@ -83,7 +85,7 @@ export function createSourceControlStore(
       }
 
       info = nextInfo;
-      status = await getWorkspaceGitStatus();
+      status = await getWorkspaceGitStatus(workspaceId ?? undefined);
       if (currentRequestId !== requestId) return;
     } catch (reason) {
       if (currentRequestId !== requestId) return;
@@ -124,7 +126,7 @@ export function createSourceControlStore(
     await run(
       "stage",
       async () => {
-        status = await stageWorkspaceGitFile(path);
+        status = await stageWorkspaceGitFile(path, options.workspaceId?.() ?? undefined);
         return null;
       },
       null,
@@ -135,7 +137,7 @@ export function createSourceControlStore(
     await run(
       "stage-all",
       async () => {
-        status = await stageAllWorkspaceGitFiles();
+        status = await stageAllWorkspaceGitFiles(options.workspaceId?.() ?? undefined);
         return null;
       },
       null,
@@ -146,7 +148,7 @@ export function createSourceControlStore(
     await run(
       "unstage",
       async () => {
-        status = await unstageWorkspaceGitFile(path);
+        status = await unstageWorkspaceGitFile(path, options.workspaceId?.() ?? undefined);
         return null;
       },
       null,
@@ -157,7 +159,7 @@ export function createSourceControlStore(
     await run(
       "unstage-all",
       async () => {
-        status = await unstageAllWorkspaceGitFiles();
+        status = await unstageAllWorkspaceGitFiles(options.workspaceId?.() ?? undefined);
         return null;
       },
       null,
@@ -167,7 +169,7 @@ export function createSourceControlStore(
   async function checkoutBranch(branch: string) {
     const nextInfo = await run(
       "checkout",
-      async () => checkoutWorkspaceGitBranch(branch),
+      async () => checkoutWorkspaceGitBranch(branch, options.workspaceId?.() ?? undefined),
       "state",
       true,
       true,
@@ -176,27 +178,57 @@ export function createSourceControlStore(
   }
 
   async function pull() {
-    const nextInfo = await run("pull", async () => gitPull(), "state", true, true);
+    const nextInfo = await run(
+      "pull",
+      async () => gitPull(options.workspaceId?.() ?? undefined),
+      "state",
+      true,
+      true,
+    );
     if (nextInfo) info = nextInfo;
   }
 
   async function push() {
-    const nextInfo = await run("push", async () => gitPush(), "state", false, false);
+    const nextInfo = await run(
+      "push",
+      async () => gitPush(options.workspaceId?.() ?? undefined),
+      "state",
+      false,
+      false,
+    );
     if (nextInfo) info = nextInfo;
   }
 
   async function merge(branch: string) {
-    const nextInfo = await run("merge", async () => gitMergeBranch(branch), "state", true, true);
+    const nextInfo = await run(
+      "merge",
+      async () => gitMergeBranch(branch, options.workspaceId?.() ?? undefined),
+      "state",
+      true,
+      true,
+    );
     if (nextInfo) info = nextInfo;
   }
 
   async function rebase(branch: string) {
-    const nextInfo = await run("rebase", async () => gitRebaseBranch(branch), "state", true, true);
+    const nextInfo = await run(
+      "rebase",
+      async () => gitRebaseBranch(branch, options.workspaceId?.() ?? undefined),
+      "state",
+      true,
+      true,
+    );
     if (nextInfo) info = nextInfo;
   }
 
   async function commit(message: string): Promise<CommitResult | null> {
-    const result = await run("commit", async () => gitCommit(message), "state", false, false);
+    const result = await run(
+      "commit",
+      async () => gitCommit(message, options.workspaceId?.() ?? undefined),
+      "state",
+      false,
+      false,
+    );
     if (result)
       options.onNotice?.("success", `Committed ${(result as CommitResult).hash.slice(0, 7)}`);
     return result as CommitResult | null;

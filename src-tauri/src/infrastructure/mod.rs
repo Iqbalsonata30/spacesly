@@ -1,4 +1,5 @@
 pub mod ai_worker;
+pub mod execution_store;
 pub mod files;
 pub mod formatting;
 pub mod git;

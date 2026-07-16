@@ -42,6 +42,10 @@ export async function workspaceRootPath(workspaceId: string): Promise<string> {
   return invokeWithPolicy<string>("workspace_root_path", { workspaceId }, IPC_POLICIES.fileRead);
 }
 
-export async function setWorkspaceRoot(absolutePath: string): Promise<string> {
-  return invokeWithPolicy<string>("set_workspace_root", { absolutePath }, IPC_POLICIES.fileWrite);
+export async function setWorkspaceRoot(workspaceId: string, absolutePath: string): Promise<string> {
+  return invokeWithPolicy<string>(
+    "set_workspace_root",
+    { workspaceId, absolutePath },
+    IPC_POLICIES.fileWrite,
+  );
 }

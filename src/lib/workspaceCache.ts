@@ -84,12 +84,18 @@ export function locallyDeletedCachedCardIds(): string[] {
   return [...deletedCardIds];
 }
 
+export function restoreLocallyDeletedCachedCards(): number {
+  const restored = deletedCardIds.size;
+  deletedCardIds.clear();
+  return restored;
+}
+
 export function cachedWorkspaceSizeBytes(): number {
   return lastCacheSizeBytes;
 }
 
 function normalizeCachedWorkspace(value: CachedWorkspace | null): CachedWorkspace | null {
-  if (!value?.workspace || !Array.isArray(value.workspace.projects)) return null;
+  if (!value?.workspace || !hasBoardProjection(value.workspace)) return null;
   deletedCardIds = new Set(
     (value.deletedCardIds ?? []).filter((id) => typeof id === "string" && id.length > 0),
   );
@@ -108,7 +114,7 @@ function loadLegacyCachedWorkspace(): CachedWorkspace | null {
 
   try {
     const parsed = JSON.parse(raw) as Partial<CachedWorkspace>;
-    if (!parsed.workspace || !Array.isArray(parsed.workspace.projects)) return null;
+    if (!parsed.workspace || !hasBoardProjection(parsed.workspace)) return null;
     return {
       savedAt: Number(parsed.savedAt) || Date.now(),
       sizeBytes: raw.length,
@@ -117,6 +123,17 @@ function loadLegacyCachedWorkspace(): CachedWorkspace | null {
   } catch {
     return null;
   }
+}
+
+function hasBoardProjection(workspace: WorkspaceProjection): boolean {
+  return (
+    Array.isArray(workspace.projects) &&
+    workspace.projects.some(
+      (project) =>
+        Array.isArray(project.boards) &&
+        project.boards.some((board) => Array.isArray(board.columns)),
+    )
+  );
 }
 
 function removeLegacyCachedWorkspace() {

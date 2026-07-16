@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ pub struct FileEntry {
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceRoot {
-    path: Arc<Mutex<PathBuf>>,
+    paths: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 impl WorkspaceRoot {
@@ -24,19 +25,23 @@ impl WorkspaceRoot {
         let path = home_dir()?
             .canonicalize()
             .map_err(|error| format!("Failed to canonicalize home directory: {error}"))?;
+        let mut paths = HashMap::new();
+        paths.insert("workspace-personal".to_string(), path);
         Ok(Self {
-            path: Arc::new(Mutex::new(path)),
+            paths: Arc::new(Mutex::new(paths)),
         })
     }
 
-    pub fn path(&self) -> Result<PathBuf, String> {
-        self.path
-            .lock()
-            .map_err(|error| error.to_string())
-            .map(|path| path.clone())
+    pub fn path(&self, workspace_id: &str) -> Result<PathBuf, String> {
+        let paths = self.paths.lock().map_err(|error| error.to_string())?;
+        paths
+            .get(workspace_id)
+            .or_else(|| paths.get("workspace-personal"))
+            .cloned()
+            .ok_or_else(|| "Workspace root is not configured.".to_string())
     }
 
-    pub fn set_path(&self, path: PathBuf) -> Result<(), String> {
+    pub fn set_path(&self, workspace_id: &str, path: PathBuf) -> Result<(), String> {
         let resolved = path
             .canonicalize()
             .map_err(|error| format!("Failed to canonicalize selected path: {error}"))?;
@@ -44,30 +49,37 @@ impl WorkspaceRoot {
             return Err("Selected path is not a directory.".to_string());
         }
 
-        *self.path.lock().map_err(|error| error.to_string())? = resolved;
+        self.paths
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(workspace_id.to_string(), resolved);
         Ok(())
     }
 }
 
-pub fn workspace_root_path(root: &WorkspaceRoot, _workspace_id: String) -> Result<String, String> {
-    Ok(root.path()?.to_string_lossy().to_string())
+pub fn workspace_root_path(root: &WorkspaceRoot, workspace_id: String) -> Result<String, String> {
+    Ok(root.path(&workspace_id)?.to_string_lossy().to_string())
 }
 
-pub fn set_workspace_root(root: &WorkspaceRoot, absolute_path: String) -> Result<String, String> {
+pub fn set_workspace_root(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+    absolute_path: String,
+) -> Result<String, String> {
     let path = PathBuf::from(absolute_path);
     if !path.is_absolute() {
         return Err("Workspace root must be an absolute path.".to_string());
     }
-    root.set_path(path)?;
-    workspace_root_path(root, "workspace-personal".to_string())
+    root.set_path(&workspace_id, path)?;
+    workspace_root_path(root, workspace_id)
 }
 
 pub fn list_directory(
     root: &WorkspaceRoot,
-    _workspace_id: String,
+    workspace_id: String,
     relative_path: String,
 ) -> Result<Vec<FileEntry>, String> {
-    let root = root.path()?;
+    let root = root.path(&workspace_id)?;
     let directory = resolve_workspace_path(&root, &relative_path)?;
     if !directory.is_dir() {
         return Err("Path is not a directory.".to_string());
@@ -91,10 +103,10 @@ pub fn list_directory(
 
 pub fn read_file_at_root(
     root: &WorkspaceRoot,
-    _workspace_id: String,
+    workspace_id: String,
     relative_path: String,
 ) -> Result<String, String> {
-    let root = root.path()?;
+    let root = root.path(&workspace_id)?;
     let path = resolve_workspace_path(&root, &relative_path)?;
     let metadata =
         fs::metadata(&path).map_err(|error| format!("Failed to read file metadata: {error}"))?;
@@ -118,11 +130,11 @@ pub fn read_file_at_root(
 
 pub fn write_file(
     root: &WorkspaceRoot,
-    _workspace_id: String,
+    workspace_id: String,
     relative_path: String,
     content: String,
 ) -> Result<(), String> {
-    let root = root.path()?;
+    let root = root.path(&workspace_id)?;
     let path = resolve_workspace_path_for_write(&root, &relative_path)?;
     if path.is_dir() {
         return Err("Cannot write over a directory.".to_string());
@@ -231,7 +243,9 @@ fn file_entry(root: &Path, path: PathBuf) -> Result<FileEntry, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_relative_path;
+    use super::{list_directory, validate_relative_path, WorkspaceRoot};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn rejects_parent_traversal() {
@@ -247,5 +261,40 @@ mod tests {
                 .to_string_lossy(),
             "src/main.rs"
         );
+    }
+
+    #[test]
+    fn file_listing_uses_workspace_specific_root() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("spacesly-workspace-roots-{suffix}"));
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(&first).expect("first workspace should be created");
+        fs::create_dir_all(&second).expect("second workspace should be created");
+        fs::write(first.join("first.txt"), "first").expect("first file should be written");
+        fs::write(second.join("second.txt"), "second").expect("second file should be written");
+
+        let root = WorkspaceRoot::home().expect("workspace root should initialize");
+        root.set_path("workspace-one", first)
+            .expect("first root should set");
+        root.set_path("workspace-two", second)
+            .expect("second root should set");
+
+        let first_entries = list_directory(&root, "workspace-one".to_string(), "".to_string())
+            .expect("first workspace should list");
+        let second_entries = list_directory(&root, "workspace-two".to_string(), "".to_string())
+            .expect("second workspace should list");
+
+        assert!(first_entries.iter().any(|entry| entry.name == "first.txt"));
+        assert!(!first_entries.iter().any(|entry| entry.name == "second.txt"));
+        assert!(second_entries
+            .iter()
+            .any(|entry| entry.name == "second.txt"));
+        assert!(!second_entries.iter().any(|entry| entry.name == "first.txt"));
+
+        let _ = fs::remove_dir_all(base);
     }
 }

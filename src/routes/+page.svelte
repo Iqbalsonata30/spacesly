@@ -14,9 +14,7 @@
   import { collectAncestorPaths, pruneExpandedFolderTree } from "$lib/fileBrowser";
   import {
     agentActionLabel,
-    agentPhaseTimeline,
     canStartAgent,
-    type AgentPhase,
     descriptionParts,
     executionDetail,
     isBlocked,
@@ -39,6 +37,7 @@
     type AgentRunStatus,
     type AgentSessionEvent,
     type AgentTerminalLine,
+    type ExecutionRun,
   } from "$lib/agentRun";
   import { capList, capText } from "$lib/boundedBuffers";
   import {
@@ -82,6 +81,8 @@
     readFile,
     resizePtyTerminal,
     saveAppSecrets,
+    saveExecutionRun,
+    listActiveExecutionRuns,
     releaseAiWorkerRun,
     reserveAiWorkerRun,
     setWorkspaceRoot,
@@ -104,6 +105,7 @@
     type GitStatus,
     type GitWorkspaceInfo,
     type AiWorkerTaskResult,
+    type ExecutionContract,
     type JiraMcpConfig,
     type JiraBoard,
     type WorkspaceProjection,
@@ -128,6 +130,7 @@
     loadCachedWorkspace,
     locallyDeleteCachedCard,
     locallyDeletedCachedCardIds,
+    restoreLocallyDeletedCachedCards,
     saveCachedWorkspace,
   } from "$lib/workspaceCache";
 
@@ -260,6 +263,7 @@
 
   let workspace = $state<WorkspaceProjection | null>(null);
   let cacheSavedAt = $state<number | null>(null);
+  let deletedJiraCardCount = $state(0);
   let error = $state<string | null>(null);
   let syncError = $state<string | null>(null);
   let syncing = $state(false);
@@ -284,6 +288,7 @@
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let secretsHydrated = $state(false);
   let workspaceCacheHydrated = $state(false);
+  let durableRunsHydrated = $state(false);
   let filesStateHydrated = $state(false);
   let selectedServerId = $state(initialSettings.jira.serverId);
   let workspaceMode = $state<WorkspaceMode>(initialUiState.workspaceMode);
@@ -307,6 +312,7 @@
   let agentTerminalLines = $state<AgentTerminalLine[]>([]);
   let agentRunGitSnapshot = $state<AgentRunGitSnapshot | null>(null);
   let agentRunTranscript = $state<AgentSessionEvent[]>([]);
+  let agentExecutionRun = $state<ExecutionRun | null>(null);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
   let latestAgentSessionId = $state<string | null>(null);
@@ -375,6 +381,7 @@
   let fileDirectory = $state("");
   let fileRootLabel = $state("~");
   let fileLoading = $state(false);
+  let fileDirectoryLoaded = $state(false);
   let fileError = $state<string | null>(null);
   let fileFilter = $state("");
   let expandedFileEntries = $state<Record<string, FileEntry[]>>({});
@@ -399,10 +406,12 @@
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceGitInfoRequestId = 0;
   let workspaceGitStatusRequestId = 0;
+  let workspaceProjectionRequest: Promise<void> | null = null;
   let backlogStartConfirmation = $state<{ cardId: string; title: string } | null>(null);
   let backlogStartConfirmationResolve: ((confirmed: boolean) => void) | null = null;
   let manualDoneConfirmation = $state<{ cardId: string; title: string } | null>(null);
   const sourceControl = createSourceControlStore({
+    workspaceId: () => workspace?.id,
     onRepositoryChanged: async (refreshFiles, refreshEditors) => {
       if (refreshFiles) await refreshFileDirectory(fileDirectory);
       if (refreshEditors) await refreshOpenEditorFilesFromDisk();
@@ -415,24 +424,30 @@
 
   onMount(() => {
     void hydrateCachedWorkspace();
+    const fallbackWorkspaceTimer = window.setTimeout(() => {
+      void loadDefaultWorkspaceProjection();
+    }, 500);
 
     const timer = window.setInterval(() => {
       now = new Date();
     }, 60_000);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(fallbackWorkspaceTimer);
+      window.clearInterval(timer);
+    };
   });
 
   $effect(() => {
     if (workspace || !workspaceCacheHydrated) return;
 
-    getWorkspace()
-      .then((projection) => {
-        workspace = projection;
-      })
-      .catch((reason: unknown) => {
-        error = reason instanceof Error ? reason.message : String(reason);
-      });
+    void loadDefaultWorkspaceProjection();
+  });
+
+  $effect(() => {
+    if (!workspace || durableRunsHydrated) return;
+    durableRunsHydrated = true;
+    void hydrateDurableExecutionRuns();
   });
 
   $effect(() => {
@@ -475,7 +490,7 @@
   });
 
   $effect(() => {
-    if (workspaceMode === "files" && workspace && fileEntries.length === 0 && !fileLoading) {
+    if (workspaceMode === "files" && workspace && !fileDirectoryLoaded && !fileLoading) {
       void refreshFileDirectory(fileDirectory);
     }
   });
@@ -502,6 +517,7 @@
       selectedWorkspaceBranch = "";
       return;
     }
+    if (workspaceMode !== "files") return;
 
     void refreshWorkspaceGitState();
   });
@@ -728,7 +744,7 @@
   let visibleAgentRunLogs = $derived(visibleAgentSession?.logs ?? []);
   let visibleAgentTerminalLines = $derived(visibleAgentSession?.terminalLines ?? []);
   let visibleAgentRunTranscript = $derived(visibleAgentSession?.transcript ?? []);
-  let agentPhases = $derived(agentPhaseTimeline(visibleAgentRunStatus, visibleAgentRunProgress));
+  let visibleExecutionRun = $derived(visibleAgentSession?.executionRun ?? null);
   let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
   let latestAgentSession = $derived<AgentRunSession | null>(
     latestAgentSessionId ? (agentRunSessions[latestAgentSessionId] ?? null) : null,
@@ -808,6 +824,7 @@
   async function hydrateCachedWorkspace() {
     try {
       const cached = await loadCachedWorkspace();
+      deletedJiraCardCount = locallyDeletedCachedCardIds().length;
       if (cached && !workspace) {
         const storage = typeof localStorage === "undefined" ? undefined : localStorage;
         const interruptedCardIds = loadActiveAgentRunCardIds(storage);
@@ -836,6 +853,74 @@
     } finally {
       workspaceCacheHydrated = true;
     }
+  }
+
+  async function hydrateDurableExecutionRuns() {
+    try {
+      const runs = await listActiveExecutionRuns();
+      for (const run of runs) {
+        const cardId = run.contract.task_id;
+        const card = activeCardById.get(cardId);
+        if (!card || agentRunSessions[cardId]) continue;
+        const ticketTitle = run.contract.ticket.title || card.title;
+        const recoveredStatus: AgentRunStatus =
+          run.status === "blocked" || run.status === "failed" ? "blocked" : "running";
+        agentRunSessions[cardId] = createAgentRunSession(
+          cardId,
+          ticketTitle,
+          recoveredStatus,
+          recoveredStatus === "blocked" ? 75 : 55,
+          "Recovered durable execution state.",
+          null,
+          [
+            {
+              id: `recovered-${run.run_id}`,
+              at: new Date().toLocaleTimeString(),
+              tone: recoveredStatus === "blocked" ? "error" : "info",
+              label: "recovery",
+              message:
+                recoveredStatus === "blocked"
+                  ? "This execution was recovered after the application restarted and needs review."
+                  : "This execution is still active in the durable execution store.",
+            },
+          ],
+          [],
+          run.contract.repository
+            ? {
+                repo_root: run.contract.repository.root_path,
+                current_branch: run.contract.repository.branch,
+                head_commit: run.contract.repository.head_commit,
+              }
+            : null,
+          [],
+          run,
+        );
+        latestAgentSessionId = cardId;
+      }
+      agentRunSessions = retainAgentSessions(agentRunSessions);
+    } catch (reason) {
+      appNotice = {
+        tone: "error",
+        message: `Durable execution state could not be loaded: ${reason instanceof Error ? reason.message : String(reason)}`,
+      };
+    }
+  }
+
+  async function loadDefaultWorkspaceProjection() {
+    if (workspace || workspaceProjectionRequest) return workspaceProjectionRequest;
+
+    workspaceProjectionRequest = getWorkspace()
+      .then((projection) => {
+        if (!workspace) workspace = projection;
+      })
+      .catch((reason: unknown) => {
+        if (!workspace) error = reason instanceof Error ? reason.message : String(reason);
+      })
+      .finally(() => {
+        workspaceProjectionRequest = null;
+      });
+
+    return workspaceProjectionRequest;
   }
 
   async function persistSettingsAndSecrets(value: AppSettings) {
@@ -893,9 +978,9 @@
   }
 
   function setWorkspaceMode(mode: WorkspaceMode) {
-    if (workspaceMode === mode) return;
+    const changed = workspaceMode !== mode;
     workspaceMode = mode;
-    saveUiState();
+    if (changed) saveUiState();
     if (mode === "term") {
       if (workspaceTerminalOpened) {
         scheduleWorkspaceTerminalActivation();
@@ -905,6 +990,9 @@
     } else if (mode === "files") {
       void refreshFileDirectory(fileDirectory);
     }
+    void tick().then(() => {
+      if (workspaceMode === mode) window.dispatchEvent(new Event("resize"));
+    });
   }
 
   async function refreshFileDirectory(relativePath = fileDirectory) {
@@ -912,6 +1000,7 @@
     const revision = fileTreeRevision + 1;
     fileTreeRevision = revision;
     fileLoading = true;
+    fileDirectoryLoaded = false;
     fileError = null;
     fileDirectory = relativePath;
     workspaceFilesDirectory = relativePath;
@@ -926,7 +1015,10 @@
       if (revision !== fileTreeRevision) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      if (revision === fileTreeRevision) fileLoading = false;
+      if (revision === fileTreeRevision) {
+        fileLoading = false;
+        fileDirectoryLoaded = true;
+      }
     }
   }
 
@@ -942,23 +1034,36 @@
     if (!workspace || openEditorFiles.length === 0) return;
 
     const activePath = activeEditorPath;
-    const refreshedFiles: OpenEditorFile[] = [];
-    const missingFiles: string[] = [];
-
-    for (const file of openEditorFiles) {
-      try {
-        const content = await readFile(workspace.id, file.path);
-        file.editor?.setValue(content);
-        file.editor?.markSaved(content);
-        refreshedFiles.push({
-          ...file,
-          content,
-          savedContent: content,
-          dirty: false,
-        });
-      } catch {
-        missingFiles.push(file.path);
-      }
+    const workspaceId = workspace.id;
+    const refreshedResults = await Promise.all(
+      openEditorFiles.map(async (file) => {
+        try {
+          const content = await readFile(workspaceId, file.path);
+          return {
+            file: {
+              ...file,
+              content,
+              savedContent: content,
+              dirty: false,
+            },
+            content,
+          };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const refreshedFiles = refreshedResults
+      .filter((result): result is NonNullable<typeof result> => result !== null)
+      .map((result) => result.file);
+    const missingFiles = refreshedResults
+      .map((result, index) => (result ? null : openEditorFiles[index].path))
+      .filter((path): path is string => path !== null);
+    for (const result of refreshedResults) {
+      if (!result) continue;
+      const file = openEditorFiles.find((entry) => entry.path === result.file.path);
+      file?.editor?.setValue(result.content);
+      file?.editor?.markSaved(result.content);
     }
 
     openEditorFiles = refreshedFiles;
@@ -1126,7 +1231,7 @@
 
     const savedRoot = normalizeAbsolutePath(initialUiState.workspaceFilesRoot);
     if (savedRoot && savedRoot !== workspaceRoot) {
-      await setWorkspaceRoot(savedRoot);
+      await setWorkspaceRoot(workspace.id, savedRoot);
       workspaceRoot = savedRoot;
       workspaceFilesRoot = savedRoot;
       fileRootLabel = displayPath(savedRoot);
@@ -1169,7 +1274,7 @@
     });
     if (typeof selected !== "string") return;
 
-    await setWorkspaceRoot(selected);
+    await setWorkspaceRoot(workspace.id, selected);
     fileDirectory = "";
     workspaceFilesDirectory = "";
     openEditorFiles = [];
@@ -1199,7 +1304,7 @@
     const separator = normalized.lastIndexOf("/");
     const parent = separator > 0 ? normalized.slice(0, separator) : normalized;
     const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
-    await setWorkspaceRoot(parent);
+    await setWorkspaceRoot(workspace.id, parent);
     fileDirectory = "";
     workspaceFilesDirectory = "";
     expandedFileEntries = {};
@@ -1970,8 +2075,11 @@
     workspaceTerminalResizeObserver.observe(workspaceTerminalContainer);
 
     try {
-      await openPtyTerminal(workspaceTerminalId, workspaceShellWorkdir.trim() || null, (data) =>
-        workspaceTerminal?.write(new Uint8Array(data)),
+      await openPtyTerminal(
+        workspaceTerminalId,
+        workspace?.id ?? null,
+        workspaceShellWorkdir.trim() || null,
+        (data) => workspaceTerminal?.write(new Uint8Array(data)),
       );
       await resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols);
     } catch (reason) {
@@ -2348,6 +2456,18 @@
     } finally {
       syncing = false;
     }
+  }
+
+  async function restoreDeletedJiraCards() {
+    if (deletedJiraCardCount === 0) return;
+    const restored = restoreLocallyDeletedCachedCards();
+    deletedJiraCardCount = 0;
+    if (workspace) saveCachedWorkspace(workspace);
+    appNotice = {
+      tone: "info",
+      message: `Restored ${restored} deleted Jira card tombstone${restored === 1 ? "" : "s"}. Refreshing Jira...`,
+    };
+    await syncJira();
   }
 
   async function testJiraConnection() {
@@ -2742,7 +2862,10 @@
     )
       return false;
 
-    locallyDeleteCachedCard(cardId);
+    if (card.source !== "local") {
+      locallyDeleteCachedCard(cardId);
+      deletedJiraCardCount = locallyDeletedCachedCardIds().length;
+    }
     if (selectedCardId === cardId) selectedCardId = null;
     if (agentRunCardId === cardId) agentRunCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
@@ -2824,6 +2947,7 @@
   ) {
     const previousSession = agentRunSessions[card.id];
     agentRunCardId = card.id;
+    agentConsoleCardId = card.id;
     agentRunTitle = card.title;
     agentRunStatus = "running";
     agentRunProgress = continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5;
@@ -2844,6 +2968,7 @@
               "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
             ),
           ];
+    agentExecutionRun = continuation && previousSession ? (previousSession.executionRun ?? null) : null;
     agentTerminalLines =
       continuation && previousSession
         ? previousSession.terminalLines
@@ -2896,6 +3021,7 @@
       agentTerminalLines,
       agentRunGitSnapshot,
       agentRunTranscript,
+      agentExecutionRun,
     );
   }
 
@@ -2910,6 +3036,7 @@
     agentTerminalLines = session.terminalLines;
     agentRunGitSnapshot = session.gitSnapshot;
     agentRunTranscript = session.transcript ?? [];
+    agentExecutionRun = session.executionRun ?? null;
   }
 
   function agentSessionForCard(cardId: string): AgentRunSession | null {
@@ -3030,18 +3157,8 @@
     selectedCardId = card.id;
   }
 
-  function setAgentRunStatus(status: AgentRunStatus) {
-    agentRunStatus = status;
-    persistActiveAgentRun();
-  }
-
   function setAgentRunStatusForCard(cardId: string, status: AgentRunStatus) {
     updateAgentSessionForCard(cardId, (session) => ({ ...session, status }));
-  }
-
-  function setAgentRunOutput(output: string) {
-    agentRunOutput = capText(output, MAX_AGENT_OUTPUT_CHARS);
-    persistActiveAgentRun();
   }
 
   function setAgentRunOutputForCard(cardId: string, output: string) {
@@ -3055,18 +3172,45 @@
     updateAgentSessionForCard(cardId, (session) => ({ ...session, result }));
   }
 
-  function setAgentRunGitSnapshot(snapshot: AgentRunGitSnapshot | null) {
-    agentRunGitSnapshot = snapshot;
-    persistActiveAgentRun();
+  async function setExecutionRunForCard(cardId: string, executionRun: ExecutionRun) {
+    updateAgentSessionForCard(cardId, (session) => ({ ...session, executionRun }));
+    try {
+      const persisted = await saveExecutionRun(executionRun);
+      updateAgentSessionForCard(cardId, (session) => ({
+        ...session,
+        executionRun: persisted,
+      }));
+    } catch (reason) {
+      appNotice = {
+        tone: "error",
+        message: `Execution state could not be persisted: ${reason instanceof Error ? reason.message : String(reason)}`,
+      };
+      throw reason;
+    }
+  }
+
+  function updateExecutionRunForCard(
+    cardId: string,
+    transform: (run: ExecutionRun) => ExecutionRun,
+  ) {
+    const session = agentSessionForCard(cardId);
+    const currentRun = session?.executionRun;
+    if (!currentRun) return;
+    const nextRun = transform(currentRun);
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      executionRun: nextRun,
+    }));
+    void saveExecutionRun(nextRun).catch((reason) => {
+      appNotice = {
+        tone: "error",
+        message: `Execution state could not be persisted: ${reason instanceof Error ? reason.message : String(reason)}`,
+      };
+    });
   }
 
   function setAgentRunGitSnapshotForCard(cardId: string, snapshot: AgentRunGitSnapshot | null) {
     updateAgentSessionForCard(cardId, (session) => ({ ...session, gitSnapshot: snapshot }));
-  }
-
-  function setAgentProgress(value: number) {
-    agentRunProgress = Math.max(agentRunProgress, Math.min(100, value));
-    persistActiveAgentRun();
   }
 
   function setAgentProgressForCard(cardId: string, value: number) {
@@ -3213,19 +3357,190 @@
     ].join("\n");
   }
 
-  function appendTerminalLine(prompt: string, text: string) {
-    agentTerminalLines = capList(
-      [
-        ...agentTerminalLines,
+  function buildExecutionContract(
+    runId: string,
+    card: CardProjection,
+    issueKey: string | null,
+    operatorNotes: string | null,
+    previousOutput: string | null,
+    jiraTransitionCompleted: boolean,
+  ): ExecutionContract {
+    const completedSteps = jiraTransitionCompleted ? ["jira.transition.in_progress"] : [];
+    const workflow: ExecutionContract["workflow"] = [
+      {
+        step_id: "jira.transition.in_progress",
+        title: "Move linked Jira issue to In Progress if needed",
+        type: "jira.transition",
+        status: jiraTransitionCompleted ? "completed" : issueKey ? "remaining" : "completed",
+      },
+      {
+        step_id: "worker.execute",
+        title: "Execute the already-planned task",
+        type: "worker.execute",
+        status: "current",
+      },
+      {
+        step_id: "worker.verify",
+        title: "Verify execution evidence before reporting completion",
+        type: "worker.verify",
+        status: "remaining",
+      },
+      {
+        step_id: "jira.comment.result",
+        title: "Spacesly records final result on Jira after worker returns",
+        type: "jira.comment",
+        status: issueKey ? "remaining" : "completed",
+      },
+    ];
+
+    return {
+      contract_id: `contract-${runId}`,
+      version: 1,
+      task_id: card.id,
+      workspace_id: workspace?.id ?? "workspace-personal",
+      created_at: new Date().toISOString(),
+      objective: {
+        summary: card.title,
+        success_criteria: [
+          "Execute only the current worker step from this contract.",
+          "Return concrete evidence for any claimed completion.",
+          "Return blocked if required tools, permissions, or context are unavailable.",
+        ],
+      },
+      task_context: {
+        description: card.description,
+        execution_detail: executionDetail(card.execution),
+      },
+      ticket: {
+        provider: issueKey ? "jira" : "local",
+        key: issueKey,
+        url: card.url,
+        title: card.title,
+        labels: card.labels,
+        status: card.jira_snapshot?.status ?? null,
+        updated_at: card.jira_snapshot?.updated_at ?? null,
+        fetched_at: card.jira_snapshot?.fetched_at ?? null,
+      },
+      workflow,
+      completed_steps: completedSteps,
+      current_step: "worker.execute",
+      remaining_steps: workflow
+        .filter((step) => step.status === "remaining")
+        .map((step) => step.step_id),
+      repository: {
+        root_path: workspaceGitInfo?.repo_root ?? workspaceRoot,
+        branch: workspaceGitInfo?.current_branch ?? null,
+        head_commit: workspaceGitInfo?.head_commit ?? null,
+      },
+      constraints: {
+        execution_only: true,
+        planning_completed: true,
+        must_not_read_jira_for_planning: true,
+        must_not_classify_ticket: true,
+        must_not_regenerate_workflow: true,
+        must_not_rediscover_repository: true,
+        may_modify_files: true,
+        may_update_jira: false,
+      },
+      runtime_inputs: {
+        operator_notes: operatorNotes,
+        previous_output: previousOutput,
+      },
+    };
+  }
+
+  function createExecutionRun(runId: string, contract: ExecutionContract): ExecutionRun {
+    const startedAt = new Date().toISOString();
+    const step_runs = Object.fromEntries(
+      contract.workflow.map((step) => [
+        step.step_id,
         {
-          id: `term-${Date.now().toString(36)}-${agentTerminalLines.length}`,
-          prompt,
-          text,
+          step_id: step.step_id,
+          status:
+            step.status === "completed"
+              ? "completed"
+              : step.status === "current"
+                ? "ready"
+                : "pending",
+          attempt: 0,
+          started_at: step.status === "completed" ? startedAt : null,
+          completed_at: step.status === "completed" ? startedAt : null,
+          summary: step.status === "completed" ? step.title : null,
         },
-      ],
-      MAX_AGENT_TERMINAL_LINES,
-    );
-    persistActiveAgentRun();
+      ]),
+    ) as ExecutionRun["step_runs"];
+
+    return {
+      run_id: runId,
+      contract,
+      status: "pending",
+      current_step_ids: [contract.current_step],
+      step_runs,
+      started_at: startedAt,
+      completed_at: null,
+    };
+  }
+
+  function updateExecutionStep(
+    run: ExecutionRun,
+    stepId: string,
+    status: ExecutionRun["step_runs"][string]["status"],
+    summary: string | null = null,
+  ): ExecutionRun {
+    const now = new Date().toISOString();
+    const current = run.step_runs[stepId];
+    if (!current) return run;
+
+    return {
+      ...run,
+      status:
+        status === "blocked"
+          ? "blocked"
+          : status === "failed"
+            ? "failed"
+            : status === "running"
+              ? "running"
+              : run.status,
+      step_runs: {
+        ...run.step_runs,
+        [stepId]: {
+          ...current,
+          status,
+          attempt: status === "running" ? current.attempt + 1 : current.attempt,
+          started_at: status === "running" ? (current.started_at ?? now) : current.started_at,
+          completed_at: ["completed", "blocked", "failed", "skipped"].includes(status)
+            ? now
+            : current.completed_at,
+          summary: summary ?? current.summary,
+        },
+      },
+    };
+  }
+
+  function completeExecutionRun(run: ExecutionRun, blocked: boolean, summary: string): ExecutionRun {
+    const now = new Date().toISOString();
+    return {
+      ...run,
+      status: blocked ? "blocked" : "completed",
+      current_step_ids: [],
+      completed_at: now,
+      step_runs: {
+        ...run.step_runs,
+        "worker.verify": {
+          ...(run.step_runs["worker.verify"] ?? {
+            step_id: "worker.verify",
+            status: "pending",
+            attempt: 0,
+            started_at: null,
+            completed_at: null,
+            summary: null,
+          }),
+          status: blocked ? "blocked" : "completed",
+          completed_at: now,
+          summary,
+        },
+      },
+    };
   }
 
   function appendTerminalLineForCard(cardId: string, prompt: string, text: string) {
@@ -3484,7 +3799,7 @@
 
     const info = config.opencode_workdir?.trim()
       ? await getPathGitInfo(gitPath)
-      : await getWorkspaceGitInfo();
+      : await getWorkspaceGitInfo(workspace?.id);
     workspaceGitInfo = info.is_git_repo ? info : null;
     selectedWorkspaceBranch = info.current_branch ?? "";
 
@@ -3807,6 +4122,7 @@
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
     let backendExecutionStarted = false;
+    let jiraTransitionCompleted = !issueKey;
 
     try {
       beginAgentRun(card, isContinuation, null);
@@ -3822,7 +4138,7 @@
       if (config.runtime === "opencode") {
         const runGitInfo = config.opencode_workdir?.trim()
           ? await getPathGitInfo(config.opencode_workdir.trim())
-          : await getWorkspaceGitInfo();
+          : await getWorkspaceGitInfo(workspace?.id);
         setAgentRunGitSnapshotForCard(cardId, gitSnapshotFromInfo(runGitInfo));
       }
 
@@ -3870,6 +4186,7 @@
           setAgentProgressForCard(cardId, 25);
           await assignJiraIssue(jiraConfig, issueKey);
           await transitionJiraIssue(jiraConfig, issueKey, "In Progress");
+          jiraTransitionCompleted = true;
           appendStructuredAgentLogForCard(
             cardId,
             "success",
@@ -3894,6 +4211,7 @@
         setAgentProgressForCard(cardId, 35);
       }
       if (issueKey && isContinuation) {
+        jiraTransitionCompleted = true;
         appendStructuredAgentLogForCard(
           cardId,
           "info",
@@ -3928,21 +4246,50 @@
         buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput),
       );
       setAgentProgressForCard(cardId, 55);
+      const executionContract = buildExecutionContract(
+        runId,
+        card,
+        issueKey,
+        operatorNotes,
+        previousOutput,
+        jiraTransitionCompleted,
+      );
+      let executionRun = createExecutionRun(runId, executionContract);
+      if (issueKey && !jiraTransitionCompleted) {
+        const message = `Execution prerequisite failed: ${issueKey} was not transitioned to In Progress.`;
+        executionRun = updateExecutionStep(
+          { ...executionRun, status: "blocked", completed_at: new Date().toISOString() },
+          "jira.transition.in_progress",
+          "blocked",
+          message,
+        );
+        await setExecutionRunForCard(cardId, executionRun);
+        throw new Error(message);
+      }
+      executionRun = updateExecutionStep(
+        executionRun,
+        "worker.execute",
+        "running",
+        "Execution worker started.",
+      );
+      await setExecutionRunForCard(cardId, executionRun);
       let result: AiWorkerTaskResult;
       try {
         backendExecutionStarted = true;
         result = await executeAiWorkerTask(runId, config, {
-          key: issueKey,
-          title: card.title,
-          description: card.description,
-          labels: card.labels,
-          url: card.url,
-          operator_notes: operatorNotes,
-          previous_output: previousOutput,
+          execution_contract: executionContract,
         });
       } catch (reason) {
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {
           const cancelled = await cancelAiWorkerTask(runId).catch(() => false);
+          updateExecutionRunForCard(cardId, (run) =>
+            updateExecutionStep(
+              { ...run, status: cancelled ? "cancelled" : "blocked" },
+              "worker.execute",
+              cancelled ? "failed" : "blocked",
+              reason.message,
+            ),
+          );
           if (cancelled) {
             updateCardExecution(cardId, {
               blocked: { reason: "Agent timed out and was cancelled." },
@@ -4003,6 +4350,9 @@
 
       if (result.completion_status !== "completed") {
         const reason = result.blocked_reason ?? result.summary;
+        updateExecutionRunForCard(cardId, (run) =>
+          updateExecutionStep(run, "worker.execute", "blocked", reason),
+        );
         updateCardExecution(cardId, { blocked: { reason } });
         setAgentRunStatusForCard(cardId, "blocked");
         appendAgentSessionTranscriptForCard(cardId, "blocker", reason);
@@ -4022,11 +4372,30 @@
         return;
       }
 
+      updateExecutionRunForCard(cardId, (run) => {
+        const executed = updateExecutionStep(
+          run,
+          "worker.execute",
+          "completed",
+          result.summary,
+        );
+        const verifying = updateExecutionStep(
+          executed,
+          "worker.verify",
+          "running",
+          "Verification started.",
+        );
+        return { ...verifying, current_step_ids: ["worker.verify"] };
+      });
+
       let gitWritebackInfo: GitWorkspaceInfo | null = null;
       try {
         gitWritebackInfo = await verifyAgentJiraDoneGate(card, config);
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : String(reason);
+        updateExecutionRunForCard(cardId, (run) =>
+          updateExecutionStep(run, "worker.verify", "blocked", message),
+        );
         updateCardExecution(cardId, { blocked: { reason: message } });
         setAgentRunStatusForCard(cardId, "blocked");
         appendAgentSessionTranscriptForCard(cardId, "blocker", message);
@@ -4042,6 +4411,10 @@
         appNotice = { tone: "error", message };
         return;
       }
+
+      updateExecutionRunForCard(cardId, (run) =>
+        updateExecutionStep(run, "worker.verify", "completed", "Verification passed."),
+      );
 
       appendStructuredAgentLogForCard(
         cardId,
@@ -4063,6 +4436,15 @@
       if (issueKey) {
         const jiraConfig = buildJiraConfig();
         if (jiraConfig) {
+          updateExecutionRunForCard(cardId, (run) => ({
+            ...updateExecutionStep(
+              run,
+              "jira.comment.result",
+              "running",
+              "Jira writeback started.",
+            ),
+            current_step_ids: ["jira.comment.result"],
+          }));
           appendStructuredAgentLogForCard(
             cardId,
             "info",
@@ -4098,6 +4480,14 @@
             issueKey,
             agentJiraComment(result, config, gitWritebackInfo),
           );
+          updateExecutionRunForCard(cardId, (run) =>
+            updateExecutionStep(
+              run,
+              "jira.comment.result",
+              "completed",
+              "Jira transition and completion comment succeeded.",
+            ),
+          );
           appendStructuredAgentLogForCard(
             cardId,
             "success",
@@ -4110,6 +4500,7 @@
         }
       }
 
+      updateExecutionRunForCard(cardId, (run) => completeExecutionRun(run, false, result.summary));
       setAgentRunStatusForCard(cardId, "completed");
       setAgentProgressForCard(cardId, 100);
       appNotice = {
@@ -4118,6 +4509,15 @@
       };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
+      updateExecutionRunForCard(cardId, (run) => {
+        const currentStep = run.current_step_ids[0] ?? run.contract.current_step;
+        return updateExecutionStep(
+          { ...run, status: "failed", completed_at: new Date().toISOString() },
+          currentStep,
+          "failed",
+          message,
+        );
+      });
       updateCardExecution(cardId, { blocked: { reason: message } });
       setAgentRunStatusForCard(cardId, "blocked");
       setAgentRunResultForCard(cardId, null);
@@ -4207,6 +4607,17 @@
       <button class="sync-button" type="button" disabled={syncing} onclick={syncJira}>
         {syncing ? "Syncing Jira" : settings.jira.boardId ? "Sync Jira board" : "Sync Jira"}
       </button>
+      {#if deletedJiraCardCount > 0}
+        <button
+          class="sync-button restore-button"
+          type="button"
+          disabled={syncing}
+          onclick={restoreDeletedJiraCards}
+          title="Show Jira cards previously removed from Spacesly"
+        >
+          Restore {deletedJiraCardCount} deleted
+        </button>
+      {/if}
     </header>
 
     {#if settingsOpen}
@@ -5080,14 +5491,14 @@
         <NotificationStack notice={appNotice} {syncError} onDismissNotice={dismissAppNotice} />
 
         <div
-          class:with-console={agentConsoleOpen && hasAgentConsoleSession}
-          class:is-hidden={workspaceMode !== "board"}
-          class="workspace-body"
-          style={agentConsoleOpen && hasAgentConsoleSession
-            ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;`
-            : `--lane-width: ${layoutPrefs.laneWidth}px;`}
-        >
-          <BoardWorkspace
+          hidden={workspaceMode !== "board"}
+            class:with-console={agentConsoleOpen && hasAgentConsoleSession}
+            class="workspace-body"
+            style={agentConsoleOpen && hasAgentConsoleSession
+              ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;`
+              : `--lane-width: ${layoutPrefs.laneWidth}px;`}
+          >
+            <BoardWorkspace
             {displayColumns}
             {selectedCardId}
             {draggedCardId}
@@ -5125,8 +5536,8 @@
             {operatorNotesForCard}
           />
 
-          {#if agentConsoleOpen && hasAgentConsoleSession}
-            <div class="grid-resize-handle">
+            {#if agentConsoleOpen && hasAgentConsoleSession}
+              <div class="grid-resize-handle">
               <span
                 class="drag-handle horizontal"
                 role="separator"
@@ -5137,19 +5548,19 @@
                 onpointerup={endLayoutResize}
                 onpointercancel={endLayoutResize}
               ></span>
-            </div>
-            {#if agentConsoleModule}
-              {@const AgentConsolePanel = agentConsoleModule.default}
-              <AgentConsolePanel
+              </div>
+              {#if agentConsoleModule}
+                {@const AgentConsolePanel = agentConsoleModule.default}
+                <AgentConsolePanel
                 style=""
                 title={visibleAgentRunTitle}
                 status={visibleAgentRunStatus}
                 progress={visibleAgentRunProgress}
-                phases={agentPhases}
                 logs={visibleAgentRunLogs}
                 transcript={visibleAgentRunTranscript}
                 output={visibleAgentRunOutput}
                 result={visibleAgentRunResult}
+                executionRun={visibleExecutionRun}
                 runStatus={visibleAgentRunStatus}
                 terminalLines={visibleAgentTerminalLines}
                 terminalInput={agentTerminalInput}
@@ -5159,9 +5570,9 @@
                 onSubmitTerminalInput={submitAgentTerminalInput}
                 onOpenCard={(cardId) => (selectedCardId = cardId)}
                 onMarkBlockedDone={requestManualDoneConfirmation}
-              />
-            {:else}
-              <aside class="agent-console" aria-label="Agent run console loading">
+                />
+              {:else}
+                <aside class="agent-console" aria-label="Agent run console loading">
                 <header>
                   <div>
                     <p>Agent Console</p>
@@ -5185,9 +5596,9 @@
                   <progress max="100" value={visibleAgentRunProgress}></progress>
                   <p>Preparing the Agent console only when opened.</p>
                 </div>
-              </aside>
+                </aside>
+              {/if}
             {/if}
-          {/if}
         </div>
         {#if workspaceMode === "board" && newTaskOpen}
           <NewTaskPopover
@@ -5284,7 +5695,7 @@
 
         <div
           class:collapsed={fileSidebarCollapsed}
-          class:is-hidden={workspaceMode !== "files"}
+          hidden={workspaceMode !== "files"}
           class="files-workspace"
           style={`--file-sidebar-width: ${layoutPrefs.fileSidebarWidth}px;`}
         >
@@ -5440,7 +5851,7 @@
         </div>
 
         <div
-          class:is-hidden={workspaceMode !== "term"}
+          hidden={workspaceMode !== "term"}
           class="term-workspace"
           style={`--terminal-width: ${layoutPrefs.terminalWidth}px;`}
         >
@@ -5585,6 +5996,11 @@
           </footer>
         </div>
       {/if}
+    {:else if workspace}
+      <section class="state-panel">
+        <strong>Unable to open workspace board</strong>
+        <p>The loaded workspace does not contain a board projection. Clear the saved workspace or sync Jira again.</p>
+      </section>
     {:else}
       <section class="state-panel">Preparing workspace projection...</section>
     {/if}

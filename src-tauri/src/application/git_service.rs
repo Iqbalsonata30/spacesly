@@ -6,7 +6,7 @@ use crate::infrastructure::git::{
     commit_workspace_git_changes, merge_workspace_git_branch, pull_workspace_git_changes,
     push_workspace_git_changes, rebase_workspace_git_branch, stage_all_workspace_git_files,
     stage_workspace_git_file, unstage_all_workspace_git_files, unstage_workspace_git_file,
-    workspace_changed_files, workspace_git_status, CommitResult, GitChangedFile, GitStatus,
+    workspace_git_status, CommitResult, GitStatus,
 };
 
 #[derive(Clone)]
@@ -19,55 +19,67 @@ impl GitService {
         Self { root }
     }
 
-    pub fn workspace_git_info(&self) -> Result<GitWorkspaceInfo, String> {
-        workspace_git_info(&self.root)
+    pub fn workspace_git_info(&self, workspace_id: String) -> Result<GitWorkspaceInfo, String> {
+        workspace_git_info(&self.root, workspace_id)
     }
 
-    pub fn changed_files(&self) -> Result<Vec<GitChangedFile>, String> {
-        workspace_changed_files(&self.root)
+    pub fn status(&self, workspace_id: String) -> Result<GitStatus, String> {
+        workspace_git_status(&self.root, workspace_id)
     }
 
-    pub fn status(&self) -> Result<GitStatus, String> {
-        workspace_git_status(&self.root)
+    pub fn stage_file(&self, workspace_id: String, path: String) -> Result<GitStatus, String> {
+        stage_workspace_git_file(&self.root, workspace_id, path)
     }
 
-    pub fn stage_file(&self, path: String) -> Result<GitStatus, String> {
-        stage_workspace_git_file(&self.root, path)
+    pub fn stage_all(&self, workspace_id: String) -> Result<GitStatus, String> {
+        stage_all_workspace_git_files(&self.root, workspace_id)
     }
 
-    pub fn stage_all(&self) -> Result<GitStatus, String> {
-        stage_all_workspace_git_files(&self.root)
+    pub fn unstage_file(&self, workspace_id: String, path: String) -> Result<GitStatus, String> {
+        unstage_workspace_git_file(&self.root, workspace_id, path)
     }
 
-    pub fn unstage_file(&self, path: String) -> Result<GitStatus, String> {
-        unstage_workspace_git_file(&self.root, path)
+    pub fn unstage_all(&self, workspace_id: String) -> Result<GitStatus, String> {
+        unstage_all_workspace_git_files(&self.root, workspace_id)
     }
 
-    pub fn unstage_all(&self) -> Result<GitStatus, String> {
-        unstage_all_workspace_git_files(&self.root)
+    pub fn checkout_branch(
+        &self,
+        workspace_id: String,
+        branch: String,
+    ) -> Result<GitWorkspaceInfo, String> {
+        checkout_workspace_git_branch(&self.root, workspace_id, branch)
     }
 
-    pub fn checkout_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
-        checkout_workspace_git_branch(&self.root, branch)
+    pub fn pull_changes(&self, workspace_id: String) -> Result<GitWorkspaceInfo, String> {
+        pull_workspace_git_changes(&self.root, workspace_id)
     }
 
-    pub fn pull_changes(&self) -> Result<GitWorkspaceInfo, String> {
-        pull_workspace_git_changes(&self.root)
+    pub fn commit_changes(
+        &self,
+        workspace_id: String,
+        message: String,
+    ) -> Result<CommitResult, String> {
+        commit_workspace_git_changes(&self.root, workspace_id, message)
     }
 
-    pub fn commit_changes(&self, message: String) -> Result<CommitResult, String> {
-        commit_workspace_git_changes(&self.root, message)
+    pub fn push_changes(&self, workspace_id: String) -> Result<GitWorkspaceInfo, String> {
+        push_workspace_git_changes(&self.root, workspace_id)
     }
 
-    pub fn push_changes(&self) -> Result<GitWorkspaceInfo, String> {
-        push_workspace_git_changes(&self.root)
+    pub fn merge_branch(
+        &self,
+        workspace_id: String,
+        branch: String,
+    ) -> Result<GitWorkspaceInfo, String> {
+        merge_workspace_git_branch(&self.root, workspace_id, branch)
     }
 
-    pub fn merge_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
-        merge_workspace_git_branch(&self.root, branch)
-    }
-
-    pub fn rebase_branch(&self, branch: String) -> Result<GitWorkspaceInfo, String> {
-        rebase_workspace_git_branch(&self.root, branch)
+    pub fn rebase_branch(
+        &self,
+        workspace_id: String,
+        branch: String,
+    ) -> Result<GitWorkspaceInfo, String> {
+        rebase_workspace_git_branch(&self.root, workspace_id, branch)
     }
 }

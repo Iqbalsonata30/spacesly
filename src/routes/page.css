@@ -229,6 +229,12 @@ button:active:not(:disabled) {
   display: none;
 }
 
+.workspace-body[hidden],
+.files-workspace[hidden],
+.term-workspace[hidden] {
+  display: none !important;
+}
+
 .workspace-body.with-console {
   grid-template-columns: minmax(0, 1fr) 1px minmax(360px, var(--agent-console-width));
 }

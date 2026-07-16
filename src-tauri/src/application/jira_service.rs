@@ -5,6 +5,7 @@ use crate::infrastructure::mcp::{
     fetch_jira_boards, fetch_jira_issues, test_jira_connection, test_mcp_connection, JiraBoard,
     JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Application boundary for Jira/MCP workflows exposed through IPC.
 pub struct JiraService;
@@ -38,6 +39,11 @@ impl JiraService {
 
     pub fn sync_workspace(&self, config: JiraMcpConfig) -> Result<Workspace, String> {
         let issues = fetch_jira_issues(config)?;
+        let fetched_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
+            .as_millis()
+            .to_string();
         let imported_issues: Vec<ImportedIssue> = issues
             .into_iter()
             .map(|issue| ImportedIssue {
@@ -48,6 +54,8 @@ impl JiraService {
                 issue_type: issue.issue_type,
                 url: issue.url,
                 labels: issue.labels,
+                jira_updated_at: issue.updated_at,
+                jira_fetched_at: fetched_at.clone(),
             })
             .collect();
 

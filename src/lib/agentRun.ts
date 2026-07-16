@@ -1,4 +1,4 @@
-import type { AiWorkerTaskResult } from "$lib/ipc";
+import type { AiWorkerTaskResult, ExecutionContract } from "$lib/ipc";
 import type { GitWorkspaceInfo } from "$lib/ipc/git";
 
 export type AgentRunStatus = "idle" | "running" | "timeout" | "completed" | "blocked";
@@ -32,6 +32,38 @@ export type AgentSessionEvent = {
   text: string;
 };
 
+export type ExecutionStepStatus =
+  | "pending"
+  | "ready"
+  | "running"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "interrupted"
+  | "skipped";
+
+export type StepRun = {
+  step_id: string;
+  status: ExecutionStepStatus;
+  attempt: number;
+  started_at: string | null;
+  completed_at: string | null;
+  summary: string | null;
+  lease_owner?: string | null;
+  lease_expires_at?: number | null;
+};
+
+export type ExecutionRun = {
+  run_id: string;
+  contract: ExecutionContract;
+  status: "pending" | "running" | "blocked" | "failed" | "completed" | "cancelled";
+  current_step_ids: string[];
+  step_runs: Record<string, StepRun>;
+  started_at: string;
+  completed_at: string | null;
+  revision?: number;
+};
+
 export type AgentRunSession = {
   cardId: string;
   title: string;
@@ -43,6 +75,7 @@ export type AgentRunSession = {
   terminalLines: AgentTerminalLine[];
   gitSnapshot: AgentRunGitSnapshot | null;
   transcript: AgentSessionEvent[];
+  executionRun: ExecutionRun | null;
 };
 
 const ACTIVE_AGENT_RUNS_KEY = "spacesly.agent.active-runs.v1";
@@ -138,6 +171,7 @@ export function createAgentRunSession(
   terminalLines: AgentTerminalLine[],
   gitSnapshot: AgentRunGitSnapshot | null,
   transcript: AgentSessionEvent[],
+  executionRun: ExecutionRun | null,
 ): AgentRunSession {
   return {
     cardId,
@@ -150,6 +184,7 @@ export function createAgentRunSession(
     terminalLines,
     gitSnapshot,
     transcript,
+    executionRun,
   };
 }
 

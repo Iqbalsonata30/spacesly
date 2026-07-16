@@ -11,13 +11,13 @@
     Wrench,
     X,
   } from "lucide-svelte";
-  import type { AgentPhase } from "$lib/boardWorkflow";
   import type { AiWorkerTaskResult } from "$lib/ipc";
   import type {
     AgentRunLog,
     AgentRunStatus,
     AgentSessionEvent,
     AgentTerminalLine,
+    ExecutionRun,
   } from "$lib/agentRun";
 
   type Props = {
@@ -25,11 +25,11 @@
     title: string;
     status: string;
     progress: number;
-    phases: AgentPhase[];
     logs: AgentRunLog[];
     transcript: AgentSessionEvent[];
     output: string;
     result: AiWorkerTaskResult | null;
+    executionRun: ExecutionRun | null;
     runStatus: AgentRunStatus;
     terminalLines: AgentTerminalLine[];
     terminalInput: string;
@@ -46,11 +46,11 @@
     title,
     status: _status,
     progress,
-    phases,
     logs,
     transcript,
     output,
     result,
+    executionRun,
     runStatus,
     terminalLines,
     terminalInput,
@@ -99,39 +99,6 @@
       .slice(0, 4),
   );
 
-  function phaseTitle(phase: AgentPhase): string {
-    return (
-      {
-        prepare: "Planning",
-        jira: "Repository",
-        model: "Ready to work",
-        execute: "Executing task",
-        writeback: "Reviewing changes",
-        done: "Completed",
-      }[phase.key] ?? phase.label
-    );
-  }
-
-  function phaseDescription(phase: AgentPhase): string {
-    return (
-      {
-        prepare: "Understanding the task and preparing a plan.",
-        jira: "Loading the task workspace and repository context.",
-        model: "The Agent is ready with the requested context.",
-        execute: "Making and verifying the requested changes.",
-        writeback: "Recording the result and preparing the final handoff.",
-        done: "The task is complete and ready for review.",
-      }[phase.key] ?? "Task stage."
-    );
-  }
-
-  function phaseIcon(phase: AgentPhase) {
-    if (phase.state === "done") return Check;
-    if (phase.state === "active") return Loader2;
-    if (phase.state === "blocked" || phase.state === "timeout") return AlertCircle;
-    return Circle;
-  }
-
   function latestActivities() {
     return logs.slice(-8).reverse();
   }
@@ -175,7 +142,7 @@
         detail: "You can review the task and retry when ready.",
       };
     if (currentProgress < 15)
-      return { title: "Understanding the task", detail: "The Agent is preparing a plan." };
+      return { title: "Loading execution contract", detail: "The planned work is being prepared for execution." };
     if (currentProgress < 35)
       return { title: "Getting ready", detail: "The Agent is gathering the context it needs." };
     if (currentProgress < 75)
@@ -225,6 +192,25 @@
     if (/(test|verified|passed|lint|check)/i.test(value)) return "Verification";
     if (/(commit|push|pull request|pr)/i.test(value)) return "Delivery";
     return "Outcome detail";
+  }
+
+  function stepStatusLabel(status: string): string {
+    return {
+      pending: "Pending",
+      ready: "Ready",
+      running: "Running",
+      completed: "Completed",
+      blocked: "Blocked",
+      failed: "Failed",
+      skipped: "Skipped",
+    }[status] ?? status;
+  }
+
+  function stepIcon(status: string) {
+    if (status === "completed" || status === "skipped") return Check;
+    if (status === "running" || status === "ready") return Loader2;
+    if (status === "blocked" || status === "failed") return AlertCircle;
+    return Circle;
   }
 </script>
 
@@ -307,46 +293,36 @@
     </section>
   {/if}
 
-  <section class="console-section timeline-section" aria-label="Execution timeline">
-    <div class="section-heading static-heading">
-      <span>Execution timeline</span><small
-        >{isComplete ? "Finished" : isBlocked ? "Paused" : "In progress"}</small
-      >
-    </div>
-    <div class="timeline">
-      {#each phases as phase, index (phase.key)}
-        {@const Icon = phaseIcon(phase)}
-        <article
-          class:active={phase.state === "active"}
-          class:done={phase.state === "done"}
-          class:blocked={phase.state === "blocked" || phase.state === "timeout"}
-          class="timeline-item"
-        >
-          <div class="timeline-rail">
-            <span class={`timeline-icon ${phase.state}`}><Icon size={13} /></span
-            >{#if index < phases.length - 1}<span class="timeline-line"></span>{/if}
-          </div>
-          <div class="timeline-content">
-            <div class="timeline-title">
-              <strong>{phaseTitle(phase)}</strong><span
-                >{phase.state === "done"
-                  ? "Completed"
-                  : phase.state === "active"
-                    ? "Running"
-                    : phase.state === "blocked" || phase.state === "timeout"
-                      ? "Needs attention"
-                      : "Pending"}</span
-              >
+  {#if executionRun}
+    <section class="console-section timeline-section" aria-label="Execution contract steps">
+      <div class="section-heading static-heading">
+        <span>Execution contract</span><small>{executionRun.run_id}</small>
+      </div>
+      <div class="timeline">
+        {#each executionRun.contract.workflow as step, index (step.step_id)}
+          {@const stepRun = executionRun.step_runs[step.step_id]}
+          {@const Icon = stepIcon(stepRun?.status ?? "pending")}
+          <article
+            class:active={stepRun?.status === "running" || stepRun?.status === "ready"}
+            class:done={stepRun?.status === "completed" || stepRun?.status === "skipped"}
+            class:blocked={stepRun?.status === "blocked" || stepRun?.status === "failed"}
+            class="timeline-item"
+          >
+            <div class="timeline-rail">
+              <span class={`timeline-icon ${stepRun?.status ?? "pending"}`}><Icon size={13} /></span
+              >{#if index < executionRun.contract.workflow.length - 1}<span class="timeline-line"></span>{/if}
             </div>
-            {#if phase.state === "active" || phase.state === "blocked" || phase.state === "timeout"}<p
-              >
-                {phaseDescription(phase)}
-              </p>{/if}
-          </div>
-        </article>
-      {/each}
-    </div>
-  </section>
+            <div class="timeline-content">
+              <div class="timeline-title">
+                <strong>{step.title}</strong><span>{stepStatusLabel(stepRun?.status ?? "pending")}</span>
+              </div>
+              <p>{stepRun?.summary ?? `Step type: ${step.type}`}</p>
+            </div>
+          </article>
+        {/each}
+      </div>
+    </section>
+  {/if}
 
   {#if result || isComplete || isBlocked}
     <section class="console-section result-section" aria-label="Result">
@@ -745,12 +721,27 @@
     border-color: rgba(115, 205, 139, 0.5);
     color: #79cf91;
   }
+  .timeline-icon.completed,
+  .timeline-icon.skipped {
+    border-color: rgba(115, 205, 139, 0.5);
+    color: #79cf91;
+  }
   .timeline-icon.active {
     border-color: #866fff;
     color: #b0a2ff;
   }
+  .timeline-icon.running,
+  .timeline-icon.ready {
+    border-color: #866fff;
+    color: #b0a2ff;
+  }
+  .timeline-icon.running :global(svg),
+  .timeline-icon.ready :global(svg) {
+    animation: timeline-spin 1s linear infinite;
+  }
   .timeline-icon.blocked,
-  .timeline-icon.timeout {
+  .timeline-icon.timeout,
+  .timeline-icon.failed {
     border-color: rgba(225, 134, 106, 0.5);
     color: #e79a80;
   }
@@ -784,6 +775,11 @@
     color: #8f879a;
     font-size: 11px;
     line-height: 1.35;
+  }
+  @keyframes timeline-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .result-summary {
     gap: 10px;

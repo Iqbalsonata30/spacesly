@@ -41,6 +41,7 @@ export async function completeShellInput(
 
 export async function openPtyTerminal(
   terminalId: string,
+  workspaceId: string | null,
   workdir: string | null,
   onData: (data: number[]) => void,
 ): Promise<void> {
@@ -48,7 +49,7 @@ export async function openPtyTerminal(
   channel.onmessage = onData;
   return invokeWithPolicy<void>(
     "open_pty_terminal",
-    { terminalId, workdir, onData: channel },
+    { terminalId, workspaceId, workdir, onData: channel },
     IPC_POLICIES.pty,
   );
 }

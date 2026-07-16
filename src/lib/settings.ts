@@ -124,17 +124,17 @@ export const defaultSettings: AppSettings = {
 };
 
 export function loadSettings(): AppSettings {
-  if (typeof localStorage === "undefined") return structuredClone(defaultSettings);
+  if (typeof localStorage === "undefined") return cloneDefaultSettings();
 
   const raw = localStorage.getItem(SETTINGS_KEY);
-  if (!raw) return structuredClone(defaultSettings);
+  if (!raw) return cloneDefaultSettings();
 
   try {
     const settings = settingsWithoutSecrets(normalizeSettings(JSON.parse(raw)));
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     return settings;
   } catch {
-    return structuredClone(defaultSettings);
+    return cloneDefaultSettings();
   }
 }
 
@@ -269,7 +269,7 @@ export function parseEnvText(value: string): Record<string, string> {
 }
 
 function normalizeSettings(value: unknown): AppSettings {
-  const fallback = structuredClone(defaultSettings);
+  const fallback = cloneDefaultSettings();
   if (!value || typeof value !== "object") return fallback;
 
   const candidate = value as Partial<AppSettings>;
@@ -337,6 +337,10 @@ function normalizeSettings(value: unknown): AppSettings {
         : fallback.jira.boards,
     },
   };
+}
+
+function cloneDefaultSettings(): AppSettings {
+  return JSON.parse(JSON.stringify(defaultSettings)) as AppSettings;
 }
 
 function normalizeAiModelIds(

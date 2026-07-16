@@ -8,6 +8,7 @@ export type {
   AiWorkerStatus,
   AiWorkerTask,
   AiWorkerTaskResult,
+  ExecutionContract,
 } from "$lib/ipc/agent";
 export {
   cancelAiWorkerTask,
@@ -34,7 +35,6 @@ export {
   gitPush,
   gitRebaseBranch,
   getPathGitInfo,
-  getWorkspaceChangedFiles,
   getWorkspaceGitInfo,
   getWorkspaceGitStatus,
   stageAllWorkspaceGitFiles,
@@ -61,6 +61,7 @@ export {
   transitionJiraIssue,
 } from "$lib/ipc/jira";
 export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
+export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export { IpcPolicyError } from "$lib/ipc/policy";
 export type {
   ShellCommandRequest,
@@ -83,6 +84,12 @@ export interface WorkspaceProjection {
   id: string;
   name: string;
   projects: ProjectProjection[];
+}
+
+export interface JiraSnapshot {
+  fetched_at: string;
+  updated_at: string | null;
+  status: string;
 }
 
 export interface ProjectProjection {
@@ -128,6 +135,7 @@ export interface CardProjection {
   assignee: string | null;
   priority: Priority;
   execution: ExecutionState;
+  jira_snapshot?: JiraSnapshot | null;
   completedAt?: number | null;
   syncMissingAt?: number | null;
 }

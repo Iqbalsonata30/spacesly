@@ -3,6 +3,7 @@ use super::shell_env::inject_shell_env;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
@@ -34,6 +35,7 @@ impl PtyRegistry {
 pub fn open_pty_terminal(
     state: &PtyState,
     workspace_root: &WorkspaceRoot,
+    workspace_id: Option<String>,
     terminal_id: String,
     workdir: Option<String>,
     on_data: Channel<Vec<u8>>,
@@ -75,8 +77,9 @@ pub fn open_pty_terminal(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .or_else(|| {
+            let workspace_id = workspace_id.as_deref().unwrap_or("workspace-personal");
             workspace_root
-                .path()
+                .path(workspace_id)
                 .ok()
                 .map(|path| path.to_string_lossy().to_string())
         })
@@ -122,20 +125,28 @@ pub fn open_pty_terminal(
             })),
         );
 
+    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(32);
     std::thread::spawn(move || {
         let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    if output_tx.send(buffer[..size].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    std::thread::spawn(move || {
         let mut batch = Vec::with_capacity(PTY_OUTPUT_BATCH_BYTES);
         let mut last_flush = Instant::now();
         loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    if !batch.is_empty() {
-                        let _ = on_data.send(std::mem::take(&mut batch));
-                    }
-                    break;
-                }
-                Ok(size) => {
-                    batch.extend_from_slice(&buffer[..size]);
+            match output_rx.recv_timeout(PTY_OUTPUT_FLUSH_INTERVAL) {
+                Ok(chunk) => {
+                    batch.extend_from_slice(&chunk);
                     if should_flush_pty_batch(batch.len(), last_flush.elapsed()) {
                         if on_data.send(std::mem::take(&mut batch)).is_err() {
                             break;
@@ -143,7 +154,20 @@ pub fn open_pty_terminal(
                         last_flush = Instant::now();
                     }
                 }
-                Err(_) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    if !batch.is_empty() {
+                        if on_data.send(std::mem::take(&mut batch)).is_err() {
+                            break;
+                        }
+                        last_flush = Instant::now();
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    if !batch.is_empty() {
+                        let _ = on_data.send(batch);
+                    }
+                    break;
+                }
             }
         }
     });

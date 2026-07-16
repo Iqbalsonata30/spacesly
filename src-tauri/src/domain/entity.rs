@@ -77,6 +77,15 @@ pub struct Card {
     pub assignee: Option<String>,
     pub priority: Priority,
     pub execution: ExecutionState,
+    #[serde(default)]
+    pub jira_snapshot: Option<JiraSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JiraSnapshot {
+    pub fetched_at: String,
+    pub updated_at: Option<String>,
+    pub status: String,
 }
 
 /// Origin of the work item.

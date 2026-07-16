@@ -613,6 +613,7 @@
   }
 
   .source-header {
+    flex: 0 0 auto;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
@@ -853,17 +854,23 @@
     padding: 8px 10px;
   }
   .source-body {
+    flex: 1 1 0;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: max-content;
+    align-content: start;
     gap: 12px;
     min-width: 0;
     min-height: 0;
     overflow-x: hidden;
     overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
     padding: 12px;
   }
   .source-card {
     min-width: 0;
+    min-height: max-content;
     box-sizing: border-box;
     overflow: hidden;
     border: 1px solid #272530;
@@ -939,6 +946,9 @@
   .changes-list {
     display: grid;
     min-width: 0;
+    max-height: clamp(144px, 32vh, 320px);
+    overflow-x: hidden;
+    overflow-y: auto;
   }
   .change-row {
     position: relative;

@@ -7,6 +7,9 @@ export interface JiraIssue {
   description: string | null;
   status: string;
   issue_type: string;
+  url: string | null;
+  labels: string[];
+  updated_at: string | null;
 }
 
 export interface JiraBoard {

@@ -7,16 +7,18 @@ use application::files_service::FilesService;
 use application::git_service::GitService;
 use application::jira_service::JiraService;
 use domain::entity::Workspace;
+use domain::execution::ExecutionRun;
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, execute_ai_worker_task as execute_ai_worker_task_impl,
     test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiWorkerChatRequest,
     AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask, AiWorkerTaskResult,
 };
+use infrastructure::execution_store::ExecutionStore;
 use infrastructure::files::{FileEntry, WorkspaceRoot};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::git_info_for_path;
 use infrastructure::git::{
-    invalidate_workspace_git_status, CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo,
+    invalidate_workspace_git_status, CommitResult, GitStatus, GitWorkspaceInfo,
 };
 use infrastructure::mcp::{
     close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
@@ -44,6 +46,10 @@ use infrastructure::workspace_cache::{
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::State;
+
+fn workspace_id_or_default(workspace_id: Option<String>) -> String {
+    workspace_id.unwrap_or_else(|| "workspace-personal".to_string())
+}
 
 #[tauri::command]
 fn get_workspace() -> Workspace {
@@ -142,11 +148,28 @@ async fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     agent_runs: State<'_, AgentRunRegistry>,
+    execution_store: State<'_, ExecutionStore>,
 ) -> Result<AiWorkerTaskResult, String> {
     let registry = agent_runs.inner().clone();
     let cancellation = registry.start(&run_id)?;
+    let store = execution_store.inner().clone();
+    if let Err(error) = store.claim_step(&run_id, "worker.execute", &run_id, 15 * 60 * 1000) {
+        let _ = registry.finish(&run_id);
+        return Err(error);
+    }
     let result = tauri::async_runtime::spawn_blocking(move || {
         let result = execute_ai_worker_task_impl(config, task, cancellation);
+        let (status, summary) = match &result {
+            Ok(value)
+                if value.completion_status
+                    == infrastructure::ai_worker::AiWorkerCompletionStatus::Completed =>
+            {
+                ("completed", Some(value.summary.as_str()))
+            }
+            Ok(value) => ("blocked", Some(value.summary.as_str())),
+            Err(error) => ("failed", Some(error.as_str())),
+        };
+        let _ = store.finish_step(&run_id, "worker.execute", &run_id, status, summary);
         let _ = registry.finish(&run_id);
         result
     })
@@ -218,8 +241,8 @@ async fn write_file(
 ) -> Result<(), String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        FilesService::new(root.clone()).write_file(workspace_id, relative_path, content)?;
-        let _ = invalidate_workspace_git_status(&root);
+        FilesService::new(root.clone()).write_file(workspace_id.clone(), relative_path, content)?;
+        let _ = invalidate_workspace_git_status(&root, workspace_id);
         Ok(())
     })
     .await
@@ -241,12 +264,13 @@ async fn workspace_root_path(
 
 #[tauri::command]
 async fn set_workspace_root(
+    workspace_id: String,
     absolute_path: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        FilesService::new(root).set_workspace_root(absolute_path)
+        FilesService::new(root).set_workspace_root(workspace_id, absolute_path)
     })
     .await
     .map_err(|error| format!("Set workspace root task failed: {error}"))?
@@ -286,6 +310,27 @@ async fn save_cached_workspace(
 }
 
 #[tauri::command]
+async fn save_execution_run(
+    run: ExecutionRun,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<ExecutionRun, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save(&run))
+        .await
+        .map_err(|error| format!("Save execution run task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_active_execution_runs(
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<Vec<ExecutionRun>, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list_active())
+        .await
+        .map_err(|error| format!("List execution runs task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -294,12 +339,15 @@ async fn format_code(formatter: String, source: String) -> Result<String, String
 
 #[tauri::command]
 async fn get_workspace_git_info(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).workspace_git_info())
-        .await
-        .map_err(|error| format!("Workspace git info task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).workspace_git_info(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Workspace git info task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -313,129 +361,152 @@ async fn get_path_git_info(path: String) -> Result<GitWorkspaceInfo, String> {
 }
 
 #[tauri::command]
-async fn get_workspace_changed_files(
-    workspace_root: State<'_, WorkspaceRoot>,
-) -> Result<Vec<GitChangedFile>, String> {
-    let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).changed_files())
-        .await
-        .map_err(|error| format!("Workspace changed files task failed: {error}"))?
-}
-
-#[tauri::command]
 async fn get_workspace_git_status(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitStatus, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).status())
-        .await
-        .map_err(|error| format!("Workspace git status task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).status(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Workspace git status task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn stage_workspace_git_file(
+    workspace_id: Option<String>,
     path: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitStatus, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).stage_file(path))
-        .await
-        .map_err(|error| format!("Stage git file task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).stage_file(workspace_id_or_default(workspace_id), path)
+    })
+    .await
+    .map_err(|error| format!("Stage git file task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn stage_all_workspace_git_files(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitStatus, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).stage_all())
-        .await
-        .map_err(|error| format!("Stage all git files task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).stage_all(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Stage all git files task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn unstage_workspace_git_file(
+    workspace_id: Option<String>,
     path: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitStatus, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).unstage_file(path))
-        .await
-        .map_err(|error| format!("Unstage git file task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).unstage_file(workspace_id_or_default(workspace_id), path)
+    })
+    .await
+    .map_err(|error| format!("Unstage git file task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn unstage_all_workspace_git_files(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitStatus, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).unstage_all())
-        .await
-        .map_err(|error| format!("Unstage all git files task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).unstage_all(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Unstage all git files task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn checkout_workspace_git_branch(
+    workspace_id: Option<String>,
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).checkout_branch(branch))
-        .await
-        .map_err(|error| format!("Checkout branch task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).checkout_branch(workspace_id_or_default(workspace_id), branch)
+    })
+    .await
+    .map_err(|error| format!("Checkout branch task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn pull_workspace_git_changes(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).pull_changes())
-        .await
-        .map_err(|error| format!("Git pull task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).pull_changes(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Git pull task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn commit_workspace_git_changes(
+    workspace_id: Option<String>,
     message: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<CommitResult, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).commit_changes(message))
-        .await
-        .map_err(|error| format!("Git commit task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).commit_changes(workspace_id_or_default(workspace_id), message)
+    })
+    .await
+    .map_err(|error| format!("Git commit task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn push_workspace_git_changes(
+    workspace_id: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).push_changes())
-        .await
-        .map_err(|error| format!("Git push task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).push_changes(workspace_id_or_default(workspace_id))
+    })
+    .await
+    .map_err(|error| format!("Git push task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn merge_workspace_git_branch(
+    workspace_id: Option<String>,
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).merge_branch(branch))
-        .await
-        .map_err(|error| format!("Git merge task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).merge_branch(workspace_id_or_default(workspace_id), branch)
+    })
+    .await
+    .map_err(|error| format!("Git merge task failed: {error}"))?
 }
 
 #[tauri::command]
 async fn rebase_workspace_git_branch(
+    workspace_id: Option<String>,
     branch: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<GitWorkspaceInfo, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || GitService::new(root).rebase_branch(branch))
-        .await
-        .map_err(|error| format!("Git rebase task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        GitService::new(root).rebase_branch(workspace_id_or_default(workspace_id), branch)
+    })
+    .await
+    .map_err(|error| format!("Git rebase task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -447,13 +518,21 @@ async fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandR
 
 #[tauri::command]
 fn open_pty_terminal(
+    workspace_id: Option<String>,
     terminal_id: String,
     workdir: Option<String>,
     on_data: Channel<Vec<u8>>,
     state: State<'_, PtyState>,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<(), String> {
-    open_pty_terminal_impl(&state, &workspace_root, terminal_id, workdir, on_data)
+    open_pty_terminal_impl(
+        &state,
+        &workspace_root,
+        workspace_id,
+        terminal_id,
+        workdir,
+        on_data,
+    )
 }
 
 #[tauri::command]
@@ -502,12 +581,13 @@ pub fn run() {
     let pty_state: PtyState = Arc::new(Mutex::new(PtyRegistry::new()));
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
+    let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
     tauri::Builder::default()
         .manage(pty_state)
         .manage(workspace_root)
+        .manage(execution_store)
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_workspace,
             get_jira_issues,
@@ -533,10 +613,11 @@ pub fn run() {
             save_app_secrets,
             load_cached_workspace,
             save_cached_workspace,
+            save_execution_run,
+            list_active_execution_runs,
             format_code,
             get_workspace_git_info,
             get_path_git_info,
-            get_workspace_changed_files,
             get_workspace_git_status,
             stage_workspace_git_file,
             stage_all_workspace_git_files,

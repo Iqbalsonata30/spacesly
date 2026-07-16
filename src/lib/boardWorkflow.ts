@@ -6,22 +6,6 @@ import type {
   WorkspaceProjection,
 } from "$lib/ipc";
 
-export type AgentRunLog = {
-  id: string;
-  at: string;
-  tone: "info" | "success" | "error";
-  label: string;
-  message: string;
-};
-
-export type AgentPhaseKey = "prepare" | "jira" | "model" | "execute" | "writeback" | "done";
-
-export type AgentPhase = {
-  key: AgentPhaseKey;
-  label: string;
-  state: "pending" | "active" | "done" | "blocked" | "timeout";
-};
-
 export function withCompletionMetadata(
   card: CardProjection,
   columnIntent: ColumnIntent,
@@ -71,6 +55,7 @@ export function mergeSyncedWorkspace(
   const deletedIds = new Set(locallyDeletedCardIds);
   const currentEntries = new Map<string, { card: CardProjection; intent: ColumnIntent }>();
   const incomingIds = new Set<string>();
+  const incomingCards = new Map<string, CardProjection>();
 
   for (const column of currentColumns ?? []) {
     for (const card of column.cards) {
@@ -83,6 +68,7 @@ export function mergeSyncedWorkspace(
     for (const card of column.cards) {
       if (deletedIds.has(card.id)) continue;
       incomingIds.add(card.id);
+      incomingCards.set(card.id, card);
     }
   }
 
@@ -109,7 +95,14 @@ export function mergeSyncedWorkspace(
     const missingAt = incomingIds.has(card.id) ? null : (card.syncMissingAt ?? nowMs);
     if (missingAt !== null && nowMs - missingAt > retainMissingCardMs) continue;
 
-    retainCard({ ...card, syncMissingAt: missingAt }, intent);
+    retainCard(
+      {
+        ...card,
+        jira_snapshot: incomingCards.get(card.id)?.jira_snapshot ?? card.jira_snapshot ?? null,
+        syncMissingAt: missingAt,
+      },
+      intent,
+    );
   }
 
   return {
@@ -171,107 +164,6 @@ export function executionDetail(execution: ExecutionState): string {
   if (typeof execution === "string") return execution.replace("_", " ");
   if ("blocked" in execution) return execution.blocked.reason;
   return execution.completed.summary;
-}
-
-export function agentActivity(
-  status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed",
-  progress: number,
-  log: AgentRunLog | null,
-): { title: string; detail: string; next: string } {
-  if (status === "timeout") {
-    return {
-      title: "Response timed out",
-      detail:
-        log?.message ??
-        "Spacesly stopped waiting for the Agent response before a structured result arrived.",
-      next: "Check the Agent runtime output, then continue or retry from this card.",
-    };
-  }
-
-  if (status === "blocked") {
-    return {
-      title: "Blocked",
-      detail: log?.message ?? "Agent stopped because it needs attention.",
-      next: "Review the blocker, then retry the Agent when ready.",
-    };
-  }
-
-  if (status === "completed") {
-    return {
-      title: "Completed and verified",
-      detail: log?.message ?? "Agent finished the task and stored the result.",
-      next: "Review the result or open the card for details.",
-    };
-  }
-
-  if (progress < 15) {
-    return {
-      title: "Preparing workspace task",
-      detail: log?.message ?? "Opening execution session and reading card context.",
-      next: "Move the card into execution state.",
-    };
-  }
-
-  if (progress < 35) {
-    return {
-      title: "Syncing Jira execution state",
-      detail: log?.message ?? "Assigning the issue and moving Jira to In Progress when available.",
-      next: "Send the task context to the Agent runtime.",
-    };
-  }
-
-  if (progress < 75) {
-    return {
-      title: "Agent is working",
-      detail: log?.message ?? "The selected runtime is processing the task and preparing output.",
-      next: "Wait for completion evidence or a blocker.",
-    };
-  }
-
-  if (progress < 94) {
-    return {
-      title: "Recording result",
-      detail: log?.message ?? "Spacesly is saving the Agent result and preparing Jira write-back.",
-      next: "Post summary/comment and transition Jira if configured.",
-    };
-  }
-
-  return {
-    title: "Finalizing",
-    detail: log?.message ?? "Spacesly is finishing local and Jira state updates.",
-    next: "Mark the run completed after final verification.",
-  };
-}
-
-export function agentPhaseTimeline(
-  status: "idle" | "queued" | "running" | "timeout" | "blocked" | "completed",
-  progress: number,
-): AgentPhase[] {
-  const phases: Array<Omit<AgentPhase, "state"> & { threshold: number }> = [
-    { key: "prepare", label: "Prepare", threshold: 5 },
-    { key: "jira", label: "Jira", threshold: 25 },
-    { key: "model", label: "Runtime", threshold: 35 },
-    { key: "execute", label: "Execute", threshold: 55 },
-    { key: "writeback", label: "Write-back", threshold: 82 },
-    { key: "done", label: "Done", threshold: 100 },
-  ];
-
-  return phases.map((phase, index) => {
-    const next = phases[index + 1];
-    const active = progress >= phase.threshold && (!next || progress < next.threshold);
-    return {
-      key: phase.key,
-      label: phase.label,
-      state:
-        (status === "blocked" || status === "timeout") && active
-          ? status
-          : progress >= phase.threshold && (!next || progress >= next.threshold)
-            ? "done"
-            : active
-              ? "active"
-              : "pending",
-    };
-  });
 }
 
 export function isBlocked(execution: ExecutionState): boolean {

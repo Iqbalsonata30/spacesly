@@ -6,7 +6,7 @@ Spacesly is a local-first, AI-augmented desktop workspace for orchestrating dail
 
 - **Kanban Board** — Track work items from Jira or local cards with column workflow (Backlog → Queued → In Progress → Review → Done)
 - **Jira Sync** — Import boards and issues via direct Jira REST API or MCP server; transition statuses, assign, and comment on issues
-- **AI Agent** — Execute cards through an AI worker (OpenAI, Anthropic, Gemini, DeepSeek, or opencode CLI) with structured results and Jira comment posting
+- **AI Agent** — Execute immutable Execution Contracts through bounded workers (OpenAI, Anthropic, Gemini, DeepSeek, or opencode CLI) with structured results and Jira comment posting
 - **Code Editor** — Browse and edit workspace files with CodeMirror (syntax highlighting for JS, TS, Rust, Go, HTML, CSS, JSON, Markdown, YAML, Svelte)
 - **Local Terminal** — Full PTY shell session embedded in the app via xterm.js and portable-pty
 - **AI Chat** — Command-first assistant with workspace, board, and task context
@@ -26,11 +26,18 @@ Frontend (SvelteKit 5 SPA)
 Tauri IPC Bridge (JSON-RPC)
 
 Backend (Rust / src-tauri/)
-  ├── application/          — Use cases: files, git, workspace
-  ├── domain/entity.rs      — Pure data model (Board, Card, Column, etc.)
+  ├── application/          — Use cases: execution, files, git, workspace
+  ├── domain/                — Pure board/entity and ExecutionRun models
   └── infrastructure/       — Adapters: pty, shell, mcp, jira_rest, ai_worker,
-                              files, git, formatting, secrets, shell_env
+                               execution_store (SQLite), files, git, formatting,
+                               secrets, shell_env
 ```
+
+AI execution is contract-first. The planner-facing UI creates an immutable
+Execution Contract once; the backend persists its `ExecutionRun` and `StepRun`
+state in `~/.local/share/spacesly/executions.db`. Workers receive only the
+contract and execute the current step. SQLite leases prevent duplicate worker
+execution, and orphaned running steps are recovered as interrupted after restart.
 
 ## Getting Started
 
@@ -70,7 +77,7 @@ The workspace initializes with a seeded board ("Daily work orchestration") and d
 
 ### AI Agent
 
-Configure a provider and API key in **Settings → Agent**. Click **Start** on a card or drag it to **Ready/In Progress** to execute it through the AI worker. Results stream into the card and, for Jira-backed cards, are posted as comments with automatic issue transition to Done.
+Configure a provider and API key in **Settings → Agent**. Click **Start** on a card or drag it to **Ready/In Progress** to create and execute an immutable contract. Results stream into the card and, for Jira-backed cards, are posted as comments with automatic issue transition to Done. Execution state survives restart in the durable SQLite store.
 
 ### Terminal
 
@@ -97,5 +104,5 @@ Jira credentials, AI provider keys, and MCP server configurations are stored loc
 | Editor        | CodeMirror 6                                   |
 | Terminal      | xterm.js + portable-pty                        |
 | Icons         | Lucide Svelte                                  |
-| Backend       | Rust (tokio, reqwest, serde)                   |
+| Backend       | Rust (reqwest, rusqlite, serde)                |
 | AI            | OpenAI/Anthropic-compatible API + opencode CLI |

@@ -1,6 +1,7 @@
 use super::shell_env::inject_shell_env;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
@@ -179,13 +180,7 @@ pub struct AiWorkerConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiWorkerTask {
-    pub key: Option<String>,
-    pub title: String,
-    pub description: String,
-    pub labels: Vec<String>,
-    pub url: Option<String>,
-    pub operator_notes: Option<String>,
-    pub previous_output: Option<String>,
+    pub execution_contract: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -313,6 +308,7 @@ pub fn execute_ai_worker_task(
     cancellation: Arc<AtomicBool>,
 ) -> Result<AiWorkerTaskResult, String> {
     check_cancelled(&cancellation)?;
+    require_execution_contract(&task)?;
     if config.runtime == "opencode" {
         return execute_opencode_task(config, task, cancellation);
     }
@@ -320,18 +316,12 @@ pub fn execute_ai_worker_task(
     validate_config(&config)?;
 
     let system_prompt = format!(
-        "You are an Agent inside Spacesly, an orchestration app for human and AI agents. You receive Jira-style work cards and produce a concrete execution result. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the work requires changing files, running commands, checking external systems, or using unavailable credentials/tools, set completion_status to blocked and explain what runtime/tool is needed. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
+        "You are an execution-only Worker inside Spacesly. Planning already happened exactly once and is encoded in the immutable Execution Contract. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step and return structured evidence. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the contract current_step requires unavailable tools or credentials, set completion_status to blocked and explain the missing runtime/tool. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
         governance_context(&config, true),
     );
     let user_prompt = format!(
-        "Task key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually verified\"],\n  \"details\": [\"concise notes\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
-        task.key.as_deref().unwrap_or("local"),
-        task.title,
-        task.url.as_deref().unwrap_or("none"),
-        if task.labels.is_empty() { "none".to_string() } else { task.labels.join(", ") },
-        task.description,
-        task.operator_notes.as_deref().unwrap_or("none"),
-        task.previous_output.as_deref().unwrap_or("none"),
+        "Execution Contract (authoritative, immutable):\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually executed and verified for the contract current_step\"],\n  \"details\": [\"concise execution notes; include contract_id/current_step if relevant\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
+        execution_contract_context(&task),
     );
 
     check_cancelled(&cancellation)?;
@@ -465,6 +455,63 @@ fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
     }
 }
 
+fn execution_contract_context(task: &AiWorkerTask) -> String {
+    let Some(contract) = task.execution_contract.as_ref() else {
+        return "No Execution Contract was provided by Spacesly.".to_string();
+    };
+    serde_json::to_string_pretty(contract).unwrap_or_else(|_| contract.to_string())
+}
+
+fn contract_value(task: &AiWorkerTask, path: &[&str]) -> Option<String> {
+    let mut value = task.execution_contract.as_ref()?;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str().map(ToString::to_string)
+}
+
+fn contract_text(task: &AiWorkerTask) -> String {
+    let Some(contract) = task.execution_contract.as_ref() else {
+        return String::new();
+    };
+    let mut values = Vec::new();
+    for path in [
+        &["objective", "summary"][..],
+        &["task_context", "description"][..],
+        &["ticket", "title"][..],
+    ] {
+        if let Some(value) = contract_value(task, path) {
+            values.push(value);
+        }
+    }
+    if let Some(labels) = contract
+        .get("ticket")
+        .and_then(|ticket| ticket.get("labels"))
+        .and_then(Value::as_array)
+    {
+        values.extend(
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string),
+        );
+    }
+    values.join("\n")
+}
+
+fn contract_title(task: &AiWorkerTask) -> String {
+    contract_value(task, &["ticket", "title"])
+        .or_else(|| contract_value(task, &["objective", "summary"]))
+        .unwrap_or_else(|| "Spacesly execution".to_string())
+}
+
+fn require_execution_contract(task: &AiWorkerTask) -> Result<(), String> {
+    if task.execution_contract.is_none() {
+        return Err("Execution Contract is required before starting an Agent worker.".to_string());
+    }
+    Ok(())
+}
+
 fn test_opencode_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> {
     validate_opencode_config(&config)?;
     let mut command = opencode_command(&config);
@@ -503,18 +550,13 @@ fn execute_opencode_task(
     cancellation: Arc<AtomicBool>,
 ) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
+    require_execution_contract(&task)?;
     check_cancelled(&cancellation)?;
     let start_head = git_head(&config);
     let prompt = format!(
-        "You are an Agent inside Spacesly running through OpenCode. You must execute the work card, not merely describe what you would do. If this is a continuation, use the previous Agent output and operator notes to finish only the remaining work; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the task requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the requested work is done and verified. If you cannot perform or verify the work, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the task explicitly asks you to update env/config files or variables, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nTask key: {}\nTitle: {}\nURL: {}\nLabels: {}\n\nDescription:\n{}\n\nOperator notes / approvals:\n{}\n\nPrevious Agent output from this card session:\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed, including file paths/commands/results when applicable\nDETAILS: concise notes",
+        "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
         governance_context(&config, true),
-        task.key.as_deref().unwrap_or("local"),
-        task.title,
-        task.url.as_deref().unwrap_or("none"),
-        if task.labels.is_empty() { "none".to_string() } else { task.labels.join(", ") },
-        task.description,
-        task.operator_notes.as_deref().unwrap_or("none"),
-        task.previous_output.as_deref().unwrap_or("none"),
+        execution_contract_context(&task),
     );
     let mut command = opencode_command(&config);
     command.args([
@@ -527,7 +569,10 @@ fn execute_opencode_task(
     if config.opencode_auto_approve {
         command.arg("--auto");
     }
-    command.arg("--title").arg(&task.title).arg(prompt);
+    command
+        .arg("--title")
+        .arg(contract_title(&task))
+        .arg(prompt);
     let output = run_cancellable_command(command, cancellation)?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -839,18 +884,14 @@ fn missing_sensitive_approval(task: Option<&AiWorkerTask>) -> bool {
 }
 
 fn has_operator_approval(task: &AiWorkerTask) -> bool {
-    let notes = task.operator_notes.as_deref().unwrap_or("").to_lowercase();
+    let notes = contract_value(task, &["runtime_inputs", "operator_notes"])
+        .unwrap_or_default()
+        .to_lowercase();
     notes.contains("approve") || notes.contains("approved") || notes.contains("approval granted")
 }
 
 fn task_requires_sensitive_approval(task: &AiWorkerTask) -> bool {
-    let text = format!(
-        "{}\n{}\n{}",
-        task.title,
-        task.description,
-        task.labels.join(" ")
-    )
-    .to_lowercase();
+    let text = contract_text(task).to_lowercase();
     [
         ".env",
         " env",
@@ -903,7 +944,7 @@ fn block_result(result: &mut AiWorkerTaskResult, reason: String) {
 }
 
 fn task_requires_push(task: &AiWorkerTask) -> bool {
-    let text = format!("{}\n{}", task.title, task.description).to_lowercase();
+    let text = contract_text(task).to_lowercase();
     text.contains("push")
         || text.contains("merge request")
         || text.contains("pull request")
@@ -911,13 +952,7 @@ fn task_requires_push(task: &AiWorkerTask) -> bool {
 }
 
 fn task_requires_env_update_commit(task: &AiWorkerTask) -> bool {
-    let text = format!(
-        "{}\n{}\n{}",
-        task.title,
-        task.description,
-        task.labels.join(" ")
-    )
-    .to_lowercase();
+    let text = contract_text(task).to_lowercase();
 
     let has_update_verb = ["update", "change", "modify", "edit", "add", "remove", "set"]
         .iter()
@@ -1461,13 +1496,12 @@ mod tests {
     #[test]
     fn structured_result_keeps_sensitive_task_blocked_without_approval() {
         let task = AiWorkerTask {
-            key: Some("SEC-1".to_string()),
-            title: "Update API token".to_string(),
-            description: "Change secret token handling.".to_string(),
-            labels: Vec::new(),
-            url: None,
-            operator_notes: None,
-            previous_output: None,
+            execution_contract: Some(serde_json::json!({
+                "objective": { "summary": "Update API token" },
+                "task_context": { "description": "Change secret token handling." },
+                "ticket": { "title": "Update API token", "labels": [] },
+                "runtime_inputs": { "operator_notes": null }
+            })),
         };
 
         let result = result_from_structured_response(
@@ -1494,13 +1528,12 @@ mod tests {
     #[test]
     fn env_update_tasks_require_commit_and_push() {
         let task = AiWorkerTask {
-            key: Some("QCASH-1".to_string()),
-            title: "Update env variable in qcash-deployment Helm template".to_string(),
-            description: "Change values.yaml for the prerelease chart.".to_string(),
-            labels: vec!["deployment".to_string()],
-            url: None,
-            operator_notes: Some("approval granted".to_string()),
-            previous_output: None,
+            execution_contract: Some(serde_json::json!({
+                "objective": { "summary": "Update env variable" },
+                "task_context": { "description": "Change values.yaml for the prerelease chart." },
+                "ticket": { "title": "Update env variable in Helm template", "labels": ["deployment"] },
+                "runtime_inputs": { "operator_notes": "approval granted" }
+            })),
         };
 
         assert!(task_requires_env_update_commit(&task));
@@ -1510,13 +1543,7 @@ mod tests {
     #[test]
     fn redeploy_only_tasks_do_not_require_commit_or_push() {
         let task = AiWorkerTask {
-            key: Some("QCASH-2".to_string()),
-            title: "Redeploy service".to_string(),
-            description: "Redeploy qcash-deployment after the release is available.".to_string(),
-            labels: vec!["deployment".to_string()],
-            url: None,
-            operator_notes: None,
-            previous_output: None,
+            execution_contract: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));
@@ -1526,13 +1553,7 @@ mod tests {
     #[test]
     fn non_repo_chat_task_does_not_require_push() {
         let task = AiWorkerTask {
-            key: Some("QCASH-2".to_string()),
-            title: "Explain current queue".to_string(),
-            description: "Summarize the visible board state.".to_string(),
-            labels: Vec::new(),
-            url: None,
-            operator_notes: None,
-            previous_output: None,
+            execution_contract: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));

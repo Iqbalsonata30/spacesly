@@ -63,6 +63,8 @@
     gap: 9px;
     width: 100%;
     box-sizing: border-box;
+    content-visibility: auto;
+    contain-intrinsic-size: 36px;
     min-width: 0;
     border: 0;
     border-radius: 0;

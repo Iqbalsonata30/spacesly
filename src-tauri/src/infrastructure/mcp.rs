@@ -27,6 +27,7 @@ pub struct JiraIssue {
     pub issue_type: String,
     pub url: Option<String>,
     pub labels: Vec<String>,
+    pub updated_at: Option<String>,
 }
 
 /// Jira agile board exposed by a Jira MCP server.
@@ -205,7 +206,7 @@ pub fn fetch_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String
                 json!({
                     "board_id": board_id,
                     "jql": config.jql,
-                    "fields": "key,summary,description,status,issuetype",
+                    "fields": "key,summary,description,status,issuetype,labels,updated",
                     "start_at": 0,
                     "limit": 50
                 }),
@@ -215,7 +216,7 @@ pub fn fetch_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String
                 resolve_tool(&tools, &config.tool_name)?,
                 json!({
                     "jql": config.jql,
-                    "fields": "key,summary,description,status,issuetype",
+                    "fields": "key,summary,description,status,issuetype,labels,updated",
                     "limit": 50
                 }),
             )
@@ -929,6 +930,7 @@ fn parse_issue(value: &Value) -> Option<JiraIssue> {
         issue_type,
         url: None,
         labels: labels_field(fields),
+        updated_at: text_field(fields, "updated"),
     })
 }
 

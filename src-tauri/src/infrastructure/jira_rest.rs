@@ -210,6 +210,7 @@ pub fn fetch_board_issues_paginated(
             status: issue.fields.status.name,
             issue_type: issue.fields.issue_type.name,
             labels: issue.fields.labels,
+            updated_at: issue.fields.updated,
         }));
 
         page_count += 1;
@@ -397,6 +398,7 @@ struct RestIssueFields {
     status: NamedValue,
     #[serde(rename = "issuetype")]
     issue_type: NamedValue,
+    updated: Option<String>,
 }
 
 #[derive(Deserialize)]

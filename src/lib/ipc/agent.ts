@@ -17,13 +17,63 @@ export interface AiWorkerConfig {
 }
 
 export interface AiWorkerTask {
-  key: string | null;
+  execution_contract: ExecutionContract;
+}
+
+export interface ExecutionContract {
+  contract_id: string;
+  version: number;
+  task_id: string;
+  workspace_id: string;
+  created_at: string;
+  objective: {
+    summary: string;
+    success_criteria: string[];
+  };
+  task_context: {
+    description: string;
+    execution_detail: string;
+  };
+  ticket: {
+    provider: "jira" | "local";
+    key: string | null;
+    url: string | null;
+    title: string;
+    labels: string[];
+    status: string | null;
+    updated_at: string | null;
+    fetched_at: string | null;
+  };
+  workflow: ExecutionContractStep[];
+  completed_steps: string[];
+  current_step: string;
+  remaining_steps: string[];
+  repository: {
+    root_path: string | null;
+    branch: string | null;
+    head_commit: string | null;
+  };
+  constraints: {
+    execution_only: true;
+    planning_completed: true;
+    must_not_read_jira_for_planning: true;
+    must_not_classify_ticket: true;
+    must_not_regenerate_workflow: true;
+    must_not_rediscover_repository: true;
+    may_modify_files: boolean;
+    may_update_jira: boolean;
+  };
+  runtime_inputs: {
+    operator_notes: string | null;
+    previous_output: string | null;
+  };
+}
+
+export interface ExecutionContractStep {
+  step_id: string;
   title: string;
-  description: string;
-  labels: string[];
-  url: string | null;
-  operator_notes?: string | null;
-  previous_output?: string | null;
+  type: "jira.transition" | "worker.execute" | "worker.verify" | "jira.comment";
+  status: "completed" | "current" | "remaining";
 }
 
 export interface AiWorkerChatRequest {

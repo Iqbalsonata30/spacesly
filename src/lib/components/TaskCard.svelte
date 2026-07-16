@@ -96,7 +96,7 @@
   </div>
   <h3>{card.title}</h3>
   <p>
-    {#each description as part (part.url || part.text)}
+    {#each description as part, index (`${index}:${part.url || part.text}`)}
       {#if part.url}
         <a
           href={part.url}
@@ -114,7 +114,7 @@
   </footer>
   {#if card.labels.length > 0}
     <div class="labels">
-      {#each card.labels.slice(0, 4) as label (label)}
+      {#each card.labels.slice(0, 4) as label, index (`${index}:${label}`)}
         <span>{label}</span>
       {/each}
     </div>

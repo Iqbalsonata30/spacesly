@@ -28,10 +28,10 @@ export interface CommitResult {
   message: string;
 }
 
-export async function getWorkspaceGitInfo(): Promise<GitWorkspaceInfo> {
+export async function getWorkspaceGitInfo(workspaceId?: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "get_workspace_git_info",
-    undefined,
+    { workspaceId },
     IPC_POLICIES.gitRead,
   );
 }
@@ -40,94 +40,99 @@ export async function getPathGitInfo(path: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>("get_path_git_info", { path }, IPC_POLICIES.gitRead);
 }
 
-export async function getWorkspaceChangedFiles(): Promise<GitChangedFile[]> {
-  return invokeWithPolicy<GitChangedFile[]>(
-    "get_workspace_changed_files",
-    undefined,
+export async function getWorkspaceGitStatus(workspaceId?: string): Promise<GitStatus> {
+  return invokeWithPolicy<GitStatus>(
+    "get_workspace_git_status",
+    { workspaceId },
     IPC_POLICIES.gitRead,
   );
 }
 
-export async function getWorkspaceGitStatus(): Promise<GitStatus> {
-  return invokeWithPolicy<GitStatus>("get_workspace_git_status", undefined, IPC_POLICIES.gitRead);
-}
-
-export async function stageWorkspaceGitFile(path: string): Promise<GitStatus> {
+export async function stageWorkspaceGitFile(path: string, workspaceId?: string): Promise<GitStatus> {
   return invokeWithPolicy<GitStatus>(
     "stage_workspace_git_file",
-    { path },
+    { workspaceId, path },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function stageAllWorkspaceGitFiles(): Promise<GitStatus> {
+export async function stageAllWorkspaceGitFiles(workspaceId?: string): Promise<GitStatus> {
   return invokeWithPolicy<GitStatus>(
     "stage_all_workspace_git_files",
-    undefined,
+    { workspaceId },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function unstageWorkspaceGitFile(path: string): Promise<GitStatus> {
+export async function unstageWorkspaceGitFile(
+  path: string,
+  workspaceId?: string,
+): Promise<GitStatus> {
   return invokeWithPolicy<GitStatus>(
     "unstage_workspace_git_file",
-    { path },
+    { workspaceId, path },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function unstageAllWorkspaceGitFiles(): Promise<GitStatus> {
+export async function unstageAllWorkspaceGitFiles(workspaceId?: string): Promise<GitStatus> {
   return invokeWithPolicy<GitStatus>(
     "unstage_all_workspace_git_files",
-    undefined,
+    { workspaceId },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function checkoutWorkspaceGitBranch(branch: string): Promise<GitWorkspaceInfo> {
+export async function checkoutWorkspaceGitBranch(
+  branch: string,
+  workspaceId?: string,
+): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "checkout_workspace_git_branch",
-    { branch },
+    { workspaceId, branch },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function gitCommit(message: string): Promise<CommitResult> {
+export async function gitCommit(message: string, workspaceId?: string): Promise<CommitResult> {
   return invokeWithPolicy<CommitResult>(
     "commit_workspace_git_changes",
-    { message },
+    { workspaceId, message },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function gitPush(): Promise<GitWorkspaceInfo> {
+export async function gitPush(workspaceId?: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "push_workspace_git_changes",
-    undefined,
+    { workspaceId },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function gitPull(): Promise<GitWorkspaceInfo> {
+export async function gitPull(workspaceId?: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "pull_workspace_git_changes",
-    undefined,
+    { workspaceId },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function gitMergeBranch(branch: string): Promise<GitWorkspaceInfo> {
+export async function gitMergeBranch(branch: string, workspaceId?: string): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "merge_workspace_git_branch",
-    { branch },
+    { workspaceId, branch },
     IPC_POLICIES.gitMutation,
   );
 }
 
-export async function gitRebaseBranch(branch: string): Promise<GitWorkspaceInfo> {
+export async function gitRebaseBranch(
+  branch: string,
+  workspaceId?: string,
+): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "rebase_workspace_git_branch",
-    { branch },
+    { workspaceId, branch },
     IPC_POLICIES.gitMutation,
   );
 }

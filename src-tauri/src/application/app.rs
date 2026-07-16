@@ -1,6 +1,6 @@
 use crate::domain::entity::{
     Board, BoardId, Card, CardId, CardSource, Column, ColumnId, ColumnIntent, ExecutionState,
-    Priority, Project, ProjectId, Workspace, WorkspaceId,
+    JiraSnapshot, Priority, Project, ProjectId, Workspace, WorkspaceId,
 };
 
 /// Application service for workspace projections.
@@ -17,6 +17,8 @@ pub struct ImportedIssue {
     pub issue_type: String,
     pub url: Option<String>,
     pub labels: Vec<String>,
+    pub jira_updated_at: Option<String>,
+    pub jira_fetched_at: String,
 }
 
 impl AppState {
@@ -75,6 +77,11 @@ fn card_from_issue(issue: &ImportedIssue) -> Card {
         assignee: None,
         priority: Priority::Medium,
         execution: ExecutionState::Idle,
+        jira_snapshot: Some(JiraSnapshot {
+            fetched_at: issue.jira_fetched_at.clone(),
+            updated_at: issue.jira_updated_at.clone(),
+            status: issue.status.clone(),
+        }),
     }
 }
 
@@ -186,6 +193,8 @@ mod tests {
             issue_type: "Task".to_string(),
             url: None,
             labels: Vec::new(),
+            jira_updated_at: Some("2026-07-16T00:00:00Z".to_string()),
+            jira_fetched_at: "1752624000000".to_string(),
         }]);
         let board = &workspace.projects[0].boards[0];
         let in_progress = board

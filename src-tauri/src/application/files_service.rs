@@ -38,7 +38,11 @@ impl FilesService {
         workspace_root_path(&self.root, workspace_id)
     }
 
-    pub fn set_workspace_root(&self, absolute_path: String) -> Result<String, String> {
-        set_workspace_root(&self.root, absolute_path)
+    pub fn set_workspace_root(
+        &self,
+        workspace_id: String,
+        absolute_path: String,
+    ) -> Result<String, String> {
+        set_workspace_root(&self.root, workspace_id, absolute_path)
     }
 }

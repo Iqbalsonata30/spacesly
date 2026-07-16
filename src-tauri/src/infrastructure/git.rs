@@ -1,8 +1,8 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::files::WorkspaceRoot;
@@ -14,7 +14,18 @@ struct CachedGitStatus {
     status: GitStatus,
 }
 
-static GIT_STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedGitStatus>>> = OnceLock::new();
+struct GitStatusCache {
+    state: Mutex<GitStatusCacheState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct GitStatusCacheState {
+    entries: HashMap<PathBuf, CachedGitStatus>,
+    in_flight: HashSet<PathBuf>,
+}
+
+static GIT_STATUS_CACHE: OnceLock<GitStatusCache> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GitWorkspaceInfo {
@@ -48,8 +59,11 @@ pub struct CommitResult {
     pub message: String,
 }
 
-pub fn workspace_git_info(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
-    let workspace_root = root.path()?;
+pub fn workspace_git_info(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitWorkspaceInfo, String> {
+    let workspace_root = root.path(&workspace_id)?;
     git_info_for_path(&workspace_root)
 }
 
@@ -124,9 +138,10 @@ pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
 
 pub fn checkout_workspace_git_branch(
     root: &WorkspaceRoot,
+    workspace_id: String,
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
-    let workspace_root = root.path()?;
+    let workspace_root = root.path(&workspace_id)?;
     let Some(repo_root) = git_repo_root(&workspace_root)? else {
         return Err("Workspace root is not inside a git repository.".to_string());
     };
@@ -145,32 +160,51 @@ pub fn checkout_workspace_git_branch(
     }
 
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_info(root)
+    workspace_git_info(root, workspace_id)
 }
 
-pub fn workspace_changed_files(root: &WorkspaceRoot) -> Result<Vec<GitChangedFile>, String> {
-    let status = workspace_git_status(root)?;
-    let mut files = status.staged;
-    files.extend(status.unstaged);
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
-}
-
-pub fn workspace_git_status(root: &WorkspaceRoot) -> Result<GitStatus, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn workspace_git_status(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     git_status_for_repo(&repo_root)
 }
 
 fn git_status_for_repo(repo_root: &Path) -> Result<GitStatus, String> {
-    let mut cache = git_status_cache()
-        .lock()
-        .map_err(|error| error.to_string())?;
-    if let Some(cached) = cache.get(repo_root) {
-        if cached.refreshed_at.elapsed() <= GIT_STATUS_CACHE_TTL {
-            return Ok(cached.status.clone());
+    let cache = git_status_cache();
+    loop {
+        let mut state = cache.state.lock().map_err(|error| error.to_string())?;
+        if let Some(cached) = state.entries.get(repo_root) {
+            if cached.refreshed_at.elapsed() <= GIT_STATUS_CACHE_TTL {
+                return Ok(cached.status.clone());
+            }
         }
+
+        if state.in_flight.insert(repo_root.to_path_buf()) {
+            break;
+        }
+        state = cache.ready.wait(state).map_err(|error| error.to_string())?;
+        drop(state);
     }
 
+    let result = load_git_status(repo_root);
+    let mut state = cache.state.lock().map_err(|error| error.to_string())?;
+    state.in_flight.remove(repo_root);
+    if let Ok(status) = &result {
+        state.entries.insert(
+            repo_root.to_path_buf(),
+            CachedGitStatus {
+                refreshed_at: Instant::now(),
+                status: status.clone(),
+            },
+        );
+    }
+    cache.ready.notify_all();
+    result
+}
+
+fn load_git_status(repo_root: &Path) -> Result<GitStatus, String> {
     let output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
         .current_dir(repo_root)
@@ -232,59 +266,69 @@ fn git_status_for_repo(repo_root: &Path) -> Result<GitStatus, String> {
 
     staged.sort_by(|a, b| a.path.cmp(&b.path));
     unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-    let status = GitStatus { staged, unstaged };
-    cache.insert(
-        repo_root.to_path_buf(),
-        CachedGitStatus {
-            refreshed_at: Instant::now(),
-            status: status.clone(),
-        },
-    );
-    Ok(status)
+    Ok(GitStatus { staged, unstaged })
 }
 
-pub fn stage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<GitStatus, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn stage_workspace_git_file(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+    path: String,
+) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     let path = normalized_file_path(path)?;
     run_git_dynamic(&repo_root, &["add", "--", &path])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_status(root)
+    workspace_git_status(root, workspace_id)
 }
 
-pub fn stage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn stage_all_workspace_git_files(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     run_git(&repo_root, ["add", "."])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_status(root)
+    workspace_git_status(root, workspace_id)
 }
 
-pub fn unstage_workspace_git_file(root: &WorkspaceRoot, path: String) -> Result<GitStatus, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn unstage_workspace_git_file(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+    path: String,
+) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     let path = normalized_file_path(path)?;
     run_git_dynamic(&repo_root, &["restore", "--staged", "--", &path])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_status(root)
+    workspace_git_status(root, workspace_id)
 }
 
-pub fn unstage_all_workspace_git_files(root: &WorkspaceRoot) -> Result<GitStatus, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn unstage_all_workspace_git_files(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitStatus, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     run_git(&repo_root, ["restore", "--staged", "--", "."])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_status(root)
+    workspace_git_status(root, workspace_id)
 }
 
-pub fn pull_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn pull_workspace_git_changes(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     run_git(&repo_root, ["pull"])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_info(root)
+    workspace_git_info(root, workspace_id)
 }
 
 pub fn commit_workspace_git_changes(
     root: &WorkspaceRoot,
+    workspace_id: String,
     message: String,
 ) -> Result<CommitResult, String> {
-    let repo_root = workspace_repo_root(root)?;
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     let message = message.trim();
     if message.is_empty() {
         return Err("Commit message is required.".to_string());
@@ -303,18 +347,22 @@ pub fn commit_workspace_git_changes(
     })
 }
 
-pub fn push_workspace_git_changes(root: &WorkspaceRoot) -> Result<GitWorkspaceInfo, String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn push_workspace_git_changes(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<GitWorkspaceInfo, String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     run_git(&repo_root, ["push"])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_info(root)
+    workspace_git_info(root, workspace_id)
 }
 
 pub fn merge_workspace_git_branch(
     root: &WorkspaceRoot,
+    workspace_id: String,
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
-    let repo_root = workspace_repo_root(root)?;
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     let branch = branch.trim();
     if branch.is_empty() {
         return Err("Merge branch is required.".to_string());
@@ -322,14 +370,15 @@ pub fn merge_workspace_git_branch(
 
     run_git(&repo_root, ["merge", branch, "--no-edit"])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_info(root)
+    workspace_git_info(root, workspace_id)
 }
 
 pub fn rebase_workspace_git_branch(
     root: &WorkspaceRoot,
+    workspace_id: String,
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
-    let repo_root = workspace_repo_root(root)?;
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     let branch = branch.trim();
     if branch.is_empty() {
         return Err("Rebase branch is required.".to_string());
@@ -337,7 +386,7 @@ pub fn rebase_workspace_git_branch(
 
     run_git(&repo_root, ["rebase", branch])?;
     invalidate_git_status_for_repo(&repo_root);
-    workspace_git_info(root)
+    workspace_git_info(root, workspace_id)
 }
 
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
@@ -416,25 +465,31 @@ fn normalize_git_status(status: char) -> String {
     .to_string()
 }
 
-fn workspace_repo_root(root: &WorkspaceRoot) -> Result<PathBuf, String> {
-    let workspace_root = root.path()?;
+fn workspace_repo_root(root: &WorkspaceRoot, workspace_id: &str) -> Result<PathBuf, String> {
+    let workspace_root = root.path(workspace_id)?;
     git_repo_root(&workspace_root)?
         .ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
 }
 
-pub fn invalidate_workspace_git_status(root: &WorkspaceRoot) -> Result<(), String> {
-    let repo_root = workspace_repo_root(root)?;
+pub fn invalidate_workspace_git_status(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+) -> Result<(), String> {
+    let repo_root = workspace_repo_root(root, &workspace_id)?;
     invalidate_git_status_for_repo(&repo_root);
     Ok(())
 }
 
-fn git_status_cache() -> &'static Mutex<HashMap<PathBuf, CachedGitStatus>> {
-    GIT_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn git_status_cache() -> &'static GitStatusCache {
+    GIT_STATUS_CACHE.get_or_init(|| GitStatusCache {
+        state: Mutex::new(GitStatusCacheState::default()),
+        ready: Condvar::new(),
+    })
 }
 
 fn invalidate_git_status_for_repo(repo_root: &Path) {
-    if let Ok(mut cache) = git_status_cache().lock() {
-        cache.remove(repo_root);
+    if let Ok(mut state) = git_status_cache().state.lock() {
+        state.entries.remove(repo_root);
     }
 }
 
@@ -458,6 +513,8 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -492,6 +549,45 @@ mod tests {
         let refreshed = git_status_for_repo(&repo).expect("status should refresh");
         assert!(refreshed.unstaged.is_empty());
 
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn concurrent_status_requests_share_repository_in_flight_state() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("spacesly-git-coalesce-{suffix}"));
+        fs::create_dir_all(&repo).expect("temporary repository should be created");
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git should start");
+        assert!(init.success());
+        invalidate_git_status_for_repo(&repo);
+
+        let barrier = Arc::new(Barrier::new(6));
+        let handles = (0..6)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let repo = repo.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    git_status_for_repo(&repo).expect("status should load")
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("status request should not deadlock");
+        }
+
+        let cache = git_status_cache();
+        let state = cache.state.lock().expect("cache should not be poisoned");
+        assert!(!state.in_flight.contains(&repo));
+        assert!(state.entries.contains_key(&repo));
+        drop(state);
         let _ = fs::remove_dir_all(repo);
     }
 }
