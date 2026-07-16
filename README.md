@@ -89,7 +89,7 @@ Use the file browser to navigate directories and open files. Files open in a Cod
 
 ### MCP Connections
 
-Add reusable MCP server configurations in **Settings → MCP Connections**. These can be used for Jira, Kubernetes/OCP, Bamboo, or any stdio-based MCP tool server.
+Add reusable MCP server configurations in **Settings → MCP**. These can be used for Jira, Kubernetes/OCP, Bamboo, or any stdio-based MCP tool server.
 
 ## Configuration
 

@@ -176,6 +176,15 @@ pub struct AiWorkerConfig {
     pub agent_rules: String,
     pub agent_skills: String,
     pub temperature: f32,
+    #[serde(default)]
+    pub mcp_servers: Vec<AiWorkerMcpServer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AiWorkerMcpServer {
+    pub name: String,
+    pub command: Vec<String>,
+    pub environment: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1110,6 +1119,31 @@ fn opencode_command(config: &AiWorkerConfig) -> Command {
     inject_shell_env(&mut command);
     command.stdin(Stdio::null());
 
+    if !config.mcp_servers.is_empty() {
+        let mcp = config
+            .mcp_servers
+            .iter()
+            .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
+            .map(|server| {
+                (
+                    server.name.clone(),
+                    serde_json::json!({
+                        "type": "local",
+                        "command": server.command,
+                        "enabled": true,
+                        "environment": server.environment,
+                    }),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        if !mcp.is_empty() {
+            command.env(
+                "OPENCODE_CONFIG_CONTENT",
+                serde_json::json!({ "mcp": mcp }).to_string(),
+            );
+        }
+    }
+
     if let Some(workdir) = config
         .opencode_workdir
         .as_deref()
@@ -1385,7 +1419,37 @@ mod tests {
             agent_rules: rules.to_string(),
             agent_skills: skills.to_string(),
             temperature: 0.2,
+            mcp_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn opencode_command_injects_configured_mcp_servers() {
+        let mut config = config_with_governance("", "");
+        config.runtime = "opencode".to_string();
+        config.mcp_servers.push(AiWorkerMcpServer {
+            name: "spacesly-jira".to_string(),
+            command: vec!["npx".to_string(), "-y".to_string(), "jira-mcp".to_string()],
+            environment: HashMap::from([("JIRA_URL".to_string(), "https://jira.test".to_string())]),
+        });
+
+        let command = opencode_command(&config);
+        let config_content = command
+            .get_envs()
+            .find(|(key, _)| *key == "OPENCODE_CONFIG_CONTENT")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("MCP config should be passed to OpenCode");
+        let parsed: Value = serde_json::from_str(config_content).expect("valid OpenCode config");
+
+        assert_eq!(
+            parsed["mcp"]["spacesly-jira"]["command"],
+            serde_json::json!(["npx", "-y", "jira-mcp"])
+        );
+        assert_eq!(
+            parsed["mcp"]["spacesly-jira"]["environment"]["JIRA_URL"],
+            "https://jira.test"
+        );
     }
 
     #[test]

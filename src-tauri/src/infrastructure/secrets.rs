@@ -13,6 +13,8 @@ pub struct AppSecrets {
     pub jira_password: String,
     #[serde(default)]
     pub ai_api_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub mcp_env: HashMap<String, HashMap<String, String>>,
 }
 
 pub fn load_app_secrets() -> Result<AppSecrets, String> {

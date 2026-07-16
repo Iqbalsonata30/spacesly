@@ -51,6 +51,44 @@ fn workspace_id_or_default(workspace_id: Option<String>) -> String {
     workspace_id.unwrap_or_else(|| "workspace-personal".to_string())
 }
 
+fn mcp_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    let (category, retryable) = if lower.contains("timed out") || lower.contains("timeout") {
+        ("timeout", true)
+    } else if lower.contains("not found")
+        || lower.contains("command is required")
+        || lower.contains("could not find")
+        || lower.contains("did not return")
+        || lower.contains("did not contain")
+    {
+        ("validation", false)
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("credential")
+        || lower.contains("token")
+        || lower.contains("permission")
+    {
+        ("auth", false)
+    } else if lower.contains("failed to start")
+        || lower.contains("connection")
+        || lower.contains("temporarily")
+        || lower.contains("unavailable")
+    {
+        ("transient", true)
+    } else {
+        ("unknown", false)
+    };
+
+    serde_json::json!({
+        "category": category,
+        "message": format!("{operation}: {message}"),
+        "retryable": retryable,
+    })
+    .to_string()
+}
+
 #[tauri::command]
 fn get_workspace() -> Workspace {
     AppState::new().workspace()
@@ -58,39 +96,59 @@ fn get_workspace() -> Workspace {
 
 #[tauri::command]
 async fn get_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().issues(config))
+    let result = tauri::async_runtime::spawn_blocking(move || JiraService::new().issues(config))
         .await
-        .map_err(|error| format!("Jira issue task failed: {error}"))?
+        .map_err(|error| mcp_ipc_error("Jira issue task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira issue request failed", error))
 }
 
 #[tauri::command]
 async fn get_jira_boards(config: JiraMcpConfig) -> Result<Vec<JiraBoard>, String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().boards(config))
+    let result = tauri::async_runtime::spawn_blocking(move || JiraService::new().boards(config))
         .await
-        .map_err(|error| format!("Jira board task failed: {error}"))?
+        .map_err(|error| mcp_ipc_error("Jira board task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira board request failed", error))
 }
 
 #[tauri::command]
 async fn test_jira_mcp_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().test_jira_connection(config))
-        .await
-        .map_err(|error| format!("Jira MCP test task failed: {error}"))?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().test_jira_connection(config)
+    })
+    .await
+    .map_err(|error| mcp_ipc_error("Jira MCP test task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira MCP test failed", error))
 }
 
 #[tauri::command]
 async fn test_mcp_server_connection(
     config: McpServerConfig,
 ) -> Result<McpConnectionStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().test_mcp_connection(config))
-        .await
-        .map_err(|error| format!("MCP test task failed: {error}"))?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().test_mcp_connection(config)
+    })
+    .await
+    .map_err(|error| mcp_ipc_error("MCP test task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("MCP test failed", error))
+}
+
+#[tauri::command]
+async fn disconnect_mcp_server(config: McpServerConfig) -> Result<bool, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().disconnect_mcp_server(config)
+    })
+    .await
+    .map_err(|error| mcp_ipc_error("MCP disconnect task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("MCP disconnect failed", error))
 }
 
 #[tauri::command]
 async fn sync_jira_workspace(config: JiraMcpConfig) -> Result<Workspace, String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().sync_workspace(config))
-        .await
-        .map_err(|error| format!("Jira sync task failed: {error}"))?
+    let result =
+        tauri::async_runtime::spawn_blocking(move || JiraService::new().sync_workspace(config))
+            .await
+            .map_err(|error| mcp_ipc_error("Jira sync task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira sync failed", error))
 }
 
 #[tauri::command]
@@ -99,18 +157,22 @@ async fn transition_jira_issue(
     issue_key: String,
     target_status: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().transition_issue(config, issue_key, target_status)
     })
     .await
-    .map_err(|error| format!("Jira transition task failed: {error}"))?
+    .map_err(|error| mcp_ipc_error("Jira transition task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira transition failed", error))
 }
 
 #[tauri::command]
 async fn assign_jira_issue(config: JiraMcpConfig, issue_key: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || JiraService::new().assign_issue(config, issue_key))
-        .await
-        .map_err(|error| format!("Jira assign task failed: {error}"))?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().assign_issue(config, issue_key)
+    })
+    .await
+    .map_err(|error| mcp_ipc_error("Jira assign task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira assign failed", error))
 }
 
 #[tauri::command]
@@ -119,11 +181,12 @@ async fn add_jira_comment(
     issue_key: String,
     comment: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().add_comment(config, issue_key, comment)
     })
     .await
-    .map_err(|error| format!("Jira comment task failed: {error}"))?
+    .map_err(|error| mcp_ipc_error("Jira comment task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("Jira comment failed", error))
 }
 
 #[tauri::command]
@@ -576,6 +639,26 @@ async fn complete_shell_input(
         .map_err(|error| format!("Shell completion task failed: {error}"))?
 }
 
+#[cfg(test)]
+mod tests {
+    use super::mcp_ipc_error;
+    use serde_json::Value;
+
+    #[test]
+    fn mcp_ipc_errors_include_category_and_retryability() {
+        let value: Value =
+            serde_json::from_str(&mcp_ipc_error("MCP test failed", "request timed out"))
+                .expect("structured MCP error");
+
+        assert_eq!(value["category"], "timeout");
+        assert_eq!(value["retryable"], true);
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("MCP test failed"));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let pty_state: PtyState = Arc::new(Mutex::new(PtyRegistry::new()));
@@ -594,6 +677,7 @@ pub fn run() {
             get_jira_boards,
             test_jira_mcp_connection,
             test_mcp_server_connection,
+            disconnect_mcp_server,
             sync_jira_workspace,
             transition_jira_issue,
             assign_jira_issue,

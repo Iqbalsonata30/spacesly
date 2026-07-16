@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::jira_rest;
 use super::shell_env::inject_shell_env;
 
-const MCP_RESPONSE_QUEUE_CAPACITY: usize = 128;
 const MCP_STDERR_LIMIT: usize = 64 * 1024;
 const MCP_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
 const MCP_HEADER_LINE_LIMIT: usize = 8 * 1024;
@@ -45,6 +45,7 @@ pub struct JiraConnectionStatus {
     pub issue_count: usize,
     pub board_count: usize,
     pub tools: Vec<String>,
+    pub tool_metadata: Vec<McpToolMetadata>,
 }
 
 /// Result of validating a generic MCP connector.
@@ -52,6 +53,14 @@ pub struct JiraConnectionStatus {
 pub struct McpConnectionStatus {
     pub tool_count: usize,
     pub tools: Vec<String>,
+    pub tool_metadata: Vec<McpToolMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct McpToolMetadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Option<Value>,
 }
 
 /// Configuration for a Jira MCP stdio connector.
@@ -62,15 +71,22 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
 }
 
 /// Validates any stdio MCP server by initializing it and listing tools.
 pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatus, String> {
     let tools = with_mcp_client(&server, |client| client.tools())?;
+    if tools.is_empty() {
+        return Err("MCP server initialized but exposed no tools.".to_string());
+    }
 
+    let tool_metadata = with_mcp_client(&server, |client| client.tool_metadata())?;
     Ok(McpConnectionStatus {
         tool_count: tools.len(),
         tools,
+        tool_metadata,
     })
 }
 
@@ -132,6 +148,7 @@ fn default_board_issues_tool_name() -> String {
 pub fn test_jira_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatus, String> {
     with_mcp_client(&config.server, |client| {
         let tools = client.tools()?;
+        let tool_metadata = client.tool_metadata()?;
         let search_tool = resolve_tool(&tools, &config.tool_name)?;
 
         let issues_result = client.call_tool(
@@ -165,74 +182,85 @@ pub fn test_jira_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatu
             issue_count,
             board_count,
             tools,
+            tool_metadata,
         })
     })
 }
 
 /// Fetches Jira agile boards through the configured MCP server.
 pub fn fetch_jira_boards(config: JiraMcpConfig) -> Result<Vec<JiraBoard>, String> {
-    jira_rest::fetch_boards(
-        &config.auth,
-        config.project_key.as_deref(),
-        config.board_name.as_deref(),
-    )
+    let mcp_result = with_mcp_client(&config.server, |client| {
+        let tools = client.tools()?;
+        let board_tool = resolve_tool(&tools, &config.board_tool_name)?;
+        fetch_boards_with_fallbacks(client, &board_tool, &config)
+    });
+
+    mcp_result.or_else(|_| {
+        jira_rest::fetch_boards(
+            &config.auth,
+            config.project_key.as_deref(),
+            config.board_name.as_deref(),
+        )
+    })
 }
 
 /// Fetches Jira issues through the configured MCP server.
 pub fn fetch_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String> {
-    if let Some(board_id) = config
+    let board_id = config
         .board_id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
-    {
-        return jira_rest::fetch_board_issues_paginated(
-            &config.auth,
-            board_id,
-            &config.jql,
-            config.page_size,
-            config.max_pages,
-        );
-    }
+        .map(str::to_string);
 
-    with_mcp_client(&config.server, |client| {
-        let tools = client.tools()?;
-        let (tool_name, arguments) = if let Some(board_id) = config
-            .board_id
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-        {
-            (
-                resolve_tool(&tools, &config.board_issues_tool_name)?,
+    if let Some(board_id) = board_id {
+        let mcp_result = with_mcp_client(&config.server, |client| {
+            let tools = client.tools()?;
+            let tool_name = resolve_tool(&tools, &config.board_issues_tool_name)?;
+            let result = client.call_tool(
+                &tool_name,
                 json!({
                     "board_id": board_id,
                     "jql": config.jql,
                     "fields": "key,summary,description,status,issuetype,labels,updated",
                     "start_at": 0,
-                    "limit": 50
+                    "limit": config.page_size
                 }),
+            )?;
+            parse_jira_issues(&result)
+        });
+
+        return mcp_result.or_else(|_| {
+            jira_rest::fetch_board_issues_paginated(
+                &config.auth,
+                &board_id,
+                &config.jql,
+                config.page_size,
+                config.max_pages,
             )
-        } else {
-            (
-                resolve_tool(&tools, &config.tool_name)?,
-                json!({
-                    "jql": config.jql,
-                    "fields": "key,summary,description,status,issuetype,labels,updated",
-                    "limit": 50
-                }),
-            )
-        };
+        });
+    }
+
+    with_mcp_client(&config.server, |client| {
+        let tools = client.tools()?;
+        let tool_name = resolve_tool(&tools, &config.tool_name)?;
+        let arguments = json!({
+            "jql": config.jql,
+            "fields": "key,summary,description,status,issuetype,labels,updated",
+            "limit": config.page_size
+        });
         let result = client.call_tool(&tool_name, arguments)?;
         parse_jira_issues(&result)
     })
 }
 
 struct StdioMcpClient {
-    child: Child,
-    stdin: std::process::ChildStdin,
-    responses: mpsc::Receiver<Value>,
+    child: Mutex<Child>,
+    stdin: Mutex<std::process::ChildStdin>,
+    pending: Arc<Mutex<HashMap<u64, mpsc::SyncSender<Value>>>>,
     stderr: Arc<Mutex<String>>,
-    next_id: u64,
-    tools: Option<Vec<String>>,
+    reader_error: Arc<Mutex<Option<String>>>,
+    next_id: AtomicU64,
+    tool_metadata: Mutex<Option<Vec<McpToolMetadata>>>,
 }
 
 impl StdioMcpClient {
@@ -259,39 +287,41 @@ impl StdioMcpClient {
                         config.command
                     )
                 } else {
-                    format!("Failed to start Jira MCP server: {error}")
+                    format!("Failed to start MCP server: {error}")
                 }
             })?;
 
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "Failed to open Jira MCP stdin".to_string())?;
+            .ok_or_else(|| "Failed to open MCP stdin".to_string())?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "Failed to open Jira MCP stdout".to_string())?;
+            .ok_or_else(|| "Failed to open MCP stdout".to_string())?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| "Failed to open Jira MCP stderr".to_string())?;
-        let (tx, responses) = mpsc::sync_channel(MCP_RESPONSE_QUEUE_CAPACITY);
+            .ok_or_else(|| "Failed to open MCP stderr".to_string())?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        let reader_error = Arc::new(Mutex::new(None));
 
-        spawn_stdout_reader(stdout, tx);
+        spawn_stdout_reader(stdout, Arc::clone(&pending), Arc::clone(&reader_error));
         spawn_stderr_reader(stderr, Arc::clone(&stderr_buffer));
 
         Ok(Self {
-            child,
-            stdin,
-            responses,
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            pending,
             stderr: stderr_buffer,
-            next_id: request_seed(),
-            tools: None,
+            reader_error,
+            next_id: AtomicU64::new(request_seed()),
+            tool_metadata: Mutex::new(None),
         })
     }
 
-    fn initialize(&mut self) -> Result<(), String> {
+    fn initialize(&self) -> Result<(), String> {
         self.request(
             "initialize",
             json!({
@@ -306,7 +336,7 @@ impl StdioMcpClient {
         self.notify("notifications/initialized", json!({}))
     }
 
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+    fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
         self.request(
             "tools/call",
             json!({
@@ -316,7 +346,7 @@ impl StdioMcpClient {
         )
     }
 
-    fn list_tools(&mut self) -> Result<Vec<String>, String> {
+    fn list_tool_metadata(&self) -> Result<Vec<McpToolMetadata>, String> {
         let result = self.request("tools/list", json!({}))?;
         let tools = result
             .get("tools")
@@ -325,27 +355,67 @@ impl StdioMcpClient {
 
         Ok(tools
             .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .map(str::to_string)
+            .filter_map(|tool| {
+                Some(McpToolMetadata {
+                    name: tool.get("name")?.as_str()?.to_string(),
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    input_schema: tool.get("inputSchema").cloned(),
+                })
+            })
             .collect())
     }
 
-    fn tools(&mut self) -> Result<Vec<String>, String> {
-        if let Some(tools) = self.tools.as_ref() {
-            return Ok(tools.clone());
+    fn tools(&self) -> Result<Vec<String>, String> {
+        if let Some(metadata) = self
+            .tool_metadata
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+        {
+            return Ok(metadata.into_iter().map(|tool| tool.name).collect());
         }
-        let tools = self.list_tools()?;
-        self.tools = Some(tools.clone());
+        let metadata = self.list_tool_metadata()?;
+        let tools: Vec<String> = metadata.iter().map(|tool| tool.name.clone()).collect();
+        *self
+            .tool_metadata
+            .lock()
+            .map_err(|error| error.to_string())? = Some(metadata);
         Ok(tools)
     }
 
-    fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    fn tool_metadata(&self) -> Result<Vec<McpToolMetadata>, String> {
+        if let Some(metadata) = self
+            .tool_metadata
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+        {
+            return Ok(metadata);
+        }
+        self.tools()?;
+        Ok(self
+            .tool_metadata
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone()
+            .unwrap_or_default())
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_id;
-        self.next_id += 1;
+    fn is_alive(&self) -> bool {
+        matches!(
+            self.child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok()),
+            Some(None)
+        )
+    }
+
+    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let message = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -353,27 +423,48 @@ impl StdioMcpClient {
             "params": params
         });
 
-        self.write_message(&message)?;
-
-        let deadline = Duration::from_secs(45);
-        loop {
-            let response = self.read_message(deadline)?;
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-
-            if let Some(error) = response.get("error") {
-                return Err(format!("Jira MCP request failed: {error}"));
-            }
-
-            return response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| "Jira MCP response did not include a result".to_string());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(id, sender);
+        if let Err(error) = self.write_message(&message) {
+            let _ = self.pending.lock().map(|mut pending| pending.remove(&id));
+            return Err(error);
         }
+
+        let response = receiver.recv_timeout(Duration::from_secs(45)).map_err(|error| {
+            let _ = self.pending.lock().map(|mut pending| pending.remove(&id));
+            let stderr = self
+                .stderr
+                .lock()
+                .map(|buffer| buffer.trim().to_string())
+                .unwrap_or_default();
+            let reader_error = self
+                .reader_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone());
+            if let Some(reader_error) = reader_error {
+                reader_error
+            } else if stderr.is_empty() {
+                format!("Timed out waiting for MCP response after 45s. The MCP server started but did not answer this request. Verify the selected tool arguments. Internal timeout: {error}")
+            } else {
+                format!("Timed out waiting for MCP response after 45s. MCP stderr: {stderr}")
+            }
+        })?;
+
+        if let Some(error) = response.get("error") {
+            return Err(format!("MCP request failed: {error}"));
+        }
+
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "MCP response did not include a result".to_string())
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+    fn notify(&self, method: &str, params: Value) -> Result<(), String> {
         self.write_message(&json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -381,49 +472,33 @@ impl StdioMcpClient {
         }))
     }
 
-    fn write_message(&mut self, message: &Value) -> Result<(), String> {
+    fn write_message(&self, message: &Value) -> Result<(), String> {
         let body = serde_json::to_vec(message)
             .map_err(|error| format!("Failed to serialize MCP message: {error}"))?;
-        self.stdin
+        let mut stdin = self.stdin.lock().map_err(|error| error.to_string())?;
+        stdin
             .write_all(&body)
             .map_err(|error| format!("Failed to write MCP body: {error}"))?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .map_err(|error| format!("Failed to write MCP newline: {error}"))?;
-        self.stdin
+        stdin
             .flush()
             .map_err(|error| format!("Failed to flush MCP message: {error}"))
-    }
-
-    fn read_message(&mut self, timeout: Duration) -> Result<Value, String> {
-        self.responses.recv_timeout(timeout).map_err(|error| {
-            let stderr = self
-                .stderr
-                .lock()
-                .map(|buffer| buffer.trim().to_string())
-                .unwrap_or_default();
-            if stderr.is_empty() {
-                format!("Timed out waiting for Jira MCP response after {}s. The MCP server started but did not answer this request. Try narrowing the project/board filter or verify the selected tool arguments. Internal timeout: {error}", timeout.as_secs())
-            } else {
-                format!(
-                    "Timed out waiting for Jira MCP response after {}s. MCP stderr: {}",
-                    timeout.as_secs(),
-                    stderr
-                )
-            }
-        })
     }
 }
 
 impl Drop for StdioMcpClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 struct McpSessionEntry {
-    client: Arc<Mutex<StdioMcpClient>>,
+    client: Arc<StdioMcpClient>,
     last_used: Instant,
 }
 
@@ -453,9 +528,23 @@ pub fn close_all_mcp_sessions() {
     }
 }
 
+pub fn close_mcp_session(server: McpServerConfig) -> Result<bool, String> {
+    let manager = mcp_session_manager();
+    let key = mcp_server_key(&server);
+    let session = manager
+        .sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&key)
+        .map(|entry| entry.client);
+    let existed = session.is_some();
+    drop(session);
+    Ok(existed)
+}
+
 fn with_mcp_client<T, F>(server: &McpServerConfig, operation: F) -> Result<T, String>
 where
-    F: FnOnce(&mut StdioMcpClient) -> Result<T, String>,
+    F: FnOnce(&StdioMcpClient) -> Result<T, String>,
 {
     let key = mcp_server_key(server);
     let manager = mcp_session_manager();
@@ -473,10 +562,10 @@ where
     let session = if let Some(session) = session {
         session
     } else {
-        let mut client = StdioMcpClient::start(server)?;
+        let client = StdioMcpClient::start(server)?;
         client.initialize()?;
         client.tools()?;
-        let candidate = Arc::new(Mutex::new(client));
+        let candidate = Arc::new(client);
         let (session, evicted) = {
             let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
             if let Some(existing) = sessions.get(&key) {
@@ -502,10 +591,8 @@ where
         session
     };
 
-    let mut client = session.lock().map_err(|error| error.to_string())?;
-    let result = operation(&mut client);
-    let alive = client.is_alive();
-    drop(client);
+    let result = operation(&session).map_err(|error| redact_mcp_diagnostic(&error, &server.env));
+    let alive = session.is_alive();
 
     let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
     if let Some(entry) = sessions.get_mut(&key) {
@@ -523,7 +610,7 @@ where
 fn reap_idle_sessions(
     sessions: &mut HashMap<String, McpSessionEntry>,
     now: Instant,
-) -> Vec<Arc<Mutex<StdioMcpClient>>> {
+) -> Vec<Arc<StdioMcpClient>> {
     let expired: Vec<String> = sessions
         .iter()
         .filter(|(_, entry)| {
@@ -541,7 +628,7 @@ fn reap_idle_sessions(
 fn evict_oldest_idle_session(
     sessions: &mut HashMap<String, McpSessionEntry>,
     now: Instant,
-) -> Vec<Arc<Mutex<StdioMcpClient>>> {
+) -> Vec<Arc<StdioMcpClient>> {
     let mut evicted = reap_idle_sessions(sessions, now);
     if sessions.len() < MCP_MAX_SESSIONS {
         return evicted;
@@ -563,7 +650,8 @@ fn mcp_server_key(server: &McpServerConfig) -> String {
     let mut env: Vec<_> = server.env.iter().collect();
     env.sort_by(|left, right| left.0.cmp(right.0));
     format!(
-        "{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
+        server.scope_id.as_deref().unwrap_or("workspace-personal"),
         server.command,
         server.args.join("\0"),
         env.into_iter()
@@ -573,26 +661,79 @@ fn mcp_server_key(server: &McpServerConfig) -> String {
     )
 }
 
-fn spawn_stdout_reader(stdout: std::process::ChildStdout, tx: mpsc::SyncSender<Value>) {
+fn redact_mcp_diagnostic(error: &str, env: &HashMap<String, String>) -> String {
+    env.values()
+        .filter(|value| value.len() >= 4)
+        .fold(error.to_string(), |message, value| {
+            message.replace(value, "[REDACTED]")
+        })
+}
+
+fn spawn_stdout_reader(
+    stdout: std::process::ChildStdout,
+    pending: Arc<Mutex<HashMap<u64, mpsc::SyncSender<Value>>>>,
+    reader_error: Arc<Mutex<Option<String>>>,
+) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_stdout_message(&mut reader) {
                 Ok(Some(value)) => {
-                    let is_response = value.get("id").is_some();
-                    if is_response {
-                        if tx.send(value).is_err() {
-                            break;
-                        }
-                    } else {
-                        let _ = tx.try_send(value);
-                    }
+                    dispatch_mcp_response(&pending, value);
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) => {
+                    fail_pending_requests(
+                        &pending,
+                        &reader_error,
+                        "MCP stdout closed before the pending request completed.".to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    fail_pending_requests(
+                        &pending,
+                        &reader_error,
+                        format!("MCP protocol reader failed: {error}"),
+                    );
+                    break;
+                }
             }
         }
     });
+}
+
+fn fail_pending_requests(
+    pending: &Mutex<HashMap<u64, mpsc::SyncSender<Value>>>,
+    reader_error: &Mutex<Option<String>>,
+    message: String,
+) {
+    if let Ok(mut error) = reader_error.lock() {
+        *error = Some(message.clone());
+    }
+    let senders = pending
+        .lock()
+        .map(|mut pending| pending.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (id, sender) in senders {
+        let _ = sender.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32000, "message": message }
+        }));
+    }
+}
+
+fn dispatch_mcp_response(pending: &Mutex<HashMap<u64, mpsc::SyncSender<Value>>>, value: Value) {
+    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+        return;
+    };
+    let sender = pending
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(&id));
+    if let Some(sender) = sender {
+        let _ = sender.send(value);
+    }
 }
 
 fn spawn_stderr_reader(stderr: std::process::ChildStderr, buffer: Arc<Mutex<String>>) {
@@ -607,18 +748,20 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr, buffer: Arc<Mutex<Stri
 }
 
 fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, String> {
-    let Some(line) = read_bounded_line(reader, MCP_MESSAGE_LIMIT)? else {
-        return Ok(None);
+    let trimmed = loop {
+        let Some(line) = read_bounded_line(reader, MCP_MESSAGE_LIMIT)? else {
+            return Ok(None);
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if !trimmed.is_empty() {
+            break trimmed.to_string();
+        }
     };
 
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    if trimmed.is_empty() {
-        return Ok(Some(
-            json!({ "jsonrpc": "2.0", "method": "_spacesly_empty" }),
-        ));
-    }
-
-    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+    let content_length = trimmed
+        .split_once(':')
+        .and_then(|(name, value)| name.eq_ignore_ascii_case("content-length").then_some(value));
+    if let Some(value) = content_length {
         let length = value
             .trim()
             .parse::<usize>()
@@ -642,12 +785,9 @@ fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, Stri
             .map_err(|error| format!("Failed to parse framed MCP JSON: {error}"));
     }
 
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(value) => Ok(Some(value)),
-        Err(_) => Ok(Some(
-            json!({ "jsonrpc": "2.0", "method": "_spacesly_log", "params": { "line": trimmed } }),
-        )),
-    }
+    serde_json::from_str::<Value>(&trimmed)
+        .map(Some)
+        .map_err(|error| format!("Invalid JSON on MCP stdout: {error}"))
 }
 
 fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<Option<String>, String> {
@@ -728,26 +868,47 @@ fn request_seed() -> u64 {
 
 fn resolve_tool(tools: &[String], preferred: &str) -> Result<String, String> {
     let preferred = preferred.trim();
+    if preferred.is_empty() {
+        return Err("MCP tool name is required.".to_string());
+    }
     if let Some(tool) = tools.iter().find(|tool| tool.as_str() == preferred) {
         return Ok(tool.clone());
     }
-    if let Some(tool) = tools.iter().find(|tool| tool.ends_with(preferred)) {
-        return Ok(tool.clone());
+    if let Some(tool) = resolve_unique_tool_suffix(tools, preferred)? {
+        return Ok(tool);
     }
 
     let suffix = preferred.strip_prefix("jira_").unwrap_or(preferred);
-    if let Some(tool) = tools.iter().find(|tool| tool.ends_with(suffix)) {
-        return Ok(tool.clone());
+    if suffix != preferred {
+        if let Some(tool) = resolve_unique_tool_suffix(tools, suffix)? {
+            return Ok(tool);
+        }
     }
 
     Err(format!(
-        "Could not find Jira MCP tool '{preferred}'. Available tools: {}",
+        "Could not find MCP tool '{preferred}'. Available tools: {}",
         tools.join(", ")
     ))
 }
 
+fn resolve_unique_tool_suffix(tools: &[String], suffix: &str) -> Result<Option<String>, String> {
+    let matches: Vec<&String> = tools.iter().filter(|tool| tool.ends_with(suffix)).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [tool] => Ok(Some((*tool).clone())),
+        _ => Err(format!(
+            "MCP tool name '{suffix}' is ambiguous. Matching tools: {}",
+            matches
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn fetch_boards_with_fallbacks(
-    client: &mut StdioMcpClient,
+    client: &StdioMcpClient,
     board_tool: &str,
     config: &JiraMcpConfig,
 ) -> Result<Vec<JiraBoard>, String> {
@@ -1014,6 +1175,29 @@ mod tests {
     }
 
     #[test]
+    fn accepts_case_insensitive_content_length_and_skips_blank_lines() {
+        let body = br#"{"id":1,"result":{}}"#;
+        let input = format!(
+            "\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+
+        let message = read_stdout_message(&mut reader)
+            .expect("framed message should parse")
+            .expect("framed message should exist");
+        assert_eq!(message["id"], 1);
+    }
+
+    #[test]
+    fn rejects_non_json_stdout_instead_of_treating_it_as_a_response() {
+        let mut reader = BufReader::new(std::io::Cursor::new("server log\n"));
+        let error = read_stdout_message(&mut reader).expect_err("invalid stdout should fail");
+        assert!(error.contains("Invalid JSON on MCP stdout"));
+    }
+
+    #[test]
     fn bounds_mcp_stderr_retention() {
         let mut output = String::new();
         append_bounded_text(
@@ -1037,13 +1221,58 @@ mod tests {
             command: "server".to_string(),
             args: vec!["--stdio".to_string()],
             env: first_env,
+            scope_id: None,
         };
         let second = McpServerConfig {
             command: "server".to_string(),
             args: vec!["--stdio".to_string()],
             env: second_env,
+            scope_id: None,
         };
 
         assert_eq!(mcp_server_key(&first), mcp_server_key(&second));
+
+        let mut other_scope = first.clone();
+        other_scope.scope_id = Some("workspace-other".to_string());
+        assert_ne!(mcp_server_key(&first), mcp_server_key(&other_scope));
+    }
+
+    #[test]
+    fn redacts_environment_values_from_mcp_diagnostics() {
+        let env = HashMap::from([
+            ("TOKEN".to_string(), "super-secret-token".to_string()),
+            ("SHORT".to_string(), "abc".to_string()),
+        ]);
+
+        let diagnostic = redact_mcp_diagnostic("MCP stderr: super-secret-token and abc", &env);
+
+        assert!(!diagnostic.contains("super-secret-token"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(diagnostic.contains("abc"));
+    }
+
+    #[test]
+    fn routes_out_of_order_responses_to_the_matching_request() {
+        let pending = Mutex::new(HashMap::new());
+        let (first_sender, first_receiver) = mpsc::sync_channel(1);
+        let (second_sender, second_receiver) = mpsc::sync_channel(1);
+        pending.lock().unwrap().insert(1, first_sender);
+        pending.lock().unwrap().insert(2, second_sender);
+
+        dispatch_mcp_response(&pending, json!({ "id": 2, "result": "second" }));
+        dispatch_mcp_response(&pending, json!({ "id": 1, "result": "first" }));
+
+        assert_eq!(first_receiver.recv().unwrap()["result"], "first");
+        assert_eq!(second_receiver.recv().unwrap()["result"], "second");
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_ambiguous_tool_suffix_matches() {
+        let tools = vec!["jira_search".to_string(), "legacy_search".to_string()];
+        let error = resolve_tool(&tools, "search").expect_err("suffix should be ambiguous");
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("jira_search"));
+        assert!(error.contains("legacy_search"));
     }
 }

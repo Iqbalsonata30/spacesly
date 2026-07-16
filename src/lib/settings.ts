@@ -42,6 +42,7 @@ export interface AppSecrets {
   jira_personal_access_token: string;
   jira_password: string;
   ai_api_keys: Record<string, string>;
+  mcp_env: Record<string, Record<string, string>>;
 }
 
 export interface AiWorkerSettings {
@@ -158,6 +159,7 @@ export function saveSettings(settings: AppSettings): void {
 export function settingsWithoutSecrets(settings: AppSettings): AppSettings {
   return {
     ...settings,
+    mcpServers: settings.mcpServers.map((server) => ({ ...server, env: {} })),
     jira: {
       ...settings.jira,
       apiToken: "",
@@ -177,6 +179,7 @@ function emptyAppSecrets(): AppSecrets {
     jira_personal_access_token: "",
     jira_password: "",
     ai_api_keys: {},
+    mcp_env: {},
   };
 }
 
@@ -186,6 +189,11 @@ export function secretsFromSettings(settings: AppSettings): AppSecrets {
     jira_personal_access_token: settings.jira.personalAccessToken,
     jira_password: settings.jira.password,
     ai_api_keys: settings.aiWorker.apiKeys,
+    mcp_env: Object.fromEntries(
+      settings.mcpServers
+        .filter((server) => Object.keys(server.env).length > 0)
+        .map((server) => [server.id, { ...server.env }]),
+    ),
   };
 }
 
@@ -194,7 +202,10 @@ export function hasAnySecret(secrets: AppSecrets): boolean {
     secrets.jira_api_token ||
     secrets.jira_personal_access_token ||
     secrets.jira_password ||
-    Object.values(secrets.ai_api_keys).some((value) => value.trim()),
+    Object.values(secrets.ai_api_keys).some((value) => value.trim()) ||
+    Object.values(secrets.mcp_env).some((env) =>
+      Object.values(env).some((value) => value.trim()),
+    ),
   );
 }
 
@@ -205,6 +216,20 @@ export function mergeAppSecrets(localSecrets: AppSecrets, storedSecrets: AppSecr
       localSecrets.jira_personal_access_token || storedSecrets.jira_personal_access_token,
     jira_password: localSecrets.jira_password || storedSecrets.jira_password,
     ai_api_keys: { ...storedSecrets.ai_api_keys, ...localSecrets.ai_api_keys },
+    mcp_env: { ...storedSecrets.mcp_env, ...localSecrets.mcp_env },
+  };
+}
+
+export function mergeMcpSecretsIntoSettings(
+  settings: AppSettings,
+  secrets: AppSecrets,
+): AppSettings {
+  return {
+    ...settings,
+    mcpServers: settings.mcpServers.map((server) => ({
+      ...server,
+      env: { ...server.env, ...(secrets.mcp_env[server.id] ?? {}) },
+    })),
   };
 }
 

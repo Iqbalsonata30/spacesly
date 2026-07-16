@@ -1,5 +1,11 @@
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 
+export interface AiWorkerMcpServer {
+  name: string;
+  command: string[];
+  environment: Record<string, string>;
+}
+
 export interface AiWorkerConfig {
   runtime: "api" | "opencode";
   provider_name: string;
@@ -14,6 +20,7 @@ export interface AiWorkerConfig {
   agent_rules: string;
   agent_skills: string;
   temperature: number;
+  mcp_servers: AiWorkerMcpServer[];
 }
 
 export interface AiWorkerTask {

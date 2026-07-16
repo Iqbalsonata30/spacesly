@@ -49,10 +49,12 @@ export type {
   JiraMcpConfig,
   JiraMcpServerConfig,
   McpConnectionStatus,
+  McpToolMetadata,
 } from "$lib/ipc/jira";
 export {
   addJiraComment,
   assignJiraIssue,
+  disconnectMcpServer,
   getJiraBoards,
   getJiraIssues,
   syncJiraWorkspace,

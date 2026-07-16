@@ -23,17 +23,26 @@ export interface JiraConnectionStatus {
   issue_count: number;
   board_count: number;
   tools: string[];
+  tool_metadata: McpToolMetadata[];
+}
+
+export interface McpToolMetadata {
+  name: string;
+  description: string | null;
+  input_schema: unknown | null;
 }
 
 export interface JiraMcpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  scope_id?: string;
 }
 
 export interface McpConnectionStatus {
   tool_count: number;
   tools: string[];
+  tool_metadata: McpToolMetadata[];
 }
 
 export interface JiraMcpConfig {
@@ -69,7 +78,7 @@ export async function testJiraMcpConnection(config: JiraMcpConfig): Promise<Jira
   return invokeWithPolicy<JiraConnectionStatus>(
     "test_jira_mcp_connection",
     { config },
-    IPC_POLICIES.jiraTest,
+    IPC_POLICIES.mcpTest,
   );
 }
 
@@ -79,7 +88,15 @@ export async function testMcpServerConnection(
   return invokeWithPolicy<McpConnectionStatus>(
     "test_mcp_server_connection",
     { config },
-    IPC_POLICIES.jiraTest,
+    IPC_POLICIES.mcpTest,
+  );
+}
+
+export async function disconnectMcpServer(config: JiraMcpServerConfig): Promise<boolean> {
+  return invokeWithPolicy<boolean>(
+    "disconnect_mcp_server",
+    { config },
+    IPC_POLICIES.jiraMutation,
   );
 }
 

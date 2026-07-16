@@ -35,6 +35,7 @@ export const IPC_POLICIES = {
   jiraMutation: { timeoutMs: 30_000, retries: 0 },
   jiraRead: { timeoutMs: 30_000, retries: 2, retryDelayMs: 500 },
   jiraTest: { timeoutMs: 20_000, retries: 1, retryDelayMs: 500 },
+  mcpTest: { timeoutMs: 180_000, retries: 0 },
   pty: { timeoutMs: 5_000, retries: 0 },
   secret: { timeoutMs: 10_000, retries: 0 },
   shellCompletion: { timeoutMs: 3_000, retries: 0 },

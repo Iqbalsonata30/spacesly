@@ -1,10 +1,5 @@
 <script lang="ts">
-  import {
-    parseArgsText,
-    parseCommandText,
-    parseEnvText,
-    type McpServerSettings,
-  } from "$lib/settings";
+  import { parseArgsText, parseEnvText, type McpServerSettings } from "$lib/settings";
 
   let {
     server,
@@ -23,8 +18,7 @@
   } = $props();
 
   function updateCommand(value: string) {
-    const parsed = parseCommandText(value);
-    onUpdate({ command: parsed.command, args: parsed.args });
+    onUpdate({ command: value.trim() });
   }
 
   function updateArgs(value: string) {
@@ -65,6 +59,12 @@
     <h3>Server runtime</h3>
   </div>
 
+  <p class="field-help">
+    MCP servers extend the OpenCode Agent with tools from external services. Spacesly starts this
+    local stdio server when the Agent runs; use Test connection to verify startup and discover its
+    tools before executing a task.
+  </p>
+
   <label>
     <span>Connection Name</span>
     <input value={server.name} oninput={(event) => onUpdate({ name: event.currentTarget.value })} />
@@ -85,9 +85,9 @@
   </label>
 
   <label>
-    <span>Command or command line</span>
+    <span>Command</span>
     <input
-      placeholder="uvx mcp-server-package"
+      placeholder="uvx"
       value={server.command}
       oninput={(event) => updateCommand(event.currentTarget.value)}
     />

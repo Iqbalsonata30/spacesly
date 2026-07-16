@@ -78,6 +78,7 @@
     loadAppSecrets,
     openPtyTerminal,
     closePtyTerminal,
+    disconnectMcpServer,
     readFile,
     resizePtyTerminal,
     saveAppSecrets,
@@ -117,6 +118,7 @@
     loadSettings,
     saveSettings,
     hasAnySecret,
+    mergeMcpSecretsIntoSettings,
     mergeAppSecrets,
     secretsFromSettings,
     settingsWithoutSecrets,
@@ -811,7 +813,7 @@
       }
 
       appSecrets = mergedSecrets;
-      settings = settingsWithoutSecrets(settings);
+      settings = mergeMcpSecretsIntoSettings(settingsWithoutSecrets(settings), mergedSecrets);
       secretsHydrated = true;
     } catch (reason: unknown) {
       appNotice = {
@@ -928,7 +930,16 @@
     const mergedSecrets = hasAnySecret(appSecrets)
       ? mergeAppSecrets(appSecrets, storedSecrets)
       : storedSecrets;
-    await saveAppSecrets(mergedSecrets);
+    const nextSecrets = {
+      ...mergedSecrets,
+      mcp_env: Object.fromEntries(
+        value.mcpServers
+          .filter((server) => Object.keys(server.env).length > 0)
+          .map((server) => [server.id, { ...server.env }]),
+      ),
+    };
+    await saveAppSecrets(nextSecrets);
+    appSecrets = nextSecrets;
     saveSettings(value);
   }
 
@@ -1700,6 +1711,13 @@
     mcpConnectionStates = { ...mcpConnectionStates, [serverId]: state };
   }
 
+  function invalidateMcpConnection(serverId: string) {
+    const { [serverId]: _state, ...remainingStates } = mcpConnectionStates;
+    const { [serverId]: _tools, ...remainingTools } = mcpToolsByServer;
+    mcpConnectionStates = remainingStates;
+    mcpToolsByServer = remainingTools;
+  }
+
   function rememberMcpTools(serverId: string, tools: string[]) {
     mcpToolsByServer = { ...mcpToolsByServer, [serverId]: tools };
   }
@@ -1711,7 +1729,7 @@
   function mcpConnectionLabel(serverId: string): string {
     const state = mcpConnectionState(serverId);
     if (!state) return "Not tested";
-    return state.status === "connected" ? "Connected" : "Disconnected";
+    return state.status === "connected" ? "Test passed" : "Test failed";
   }
 
   function mcpConnectionDetail(serverId: string): string {
@@ -1786,6 +1804,7 @@
       server: {
         command: server?.command ?? "",
         args: server?.args ?? [],
+        scope_id: workspace?.id ?? "workspace-personal",
         env: {
           ...(server?.env ?? {}),
           JIRA_URL: settings.jira.baseUrl,
@@ -1858,6 +1877,17 @@
       agent_rules: effectiveSettings.aiWorker.agentRules,
       agent_skills: effectiveSettings.aiWorker.agentSkills,
       temperature: effectiveSettings.aiWorker.temperature,
+      mcp_servers: effectiveSettings.mcpServers.flatMap((server) => {
+        const command = [server.command.trim(), ...server.args].filter(Boolean);
+        if (command.length === 0) return [];
+        return [
+          {
+            name: `spacesly-${server.id}`,
+            command,
+            environment: server.env,
+          },
+        ];
+      }),
     };
   }
 
@@ -2489,8 +2519,8 @@
       rememberMcpTools(serverId, status.tools);
       connectionMessage =
         status.board_count > 0 || status.issue_count > 0
-          ? `Jira connected. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
-          : `MCP connected with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
+             ? `Jira test passed. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
+             : `MCP test passed with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
       rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
@@ -2522,6 +2552,7 @@
         : {
             command: selectedServer.command,
             args: selectedServer.args,
+            scope_id: workspace?.id ?? "workspace-personal",
             env: selectedServer.env,
           };
     if (!serverConfig) return;
@@ -2533,7 +2564,7 @@
     try {
       const status = await testMcpServerConnection(serverConfig);
       rememberMcpTools(serverId, status.tools);
-      connectionMessage = `Connected. ${status.tool_count} MCP tool${status.tool_count === 1 ? "" : "s"} available.`;
+      connectionMessage = `MCP test passed. ${status.tool_count} tool${status.tool_count === 1 ? "" : "s"} available.`;
       rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
@@ -2552,6 +2583,31 @@
       });
     } finally {
       testingConnection = false;
+    }
+  }
+
+  async function disconnectSelectedMcpServer(): Promise<boolean> {
+    if (!selectedServer) return false;
+    const serverId = selectedServer.id;
+    const serverConfig =
+      selectedServer.kind === "jira"
+        ? buildJiraConfig()?.server
+        : {
+            command: selectedServer.command,
+            args: selectedServer.args,
+            scope_id: workspace?.id ?? "workspace-personal",
+            env: selectedServer.env,
+          };
+    if (!serverConfig) return false;
+
+    try {
+      await disconnectMcpServer(serverConfig);
+      invalidateMcpConnection(serverId);
+      connectionMessage = "MCP server disconnected.";
+      return true;
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+      return false;
     }
   }
 
@@ -2675,10 +2731,14 @@
     selectedServerId = server.id;
   }
 
-  function removeSelectedServer() {
+  async function removeSelectedServer() {
     if (settings.mcpServers.length <= 1 || !selectedServer) return;
+    const serverId = selectedServer.id;
 
-    const remaining = settings.mcpServers.filter((server) => server.id !== selectedServer.id);
+    settingsError = null;
+    if (!(await disconnectSelectedMcpServer())) return;
+
+    const remaining = settings.mcpServers.filter((server) => server.id !== serverId);
     settings = {
       ...settings,
       mcpServers: remaining,
@@ -2698,10 +2758,12 @@
   ) {
     if (!selectedServer) return;
 
+    const serverId = selectedServer.id;
+    invalidateMcpConnection(serverId);
     settings = {
       ...settings,
       mcpServers: settings.mcpServers.map((server) =>
-        server.id === selectedServer.id ? { ...server, ...values } : server,
+        server.id === serverId ? { ...server, ...values } : server,
       ),
     };
   }
@@ -4622,13 +4684,13 @@
 
     {#if settingsOpen}
       <section class="settings-backdrop" aria-label="Settings dialog">
-        <div class="settings-panel">
+        <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
           <header>
             <div>
               <p>Settings</p>
-              <h2>{settingsTitle}</h2>
-            </div>
-            <button type="button" onclick={closeSettings}>×</button>
+                <h2 id="settings-title">{settingsTitle}</h2>
+              </div>
+            <button type="button" aria-label="Close settings" onclick={closeSettings}>×</button>
           </header>
 
           <div class:mcp={settingsTab === "mcp"} class="settings-grid">
@@ -4689,6 +4751,7 @@
                   <button
                     class:active={server.id === selectedServerId}
                     type="button"
+                    aria-pressed={server.id === selectedServerId}
                     onclick={() => {
                       selectedServerId = server.id;
                       if (server.kind === "jira") {
@@ -5438,6 +5501,9 @@
                       disabled={settings.mcpServers.length <= 1}
                     >
                       Remove
+                    </button>
+                    <button type="button" onclick={disconnectSelectedMcpServer}>
+                      Disconnect
                     </button>
                     <button
                       type="button"

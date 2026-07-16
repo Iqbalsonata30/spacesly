@@ -2,8 +2,9 @@ use crate::application::app::{AppState, ImportedIssue};
 use crate::domain::entity::Workspace;
 use crate::infrastructure::jira_rest::{add_comment, assign_issue, transition_issue};
 use crate::infrastructure::mcp::{
-    fetch_jira_boards, fetch_jira_issues, test_jira_connection, test_mcp_connection, JiraBoard,
-    JiraConnectionStatus, JiraIssue, JiraMcpConfig, McpConnectionStatus, McpServerConfig,
+    close_mcp_session, fetch_jira_boards, fetch_jira_issues, test_jira_connection,
+    test_mcp_connection, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
+    McpConnectionStatus, McpServerConfig,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +36,10 @@ impl JiraService {
         config: McpServerConfig,
     ) -> Result<McpConnectionStatus, String> {
         test_mcp_connection(config)
+    }
+
+    pub fn disconnect_mcp_server(&self, config: McpServerConfig) -> Result<bool, String> {
+        close_mcp_session(config)
     }
 
     pub fn sync_workspace(&self, config: JiraMcpConfig) -> Result<Workspace, String> {
