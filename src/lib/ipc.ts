@@ -1,9 +1,12 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import type { FileEntry } from "$lib/ipc/files";
 export type {
   AiWorkerChatResult,
   AiWorkerChatRequest,
+  AiEditRequest,
+  AiEditResult,
   AiWorkerConfig,
   AiWorkerStatus,
   AiWorkerTask,
@@ -13,16 +16,20 @@ export type {
 export {
   cancelAiWorkerTask,
   chatAiWorker,
+  proposeAiEdit,
   executeAiWorkerTask,
   releaseAiWorkerRun,
   reserveAiWorkerRun,
   testAiWorker,
 } from "$lib/ipc/agent";
-export type { FileEntry } from "$lib/ipc/files";
+export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {
   listDirectory,
+  onWorkspaceFileChange,
   readFile,
   setWorkspaceRoot,
+  unwatchWorkspaceFiles,
+  watchWorkspaceFiles,
   workspaceRootPath,
   writeFile,
 } from "$lib/ipc/files";
@@ -735,6 +742,7 @@ export interface NamedScript {
 }
 
 export interface LspServerConfig {
+  server_id: string;
   command: string;
   args: string[];
   extensions: string[];
@@ -786,30 +794,43 @@ export async function mcpOauthStart(url: string): Promise<string> {
 
 // ── LSP ─────────────────────────────────────────────────────────────
 
-/** Start LSP servers for a workspace in the background. Returns immediately. */
-export async function lspStartServer(workspaceId: string): Promise<void> {
-  return invoke("lsp_start_server", { workspaceId });
+export interface LspServerStatus {
+  workspace_id: string;
+  server_id: string;
+  language_id: string;
+  status: string;
 }
 
-/** Stop a single LSP server by repo + server ID. */
-export async function lspStopServer(repoId: string, serverId: string): Promise<void> {
-  return invoke("lsp_stop_server", { repoId, serverId });
-}
-
-/** Stop and restart a single LSP server. Needs workspaceId to resolve worktree path. */
-export async function lspRestartServer(
-  repoId: string,
-  serverId: string,
+export async function lspStartServer(
   workspaceId: string,
-): Promise<void> {
-  return invoke("lsp_restart_server", { repoId, serverId, workspaceId });
+  config: LspServerConfig,
+): Promise<LspServerStatus> {
+  return invokeWithPolicy<LspServerStatus>(
+    "lsp_start_server",
+    { workspaceId, config },
+    IPC_POLICIES.lspStart,
+  );
 }
 
-/** Query current LSP server status (for populating status bar on mount). */
-export async function lspGetStatus(): Promise<
-  { repo_id: string; server_id: string; status: string }[]
-> {
-  return invoke("lsp_get_status");
+export async function lspStopServer(workspaceId: string, serverId: string): Promise<boolean> {
+  return invokeWithPolicy<boolean>(
+    "lsp_stop_server",
+    { workspaceId, serverId },
+    IPC_POLICIES.lspRead,
+  );
+}
+
+export async function lspRestartServer(
+  workspaceId: string,
+  serverId: string,
+  config: LspServerConfig,
+): Promise<LspServerStatus> {
+  await lspStopServer(workspaceId, serverId);
+  return lspStartServer(workspaceId, config);
+}
+
+export async function lspGetStatus(): Promise<LspServerStatus[]> {
+  return invokeWithPolicy<LspServerStatus[]>("lsp_get_status", {}, IPC_POLICIES.lspRead);
 }
 
 export interface LspLocation {
@@ -819,13 +840,22 @@ export interface LspLocation {
 }
 
 export interface LspDiagnostic {
+  range: { start: LspPosition; end: LspPosition };
+  severity: number | null;
+  message: string;
+  source: string | null;
+  code: unknown;
+  data: unknown;
+}
+
+export interface LspDiagnosticReport {
+  version: number | null;
+  diagnostics: LspDiagnostic[];
+}
+
+export interface LspPosition {
   line: number;
   character: number;
-  end_line: number;
-  end_character: number;
-  severity: string;
-  message: string;
-  source: string;
 }
 
 export interface LspHoverResult {
@@ -833,50 +863,142 @@ export interface LspHoverResult {
   text: string;
 }
 
+export interface LspRange {
+  start: LspPosition;
+  end: LspPosition;
+}
+
+export interface LspTextEdit {
+  range: LspRange;
+  new_text: string;
+}
+
+export interface LspCompletionRequest {
+  file_path: string;
+  position: LspPosition;
+  trigger_kind?: number | null;
+  trigger_character?: string | null;
+}
+
+export interface LspCompletionItem {
+  label: string;
+  detail: string | null;
+  documentation: LspHoverResult | null;
+  kind: number | null;
+  sort_text: string | null;
+  filter_text: string | null;
+  insert_text: string | null;
+  insert_text_format: number | null;
+  text_edit: LspTextEdit | null;
+  additional_text_edits: LspTextEdit[];
+}
+
+export interface LspCompletionResult {
+  is_incomplete: boolean;
+  items: LspCompletionItem[];
+}
+
+export interface LspCodeActionRequest {
+  file_path: string;
+  range: LspRange;
+  diagnostics?: LspDiagnostic[];
+  only?: string[];
+}
+
+export interface LspCodeAction {
+  title: string;
+  kind: string | null;
+  is_preferred: boolean | null;
+  edits: LspTextEdit[];
+}
+
+export async function lspCompletion(
+  workspaceId: string,
+  serverId: string,
+  request: LspCompletionRequest,
+): Promise<LspCompletionResult> {
+  return invokeWithPolicy<LspCompletionResult>(
+    "lsp_completion",
+    { workspaceId, serverId, request },
+    IPC_POLICIES.lspInteractive,
+  );
+}
+
+export async function lspCodeActions(
+  workspaceId: string,
+  serverId: string,
+  request: LspCodeActionRequest,
+): Promise<LspCodeAction[]> {
+  return invokeWithPolicy<LspCodeAction[]>(
+    "lsp_code_actions",
+    { workspaceId, serverId, request },
+    IPC_POLICIES.lspInteractive,
+  );
+}
+
 export async function lspHover(
   workspaceId: string,
+  serverId: string,
   filePath: string,
-  line: number,
-  character: number,
+  position: LspPosition,
 ): Promise<LspHoverResult | null> {
-  return invoke<LspHoverResult | null>("lsp_hover", { workspaceId, filePath, line, character });
+  return invokeWithPolicy<LspHoverResult | null>(
+    "lsp_hover",
+    { workspaceId, serverId, filePath, position },
+    IPC_POLICIES.lspRead,
+  );
 }
 
 export async function lspGotoDefinition(
   workspaceId: string,
+  serverId: string,
   filePath: string,
-  line: number,
-  character: number,
+  position: LspPosition,
 ): Promise<LspLocation | null> {
-  return invoke<LspLocation | null>("lsp_goto_definition", {
-    workspaceId,
-    filePath,
-    line,
-    character,
-  });
+  return invokeWithPolicy<LspLocation | null>(
+    "lsp_goto_definition",
+    { workspaceId, serverId, filePath, position },
+    IPC_POLICIES.lspRead,
+  );
 }
 
 export async function lspDiagnostics(
   workspaceId: string,
+  serverId: string,
   filePath: string,
-): Promise<LspDiagnostic[]> {
-  return invoke<LspDiagnostic[]>("lsp_diagnostics", { workspaceId, filePath });
+): Promise<LspDiagnosticReport> {
+  return invokeWithPolicy<LspDiagnosticReport>(
+    "lsp_diagnostics",
+    { workspaceId, serverId, filePath },
+    IPC_POLICIES.lspRead,
+  );
 }
 
-export interface LspRenameResult {
-  files_changed: number;
-  edits_applied: number;
-  details: { file_path: string; edit_count: number }[];
-}
-
-export async function lspRename(
+export async function lspSyncDocument(
   workspaceId: string,
+  serverId: string,
   filePath: string,
-  line: number,
-  character: number,
-  newName: string,
-): Promise<LspRenameResult> {
-  return invoke<LspRenameResult>("lsp_rename", { workspaceId, filePath, line, character, newName });
+  languageId: string,
+  version: number,
+  text: string,
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "lsp_sync_document",
+    { workspaceId, serverId, filePath, languageId, version, text },
+    IPC_POLICIES.lspRead,
+  );
+}
+
+export async function lspCloseDocument(
+  workspaceId: string,
+  serverId: string,
+  filePath: string,
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "lsp_close_document",
+    { workspaceId, serverId, filePath },
+    IPC_POLICIES.lspRead,
+  );
 }
 
 // ── Script Runner ───────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
-  import { SvelteMap } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
@@ -9,6 +9,22 @@
   import SegmentedControl from "$lib/components/SegmentedControl.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
+  import {
+    createDocumentSession,
+    documentSnapshot,
+    markDocumentExternalConflict,
+    markDocumentSaved,
+    replaceDocument,
+    type CodeEditorHandle,
+    type DocumentSession,
+  } from "$lib/editorDocument";
+  import { createEditorCommandRegistry, type EditorCommandId } from "$lib/editorCommands";
+  import {
+    aiEditProposalIsStale,
+    applyAiEditHunks,
+    createAiEditProposal,
+    type AiEditProposal,
+  } from "$lib/aiEdit";
   import { chatTitleForCard, isGenericChatTitle, summarizeChatTitle } from "$lib/chatSession";
   import { displayPath, fileName, normalizeAbsolutePath } from "$lib/filesFeature";
   import { collectAncestorPaths, pruneExpandedFolderTree } from "$lib/fileBrowser";
@@ -69,13 +85,24 @@
     assignJiraIssue,
     cancelAiWorkerTask,
     chatAiWorker,
+    proposeAiEdit,
     executeAiWorkerTask,
     getJiraBoards,
     getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
     listDirectory,
+    lspCloseDocument,
+    lspDiagnostics,
+    lspCompletion,
+    lspCodeActions,
+    lspGotoDefinition,
+    lspHover,
+    lspStartServer,
+    lspStopServer,
+    lspSyncDocument,
     loadAppSecrets,
+    onWorkspaceFileChange,
     openPtyTerminal,
     closePtyTerminal,
     disconnectMcpServer,
@@ -91,6 +118,8 @@
     testAiWorker,
     testMcpServerConnection,
     transitionJiraIssue,
+    unwatchWorkspaceFiles,
+    watchWorkspaceFiles,
     writeFile,
     writePtyTerminal,
     workspaceRootPath,
@@ -109,9 +138,15 @@
     type ExecutionContract,
     type JiraMcpConfig,
     type JiraBoard,
+    type LspDiagnostic,
+    type LspCodeAction,
+    type LspCompletionResult,
+    type LspServerConfig,
     type WorkspaceProjection,
+    type WorkspaceFileChange,
     testJiraMcpConnection,
   } from "$lib/ipc";
+  import { lspConfigForPath } from "$lib/lspConfig";
   import {
     createMcpServer,
     loadLegacySettingsSecrets,
@@ -136,13 +171,6 @@
     saveCachedWorkspace,
   } from "$lib/workspaceCache";
 
-  type CodeEditorHandle = {
-    getValue: () => string;
-    setValue: (value: string) => void;
-    markSaved: (value?: string) => void;
-    focus: () => void;
-  };
-
   const initialSettings = loadSettings();
   const initialAppSecrets = loadLegacySettingsSecrets();
   const AGENT_STATUS_KEY = "spacesly.agent.status.v1";
@@ -166,6 +194,8 @@
   const ERROR_NOTICE_AUTO_DISMISS_MS = 5_000;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
   const UI_STATE_KEY = "spacesly.ui.v1";
+  const EDITOR_VIM_MODE_KEY = "spacesly.editor.vim-mode.v1";
+  const editorCommands = createEditorCommandRegistry();
 
   type LayoutPrefs = {
     laneWidth: number;
@@ -185,14 +215,7 @@
     pointerId: number;
   };
 
-  type OpenEditorFile = {
-    path: string;
-    name: string;
-    content: string;
-    savedContent: string;
-    dirty: boolean;
-    editor: CodeEditorHandle | null;
-  };
+  type OpenEditorFile = DocumentSession;
 
   const defaultLayoutPrefs: LayoutPrefs = {
     laneWidth: 300,
@@ -395,9 +418,18 @@
   let workspaceFilesDirectory = $state(initialUiState.workspaceFilesDirectory);
   let openEditorFiles = $state<OpenEditorFile[]>([]);
   let activeEditorPath = $state<string | null>(null);
+  let activeEditorHandle = $state<CodeEditorHandle | null>(null);
+  let editorVimMode = $state(
+    typeof localStorage !== "undefined" && localStorage.getItem(EDITOR_VIM_MODE_KEY) === "true",
+  );
   let savingFilePath = $state<string | null>(null);
   let formattingFilePath = $state<string | null>(null);
   let editorDiagnostic = $state<string | null>(null);
+  let aiEditProposal = $state<AiEditProposal | null>(null);
+  let aiEditSelectedHunkIds = $state<string[]>([]);
+  let aiEditGenerating = $state(false);
+  let aiEditError = $state<string | null>(null);
+  let aiEditRequestId = 0;
   let workspaceRoot = $state<string | null>(null);
   let workspaceGitInfo = $state<GitWorkspaceInfo | null>(null);
   let workspaceGitLoading = $state(false);
@@ -406,8 +438,22 @@
   let selectedWorkspaceBranch = $state("");
   let switchingWorkspaceBranch = $state(false);
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
+  let editorDiagnosticRequestId = 0;
+  let activeLspDiagnostics = $state<LspDiagnostic[]>([]);
+  let activeLspCodeActions = $state<LspCodeAction[]>([]);
+  let lspCodeActionsLoading = $state(false);
+  let lspCodeActionRevision: number | null = null;
+  let activeLspStatus = $state("idle");
+  let lspServerStates = $state<Record<string, "starting" | "running" | "error">>({});
+  let lspStartPromises = new SvelteMap<string, Promise<boolean>>();
+  let lspSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let workspaceFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingWorkspaceFilePaths = new SvelteSet<string>();
+  let unlistenWorkspaceFileChanges: (() => void) | null = null;
   let workspaceGitInfoRequestId = 0;
   let workspaceGitStatusRequestId = 0;
+  let allowWindowClose = false;
+  let unlistenWindowClose: (() => void) | null = null;
   let workspaceProjectionRequest: Promise<void> | null = null;
   let backlogStartConfirmation = $state<{ cardId: string; title: string } | null>(null);
   let backlogStartConfirmationResolve: ((confirmed: boolean) => void) | null = null;
@@ -425,7 +471,61 @@
   });
 
   onMount(() => {
+    let disposed = false;
     void hydrateCachedWorkspace();
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (allowWindowClose || !openEditorFiles.some((file) => file.dirty)) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    const unregisterEditorCommands = [
+      editorCommands.register("editor.save", saveActiveFile),
+      editorCommands.register("editor.format", formatActiveFile),
+      editorCommands.register("editor.close", () => {
+        if (activeEditorPath) return closeEditorTab(activeEditorPath);
+      }),
+      editorCommands.register("editor.nextTab", () => selectAdjacentEditorTab(1)),
+      editorCommands.register("editor.previousTab", () => selectAdjacentEditorTab(-1)),
+      editorCommands.register("editor.goToDefinition", goToDefinition),
+      editorCommands.register("editor.quickFix", requestLspCodeActions),
+    ];
+    const editorKeydown = (event: KeyboardEvent) => {
+      if (workspaceMode !== "files" || settingsOpen) return;
+      const modifier = event.metaKey || event.ctrlKey;
+      let command: EditorCommandId | null = null;
+      if (modifier && event.key.toLowerCase() === "s") command = "editor.save";
+      else if (modifier && event.shiftKey && event.key.toLowerCase() === "f")
+        command = "editor.format";
+      else if (modifier && event.key.toLowerCase() === "w") command = "editor.close";
+      else if (event.ctrlKey && event.key === "Tab")
+        command = event.shiftKey ? "editor.previousTab" : "editor.nextTab";
+      if (!command || !editorCommands.execute(command)) return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", editorKeydown);
+    if ("__TAURI_INTERNALS__" in window) {
+      void onWorkspaceFileChange(queueWorkspaceFileChange)
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else unlistenWorkspaceFileChanges = unlisten;
+        })
+        .catch(() => {});
+      void import("@tauri-apps/api/window")
+        .then(async ({ getCurrentWindow }) => {
+          const appWindow = getCurrentWindow();
+          const unlisten = await appWindow.onCloseRequested(async (event) => {
+            if (allowWindowClose) return;
+            event.preventDefault();
+            if (!(await resolveDirtyEditors(openEditorFiles, "closing Spacesly"))) return;
+            allowWindowClose = true;
+            await appWindow.close();
+          });
+          if (disposed) unlisten();
+          else unlistenWindowClose = unlisten;
+        })
+        .catch(() => {});
+    }
     const fallbackWorkspaceTimer = window.setTimeout(() => {
       void loadDefaultWorkspaceProjection();
     }, 500);
@@ -433,10 +533,26 @@
     const timer = window.setInterval(() => {
       now = new Date();
     }, 60_000);
+    const lspDiagnosticTimer = window.setInterval(() => {
+      void refreshActiveLspDiagnostics();
+    }, 1_500);
 
     return () => {
+      disposed = true;
       window.clearTimeout(fallbackWorkspaceTimer);
       window.clearInterval(timer);
+      window.clearInterval(lspDiagnosticTimer);
+      if (lspSyncTimer) clearTimeout(lspSyncTimer);
+      window.removeEventListener("beforeunload", beforeUnload);
+      window.removeEventListener("keydown", editorKeydown);
+      for (const unregister of unregisterEditorCommands) unregister();
+      if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
+      unlistenWindowClose?.();
+      unlistenWindowClose = null;
+      unlistenWorkspaceFileChanges?.();
+      unlistenWorkspaceFileChanges = null;
+      if (workspace) void unwatchWorkspaceFiles(workspace.id).catch(() => {});
+      void stopWorkspaceLspServers();
     };
   });
 
@@ -508,6 +624,13 @@
       .catch(() => {
         workspaceRoot = null;
       });
+  });
+
+  $effect(() => {
+    if (!workspace || !workspaceRoot || !("__TAURI_INTERNALS__" in window)) return;
+    void watchWorkspaceFiles(workspace.id).catch((reason: unknown) => {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+    });
   });
 
   $effect(() => {
@@ -658,8 +781,15 @@
       ? (openEditorFiles.find((file) => file.path === activeEditorPath) ?? null)
       : null,
   );
-  let activeEditorReady = $derived(Boolean(activeEditorFile?.editor));
+  let activeEditorReady = $derived(Boolean(activeEditorHandle));
   let activeEditorDirty = $derived(Boolean(activeEditorFile?.dirty));
+  let aiEditStale = $derived(
+    Boolean(
+      aiEditProposal &&
+      (!activeEditorFile ||
+        aiEditProposalIsStale(aiEditProposal, activeEditorFile.id, activeEditorFile.revision)),
+    ),
+  );
   let hasDirtyEditorFiles = $derived(openEditorFiles.some((file) => file.dirty));
 
   let fileStatusLabel = $derived(
@@ -1041,46 +1171,112 @@
     fileRootLabel = displayPath(root);
   }
 
-  async function refreshOpenEditorFilesFromDisk() {
+  function queueWorkspaceFileChange(change: WorkspaceFileChange) {
+    if (!workspace || change.workspace_id !== workspace.id) return;
+    for (const path of change.paths) pendingWorkspaceFilePaths.add(path);
+    if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
+    workspaceFileChangeTimer = setTimeout(() => {
+      workspaceFileChangeTimer = null;
+      const changedPaths = pendingWorkspaceFilePaths;
+      pendingWorkspaceFilePaths = new SvelteSet<string>();
+      void refreshOpenEditorFilesFromDisk(changedPaths);
+      void refreshFileDirectory(fileDirectory);
+      void refreshWorkspaceGitState();
+    }, 250);
+  }
+
+  async function refreshOpenEditorFilesFromDisk(changedPaths?: Set<string>) {
     if (!workspace || openEditorFiles.length === 0) return;
 
     const activePath = activeEditorPath;
     const workspaceId = workspace.id;
+    const filesAtStart = [...openEditorFiles];
     const refreshedResults = await Promise.all(
-      openEditorFiles.map(async (file) => {
-        try {
-          const content = await readFile(workspaceId, file.path);
+      filesAtStart.map(async (file) => {
+        if (changedPaths && !changedPaths.has(file.path)) {
           return {
-            file: {
-              ...file,
-              content,
-              savedContent: content,
-              dirty: false,
-            },
-            content,
+            path: file.path,
+            file,
+            snapshot: null,
+            preserved: false,
+            missing: false,
+            ignored: true,
+            conflicted: false,
+          };
+        }
+        if (file.dirty) {
+          return {
+            path: file.path,
+            file,
+            snapshot: null,
+            preserved: true,
+            missing: false,
+            ignored: false,
+            conflicted: Boolean(changedPaths),
+          };
+        }
+        try {
+          const snapshot = await readFile(workspaceId, file.path);
+          return {
+            path: file.path,
+            file,
+            snapshot,
+            preserved: false,
+            missing: false,
+            ignored: false,
+            conflicted: false,
           };
         } catch {
-          return null;
+          return {
+            path: file.path,
+            file: null,
+            snapshot: null,
+            preserved: false,
+            missing: true,
+            ignored: false,
+            conflicted: false,
+          };
         }
       }),
     );
-    const refreshedFiles = refreshedResults
-      .filter((result): result is NonNullable<typeof result> => result !== null)
-      .map((result) => result.file);
-    const missingFiles = refreshedResults
-      .map((result, index) => (result ? null : openEditorFiles[index].path))
-      .filter((path): path is string => path !== null);
-    for (const result of refreshedResults) {
-      if (!result) continue;
-      const file = openEditorFiles.find((entry) => entry.path === result.file.path);
-      file?.editor?.setValue(result.content);
-      file?.editor?.markSaved(result.content);
-    }
-
-    openEditorFiles = refreshedFiles;
+    const resultByPath = new Map(refreshedResults.map((result) => [result.path, result]));
+    const missingFiles: string[] = [];
+    let preservedDirtyCount = 0;
+    let externalConflictCount = 0;
+    openEditorFiles = openEditorFiles.flatMap((current) => {
+      const result = resultByPath.get(current.path);
+      if (!result || result.ignored) return [current];
+      if (result.preserved || current.dirty) {
+        preservedDirtyCount += 1;
+        if (result.conflicted || Boolean(changedPaths && current.dirty)) {
+          markDocumentExternalConflict(current);
+          externalConflictCount += 1;
+        }
+        return [{ ...current }];
+      }
+      if (result.missing || !result.file || !result.snapshot) {
+        missingFiles.push(current.path);
+        return [];
+      }
+      if (current.version === result.snapshot.version) return [current];
+      if (current.path === activeEditorPath && activeEditorHandle) {
+        activeEditorHandle.setValue(result.snapshot.content, "disk");
+      } else {
+        replaceDocument(current, result.snapshot.content, "disk");
+      }
+      markDocumentSaved(current, result.snapshot.content);
+      current.version = result.snapshot.version;
+      current.rootRevision = result.snapshot.root_revision;
+      current.encoding = result.snapshot.encoding;
+      current.lineEnding = result.snapshot.line_ending;
+      current.externalConflict = false;
+      return [{ ...current }];
+    });
     activeEditorPath =
-      (activePath && refreshedFiles.some((file) => file.path === activePath) ? activePath : null) ??
-      refreshedFiles[0]?.path ??
+      (activePath && openEditorFiles.some((file) => file.path === activePath)
+        ? activePath
+        : null) ??
+      openEditorFiles[0]?.path ??
       null;
     saveUiState();
 
@@ -1090,9 +1286,21 @@
         message: `${missingFiles.length} open file${missingFiles.length === 1 ? " was" : "s were"} missing on this branch and closed.`,
       };
     }
+    if (preservedDirtyCount > 0) {
+      appNotice = {
+        tone: "info",
+        message: `${preservedDirtyCount} dirty editor${preservedDirtyCount === 1 ? " was" : "s were"} not reloaded from disk.`,
+      };
+    }
+    if (externalConflictCount > 0) {
+      appNotice = {
+        tone: "error",
+        message: `${externalConflictCount} dirty editor${externalConflictCount === 1 ? " changed" : "s changed"} on disk. Your edits were preserved; reload or compare before saving.`,
+      };
+    }
 
     await tick();
-    activeEditorFile?.editor?.focus();
+    activeEditorHandle?.focus();
     await validateActiveEditorSyntax();
   }
 
@@ -1284,11 +1492,14 @@
       defaultPath: workspaceRoot ?? undefined,
     });
     if (typeof selected !== "string") return;
+    if (!(await resolveDirtyEditors(openEditorFiles, "opening another folder"))) return;
 
+    await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, selected);
     fileDirectory = "";
     workspaceFilesDirectory = "";
     openEditorFiles = [];
+    activeEditorHandle = null;
     activeEditorPath = null;
     expandedFileEntries = {};
     expandingFilePaths = {};
@@ -1310,16 +1521,21 @@
       defaultPath: workspaceRoot ?? undefined,
     });
     if (typeof selected !== "string") return;
+    if (!(await resolveDirtyEditors(openEditorFiles, "opening a file from another folder"))) return;
 
     const normalized = normalizeAbsolutePath(selected);
     const separator = normalized.lastIndexOf("/");
     const parent = separator > 0 ? normalized.slice(0, separator) : normalized;
     const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
+    await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, parent);
     fileDirectory = "";
     workspaceFilesDirectory = "";
     expandedFileEntries = {};
     expandingFilePaths = {};
+    openEditorFiles = [];
+    activeEditorHandle = null;
+    activeEditorPath = null;
     fileTreeRevision += 1;
     fileFilter = "";
     await refreshWorkspaceRootLabel();
@@ -1343,11 +1559,16 @@
     const normalized = target.replace(/^\/+/, "").trim();
     if (!normalized) return;
 
-    await writeFile(workspace.id, normalized, "");
-    await refreshWorkspaceGitState();
-    await refreshFileDirectory(fileDirectory);
-    await openFileEntry({ name: fileName(normalized), path: normalized, is_dir: false, size: 0 });
-    appNotice = { tone: "success", message: `Created ${normalized}` };
+    try {
+      await writeFile(workspace.id, normalized, "");
+      await refreshWorkspaceGitState();
+      await refreshFileDirectory(fileDirectory);
+      await openFileEntry({ name: fileName(normalized), path: normalized, is_dir: false, size: 0 });
+      appNotice = { tone: "success", message: `Created ${normalized}` };
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not create ${normalized}: ${fileError}` };
+    }
   }
 
   async function openFileEntry(entry: FileEntry) {
@@ -1357,33 +1578,42 @@
     }
 
     if (!workspace) return;
+    if (activeEditorPath !== entry.path) {
+      activeEditorHandle = null;
+      activeLspDiagnostics = [];
+      activeLspStatus = lspConfigForPath(entry.path) ? "loading" : "unsupported";
+    }
     activeEditorPath = entry.path;
     saveUiState();
     if (openEditorFiles.some((file) => file.path === entry.path)) {
       await tick();
-      activeEditorFile?.editor?.focus();
+      activeEditorHandle?.focus();
+      scheduleLspSync(entry.path);
       return;
     }
 
     fileLoading = true;
     fileError = null;
     try {
-      const content = await readFile(workspace.id, entry.path);
+      const snapshot = await readFile(workspace.id, entry.path);
       openEditorFiles = [
         ...openEditorFiles,
-        {
+        createDocumentSession({
+          workspaceId: workspace.id,
           path: entry.path,
           name: entry.name,
-          content,
-          savedContent: content,
-          dirty: false,
-          editor: null,
-        },
+          content: snapshot.content,
+          version: snapshot.version,
+          rootRevision: snapshot.root_revision,
+          encoding: snapshot.encoding,
+          lineEnding: snapshot.line_ending,
+        }),
       ];
       await expandFileAncestors(entry.path);
       await tick();
-      activeEditorFile?.editor?.focus();
+      activeEditorHandle?.focus();
       scheduleEditorDiagnostics();
+      scheduleLspSync(entry.path);
     } catch (reason: unknown) {
       fileError = reason instanceof Error ? reason.message : String(reason);
       activeEditorPath = openEditorFiles.at(-1)?.path ?? null;
@@ -1451,65 +1681,518 @@
     }
   }
 
+  function onEditorChange(path: string) {
+    openEditorFiles = openEditorFiles.map((file) => (file.path === path ? { ...file } : file));
+    if (path === activeEditorPath) {
+      activeLspCodeActions = [];
+      lspCodeActionRevision = null;
+      scheduleEditorDiagnostics();
+    }
+    scheduleLspSync(path);
+  }
+
+  function onEditorReady(handle: CodeEditorHandle | null) {
+    activeEditorHandle = handle;
+  }
+
   function selectEditorTab(path: string) {
     if (activeEditorPath === path) return;
+    activeEditorHandle = null;
+    activeLspDiagnostics = [];
+    activeLspCodeActions = [];
+    lspCodeActionRevision = null;
+    activeLspStatus = lspConfigForPath(path) ? "loading" : "unsupported";
     activeEditorPath = path;
     saveUiState();
     void tick().then(() => {
-      activeEditorFile?.editor?.focus();
+      activeEditorHandle?.focus();
       scheduleEditorDiagnostics();
+      scheduleLspSync(path);
     });
   }
 
-  function closeEditorTab(path: string) {
+  function scheduleLspSync(path: string) {
+    if (lspSyncTimer) clearTimeout(lspSyncTimer);
+    lspSyncTimer = setTimeout(() => {
+      lspSyncTimer = null;
+      void syncDocumentWithLsp(path);
+    }, 350);
+  }
+
+  async function ensureLspServer(config: LspServerConfig): Promise<boolean> {
+    const state = lspServerStates[config.server_id];
+    if (state === "running") return true;
+    if (state === "error") return false;
+    const existing = lspStartPromises.get(config.server_id);
+    if (existing) return existing;
+    const promise = (async () => {
+      if (!workspace) return false;
+      lspServerStates = { ...lspServerStates, [config.server_id]: "starting" };
+      if (
+        activeEditorFile &&
+        lspConfigForPath(activeEditorFile.path)?.server_id === config.server_id
+      ) {
+        activeLspStatus = "starting";
+      }
+      try {
+        await lspStartServer(workspace.id, config);
+        lspServerStates = { ...lspServerStates, [config.server_id]: "running" };
+        return true;
+      } catch (reason: unknown) {
+        lspServerStates = { ...lspServerStates, [config.server_id]: "error" };
+        const message = reason instanceof Error ? reason.message : String(reason);
+        if (
+          activeEditorFile &&
+          lspConfigForPath(activeEditorFile.path)?.server_id === config.server_id
+        ) {
+          activeLspStatus = "unavailable";
+          editorDiagnostic = `${config.server_id}: ${message}`;
+        }
+        return false;
+      } finally {
+        lspStartPromises.delete(config.server_id);
+      }
+    })();
+    lspStartPromises.set(config.server_id, promise);
+    return promise;
+  }
+
+  async function syncDocumentWithLsp(path: string) {
+    if (!workspace) return;
+    const file = openEditorFiles.find((entry) => entry.path === path);
+    if (!file) return;
+    const config = lspConfigForPath(path);
+    if (!config) {
+      if (path === activeEditorPath) {
+        activeLspStatus = "unsupported";
+        activeLspDiagnostics = [];
+      }
+      return;
+    }
+    if (!(await ensureLspServer(config))) return;
+    const snapshot = documentSnapshot(file);
+    try {
+      await lspSyncDocument(
+        workspace.id,
+        config.server_id,
+        file.path,
+        config.language_id,
+        snapshot.revision,
+        snapshot.value,
+      );
+      if (path === activeEditorPath) {
+        activeLspStatus = "running";
+        window.setTimeout(() => void refreshActiveLspDiagnostics(), 400);
+      }
+    } catch (reason: unknown) {
+      if (path === activeEditorPath) {
+        activeLspStatus = "error";
+        editorDiagnostic = reason instanceof Error ? reason.message : String(reason);
+      }
+    }
+  }
+
+  async function refreshActiveLspDiagnostics() {
+    if (!workspace || !activeEditorFile) return;
+    const file = activeEditorFile;
+    const config = lspConfigForPath(file.path);
+    if (!config || lspServerStates[config.server_id] !== "running") return;
+    const revision = file.revision;
+    try {
+      const report = await lspDiagnostics(workspace.id, config.server_id, file.path);
+      if (file.path !== activeEditorPath || file.revision !== revision) return;
+      if (report.version !== null && report.version !== revision) return;
+      activeLspDiagnostics = report.diagnostics;
+      activeLspStatus = "running";
+    } catch {
+      activeLspStatus = "error";
+    }
+  }
+
+  async function goToDefinition() {
+    if (!workspace || !activeEditorFile || !activeEditorHandle) return;
+    const file = activeEditorFile;
+    const config = lspConfigForPath(file.path);
+    if (!config) {
+      appNotice = { tone: "info", message: "No language server is configured for this file." };
+      return;
+    }
+    if (!(await ensureLspServer(config))) return;
+
+    try {
+      await syncDocumentWithLsp(file.path);
+      const location = await lspGotoDefinition(
+        workspace.id,
+        config.server_id,
+        file.path,
+        activeEditorHandle.getCursorPosition(),
+      );
+      if (!location) {
+        appNotice = { tone: "info", message: "No definition found at the cursor." };
+        return;
+      }
+
+      await openFileEntry({
+        name: fileName(location.file_path),
+        path: location.file_path,
+        is_dir: false,
+        size: 0,
+      });
+      await tick();
+      activeEditorHandle?.setCursorPosition(location.line, location.character);
+    } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not find definition: ${message}` };
+    }
+  }
+
+  async function requestLspHover(position: { line: number; character: number }) {
+    if (!workspace || !activeEditorFile) return null;
+    const file = activeEditorFile;
+    const config = lspConfigForPath(file.path);
+    if (!config || !(await ensureLspServer(config))) return null;
+
+    try {
+      await syncDocumentWithLsp(file.path);
+      if (activeEditorPath !== file.path) return null;
+      return (await lspHover(workspace.id, config.server_id, file.path, position))?.text ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function requestLspCompletion(position: {
+    line: number;
+    character: number;
+  }): Promise<LspCompletionResult | null> {
+    if (!workspace || !activeEditorFile) return null;
+    const file = activeEditorFile;
+    const revision = file.revision;
+    const config = lspConfigForPath(file.path);
+    if (!config || !(await ensureLspServer(config))) return null;
+    try {
+      await syncDocumentWithLsp(file.path);
+      if (activeEditorPath !== file.path || file.revision !== revision) return null;
+      const result = await lspCompletion(workspace.id, config.server_id, {
+        file_path: file.path,
+        position,
+      });
+      return activeEditorPath === file.path && file.revision === revision ? result : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function requestLspCodeActions() {
+    if (!workspace || !activeEditorFile || !activeEditorHandle || lspCodeActionsLoading) return;
+    const file = activeEditorFile;
+    const revision = file.revision;
+    const config = lspConfigForPath(file.path);
+    if (!config || !(await ensureLspServer(config))) return;
+    const cursor = activeEditorHandle.getCursorPosition();
+    const diagnostic = activeLspDiagnostics.find(
+      (entry) =>
+        (cursor.line > entry.range.start.line ||
+          (cursor.line === entry.range.start.line &&
+            cursor.character >= entry.range.start.character)) &&
+        (cursor.line < entry.range.end.line ||
+          (cursor.line === entry.range.end.line && cursor.character <= entry.range.end.character)),
+    );
+    const range = diagnostic?.range ?? { start: cursor, end: cursor };
+    lspCodeActionsLoading = true;
+    try {
+      await syncDocumentWithLsp(file.path);
+      const actions = await lspCodeActions(workspace.id, config.server_id, {
+        file_path: file.path,
+        range,
+        diagnostics: diagnostic ? [diagnostic] : activeLspDiagnostics,
+        only: ["quickfix"],
+      });
+      if (activeEditorPath !== file.path || file.revision !== revision) return;
+      activeLspCodeActions = actions;
+      lspCodeActionRevision = revision;
+      if (actions.length === 0) {
+        appNotice = { tone: "info", message: "No quick fixes are available at the cursor." };
+      }
+    } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not load quick fixes: ${message}` };
+    } finally {
+      lspCodeActionsLoading = false;
+    }
+  }
+
+  function applyLspCodeAction(action: LspCodeAction) {
+    if (!activeEditorFile || !activeEditorHandle) return;
+    if (lspCodeActionRevision !== activeEditorFile.revision) {
+      activeLspCodeActions = [];
+      appNotice = { tone: "info", message: "The document changed. Reload quick fixes first." };
+      return;
+    }
+    if (!activeEditorHandle.applyTextEdits(action.edits)) {
+      appNotice = { tone: "error", message: "The quick fix contained invalid overlapping edits." };
+      return;
+    }
+    activeLspCodeActions = [];
+    lspCodeActionRevision = null;
+    appNotice = { tone: "success", message: `Applied quick fix: ${action.title}` };
+  }
+
+  async function stopWorkspaceLspServers() {
+    if (!workspace) return;
+    const serverIds = Object.entries(lspServerStates)
+      .filter(([, state]) => state === "running" || state === "starting")
+      .map(([serverId]) => serverId);
+    await Promise.all(
+      serverIds.map((serverId) => lspStopServer(workspace!.id, serverId).catch(() => false)),
+    );
+    lspServerStates = {};
+    lspStartPromises.clear();
+    activeLspDiagnostics = [];
+    activeLspStatus = "idle";
+  }
+
+  function selectAdjacentEditorTab(direction: -1 | 1) {
+    if (openEditorFiles.length < 2) return;
+    const currentIndex = openEditorFiles.findIndex((file) => file.path === activeEditorPath);
+    const nextIndex =
+      (Math.max(currentIndex, 0) + direction + openEditorFiles.length) % openEditorFiles.length;
+    selectEditorTab(openEditorFiles[nextIndex].path);
+  }
+
+  function executeEditorCommand(command: EditorCommandId) {
+    editorCommands.execute(command);
+  }
+
+  function toggleEditorVimMode() {
+    editorVimMode = !editorVimMode;
+    localStorage.setItem(EDITOR_VIM_MODE_KEY, String(editorVimMode));
+  }
+
+  async function closeEditorTab(path: string) {
+    const target = openEditorFiles.find((file) => file.path === path);
+    if (target && !(await resolveDirtyEditors([target], `closing ${target.name}`))) return;
+    const lspConfig = lspConfigForPath(path);
+    if (workspace && lspConfig && lspServerStates[lspConfig.server_id] === "running") {
+      void lspCloseDocument(workspace.id, lspConfig.server_id, path).catch(() => {});
+    }
     const index = openEditorFiles.findIndex((file) => file.path === path);
     openEditorFiles = openEditorFiles.filter((file) => file.path !== path);
     if (activeEditorPath === path) {
+      activeEditorHandle = null;
       activeEditorPath =
         openEditorFiles[Math.max(0, index - 1)]?.path ?? openEditorFiles[0]?.path ?? null;
+      activeLspDiagnostics = [];
+      if (activeEditorPath) scheduleLspSync(activeEditorPath);
+      else activeLspStatus = "idle";
     }
     saveUiState();
   }
 
   async function saveActiveFile() {
-    const editor = activeEditorFile?.editor;
-    if (!workspace || !activeEditorPath || !editor) return;
-    const path = activeEditorPath;
-    const content = editor.getValue();
+    if (!activeEditorPath) return;
+    await saveEditorFile(activeEditorPath);
+  }
+
+  async function saveEditorFile(path: string): Promise<boolean> {
+    if (!workspace || savingFilePath !== null) return false;
+    const file = openEditorFiles.find((entry) => entry.path === path);
+    if (!file) return false;
+    const snapshot = documentSnapshot(file);
+    const workspaceId = workspace.id;
     savingFilePath = path;
     fileError = null;
     try {
-      await writeFile(workspace.id, path, content);
-      openEditorFiles = openEditorFiles.map((file) =>
-        file.path === path ? { ...file, content, savedContent: content, dirty: false } : file,
+      const result = await writeFile(
+        workspaceId,
+        path,
+        snapshot.value,
+        file.version,
+        file.rootRevision,
+        file.encoding,
+        file.lineEnding,
       );
-      editor.markSaved(content);
-      appNotice = { tone: "success", message: `Saved ${path}` };
-      await validateActiveEditorSyntax();
+      const dirty = markDocumentSaved(file, snapshot.value);
+      file.version = result.version;
+      file.rootRevision = result.root_revision;
+      openEditorFiles = openEditorFiles.map((file) =>
+        file.path === path
+          ? {
+              ...file,
+              version: result.version,
+              rootRevision: result.root_revision,
+              dirty,
+            }
+          : file,
+      );
+      appNotice = {
+        tone: dirty ? "info" : "success",
+        message: dirty ? `Saved ${path}; newer edits remain unsaved.` : `Saved ${path}`,
+      };
+      if (path === activeEditorPath) await validateActiveEditorSyntax();
       await refreshWorkspaceGitState();
       void refreshFileDirectory(fileDirectory);
+      return true;
     } catch (reason: unknown) {
       fileError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not save ${path}: ${fileError}` };
+      return false;
     } finally {
-      savingFilePath = null;
+      if (savingFilePath === path) savingFilePath = null;
     }
   }
 
+  async function resolveDirtyEditors(files: OpenEditorFile[], action: string): Promise<boolean> {
+    const dirtyFiles = files.filter((file) => file.dirty);
+    if (dirtyFiles.length === 0) return true;
+    const names = dirtyFiles.map((file) => file.name).join(", ");
+    const saveFirst = window.confirm(
+      `${dirtyFiles.length} file${dirtyFiles.length === 1 ? " has" : "s have"} unsaved changes (${names}). Press OK to save before ${action}, or Cancel to choose whether to discard them.`,
+    );
+    if (saveFirst) {
+      for (const file of dirtyFiles) {
+        if (!(await saveEditorFile(file.path))) return false;
+      }
+      return !openEditorFiles.some((file) =>
+        dirtyFiles.some((dirtyFile) => dirtyFile.path === file.path && file.dirty),
+      );
+    }
+    return window.confirm(
+      `Discard unsaved changes in ${names} and continue ${action}? Press Cancel to keep editing.`,
+    );
+  }
+
   async function formatActiveFile() {
-    const editor = activeEditorFile?.editor;
+    const editor = activeEditorHandle;
     if (!activeEditorPath || !editor) return;
 
-    formattingFilePath = activeEditorPath;
+    const path = activeEditorPath;
+    const snapshot = editor.getSnapshot();
+    formattingFilePath = path;
     fileError = null;
     try {
-      const formatted = await formatEditorText(activeEditorPath, editor.getValue());
-      editor.setValue(formatted);
-      await validateActiveEditorSyntax();
-      appNotice = { tone: "success", message: `Formatted ${activeEditorPath}` };
+      const formatted = await formatEditorText(path, snapshot.value);
+      if (editor.getSnapshot().revision !== snapshot.revision) {
+        appNotice = {
+          tone: "info",
+          message: `Formatting for ${path} was cancelled because the document changed.`,
+        };
+        return;
+      }
+      editor.setValue(formatted, "format");
+      if (path === activeEditorPath) await validateActiveEditorSyntax();
+      appNotice = { tone: "success", message: `Formatted ${path}` };
     } catch (reason: unknown) {
       fileError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not format ${path}: ${fileError}` };
     } finally {
-      formattingFilePath = null;
+      if (formattingFilePath === path) formattingFilePath = null;
+    }
+  }
+
+  async function requestAiEdit(instruction: string) {
+    const file = activeEditorFile;
+    const config = buildAiWorkerConfig();
+    if (!file || !config) return;
+    const snapshot = documentSnapshot(file);
+    const requestId = ++aiEditRequestId;
+    aiEditGenerating = true;
+    aiEditError = null;
+    aiEditProposal = null;
+    aiEditSelectedHunkIds = [];
+    try {
+      const result = await proposeAiEdit(config, {
+        file_path: file.path,
+        instruction,
+        content: snapshot.value,
+      });
+      if (requestId !== aiEditRequestId) return;
+      const proposal = createAiEditProposal({
+        documentId: file.id,
+        path: file.path,
+        baseRevision: snapshot.revision,
+        baseValue: snapshot.value,
+        proposedValue: result.content,
+        summary: result.summary,
+      });
+      if (proposal.hunks.length === 0) {
+        aiEditError = "The model returned no changes.";
+        return;
+      }
+      aiEditProposal = proposal;
+      aiEditSelectedHunkIds = proposal.hunks.map((hunk) => hunk.id);
+    } catch (reason: unknown) {
+      if (requestId !== aiEditRequestId) return;
+      aiEditError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (requestId === aiEditRequestId) aiEditGenerating = false;
+    }
+  }
+
+  function cancelAiEdit() {
+    aiEditRequestId += 1;
+    aiEditGenerating = false;
+    aiEditError = null;
+  }
+
+  function toggleAiEditHunk(id: string) {
+    aiEditSelectedHunkIds = aiEditSelectedHunkIds.includes(id)
+      ? aiEditSelectedHunkIds.filter((value) => value !== id)
+      : [...aiEditSelectedHunkIds, id];
+  }
+
+  function applyAiEdit(selectedHunkIds: string[]) {
+    const proposal = aiEditProposal;
+    const file = activeEditorFile;
+    if (!proposal || !file || aiEditProposalIsStale(proposal, file.id, file.revision)) {
+      aiEditError = "The document changed after this proposal was generated. Regenerate it first.";
+      return;
+    }
+    const value = applyAiEditHunks(proposal.baseValue, proposal.hunks, new Set(selectedHunkIds));
+    if (value !== proposal.baseValue) {
+      if (activeEditorHandle) activeEditorHandle.setValue(value, "ai");
+      else replaceDocument(file, value, "ai");
+    }
+    aiEditProposal = null;
+    aiEditSelectedHunkIds = [];
+    aiEditError = null;
+    appNotice = {
+      tone: "success",
+      message: `Applied AI edit to ${file.path}. Review and save it.`,
+    };
+  }
+
+  function rejectAiEdit() {
+    aiEditProposal = null;
+    aiEditSelectedHunkIds = [];
+    aiEditError = null;
+  }
+
+  async function reloadActiveFileFromDisk() {
+    const file = activeEditorFile;
+    if (!workspace || !file || !activeEditorHandle) return;
+    if (
+      file.dirty &&
+      !window.confirm(`Discard local edits in ${file.name} and reload the version from disk?`)
+    ) {
+      return;
+    }
+    try {
+      const snapshot = await readFile(workspace.id, file.path);
+      activeEditorHandle.setValue(snapshot.content, "disk");
+      activeEditorHandle.markSaved(snapshot.content);
+      file.version = snapshot.version;
+      file.rootRevision = snapshot.root_revision;
+      file.encoding = snapshot.encoding;
+      file.lineEnding = snapshot.line_ending;
+      file.externalConflict = false;
+      openEditorFiles = openEditorFiles.map((entry) =>
+        entry.path === file.path ? { ...file } : entry,
+      );
+      appNotice = { tone: "success", message: `Reloaded ${file.path} from disk.` };
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not reload ${file.path}: ${fileError}` };
     }
   }
 
@@ -1522,12 +2205,23 @@
   }
 
   async function validateActiveEditorSyntax() {
-    const editor = activeEditorFile?.editor;
-    if (!activeEditorPath || !editor) {
+    const file = activeEditorFile;
+    if (!activeEditorPath || !file) {
       editorDiagnostic = null;
       return;
     }
-    editorDiagnostic = await validateEditorSyntax(activeEditorPath, editor.getValue());
+    const path = activeEditorPath;
+    const snapshot = documentSnapshot(file);
+    const requestId = ++editorDiagnosticRequestId;
+    const diagnostic = await validateEditorSyntax(path, snapshot.value);
+    if (
+      requestId !== editorDiagnosticRequestId ||
+      path !== activeEditorPath ||
+      documentSnapshot(file).revision !== snapshot.revision
+    ) {
+      return;
+    }
+    editorDiagnostic = diagnostic;
   }
 
   function scheduleWorkspaceTerminalInit() {
@@ -2228,6 +2922,7 @@
         message,
         terminal_context: workspaceAgentContext(activeBoard),
         session_context: workspaceChatSessionPromptContext(),
+        session_key: `chat:${workspaceChatSession.id}`,
       });
       const response = result.message;
       const actions = extractWorkspaceActions(response);
@@ -2519,8 +3214,8 @@
       rememberMcpTools(serverId, status.tools);
       connectionMessage =
         status.board_count > 0 || status.issue_count > 0
-             ? `Jira test passed. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
-             : `MCP test passed with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
+          ? `Jira test passed. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
+          : `MCP test passed with ${status.tool_count} tools, but Jira returned no boards or tickets yet. Try Connect Jira, a project key, or a board name.`;
       rememberMcpConnection(serverId, {
         status: "connected",
         testedAt: Date.now(),
@@ -3030,7 +3725,8 @@
               "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
             ),
           ];
-    agentExecutionRun = continuation && previousSession ? (previousSession.executionRun ?? null) : null;
+    agentExecutionRun =
+      continuation && previousSession ? (previousSession.executionRun ?? null) : null;
     agentTerminalLines =
       continuation && previousSession
         ? previousSession.terminalLines
@@ -3379,20 +4075,17 @@
     );
   }
 
-  function buildAgentContextExport(
-    card: CardProjection,
-    config: AiWorkerConfig,
-    issueKey: string | null,
-    operatorNotes: string | null,
-    previousOutput: string | null,
-  ): string {
+  function buildAgentContextExport(config: AiWorkerConfig, contract: ExecutionContract): string {
     const runtimeLabel =
       config.runtime === "opencode"
         ? `OpenCode ${config.opencode_model}`
         : `${config.provider_name} ${config.model}`;
-    const description = card.description.trim();
+    const description = contract.task_context.description.trim();
     const clippedDescription =
       description.length > 320 ? `${description.slice(0, 320)}…` : description;
+    const operatorNotes = contract.runtime_inputs.operator_notes;
+    const issueKey = contract.ticket.key;
+    const previousOutput = contract.runtime_inputs.previous_output;
     const transcript = previousOutput?.trim() ? previousOutput : null;
     const clippedPreviousOutput = transcript
       ? transcript.length > 1200
@@ -3402,15 +4095,15 @@
 
     return [
       "STATUS: Running",
-      `SUMMARY: ${ticketLabel(card)} is prepared for Agent execution.`,
+      `SUMMARY: ${contract.ticket.title} is prepared for Agent execution.`,
       "EVIDENCE:",
-      `- Work item: ${ticketLabel(card)} · ${card.title}`,
+      `- Work item: ${contract.ticket.key ?? contract.task_id} · ${contract.ticket.title}`,
       `- Runtime: ${runtimeLabel}`,
       `- Jira link: ${issueKey ? `Issue ${issueKey}` : "Not linked"}`,
-      `- Labels: ${card.labels.length > 0 ? card.labels.join(", ") : "None"}`,
+      `- Labels: ${contract.ticket.labels.length > 0 ? contract.ticket.labels.join(", ") : "None"}`,
       `- Task description: ${clippedDescription || "None"}`,
       "DETAILS:",
-      `- Current board state: ${executionDetail(card.execution)}`,
+      `- Current board state: ${contract.task_context.execution_detail}`,
       `- Operator notes: ${operatorNotes ? operatorNotes : "None"}`,
       `- Session transcript replay: ${clippedPreviousOutput}`,
       "- Verification target: return evidence before marking complete.",
@@ -3543,6 +4236,60 @@
     };
   }
 
+  function resumeExecutionRun(
+    runId: string,
+    previousRun: ExecutionRun,
+    operatorNotes: string | null,
+    previousOutput: string | null,
+  ): ExecutionRun {
+    const workerStep = previousRun.step_runs["worker.execute"];
+    const verifyStep = previousRun.step_runs["worker.verify"];
+    return {
+      ...previousRun,
+      run_id: runId,
+      contract: {
+        ...previousRun.contract,
+        contract_id: `contract-${runId}`,
+        version: previousRun.contract.version + 1,
+        runtime_inputs: {
+          operator_notes: operatorNotes,
+          previous_output: previousOutput,
+        },
+      },
+      status: "pending",
+      current_step_ids: ["worker.execute"],
+      completed_at: null,
+      step_runs: {
+        ...previousRun.step_runs,
+        ...(workerStep
+          ? {
+              "worker.execute": {
+                ...workerStep,
+                status: "ready" as const,
+                completed_at: null,
+                summary: null,
+                lease_owner: null,
+                lease_expires_at: null,
+              },
+            }
+          : {}),
+        ...(verifyStep
+          ? {
+              "worker.verify": {
+                ...verifyStep,
+                status: "pending" as const,
+                started_at: null,
+                completed_at: null,
+                summary: null,
+                lease_owner: null,
+                lease_expires_at: null,
+              },
+            }
+          : {}),
+      },
+    };
+  }
+
   function updateExecutionStep(
     run: ExecutionRun,
     stepId: string,
@@ -3579,7 +4326,11 @@
     };
   }
 
-  function completeExecutionRun(run: ExecutionRun, blocked: boolean, summary: string): ExecutionRun {
+  function completeExecutionRun(
+    run: ExecutionRun,
+    blocked: boolean,
+    summary: string,
+  ): ExecutionRun {
     const now = new Date().toISOString();
     return {
       ...run,
@@ -4303,20 +5054,22 @@
         ],
         ["Pass the exported context to the runtime and wait for evidence."],
       );
-      setAgentRunOutputForCard(
-        cardId,
-        buildAgentContextExport(card, config, issueKey, operatorNotes, previousOutput),
-      );
+      let executionRun =
+        isContinuation && existingSession?.executionRun
+          ? resumeExecutionRun(runId, existingSession.executionRun, operatorNotes, previousOutput)
+          : createExecutionRun(
+              runId,
+              buildExecutionContract(
+                runId,
+                card,
+                issueKey,
+                operatorNotes,
+                previousOutput,
+                jiraTransitionCompleted,
+              ),
+            );
+      setAgentRunOutputForCard(cardId, buildAgentContextExport(config, executionRun.contract));
       setAgentProgressForCard(cardId, 55);
-      const executionContract = buildExecutionContract(
-        runId,
-        card,
-        issueKey,
-        operatorNotes,
-        previousOutput,
-        jiraTransitionCompleted,
-      );
-      let executionRun = createExecutionRun(runId, executionContract);
       if (issueKey && !jiraTransitionCompleted) {
         const message = `Execution prerequisite failed: ${issueKey} was not transitioned to In Progress.`;
         executionRun = updateExecutionStep(
@@ -4339,7 +5092,8 @@
       try {
         backendExecutionStarted = true;
         result = await executeAiWorkerTask(runId, config, {
-          execution_contract: executionContract,
+          execution_contract: executionRun.contract,
+          session_key: `task:${cardId}`,
         });
       } catch (reason) {
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {
@@ -4435,12 +5189,7 @@
       }
 
       updateExecutionRunForCard(cardId, (run) => {
-        const executed = updateExecutionStep(
-          run,
-          "worker.execute",
-          "completed",
-          result.summary,
-        );
+        const executed = updateExecutionStep(run, "worker.execute", "completed", result.summary);
         const verifying = updateExecutionStep(
           executed,
           "worker.verify",
@@ -4684,12 +5433,17 @@
 
     {#if settingsOpen}
       <section class="settings-backdrop" aria-label="Settings dialog">
-        <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div
+          class="settings-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-title"
+        >
           <header>
             <div>
               <p>Settings</p>
-                <h2 id="settings-title">{settingsTitle}</h2>
-              </div>
+              <h2 id="settings-title">{settingsTitle}</h2>
+            </div>
             <button type="button" aria-label="Close settings" onclick={closeSettings}>×</button>
           </header>
 
@@ -5558,13 +6312,13 @@
 
         <div
           hidden={workspaceMode !== "board"}
-            class:with-console={agentConsoleOpen && hasAgentConsoleSession}
-            class="workspace-body"
-            style={agentConsoleOpen && hasAgentConsoleSession
-              ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;`
-              : `--lane-width: ${layoutPrefs.laneWidth}px;`}
-          >
-            <BoardWorkspace
+          class:with-console={agentConsoleOpen && hasAgentConsoleSession}
+          class="workspace-body"
+          style={agentConsoleOpen && hasAgentConsoleSession
+            ? `--agent-console-width: ${layoutPrefs.agentConsoleWidth}px; --lane-width: ${layoutPrefs.laneWidth}px;`
+            : `--lane-width: ${layoutPrefs.laneWidth}px;`}
+        >
+          <BoardWorkspace
             {displayColumns}
             {selectedCardId}
             {draggedCardId}
@@ -5602,8 +6356,8 @@
             {operatorNotesForCard}
           />
 
-            {#if agentConsoleOpen && hasAgentConsoleSession}
-              <div class="grid-resize-handle">
+          {#if agentConsoleOpen && hasAgentConsoleSession}
+            <div class="grid-resize-handle">
               <span
                 class="drag-handle horizontal"
                 role="separator"
@@ -5614,10 +6368,10 @@
                 onpointerup={endLayoutResize}
                 onpointercancel={endLayoutResize}
               ></span>
-              </div>
-              {#if agentConsoleModule}
-                {@const AgentConsolePanel = agentConsoleModule.default}
-                <AgentConsolePanel
+            </div>
+            {#if agentConsoleModule}
+              {@const AgentConsolePanel = agentConsoleModule.default}
+              <AgentConsolePanel
                 style=""
                 title={visibleAgentRunTitle}
                 status={visibleAgentRunStatus}
@@ -5636,9 +6390,9 @@
                 onSubmitTerminalInput={submitAgentTerminalInput}
                 onOpenCard={(cardId) => (selectedCardId = cardId)}
                 onMarkBlockedDone={requestManualDoneConfirmation}
-                />
-              {:else}
-                <aside class="agent-console" aria-label="Agent run console loading">
+              />
+            {:else}
+              <aside class="agent-console" aria-label="Agent run console loading">
                 <header>
                   <div>
                     <p>Agent Console</p>
@@ -5662,9 +6416,9 @@
                   <progress max="100" value={visibleAgentRunProgress}></progress>
                   <p>Preparing the Agent console only when opened.</p>
                 </div>
-                </aside>
-              {/if}
+              </aside>
             {/if}
+          {/if}
         </div>
         {#if workspaceMode === "board" && newTaskOpen}
           <NewTaskPopover
@@ -5894,11 +6648,35 @@
               {savingFilePath}
               {editorDiagnostic}
               {fileStatusLabel}
-              onFormatActiveFile={() => void formatActiveFile()}
-              onSaveActiveFile={() => void saveActiveFile()}
+              onExecuteCommand={executeEditorCommand}
               onSelectEditorTab={selectEditorTab}
               onCloseEditorTab={closeEditorTab}
               onSetEditorDirty={setEditorDirty}
+              {onEditorChange}
+              {onEditorReady}
+              vimMode={editorVimMode}
+              onToggleVimMode={toggleEditorVimMode}
+              onReloadActiveFile={() => void reloadActiveFileFromDisk()}
+              lspDiagnostics={activeLspDiagnostics}
+              lspStatus={activeLspStatus}
+              onLspHover={requestLspHover}
+              onLspCompletion={requestLspCompletion}
+              lspCodeActions={activeLspCodeActions}
+              {lspCodeActionsLoading}
+              onRequestLspCodeActions={() => void requestLspCodeActions()}
+              onApplyLspCodeAction={applyLspCodeAction}
+              {aiEditProposal}
+              {aiEditGenerating}
+              {aiEditStale}
+              {aiEditSelectedHunkIds}
+              {aiEditError}
+              onRequestAiEdit={(instruction) => void requestAiEdit(instruction)}
+              onCancelAiEdit={cancelAiEdit}
+              onToggleAiEditHunk={toggleAiEditHunk}
+              onApplySelectedAiEdit={() => applyAiEdit(aiEditSelectedHunkIds)}
+              onAcceptAllAiEdit={() =>
+                applyAiEdit(aiEditProposal?.hunks.map((hunk) => hunk.id) ?? [])}
+              onRejectAiEdit={rejectAiEdit}
             />
           {:else}
             <section class="code-editor-pane editor-loading" aria-label="Code editor loading">
@@ -6065,7 +6843,10 @@
     {:else if workspace}
       <section class="state-panel">
         <strong>Unable to open workspace board</strong>
-        <p>The loaded workspace does not contain a board projection. Clear the saved workspace or sync Jira again.</p>
+        <p>
+          The loaded workspace does not contain a board projection. Clear the saved workspace or
+          sync Jira again.
+        </p>
       </section>
     {:else}
       <section class="state-panel">Preparing workspace projection...</section>

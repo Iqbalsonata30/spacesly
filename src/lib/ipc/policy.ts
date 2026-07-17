@@ -8,6 +8,9 @@ export type IpcErrorCategory =
   | "validation"
   | "not_found"
   | "cancelled"
+  | "conflict"
+  | "encoding"
+  | "too_large"
   | "unknown";
 
 export type IpcPolicy = {
@@ -26,6 +29,7 @@ const TEN_MINUTES_MS = 10 * 60_000;
 
 export const IPC_POLICIES = {
   aiChat: { timeoutMs: 120_000, retries: 0 },
+  aiEdit: { timeoutMs: 180_000, retries: 0 },
   aiExecution: { timeoutMs: TEN_MINUTES_MS, retries: 0 },
   aiTest: { timeoutMs: 30_000, retries: 1, retryDelayMs: 750 },
   fileRead: { timeoutMs: 15_000, retries: 0 },
@@ -35,6 +39,9 @@ export const IPC_POLICIES = {
   jiraMutation: { timeoutMs: 30_000, retries: 0 },
   jiraRead: { timeoutMs: 30_000, retries: 2, retryDelayMs: 500 },
   jiraTest: { timeoutMs: 20_000, retries: 1, retryDelayMs: 500 },
+  lspInteractive: { timeoutMs: 15_000, retries: 0 },
+  lspRead: { timeoutMs: 25_000, retries: 0 },
+  lspStart: { timeoutMs: 60_000, retries: 0 },
   mcpTest: { timeoutMs: 180_000, retries: 0 },
   pty: { timeoutMs: 5_000, retries: 0 },
   secret: { timeoutMs: 10_000, retries: 0 },
@@ -149,6 +156,9 @@ function isIpcErrorCategory(value: unknown): value is IpcErrorCategory {
     value === "validation" ||
     value === "not_found" ||
     value === "cancelled" ||
+    value === "conflict" ||
+    value === "encoding" ||
+    value === "too_large" ||
     value === "unknown"
   );
 }

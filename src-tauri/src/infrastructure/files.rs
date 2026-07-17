@@ -1,11 +1,16 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_READ_BYTES: u64 = 1_000_000;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FileEntry {
@@ -15,9 +20,46 @@ pub struct FileEntry {
     pub size: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct FileSnapshot {
+    pub content: String,
+    pub version: String,
+    pub root_revision: u64,
+    pub encoding: TextEncoding,
+    pub line_ending: LineEnding,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileWriteResult {
+    pub version: String,
+    pub root_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16le,
+    Utf16be,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+#[derive(Clone, Debug)]
+struct RootEntry {
+    path: PathBuf,
+    revision: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceRoot {
-    paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+    paths: Arc<Mutex<HashMap<String, RootEntry>>>,
 }
 
 impl WorkspaceRoot {
@@ -26,19 +68,25 @@ impl WorkspaceRoot {
             .canonicalize()
             .map_err(|error| format!("Failed to canonicalize home directory: {error}"))?;
         let mut paths = HashMap::new();
-        paths.insert("workspace-personal".to_string(), path);
+        paths.insert(
+            "workspace-personal".to_string(),
+            RootEntry { path, revision: 1 },
+        );
         Ok(Self {
             paths: Arc::new(Mutex::new(paths)),
         })
     }
 
     pub fn path(&self, workspace_id: &str) -> Result<PathBuf, String> {
+        Ok(self.snapshot(workspace_id)?.0)
+    }
+
+    fn snapshot(&self, workspace_id: &str) -> Result<(PathBuf, u64), String> {
         let paths = self.paths.lock().map_err(|error| error.to_string())?;
-        paths
+        let entry = paths
             .get(workspace_id)
-            .or_else(|| paths.get("workspace-personal"))
-            .cloned()
-            .ok_or_else(|| "Workspace root is not configured.".to_string())
+            .ok_or_else(|| "Workspace root is not configured.".to_string())?;
+        Ok((entry.path.clone(), entry.revision))
     }
 
     pub fn set_path(&self, workspace_id: &str, path: PathBuf) -> Result<(), String> {
@@ -49,10 +97,18 @@ impl WorkspaceRoot {
             return Err("Selected path is not a directory.".to_string());
         }
 
-        self.paths
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(workspace_id.to_string(), resolved);
+        let mut paths = self.paths.lock().map_err(|error| error.to_string())?;
+        let revision = paths
+            .get(workspace_id)
+            .map(|entry| entry.revision.saturating_add(1))
+            .unwrap_or(1);
+        paths.insert(
+            workspace_id.to_string(),
+            RootEntry {
+                path: resolved,
+                revision,
+            },
+        );
         Ok(())
     }
 }
@@ -105,8 +161,8 @@ pub fn read_file_at_root(
     root: &WorkspaceRoot,
     workspace_id: String,
     relative_path: String,
-) -> Result<String, String> {
-    let root = root.path(&workspace_id)?;
+) -> Result<FileSnapshot, String> {
+    let (root, root_revision) = root.snapshot(&workspace_id)?;
     let path = resolve_workspace_path(&root, &relative_path)?;
     let metadata =
         fs::metadata(&path).map_err(|error| format!("Failed to read file metadata: {error}"))?;
@@ -122,10 +178,16 @@ pub fn read_file_at_root(
     }
 
     let bytes = fs::read(&path).map_err(|error| format!("Failed to read file: {error}"))?;
-    if bytes.contains(&0) {
-        return Err("Binary files are not supported in the editor.".to_string());
-    }
-    String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8.".to_string())
+    let version = file_version(&bytes);
+    let (content, encoding) = decode_text(&bytes)?;
+    let line_ending = detect_line_ending(&content);
+    Ok(FileSnapshot {
+        content: normalize_line_endings(&content),
+        version,
+        root_revision,
+        encoding,
+        line_ending,
+    })
 }
 
 pub fn write_file(
@@ -133,8 +195,18 @@ pub fn write_file(
     workspace_id: String,
     relative_path: String,
     content: String,
-) -> Result<(), String> {
-    let root = root.path(&workspace_id)?;
+    expected_version: Option<String>,
+    expected_root_revision: Option<u64>,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
+) -> Result<FileWriteResult, String> {
+    let (root, root_revision) = root.snapshot(&workspace_id)?;
+    if expected_root_revision.is_some_and(|expected| expected != root_revision) {
+        return Err(
+            "Workspace root changed after this document was opened. Reopen the file before saving."
+                .to_string(),
+        );
+    }
     let path = resolve_workspace_path_for_write(&root, &relative_path)?;
     if path.is_dir() {
         return Err("Cannot write over a directory.".to_string());
@@ -143,7 +215,147 @@ pub fn write_file(
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create parent directory: {error}"))?;
     }
-    fs::write(&path, content).map_err(|error| format!("Failed to write file: {error}"))
+    if let Some(expected_version) = expected_version {
+        let current = fs::read(&path)
+            .map_err(|error| format!("Failed to verify current file before saving: {error}"))?;
+        if file_version(&current) != expected_version {
+            return Err("File changed on disk after it was opened. Reload or compare the file before saving.".to_string());
+        }
+    } else if path.exists() {
+        return Err("File already exists. Open it before replacing its contents.".to_string());
+    }
+
+    let encoded = encode_text(&content, encoding, line_ending);
+    if encoded.len() as u64 > MAX_READ_BYTES {
+        return Err(format!(
+            "File is too large to save safely ({} bytes, limit {}).",
+            encoded.len(),
+            MAX_READ_BYTES
+        ));
+    }
+    atomic_write(&path, &encoded)?;
+    Ok(FileWriteResult {
+        version: file_version(&encoded),
+        root_revision,
+    })
+}
+
+fn decode_text(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
+    if let Some(content) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(content.to_vec())
+            .map(|text| (text, TextEncoding::Utf8Bom))
+            .map_err(|_| "File contains invalid UTF-8 after its BOM.".to_string());
+    }
+    if let Some(content) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(content, true).map(|text| (text, TextEncoding::Utf16le));
+    }
+    if let Some(content) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(content, false).map(|text| (text, TextEncoding::Utf16be));
+    }
+    if bytes.contains(&0) {
+        return Err("Binary files are not supported in the editor.".to_string());
+    }
+    String::from_utf8(bytes.to_vec())
+        .map(|text| (text, TextEncoding::Utf8))
+        .map_err(|_| "File is not valid UTF-8 and has no supported encoding BOM.".to_string())
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err("UTF-16 file has an incomplete code unit.".to_string());
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| "File contains invalid UTF-16.".to_string())
+}
+
+fn detect_line_ending(content: &str) -> LineEnding {
+    if content.contains("\r\n") {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+fn normalize_line_endings(content: &str) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn encode_text(content: &str, encoding: TextEncoding, line_ending: LineEnding) -> Vec<u8> {
+    let normalized = normalize_line_endings(content);
+    let text = match line_ending {
+        LineEnding::Lf => normalized,
+        LineEnding::Crlf => normalized.replace('\n', "\r\n"),
+    };
+    match encoding {
+        TextEncoding::Utf8 => text.into_bytes(),
+        TextEncoding::Utf8Bom => [vec![0xEF, 0xBB, 0xBF], text.into_bytes()].concat(),
+        TextEncoding::Utf16le => {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        }
+        TextEncoding::Utf16be => {
+            let mut bytes = vec![0xFE, 0xFF];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+            bytes
+        }
+    }
+}
+
+fn file_version(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "File has no parent directory.".to_string())?;
+    let original_permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".spacesly-save-{}-{timestamp}-{sequence}.tmp",
+        std::process::id()
+    ));
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| format!("Failed to create temporary save file: {error}"))?;
+        if let Some(permissions) = original_permissions {
+            file.set_permissions(permissions)
+                .map_err(|error| format!("Failed to preserve file permissions: {error}"))?;
+        }
+        file.write_all(content)
+            .map_err(|error| format!("Failed to write temporary save file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("Failed to flush temporary save file: {error}"))?;
+        fs::rename(&temp_path, path)
+            .map_err(|error| format!("Failed to atomically replace file: {error}"))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -243,7 +455,10 @@ fn file_entry(root: &Path, path: PathBuf) -> Result<FileEntry, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{list_directory, validate_relative_path, WorkspaceRoot};
+    use super::{
+        list_directory, read_file_at_root, validate_relative_path, write_file, LineEnding,
+        TextEncoding, WorkspaceRoot,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -295,6 +510,143 @@ mod tests {
             .any(|entry| entry.name == "second.txt"));
         assert!(!second_entries.iter().any(|entry| entry.name == "first.txt"));
 
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn write_rejects_stale_file_versions() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("spacesly-file-version-{suffix}"));
+        fs::create_dir_all(&base).expect("workspace should be created");
+        fs::write(base.join("main.txt"), "first").expect("file should be created");
+        let root = WorkspaceRoot::home().expect("workspace root should initialize");
+        root.set_path("workspace", base.clone())
+            .expect("workspace root should set");
+        let snapshot = read_file_at_root(&root, "workspace".to_string(), "main.txt".to_string())
+            .expect("file should read");
+        fs::write(base.join("main.txt"), "external").expect("external edit should write");
+
+        let result = write_file(
+            &root,
+            "workspace".to_string(),
+            "main.txt".to_string(),
+            "editor".to_string(),
+            Some(snapshot.version),
+            Some(snapshot.root_revision),
+            TextEncoding::Utf8,
+            LineEnding::Lf,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(base.join("main.txt")).unwrap(),
+            "external"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn write_rejects_stale_root_revisions() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("spacesly-root-version-{suffix}"));
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(&first).expect("first workspace should be created");
+        fs::create_dir_all(&second).expect("second workspace should be created");
+        fs::write(first.join("main.txt"), "first").expect("first file should be created");
+        let root = WorkspaceRoot::home().expect("workspace root should initialize");
+        root.set_path("workspace", first.clone())
+            .expect("first root should set");
+        let snapshot = read_file_at_root(&root, "workspace".to_string(), "main.txt".to_string())
+            .expect("file should read");
+        root.set_path("workspace", second.clone())
+            .expect("second root should set");
+
+        let result = write_file(
+            &root,
+            "workspace".to_string(),
+            "main.txt".to_string(),
+            "editor".to_string(),
+            None,
+            Some(snapshot.root_revision),
+            TextEncoding::Utf8,
+            LineEnding::Lf,
+        );
+
+        assert!(result.is_err());
+        assert!(!second.join("main.txt").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn create_does_not_replace_an_existing_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("spacesly-create-conflict-{suffix}"));
+        fs::create_dir_all(&base).expect("workspace should be created");
+        fs::write(base.join("main.txt"), "existing").expect("file should be created");
+        let root = WorkspaceRoot::home().expect("workspace root should initialize");
+        root.set_path("workspace", base.clone())
+            .expect("workspace root should set");
+
+        let result = write_file(
+            &root,
+            "workspace".to_string(),
+            "main.txt".to_string(),
+            String::new(),
+            None,
+            None,
+            TextEncoding::Utf8,
+            LineEnding::Lf,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(base.join("main.txt")).unwrap(),
+            "existing"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn preserves_utf16_and_crlf_through_editor_round_trip() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("spacesly-encoding-{suffix}"));
+        fs::create_dir_all(&base).expect("workspace should be created");
+        let root = WorkspaceRoot::home().expect("workspace root should initialize");
+        root.set_path("workspace", base.clone())
+            .expect("workspace root should set");
+
+        write_file(
+            &root,
+            "workspace".to_string(),
+            "main.txt".to_string(),
+            "first\nsecond\n".to_string(),
+            None,
+            None,
+            TextEncoding::Utf16le,
+            LineEnding::Crlf,
+        )
+        .expect("encoded file should save");
+        let bytes = fs::read(base.join("main.txt")).expect("encoded file should read");
+        let snapshot = read_file_at_root(&root, "workspace".to_string(), "main.txt".to_string())
+            .expect("encoded file should decode");
+
+        assert!(bytes.starts_with(&[0xFF, 0xFE]));
+        assert_eq!(snapshot.encoding, TextEncoding::Utf16le);
+        assert_eq!(snapshot.line_ending, LineEnding::Crlf);
+        assert_eq!(snapshot.content, "first\nsecond\n");
         let _ = fs::remove_dir_all(base);
     }
 }

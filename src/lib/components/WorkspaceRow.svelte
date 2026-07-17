@@ -12,6 +12,14 @@
     leading?: Snippet;
     trailing?: Snippet;
     onClick?: () => void;
+    treeItem?: boolean;
+    tabIndex?: number;
+    ariaLevel?: number;
+    ariaExpanded?: boolean;
+    ariaSelected?: boolean;
+    treePath?: string;
+    onKeydown?: (event: KeyboardEvent) => void;
+    onFocus?: () => void;
   };
 
   let {
@@ -25,6 +33,14 @@
     leading,
     trailing,
     onClick,
+    treeItem = false,
+    tabIndex = 0,
+    ariaLevel,
+    ariaExpanded,
+    ariaSelected,
+    treePath,
+    onKeydown,
+    onFocus,
   }: Props = $props();
 
   function truncateMiddle(value: string, max = 34) {
@@ -36,12 +52,20 @@
 
 <button
   type="button"
+  role={treeItem ? "treeitem" : undefined}
+  aria-level={treeItem ? ariaLevel : undefined}
+  aria-expanded={treeItem ? ariaExpanded : undefined}
+  aria-selected={treeItem ? ariaSelected : undefined}
+  tabindex={tabIndex}
+  data-tree-path={treePath}
   class:active
   class="workspace-row"
   style={`--row-depth: ${depth};`}
   title={title ?? label}
   {disabled}
   onclick={() => onClick?.()}
+  onkeydown={(event) => onKeydown?.(event)}
+  onfocus={() => onFocus?.()}
 >
   {#if leading}
     <span class="workspace-row-leading">{@render leading()}</span>

@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
-// @ts-expect-error type error without @types/node package
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore optional Node types may be present through tooling dependencies
 import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 

@@ -5,6 +5,35 @@ export type FileBrowserRow = {
   depth: number;
 };
 
+export type FileTreeNavigationKey =
+  "ArrowDown" | "ArrowUp" | "ArrowRight" | "ArrowLeft" | "Home" | "End";
+
+export function fileTreeNavigationIndex(
+  rows: FileBrowserRow[],
+  index: number,
+  key: FileTreeNavigationKey,
+  expandedFolders: Record<string, FileEntry[]>,
+): number | null {
+  const row = rows[index];
+  if (!row) return null;
+  if (key === "ArrowDown") return Math.min(rows.length - 1, index + 1);
+  if (key === "ArrowUp") return Math.max(0, index - 1);
+  if (key === "Home") return 0;
+  if (key === "End") return rows.length - 1;
+  if (key === "ArrowRight") {
+    return row.entry.is_dir &&
+      expandedFolders[row.entry.path] &&
+      rows[index + 1]?.depth === row.depth + 1
+      ? index + 1
+      : null;
+  }
+  if (row.entry.is_dir && expandedFolders[row.entry.path]) return null;
+  for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+    if (rows[candidate].depth < row.depth) return candidate;
+  }
+  return null;
+}
+
 export function flattenFileBrowserRows(
   entries: FileEntry[],
   expandedFolders: Record<string, FileEntry[]>,

@@ -9,16 +9,26 @@ use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use infrastructure::ai_worker::{
-    chat_ai_worker as chat_ai_worker_impl, execute_ai_worker_task as execute_ai_worker_task_impl,
-    test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiWorkerChatRequest,
-    AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask, AiWorkerTaskResult,
+    chat_ai_worker as chat_ai_worker_impl, close_all_opencode_servers,
+    execute_ai_worker_task as execute_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
+    test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiEditRequest, AiEditResult,
+    AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask,
+    AiWorkerTaskResult,
 };
 use infrastructure::execution_store::ExecutionStore;
-use infrastructure::files::{FileEntry, WorkspaceRoot};
+use infrastructure::file_watcher::FileWatchRegistry;
+use infrastructure::files::{
+    FileEntry, FileSnapshot, FileWriteResult, LineEnding, TextEncoding, WorkspaceRoot,
+};
 use infrastructure::formatting::format_code as format_code_impl;
 use infrastructure::git::git_info_for_path;
 use infrastructure::git::{
     invalidate_workspace_git_status, CommitResult, GitStatus, GitWorkspaceInfo,
+};
+use infrastructure::lsp::{
+    LspCodeAction, LspCodeActionRequest, LspCompletionRequest, LspCompletionResult,
+    LspDiagnosticReport, LspHoverResult, LspLocation, LspPosition, LspRegistry, LspServerConfig,
+    LspServerStatus,
 };
 use infrastructure::mcp::{
     close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
@@ -45,7 +55,7 @@ use infrastructure::workspace_cache::{
 };
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 fn workspace_id_or_default(workspace_id: Option<String>) -> String {
     workspace_id.unwrap_or_else(|| "workspace-personal".to_string())
@@ -77,6 +87,48 @@ fn mcp_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
         || lower.contains("unavailable")
     {
         ("transient", true)
+    } else {
+        ("unknown", false)
+    };
+
+    serde_json::json!({
+        "category": category,
+        "message": format!("{operation}: {message}"),
+        "retryable": retryable,
+    })
+    .to_string()
+}
+
+fn file_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    let (category, retryable) = if lower.contains("timed out") || lower.contains("timeout") {
+        ("timeout", true)
+    } else if lower.contains("changed on disk")
+        || lower.contains("workspace root changed")
+        || lower.contains("already exists")
+    {
+        ("conflict", false)
+    } else if lower.contains("permission denied") || lower.contains("access denied") {
+        ("permission", false)
+    } else if lower.contains("too large") {
+        ("too_large", false)
+    } else if lower.contains("utf-8") || lower.contains("utf-16") || lower.contains("binary file") {
+        ("encoding", false)
+    } else if lower.contains("does not exist")
+        || lower.contains("not found")
+        || lower.contains("no such file")
+    {
+        ("not_found", false)
+    } else if lower.contains("temporarily")
+        || lower.contains("failed to start")
+        || lower.contains("resource busy")
+        || lower.contains("would block")
+        || lower.contains("interrupted")
+    {
+        ("transient", true)
+    } else if lower.contains("path") || lower.contains("directory") || lower.contains("file name") {
+        ("validation", false)
     } else {
         ("unknown", false)
     };
@@ -268,17 +320,28 @@ async fn chat_ai_worker(
 }
 
 #[tauri::command]
+async fn propose_ai_edit(
+    config: AiWorkerConfig,
+    request: AiEditRequest,
+) -> Result<AiEditResult, String> {
+    tauri::async_runtime::spawn_blocking(move || propose_ai_edit_impl(config, request))
+        .await
+        .map_err(|error| format!("AI edit proposal task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn list_directory(
     workspace_id: String,
     relative_path: String,
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<Vec<FileEntry>, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         FilesService::new(root).list_directory(workspace_id, relative_path)
     })
     .await
-    .map_err(|error| format!("File listing task failed: {error}"))?
+    .map_err(|error| file_ipc_error("File listing task failed", error))?;
+    result.map_err(|error| file_ipc_error("File listing failed", error))
 }
 
 #[tauri::command]
@@ -286,13 +349,14 @@ async fn read_file(
     workspace_id: String,
     relative_path: String,
     workspace_root: State<'_, WorkspaceRoot>,
-) -> Result<String, String> {
+) -> Result<FileSnapshot, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         FilesService::new(root).read_file(workspace_id, relative_path)
     })
     .await
-    .map_err(|error| format!("File read task failed: {error}"))?
+    .map_err(|error| file_ipc_error("File read task failed", error))?;
+    result.map_err(|error| file_ipc_error("File read failed", error))
 }
 
 #[tauri::command]
@@ -300,16 +364,30 @@ async fn write_file(
     workspace_id: String,
     relative_path: String,
     content: String,
+    expected_version: Option<String>,
+    expected_root_revision: Option<u64>,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
     workspace_root: State<'_, WorkspaceRoot>,
-) -> Result<(), String> {
+) -> Result<FileWriteResult, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        FilesService::new(root.clone()).write_file(workspace_id.clone(), relative_path, content)?;
-        let _ = invalidate_workspace_git_status(&root, workspace_id);
-        Ok(())
-    })
-    .await
-    .map_err(|error| format!("File write task failed: {error}"))?
+    let result =
+        tauri::async_runtime::spawn_blocking(move || -> Result<FileWriteResult, String> {
+            let result = FilesService::new(root.clone()).write_file(
+                workspace_id.clone(),
+                relative_path,
+                content,
+                expected_version,
+                expected_root_revision,
+                encoding,
+                line_ending,
+            )?;
+            let _ = invalidate_workspace_git_status(&root, workspace_id);
+            Ok(result)
+        })
+        .await
+        .map_err(|error| file_ipc_error("File write task failed", error))?;
+    result.map_err(|error| file_ipc_error("File write failed", error))
 }
 
 #[tauri::command]
@@ -318,11 +396,12 @@ async fn workspace_root_path(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         FilesService::new(root).workspace_root_path(workspace_id)
     })
     .await
-    .map_err(|error| format!("Workspace root task failed: {error}"))?
+    .map_err(|error| file_ipc_error("Workspace root task failed", error))?;
+    result.map_err(|error| file_ipc_error("Workspace root lookup failed", error))
 }
 
 #[tauri::command]
@@ -332,11 +411,34 @@ async fn set_workspace_root(
     workspace_root: State<'_, WorkspaceRoot>,
 ) -> Result<String, String> {
     let root = workspace_root.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         FilesService::new(root).set_workspace_root(workspace_id, absolute_path)
     })
     .await
-    .map_err(|error| format!("Set workspace root task failed: {error}"))?
+    .map_err(|error| file_ipc_error("Set workspace root task failed", error))?;
+    result.map_err(|error| file_ipc_error("Set workspace root failed", error))
+}
+
+#[tauri::command]
+fn watch_workspace_files(
+    app: AppHandle,
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+    file_watchers: State<'_, FileWatchRegistry>,
+) -> Result<(), String> {
+    file_watchers
+        .watch(app, workspace_root.inner(), workspace_id)
+        .map_err(|error| file_ipc_error("Workspace file watch failed", error))
+}
+
+#[tauri::command]
+fn unwatch_workspace_files(
+    workspace_id: String,
+    file_watchers: State<'_, FileWatchRegistry>,
+) -> Result<bool, String> {
+    file_watchers
+        .unwatch(&workspace_id)
+        .map_err(|error| file_ipc_error("Workspace file unwatch failed", error))
 }
 
 #[tauri::command]
@@ -639,9 +741,157 @@ async fn complete_shell_input(
         .map_err(|error| format!("Shell completion task failed: {error}"))?
 }
 
+#[tauri::command]
+async fn lsp_start_server(
+    workspace_id: String,
+    config: LspServerConfig,
+    workspace_root: State<'_, WorkspaceRoot>,
+    lsp: State<'_, LspRegistry>,
+) -> Result<LspServerStatus, String> {
+    let roots = workspace_root.inner().clone();
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || registry.start(&roots, workspace_id, config))
+        .await
+        .map_err(|error| file_ipc_error("LSP start task failed", error))?
+        .map_err(|error| file_ipc_error("LSP start failed", error))
+}
+
+#[tauri::command]
+async fn lsp_stop_server(
+    workspace_id: String,
+    server_id: String,
+    lsp: State<'_, LspRegistry>,
+) -> Result<bool, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || registry.stop(&workspace_id, &server_id))
+        .await
+        .map_err(|error| file_ipc_error("LSP stop task failed", error))?
+        .map_err(|error| file_ipc_error("LSP stop failed", error))
+}
+
+#[tauri::command]
+fn lsp_get_status(lsp: State<'_, LspRegistry>) -> Result<Vec<LspServerStatus>, String> {
+    lsp.statuses()
+        .map_err(|error| file_ipc_error("LSP status failed", error))
+}
+
+#[tauri::command]
+async fn lsp_sync_document(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    language_id: String,
+    version: i64,
+    text: String,
+    lsp: State<'_, LspRegistry>,
+) -> Result<(), String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.sync_document(
+            &workspace_id,
+            &server_id,
+            &file_path,
+            &language_id,
+            version,
+            text,
+        )
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP document sync task failed", error))?
+    .map_err(|error| file_ipc_error("LSP document sync failed", error))
+}
+
+#[tauri::command]
+fn lsp_close_document(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    lsp: State<'_, LspRegistry>,
+) -> Result<(), String> {
+    lsp.close_document(&workspace_id, &server_id, &file_path)
+        .map_err(|error| file_ipc_error("LSP document close failed", error))
+}
+
+#[tauri::command]
+fn lsp_diagnostics(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    lsp: State<'_, LspRegistry>,
+) -> Result<LspDiagnosticReport, String> {
+    lsp.diagnostics(&workspace_id, &server_id, &file_path)
+        .map_err(|error| file_ipc_error("LSP diagnostics failed", error))
+}
+
+#[tauri::command]
+async fn lsp_hover(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    position: LspPosition,
+    lsp: State<'_, LspRegistry>,
+) -> Result<Option<LspHoverResult>, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.hover(&workspace_id, &server_id, &file_path, position)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP hover task failed", error))?
+    .map_err(|error| file_ipc_error("LSP hover failed", error))
+}
+
+#[tauri::command]
+async fn lsp_goto_definition(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    position: LspPosition,
+    lsp: State<'_, LspRegistry>,
+) -> Result<Option<LspLocation>, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.definition(&workspace_id, &server_id, &file_path, position)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP definition task failed", error))?
+    .map_err(|error| file_ipc_error("LSP definition failed", error))
+}
+
+#[tauri::command]
+async fn lsp_completion(
+    workspace_id: String,
+    server_id: String,
+    request: LspCompletionRequest,
+    lsp: State<'_, LspRegistry>,
+) -> Result<LspCompletionResult, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.completion(&workspace_id, &server_id, request)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP completion task failed", error))?
+    .map_err(|error| file_ipc_error("LSP completion failed", error))
+}
+
+#[tauri::command]
+async fn lsp_code_actions(
+    workspace_id: String,
+    server_id: String,
+    request: LspCodeActionRequest,
+    lsp: State<'_, LspRegistry>,
+) -> Result<Vec<LspCodeAction>, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.code_actions(&workspace_id, &server_id, request)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP code action task failed", error))?
+    .map_err(|error| file_ipc_error("LSP code action failed", error))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::mcp_ipc_error;
+    use super::{file_ipc_error, mcp_ipc_error};
     use serde_json::Value;
 
     #[test]
@@ -657,6 +907,24 @@ mod tests {
             .unwrap()
             .contains("MCP test failed"));
     }
+
+    #[test]
+    fn file_ipc_errors_preserve_actionable_categories() {
+        let conflict: Value = serde_json::from_str(&file_ipc_error(
+            "File write failed",
+            "File changed on disk after it was opened.",
+        ))
+        .expect("structured file conflict");
+        let encoding: Value = serde_json::from_str(&file_ipc_error(
+            "File read failed",
+            "File is not valid UTF-8.",
+        ))
+        .expect("structured encoding error");
+
+        assert_eq!(conflict["category"], "conflict");
+        assert_eq!(conflict["retryable"], false);
+        assert_eq!(encoding["category"], "encoding");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -665,10 +933,14 @@ pub fn run() {
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
     let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
+    let lsp_registry = LspRegistry::default();
+    let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
         .manage(pty_state)
         .manage(workspace_root)
         .manage(execution_store)
+        .manage(FileWatchRegistry::default())
+        .manage(lsp_registry)
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -688,11 +960,14 @@ pub fn run() {
             release_ai_worker_run,
             cancel_ai_worker_task,
             chat_ai_worker,
+            propose_ai_edit,
             list_directory,
             read_file,
             write_file,
             workspace_root_path,
             set_workspace_root,
+            watch_workspace_files,
+            unwatch_workspace_files,
             load_app_secrets,
             save_app_secrets,
             load_cached_workspace,
@@ -719,12 +994,24 @@ pub fn run() {
             close_pty_terminal,
             write_pty_terminal,
             resize_pty_terminal,
-            pty_current_directory
+            pty_current_directory,
+            lsp_start_server,
+            lsp_stop_server,
+            lsp_get_status,
+            lsp_sync_document,
+            lsp_close_document,
+            lsp_diagnostics,
+            lsp_hover,
+            lsp_goto_definition,
+            lsp_completion,
+            lsp_code_actions
         ])
         .on_window_event(move |_window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 close_all_terminals(&shutdown_state);
                 close_all_mcp_sessions();
+                close_all_opencode_servers();
+                shutdown_lsp.stop_all();
             }
         })
         .run(tauri::generate_context!())

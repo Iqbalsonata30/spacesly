@@ -25,6 +25,7 @@ export interface AiWorkerConfig {
 
 export interface AiWorkerTask {
   execution_contract: ExecutionContract;
+  session_key: string;
 }
 
 export interface ExecutionContract {
@@ -87,6 +88,7 @@ export interface AiWorkerChatRequest {
   message: string;
   terminal_context: string | null;
   session_context: string | null;
+  session_key: string;
 }
 
 export interface AiWorkerStatus {
@@ -107,6 +109,17 @@ export interface AiWorkerTaskResult {
 
 export interface AiWorkerChatResult {
   message: string;
+}
+
+export interface AiEditRequest {
+  file_path: string;
+  instruction: string;
+  content: string;
+}
+
+export interface AiEditResult {
+  summary: string;
+  content: string;
 }
 
 export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStatus> {
@@ -146,6 +159,17 @@ export async function chatAiWorker(
     "chat_ai_worker",
     { config, request },
     IPC_POLICIES.aiChat,
+  );
+}
+
+export async function proposeAiEdit(
+  config: AiWorkerConfig,
+  request: AiEditRequest,
+): Promise<AiEditResult> {
+  return invokeWithPolicy<AiEditResult>(
+    "propose_ai_edit",
+    { config, request },
+    IPC_POLICIES.aiEdit,
   );
 }
 

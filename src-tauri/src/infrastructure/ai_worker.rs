@@ -2,12 +2,14 @@ use super::shell_env::inject_shell_env;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,8 +21,51 @@ const CHAT_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_OUTPUT_LIMIT: usize = 512 * 1024;
+const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CONCURRENT_CHAT_RUNS: usize = 2;
 static ACTIVE_CHAT_RUNS: AtomicUsize = AtomicUsize::new(0);
+static AGENT_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static OPENCODE_MCP_CONFIGS: OnceLock<Mutex<HashMap<String, Arc<String>>>> = OnceLock::new();
+static OPENCODE_SERVERS: OnceLock<Mutex<HashMap<u64, Arc<OpenCodeServer>>>> = OnceLock::new();
+static OPENCODE_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+const MAX_OPENCODE_SERVERS: usize = 4;
+
+struct OpenCodeServer {
+    child: Mutex<Child>,
+    url: String,
+    key: u64,
+    startup_logs: Arc<Mutex<Vec<u8>>>,
+}
+
+impl OpenCodeServer {
+    fn is_alive(&self) -> bool {
+        matches!(
+            self.child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok()),
+            Some(None)
+        )
+    }
+
+    fn startup_diagnostics(&self) -> String {
+        self.startup_logs
+            .lock()
+            .ok()
+            .map(|logs| String::from_utf8_lossy(&logs).trim().to_string())
+            .filter(|logs| !logs.is_empty())
+            .unwrap_or_else(|| "OpenCode produced no startup logs.".to_string())
+    }
+}
+
+impl Drop for OpenCodeServer {
+    fn drop(&mut self) {
+        if let Ok(child) = self.child.get_mut() {
+            terminate_agent_process(child);
+        }
+    }
+}
 
 struct ChatRunGuard;
 
@@ -190,6 +235,8 @@ pub struct AiWorkerMcpServer {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiWorkerTask {
     pub execution_contract: Option<Value>,
+    #[serde(default)]
+    pub session_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -197,6 +244,8 @@ pub struct AiWorkerChatRequest {
     pub message: String,
     pub terminal_context: Option<String>,
     pub session_context: Option<String>,
+    #[serde(default)]
+    pub session_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -244,6 +293,19 @@ pub struct AiWorkerChatResult {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AiEditRequest {
+    pub file_path: String,
+    pub instruction: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AiEditResult {
+    pub summary: String,
+    pub content: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
@@ -287,6 +349,11 @@ struct AnthropicContentBlock {
     #[serde(rename = "type")]
     block_type: String,
     text: Option<String>,
+}
+
+struct OpenCodeRunOutput {
+    session_id: String,
+    text: String,
 }
 
 pub fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> {
@@ -351,39 +418,85 @@ pub fn chat_ai_worker(
 
     if config.runtime == "opencode" {
         validate_opencode_config(&config)?;
-        let prompt = format!(
-            "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}\n\nSession context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
-            governance_context(&config, false),
-            request.session_context.as_deref().unwrap_or("none"),
-            request.terminal_context.as_deref().unwrap_or("none"),
-            message,
-        );
+        let (server, server_startup_error) = match opencode_server(&config) {
+            Ok(server) => (Some(server), None),
+            Err(error) => (None, Some(error)),
+        };
+        let session = server
+            .as_ref()
+            .and_then(|server| cached_opencode_session(server, request.session_key.as_deref()));
+        let session_context = if session.is_some() {
+            request
+                .session_context
+                .as_deref()
+                .unwrap_or("none")
+                .split_once("\n\nRecent chat turns:")
+                .map(|(context, _)| context)
+                .unwrap_or_else(|| request.session_context.as_deref().unwrap_or("none"))
+        } else {
+            request.session_context.as_deref().unwrap_or("none")
+        };
+        let prompt = if session.is_some() {
+            format!(
+                "Continue the existing Spacesly workspace chat session. Keep the established chat rules and history; use only the current context below to resolve the latest request. If the user asks for a board mutation, append a final SPACESLY_ACTIONS line. Keep answers concise and practical.\n\nCurrent session context:\n{}\n\nCurrent workspace context:\n{}\n\nLatest user message:\n{}",
+                session_context,
+                request.terminal_context.as_deref().unwrap_or("none"),
+                message,
+            )
+        } else {
+            format!(
+                "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}\n\nSession context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+                governance_context(&config, false),
+                session_context,
+                request.terminal_context.as_deref().unwrap_or("none"),
+                message,
+            )
+        };
         let mut command = opencode_command(&config);
+        command.args([
+            "run",
+            "--model",
+            config.opencode_model.trim(),
+            "--format",
+            "json",
+        ]);
+        if let Some(server) = server.as_ref() {
+            command.args(["--attach", server.url.as_str()]);
+        }
         command
-            .args([
-                "run",
-                "--model",
-                config.opencode_model.trim(),
-                "--format",
-                "default",
-            ])
             .arg("--title")
-            .arg("Spacesly chat")
+            .arg(format!(
+                "Spacesly chat {}",
+                request.session_key.as_deref().unwrap_or("default")
+            ))
             .arg(prompt);
+        if let Some(session) = session {
+            command.args(["--session", session.as_str()]);
+        }
         let output =
             run_bounded_command(command, CHAT_TIMEOUT, CHAT_OUTPUT_LIMIT, "OpenCode chat")?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
         if !output.status.success() {
+            let startup_context = server_startup_error
+                .as_deref()
+                .map(|error| format!(" Persistent server startup failed first: {error}"))
+                .unwrap_or_default();
             return Err(format!(
-                "OpenCode chat failed: {}",
-                if stderr.is_empty() { stdout } else { stderr }
+                "OpenCode chat failed: {}{}",
+                if stderr.is_empty() { stdout } else { stderr },
+                startup_context,
             ));
         }
 
-        let response = if stdout.is_empty() { stderr } else { stdout };
-        return Ok(AiWorkerChatResult { message: response });
+        let response = parse_opencode_run_output(&stdout)?;
+        if let Some(server) = server.as_ref() {
+            remember_opencode_session(server, request.session_key.as_deref(), &response.session_id);
+        }
+        return Ok(AiWorkerChatResult {
+            message: response.text,
+        });
     }
 
     validate_config(&config)?;
@@ -400,6 +513,73 @@ pub fn chat_ai_worker(
     let response = call_model(&config, &system_prompt, &user_prompt, 550)?;
 
     Ok(AiWorkerChatResult { message: response })
+}
+
+pub fn propose_ai_edit(
+    config: AiWorkerConfig,
+    request: AiEditRequest,
+) -> Result<AiEditResult, String> {
+    let instruction = request.instruction.trim();
+    if instruction.is_empty() {
+        return Err("AI edit instruction is required.".to_string());
+    }
+    if request.content.len() > 256 * 1024 {
+        return Err("AI edit proposals are limited to files smaller than 256 KiB.".to_string());
+    }
+    let _chat_run = acquire_chat_run()?;
+    let system_prompt = "You are a code editing engine. Return only one valid JSON object with string fields summary and content. The content field must contain the complete replacement file. Follow the requested change without unrelated rewrites. Never use tools, modify files, run commands, or wrap the JSON in Markdown.";
+    let user_prompt = format!(
+        "File: {}\n\nInstruction:\n{}\n\nCurrent file content:\n{}\n\nReturn {{\"summary\":\"concise description\",\"content\":\"complete replacement file\"}}.",
+        request.file_path, instruction, request.content
+    );
+    let response = if config.runtime == "opencode" {
+        validate_opencode_config(&config)?;
+        let mut command = Command::new(config.opencode_command.trim());
+        inject_shell_env(&mut command);
+        command
+            .stdin(Stdio::null())
+            .current_dir(std::env::temp_dir())
+            .env(
+                "OPENCODE_CONFIG_CONTENT",
+                r#"{"mcp":{},"permission":{"edit":"deny","bash":"deny","webfetch":"deny","task":"deny","external_directory":"deny"}}"#,
+            )
+            .args([
+                "run",
+                "--model",
+                config.opencode_model.trim(),
+                "--format",
+                "json",
+                "--title",
+                "Spacesly AI edit proposal",
+            ])
+            .arg(format!("{system_prompt}\n\n{user_prompt}"));
+        let output = run_bounded_command(command, CHAT_TIMEOUT, CHAT_OUTPUT_LIMIT, "AI edit")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "AI edit failed: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ));
+        }
+        parse_opencode_run_output(&stdout)?.text
+    } else {
+        validate_config(&config)?;
+        call_model(&config, system_prompt, &user_prompt, 32_768)?
+    };
+
+    parse_ai_edit_result(&response)
+}
+
+fn parse_ai_edit_result(response: &str) -> Result<AiEditResult, String> {
+    let raw = extract_json_object(response)
+        .ok_or_else(|| "AI edit response did not contain a JSON object.".to_string())?;
+    let result: AiEditResult = serde_json::from_str(raw)
+        .map_err(|error| format!("Failed to parse AI edit response: {error}"))?;
+    if result.summary.trim().is_empty() {
+        return Err("AI edit response did not include a summary.".to_string());
+    }
+    Ok(result)
 }
 
 fn validate_config(config: &AiWorkerConfig) -> Result<(), String> {
@@ -567,14 +747,27 @@ fn execute_opencode_task(
         governance_context(&config, true),
         execution_contract_context(&task),
     );
+    let (server, server_startup_error) = match opencode_server(&config) {
+        Ok(server) => (Some(server), None),
+        Err(error) => (None, Some(error)),
+    };
+    let session = server
+        .as_ref()
+        .and_then(|server| cached_opencode_session(server, task.session_key.as_deref()));
     let mut command = opencode_command(&config);
     command.args([
         "run",
         "--model",
         config.opencode_model.trim(),
         "--format",
-        "default",
+        "json",
     ]);
+    if let Some(server) = server.as_ref() {
+        command.args(["--attach", server.url.as_str()]);
+    }
+    if let Some(session) = session.as_deref() {
+        command.args(["--session", session]);
+    }
     if config.opencode_auto_approve {
         command.arg("--auto");
     }
@@ -587,18 +780,22 @@ fn execute_opencode_task(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if !output.status.success() {
+        let startup_context = server_startup_error
+            .as_deref()
+            .map(|error| format!(" Persistent server startup failed first: {error}"))
+            .unwrap_or_default();
         return Err(format!(
-            "OpenCode Agent failed: {}",
-            if stderr.is_empty() { stdout } else { stderr }
+            "OpenCode Agent failed: {}{}",
+            if stderr.is_empty() { stdout } else { stderr },
+            startup_context,
         ));
     }
 
-    let response = if stdout.is_empty() { stderr } else { stdout };
-    if response.trim().is_empty() {
-        return Err("OpenCode Agent returned no output.".to_string());
+    let response = parse_opencode_run_output(&stdout)?;
+    if let Some(server) = server.as_ref() {
+        remember_opencode_session(server, task.session_key.as_deref(), &response.session_id);
     }
-
-    let mut result = result_from_response(response, Some(&task));
+    let mut result = result_from_response(response.text, Some(&task));
     enforce_opencode_completion_guards(&mut result, &config, &task, start_head.as_deref());
     Ok(result)
 }
@@ -1061,6 +1258,226 @@ fn opencode_workdir(config: &AiWorkerConfig) -> Option<PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
+fn agent_http_client() -> Result<&'static Client, String> {
+    match AGENT_HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| format!("Failed to create Agent HTTP client: {error}"))
+    }) {
+        Ok(client) => Ok(client),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
+    let mcp = config
+        .mcp_servers
+        .iter()
+        .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
+        .map(|server| {
+            (
+                server.name.clone(),
+                serde_json::json!({
+                    "type": "local",
+                    "command": server.command,
+                    "enabled": true,
+                    "environment": server.environment.iter().collect::<BTreeMap<_, _>>(),
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if mcp.is_empty() {
+        return None;
+    }
+
+    let serialized = serde_json::json!({ "mcp": mcp }).to_string();
+    let cache = OPENCODE_MCP_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().ok()?;
+    if let Some(cached) = cache.get(&serialized) {
+        return Some(Arc::clone(cached));
+    }
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    let cached = Arc::new(serialized.clone());
+    cache.insert(serialized, Arc::clone(&cached));
+    Some(cached)
+}
+
+fn opencode_server_key(config: &AiWorkerConfig, mcp_config: Option<&str>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    config.opencode_command.trim().hash(&mut hasher);
+    config
+        .opencode_workdir
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .hash(&mut hasher);
+    mcp_config.unwrap_or_default().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn opencode_server(config: &AiWorkerConfig) -> Result<Arc<OpenCodeServer>, String> {
+    let mcp_config = opencode_mcp_config(config);
+    let key = opencode_server_key(config, mcp_config.as_deref().map(String::as_str));
+    let servers = OPENCODE_SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut servers = servers.lock().map_err(|error| error.to_string())?;
+    servers.retain(|_, server| server.is_alive());
+    if let Some(server) = servers.get(&key).filter(|server| server.is_alive()) {
+        return Ok(Arc::clone(server));
+    }
+
+    if servers.len() >= MAX_OPENCODE_SERVERS {
+        let idle_key = servers
+            .iter()
+            .find_map(|(key, server)| (Arc::strong_count(server) == 1).then_some(*key))
+            .ok_or_else(|| {
+                format!(
+                    "Spacesly already has {MAX_OPENCODE_SERVERS} active OpenCode servers. Wait for an Agent request to finish."
+                )
+            })?;
+        servers.remove(&idle_key);
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("Failed to reserve an OpenCode server port: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Failed to inspect the OpenCode server port: {error}"))?
+        .port();
+    drop(listener);
+
+    let mut command = opencode_command(config);
+    command
+        .args([
+            "serve",
+            "--print-logs",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start persistent OpenCode server: {error}"))?;
+    let startup_logs = Arc::new(Mutex::new(Vec::new()));
+    if let Some(stdout) = child.stdout.take() {
+        capture_opencode_startup_logs(stdout, Arc::clone(&startup_logs));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        capture_opencode_startup_logs(stderr, Arc::clone(&startup_logs));
+    }
+    let server = Arc::new(OpenCodeServer {
+        child: Mutex::new(child),
+        url: format!("http://127.0.0.1:{port}"),
+        key,
+        startup_logs,
+    });
+
+    let health_client = Client::builder()
+        .no_proxy()
+        .connect_timeout(OPENCODE_HEALTH_TIMEOUT)
+        .timeout(OPENCODE_HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Failed to create OpenCode health client: {error}"))?;
+    let deadline = Instant::now() + OPENCODE_STARTUP_TIMEOUT;
+    loop {
+        if !server.is_alive() {
+            return Err(format!(
+                "Persistent OpenCode server exited during startup. {}",
+                server.startup_diagnostics()
+            ));
+        }
+        let probe_error = match health_client
+            .get(format!("{}/global/health", server.url))
+            .send()
+        {
+            Ok(response) if response.status().is_success() => break,
+            Ok(response) => format!("health endpoint returned HTTP {}", response.status()),
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Persistent OpenCode server did not become ready within {}s: {}. {}",
+                OPENCODE_STARTUP_TIMEOUT.as_secs(),
+                probe_error,
+                server.startup_diagnostics()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    servers.insert(key, Arc::clone(&server));
+    Ok(server)
+}
+
+fn capture_opencode_startup_logs(
+    mut reader: impl Read + Send + 'static,
+    logs: Arc<Mutex<Vec<u8>>>,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(size) = reader.read(&mut buffer) {
+            if size == 0 {
+                break;
+            }
+            let Ok(mut logs) = logs.lock() else {
+                break;
+            };
+            let remaining = DIAGNOSTIC_OUTPUT_LIMIT.saturating_sub(logs.len());
+            if remaining > 0 {
+                logs.extend_from_slice(&buffer[..size.min(remaining)]);
+            }
+        }
+    });
+}
+
+fn opencode_session_cache_key(server: &OpenCodeServer, session_key: &str) -> String {
+    format!("{}:{session_key}", server.key)
+}
+
+fn cached_opencode_session(server: &OpenCodeServer, session_key: Option<&str>) -> Option<String> {
+    let key = opencode_session_cache_key(server, session_key?.trim());
+    OPENCODE_SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()
+}
+
+fn remember_opencode_session(server: &OpenCodeServer, session_key: Option<&str>, session_id: &str) {
+    let Some(session_key) = session_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return;
+    };
+    if let Ok(mut sessions) = OPENCODE_SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        sessions.insert(
+            opencode_session_cache_key(server, session_key),
+            session_id.to_string(),
+        );
+    }
+}
+
+pub fn close_all_opencode_servers() {
+    if let Some(servers) = OPENCODE_SERVERS.get() {
+        if let Ok(mut servers) = servers.lock() {
+            servers.clear();
+        }
+    }
+    if let Some(sessions) = OPENCODE_SESSIONS.get() {
+        if let Ok(mut sessions) = sessions.lock() {
+            sessions.clear();
+        }
+    }
+}
+
 fn labelled_value(response: &str, label: &str) -> Option<String> {
     let prefix = format!("{label}:");
     response
@@ -1119,29 +1536,8 @@ fn opencode_command(config: &AiWorkerConfig) -> Command {
     inject_shell_env(&mut command);
     command.stdin(Stdio::null());
 
-    if !config.mcp_servers.is_empty() {
-        let mcp = config
-            .mcp_servers
-            .iter()
-            .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
-            .map(|server| {
-                (
-                    server.name.clone(),
-                    serde_json::json!({
-                        "type": "local",
-                        "command": server.command,
-                        "enabled": true,
-                        "environment": server.environment,
-                    }),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        if !mcp.is_empty() {
-            command.env(
-                "OPENCODE_CONFIG_CONTENT",
-                serde_json::json!({ "mcp": mcp }).to_string(),
-            );
-        }
+    if let Some(mcp_config) = opencode_mcp_config(config) {
+        command.env("OPENCODE_CONFIG_CONTENT", mcp_config.as_str());
     }
 
     if let Some(workdir) = config
@@ -1177,11 +1573,7 @@ fn call_openai_responses(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("Failed to create Agent HTTP client: {error}"))?;
+    let client = agent_http_client()?;
     let endpoint = responses_endpoint(&config.base_url);
     let body = serde_json::json!({
         "model": config.model,
@@ -1242,11 +1634,7 @@ fn call_chat_completion(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("Failed to create Agent HTTP client: {error}"))?;
+    let client = agent_http_client()?;
     let endpoint = chat_endpoint(&config.base_url);
     let body = serde_json::json!({
         "model": config.model,
@@ -1291,11 +1679,7 @@ fn call_anthropic_messages(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("Failed to create Agent HTTP client: {error}"))?;
+    let client = agent_http_client()?;
     let endpoint = anthropic_endpoint(&config.base_url);
     let body = serde_json::json!({
         "model": config.model,
@@ -1389,6 +1773,52 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
+fn parse_opencode_run_output(stdout: &str) -> Result<OpenCodeRunOutput, String> {
+    let mut session_id = None;
+    let mut text_parts = Vec::new();
+    let mut errors = Vec::new();
+
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if session_id.is_none() {
+            session_id = value
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if value.get("type").and_then(Value::as_str) == Some("error") {
+            errors.push(value.to_string());
+        }
+        let Some(part) = value.get("part") else {
+            continue;
+        };
+        if part.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.trim().to_string());
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() && text_parts.is_empty() {
+        return Err(format!("OpenCode returned an error: {}", errors.join("\n")));
+    }
+    let text = text_parts.join("\n").trim().to_string();
+    if text.is_empty() {
+        return Err("OpenCode returned no text output.".to_string());
+    }
+    let session_id =
+        session_id.ok_or_else(|| "OpenCode did not report a session ID.".to_string())?;
+    Ok(OpenCodeRunOutput { session_id, text })
+}
+
 fn describe_reqwest_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "The request timed out after 30 seconds. Check the model provider, VPN/proxy, or use a faster model.".to_string()
@@ -1424,6 +1854,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_ai_edit_json_without_stripping_file_content() {
+        let result = parse_ai_edit_result(
+            r#"```json
+{"summary":"Add greeting","content":"fn main() {\n    println!(\"hello\");\n}\n"}
+```"#,
+        )
+        .expect("AI edit should parse");
+        assert_eq!(result.summary, "Add greeting");
+        assert_eq!(result.content, "fn main() {\n    println!(\"hello\");\n}\n");
+    }
+
+    #[test]
     fn opencode_command_injects_configured_mcp_servers() {
         let mut config = config_with_governance("", "");
         config.runtime = "opencode".to_string();
@@ -1450,6 +1892,49 @@ mod tests {
             parsed["mcp"]["spacesly-jira"]["environment"]["JIRA_URL"],
             "https://jira.test"
         );
+    }
+
+    #[test]
+    fn parses_opencode_json_run_output() {
+        let output = parse_opencode_run_output(
+            r#"{"type":"step_start","sessionID":"ses_123","part":{"type":"step-start"}}
+{"type":"text","sessionID":"ses_123","part":{"type":"text","text":"STATUS: COMPLETE\nSUMMARY: Done"}}
+"#,
+        )
+        .expect("valid opencode json output");
+
+        assert_eq!(output.session_id, "ses_123");
+        assert_eq!(output.text, "STATUS: COMPLETE\nSUMMARY: Done");
+    }
+
+    #[test]
+    fn opencode_mcp_config_is_stable_for_environment_order() {
+        let mut first = config_with_governance("", "");
+        first.mcp_servers.push(AiWorkerMcpServer {
+            name: "spacesly-kube".to_string(),
+            command: vec![
+                "npx".to_string(),
+                "kubernetes-mcp-server@latest".to_string(),
+            ],
+            environment: HashMap::from([
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "1".to_string()),
+            ]),
+        });
+        let mut second = config_with_governance("", "");
+        second.mcp_servers.push(AiWorkerMcpServer {
+            name: "spacesly-kube".to_string(),
+            command: vec![
+                "npx".to_string(),
+                "kubernetes-mcp-server@latest".to_string(),
+            ],
+            environment: HashMap::from([
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ]),
+        });
+
+        assert_eq!(opencode_mcp_config(&first), opencode_mcp_config(&second));
     }
 
     #[test]
@@ -1566,6 +2051,7 @@ mod tests {
                 "ticket": { "title": "Update API token", "labels": [] },
                 "runtime_inputs": { "operator_notes": null }
             })),
+            session_key: None,
         };
 
         let result = result_from_structured_response(
@@ -1598,6 +2084,7 @@ mod tests {
                 "ticket": { "title": "Update env variable in Helm template", "labels": ["deployment"] },
                 "runtime_inputs": { "operator_notes": "approval granted" }
             })),
+            session_key: None,
         };
 
         assert!(task_requires_env_update_commit(&task));
@@ -1608,6 +2095,7 @@ mod tests {
     fn redeploy_only_tasks_do_not_require_commit_or_push() {
         let task = AiWorkerTask {
             execution_contract: None,
+            session_key: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));
@@ -1618,6 +2106,7 @@ mod tests {
     fn non_repo_chat_task_does_not_require_push() {
         let task = AiWorkerTask {
             execution_contract: None,
+            session_key: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));

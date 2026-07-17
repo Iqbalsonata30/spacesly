@@ -1,9 +1,11 @@
 pub mod ai_worker;
 pub mod execution_store;
+pub mod file_watcher;
 pub mod files;
 pub mod formatting;
 pub mod git;
 pub mod jira_rest;
+pub mod lsp;
 pub mod mcp;
 pub mod pty;
 pub mod secrets;

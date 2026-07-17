@@ -13,7 +13,12 @@
   import WorkspaceRow from "$lib/components/WorkspaceRow.svelte";
   import type { FileEntry } from "$lib/ipc";
   import type { GitChangedFile } from "$lib/ipc/git";
-  import { flattenFileBrowserRows, folderDisclosureState } from "$lib/fileBrowser";
+  import {
+    fileTreeNavigationIndex,
+    flattenFileBrowserRows,
+    folderDisclosureState,
+    type FileTreeNavigationKey,
+  } from "$lib/fileBrowser";
 
   type Props = {
     fileRootLabel: string;
@@ -64,6 +69,21 @@
   let visibleRows = $derived(flattenFileBrowserRows(fileEntries, expandedFolders, fileFilter));
   let changedByPath = $derived(new Map(changedFiles.map((file) => [file.path, file.status])));
   let currentPath = $derived(fileDirectory ? `${fileRootLabel}/${fileDirectory}` : fileRootLabel);
+  let tree: HTMLDivElement | null = $state(null);
+  let focusedPath = $state<string | null>(null);
+  let typeahead = "";
+  let typeaheadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    if (visibleRows.length === 0) {
+      focusedPath = null;
+      return;
+    }
+    if (focusedPath && visibleRows.some((row) => row.entry.path === focusedPath)) return;
+    focusedPath =
+      visibleRows.find((row) => row.entry.path === activeEditorPath)?.entry.path ??
+      visibleRows[0].entry.path;
+  });
 
   function statusTone(status?: string): "neutral" | "modified" | "added" | "deleted" {
     if (status === "M") return "modified";
@@ -91,16 +111,72 @@
     onCreateFile();
   }
 
+  function focusRow(index: number) {
+    const row = visibleRows[index];
+    if (!row) return;
+    focusedPath = row.entry.path;
+    requestAnimationFrame(() => {
+      const items = tree?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]');
+      items?.[index]?.focus();
+    });
+  }
+
+  function activateRow(entry: FileEntry) {
+    if (entry.is_dir) onToggleFolder(entry);
+    else onOpenEntry(entry);
+  }
+
+  function handleTreeKeydown(event: KeyboardEvent, index: number) {
+    const row = visibleRows[index];
+    if (!row) return;
+    let nextIndex: number | null = null;
+    if (["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) {
+      const key = event.key as FileTreeNavigationKey;
+      nextIndex = fileTreeNavigationIndex(visibleRows, index, key, expandedFolders);
+      if (key === "ArrowRight" && row.entry.is_dir && !expandedFolders[row.entry.path]) {
+        onToggleFolder(row.entry);
+      } else if (key === "ArrowLeft" && row.entry.is_dir && expandedFolders[row.entry.path]) {
+        onToggleFolder(row.entry);
+      }
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activateRow(row.entry);
+      return;
+    } else if (event.key.length === 1 && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      typeahead += event.key.toLowerCase();
+      if (typeaheadTimer) clearTimeout(typeaheadTimer);
+      typeaheadTimer = setTimeout(() => {
+        typeahead = "";
+        typeaheadTimer = null;
+      }, 700);
+      const ordered = [...visibleRows.slice(index + 1), ...visibleRows.slice(0, index + 1)];
+      const matchOffset = ordered.findIndex((candidate) =>
+        candidate.entry.name.toLowerCase().startsWith(typeahead),
+      );
+      if (matchOffset >= 0) {
+        const remaining = visibleRows.length - index - 1;
+        nextIndex = matchOffset < remaining ? index + 1 + matchOffset : matchOffset - remaining;
+      }
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    focusRow(nextIndex);
+  }
+
   onMount(() => {
     const handleKeydown = (event: KeyboardEvent) => {
-      if (event.metaKey && event.key.toLowerCase() === "o") {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
         event.preventDefault();
-        onOpenFile();
+        if (event.shiftKey) onOpenFolder();
+        else onOpenFile();
       }
     };
 
     window.addEventListener("keydown", handleKeydown);
-    return () => window.removeEventListener("keydown", handleKeydown);
+    return () => {
+      window.removeEventListener("keydown", handleKeydown);
+      if (typeaheadTimer) clearTimeout(typeaheadTimer);
+    };
   });
 </script>
 
@@ -190,8 +266,8 @@
     <div class="file-error" role="status">{fileError}</div>
   {/if}
 
-  <div class="file-list" role="list">
-    {#each visibleRows as row (row.entry.path)}
+  <div class="file-list" role="tree" aria-label="Workspace files" bind:this={tree}>
+    {#each visibleRows as row, index (row.entry.path)}
       {@const status = changedByPath.get(row.entry.path)}
       {@const disclosure = row.entry.is_dir
         ? folderDisclosureState(expandedFolders, expandingFolders, row.entry.path)
@@ -214,10 +290,18 @@
         title={row.entry.path}
         depth={row.depth}
         active={activeEditorPath === row.entry.path}
+        treeItem={true}
+        tabIndex={focusedPath === row.entry.path ? 0 : -1}
+        ariaLevel={row.depth + 1}
+        ariaExpanded={row.entry.is_dir ? disclosure === "expanded" : undefined}
+        ariaSelected={activeEditorPath === row.entry.path}
+        treePath={row.entry.path}
         status={statusBadge(status)}
         statusTone={statusTone(status)}
         leading={rowLeading}
-        onClick={() => (row.entry.is_dir ? onToggleFolder(row.entry) : onOpenEntry(row.entry))}
+        onClick={() => activateRow(row.entry)}
+        onFocus={() => (focusedPath = row.entry.path)}
+        onKeydown={(event) => handleTreeKeydown(event, index)}
       ></WorkspaceRow>
     {:else}
       <div class="file-empty">
