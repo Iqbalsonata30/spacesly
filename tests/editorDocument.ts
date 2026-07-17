@@ -16,6 +16,12 @@ import {
   lspTextEditsToChanges,
   offsetToLspPosition,
 } from "../src/lib/lspEditor";
+import {
+  canNavigateEditor,
+  createEditorNavigation,
+  editorNavigationTarget,
+  pushEditorLocation,
+} from "../src/lib/editorNavigation";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -201,4 +207,24 @@ assertEqual(
   ]),
   null,
   "overlapping LSP edits should be rejected instead of partially applied",
+);
+
+let navigation = createEditorNavigation();
+navigation = pushEditorLocation(navigation, { path: "src/main.ts", line: 4, character: 2 });
+navigation = pushEditorLocation(navigation, { path: "src/item.ts", line: 8, character: 0 });
+const navigationBack = editorNavigationTarget(navigation, -1);
+assertEqual(
+  {
+    canBack: canNavigateEditor(navigation, -1),
+    canForward: canNavigateEditor(navigation, 1),
+    target: navigationBack?.location,
+    backCanForward: navigationBack ? canNavigateEditor(navigationBack.state, 1) : false,
+  },
+  {
+    canBack: true,
+    canForward: false,
+    target: { path: "src/main.ts", line: 4, character: 2 },
+    backCanForward: true,
+  },
+  "editor definition navigation should preserve back and forward history",
 );

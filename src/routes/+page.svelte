@@ -20,6 +20,13 @@
   } from "$lib/editorDocument";
   import { createEditorCommandRegistry, type EditorCommandId } from "$lib/editorCommands";
   import {
+    canNavigateEditor,
+    createEditorNavigation,
+    editorNavigationTarget,
+    pushEditorLocation,
+    type EditorLocation,
+  } from "$lib/editorNavigation";
+  import {
     aiEditProposalIsStale,
     applyAiEditHunks,
     createAiEditProposal,
@@ -430,6 +437,7 @@
   let aiEditGenerating = $state(false);
   let aiEditError = $state<string | null>(null);
   let aiEditRequestId = 0;
+  let editorNavigation = $state(createEditorNavigation());
   let workspaceRoot = $state<string | null>(null);
   let workspaceGitInfo = $state<GitWorkspaceInfo | null>(null);
   let workspaceGitLoading = $state(false);
@@ -489,6 +497,8 @@
       editorCommands.register("editor.previousTab", () => selectAdjacentEditorTab(-1)),
       editorCommands.register("editor.goToDefinition", goToDefinition),
       editorCommands.register("editor.quickFix", requestLspCodeActions),
+      editorCommands.register("editor.navigateBack", () => navigateEditorHistory(-1)),
+      editorCommands.register("editor.navigateForward", () => navigateEditorHistory(1)),
     ];
     const editorKeydown = (event: KeyboardEvent) => {
       if (workspaceMode !== "files" || settingsOpen) return;
@@ -790,6 +800,8 @@
         aiEditProposalIsStale(aiEditProposal, activeEditorFile.id, activeEditorFile.revision)),
     ),
   );
+  let canNavigateEditorBack = $derived(canNavigateEditor(editorNavigation, -1));
+  let canNavigateEditorForward = $derived(canNavigateEditor(editorNavigation, 1));
   let hasDirtyEditorFiles = $derived(openEditorFiles.some((file) => file.dirty));
 
   let fileStatusLabel = $derived(
@@ -1499,6 +1511,7 @@
     fileDirectory = "";
     workspaceFilesDirectory = "";
     openEditorFiles = [];
+    editorNavigation = createEditorNavigation();
     activeEditorHandle = null;
     activeEditorPath = null;
     expandedFileEntries = {};
@@ -1534,6 +1547,7 @@
     expandedFileEntries = {};
     expandingFilePaths = {};
     openEditorFiles = [];
+    editorNavigation = createEditorNavigation();
     activeEditorHandle = null;
     activeEditorPath = null;
     fileTreeRevision += 1;
@@ -1812,6 +1826,8 @@
   async function goToDefinition() {
     if (!workspace || !activeEditorFile || !activeEditorHandle) return;
     const file = activeEditorFile;
+    const revision = file.revision;
+    const sourcePosition = activeEditorHandle.getCursorPosition();
     const config = lspConfigForPath(file.path);
     if (!config) {
       appNotice = { tone: "info", message: "No language server is configured for this file." };
@@ -1825,25 +1841,45 @@
         workspace.id,
         config.server_id,
         file.path,
-        activeEditorHandle.getCursorPosition(),
+        sourcePosition,
       );
+      if (activeEditorPath !== file.path || file.revision !== revision) return;
       if (!location) {
         appNotice = { tone: "info", message: "No definition found at the cursor." };
         return;
       }
 
-      await openFileEntry({
-        name: fileName(location.file_path),
+      const source = { path: file.path, ...sourcePosition };
+      const target = {
         path: location.file_path,
-        is_dir: false,
-        size: 0,
-      });
-      await tick();
-      activeEditorHandle?.setCursorPosition(location.line, location.character);
+        line: location.line,
+        character: location.character,
+      };
+      if (!(await navigateToEditorLocation(target))) return;
+      editorNavigation = pushEditorLocation(pushEditorLocation(editorNavigation, source), target);
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : String(reason);
       appNotice = { tone: "error", message: `Could not find definition: ${message}` };
     }
+  }
+
+  async function navigateEditorHistory(direction: -1 | 1) {
+    const target = editorNavigationTarget(editorNavigation, direction);
+    if (!target || !(await navigateToEditorLocation(target.location))) return;
+    editorNavigation = target.state;
+  }
+
+  async function navigateToEditorLocation(location: EditorLocation): Promise<boolean> {
+    await openFileEntry({
+      name: fileName(location.path),
+      path: location.path,
+      is_dir: false,
+      size: 0,
+    });
+    if (activeEditorPath !== location.path) return false;
+    await tick();
+    activeEditorHandle?.setCursorPosition(location.line, location.character);
+    return Boolean(activeEditorHandle);
   }
 
   async function requestLspHover(position: { line: number; character: number }) {
@@ -6677,6 +6713,8 @@
               onAcceptAllAiEdit={() =>
                 applyAiEdit(aiEditProposal?.hunks.map((hunk) => hunk.id) ?? [])}
               onRejectAiEdit={rejectAiEdit}
+              canNavigateBack={canNavigateEditorBack}
+              canNavigateForward={canNavigateEditorForward}
             />
           {:else}
             <section class="code-editor-pane editor-loading" aria-label="Code editor loading">

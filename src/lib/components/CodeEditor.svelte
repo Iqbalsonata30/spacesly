@@ -226,7 +226,32 @@
                 return true;
               },
             },
+            {
+              key: "Alt-ArrowLeft",
+              run: () => {
+                onCommand("editor.navigateBack");
+                return true;
+              },
+            },
+            {
+              key: "Alt-ArrowRight",
+              run: () => {
+                onCommand("editor.navigateForward");
+                return true;
+              },
+            },
           ]),
+          EditorView.domEventHandlers({
+            mousedown(event, editorView) {
+              if (event.button !== 0 || (!event.metaKey && !event.ctrlKey)) return false;
+              const position = editorView.posAtCoords({ x: event.clientX, y: event.clientY });
+              if (position === null) return false;
+              event.preventDefault();
+              editorView.dispatch({ selection: { anchor: position } });
+              onCommand("editor.goToDefinition");
+              return true;
+            },
+          }),
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return;
             const previousDirty = session.dirty;

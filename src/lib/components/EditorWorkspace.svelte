@@ -47,6 +47,8 @@
     onApplySelectedAiEdit: () => void;
     onAcceptAllAiEdit: () => void;
     onRejectAiEdit: () => void;
+    canNavigateBack: boolean;
+    canNavigateForward: boolean;
   };
 
   let {
@@ -87,6 +89,8 @@
     onApplySelectedAiEdit,
     onAcceptAllAiEdit,
     onRejectAiEdit,
+    canNavigateBack,
+    canNavigateForward,
   }: Props = $props();
 
   let tablist: HTMLDivElement | null = $state(null);
@@ -135,6 +139,22 @@
       <p>Editor</p>
       <h2>{activeEditorFile?.name ?? "No file open"}</h2>
     </div>
+    <nav aria-label="Editor navigation">
+      <button
+        type="button"
+        disabled={!canNavigateBack}
+        aria-label="Navigate back"
+        title="Back (Alt+Left)"
+        onclick={() => onExecuteCommand("editor.navigateBack")}>←</button
+      >
+      <button
+        type="button"
+        disabled={!canNavigateForward}
+        aria-label="Navigate forward"
+        title="Forward (Alt+Right)"
+        onclick={() => onExecuteCommand("editor.navigateForward")}>→</button
+      >
+    </nav>
   </header>
   {#if openEditorFiles.length > 0}
     <div class="editor-tabs" role="tablist" aria-label="Open files" bind:this={tablist}>
@@ -288,6 +308,26 @@
     padding: 7px 12px;
     border-top: 1px solid var(--border-light);
     background: var(--bg-card);
+  }
+
+  header nav {
+    display: flex;
+    gap: 5px;
+  }
+
+  header nav button {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    color: var(--text-primary);
+    background: var(--bg-base);
+    cursor: pointer;
+  }
+
+  header nav button:disabled {
+    cursor: default;
+    opacity: 0.35;
   }
 
   .code-actions button {

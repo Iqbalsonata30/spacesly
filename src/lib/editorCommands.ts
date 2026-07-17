@@ -5,7 +5,9 @@ export type EditorCommandId =
   | "editor.nextTab"
   | "editor.previousTab"
   | "editor.goToDefinition"
-  | "editor.quickFix";
+  | "editor.quickFix"
+  | "editor.navigateBack"
+  | "editor.navigateForward";
 
 export type EditorCommandHandler = () => void | Promise<void>;
 
