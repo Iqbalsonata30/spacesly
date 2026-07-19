@@ -7,7 +7,8 @@ export type EditorCommandId =
   | "editor.goToDefinition"
   | "editor.quickFix"
   | "editor.navigateBack"
-  | "editor.navigateForward";
+  | "editor.navigateForward"
+  | "editor.findReferences";
 
 export type EditorCommandHandler = () => void | Promise<void>;
 

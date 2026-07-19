@@ -220,6 +220,13 @@
               },
             },
             {
+              key: "Shift-F12",
+              run: () => {
+                onCommand("editor.findReferences");
+                return true;
+              },
+            },
+            {
               key: "Mod-.",
               run: () => {
                 onCommand("editor.quickFix");

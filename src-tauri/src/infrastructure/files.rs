@@ -311,13 +311,13 @@ fn encode_text(content: &str, encoding: TextEncoding, line_ending: LineEnding) -
     }
 }
 
-fn file_version(bytes: &[u8]) -> String {
+pub(crate) fn file_version(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "File has no parent directory.".to_string())?;

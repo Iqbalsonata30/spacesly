@@ -73,6 +73,23 @@ export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export { IpcPolicyError } from "$lib/ipc/policy";
 export type {
+  WorkspaceReplaceAppliedFile,
+  WorkspaceReplaceApplyRequest,
+  WorkspaceReplaceApplyResponse,
+  WorkspaceReplacePlanFile,
+  WorkspaceReplacePreviewFile,
+  WorkspaceReplacePreviewRequest,
+  WorkspaceReplacePreviewResponse,
+  WorkspaceSearchRequest,
+  WorkspaceSearchResponse,
+  WorkspaceSearchResult,
+} from "$lib/ipc/workspaceSearch";
+export {
+  applyWorkspaceReplace,
+  previewWorkspaceReplace,
+  searchWorkspace,
+} from "$lib/ipc/workspaceSearch";
+export type {
   ShellCommandRequest,
   ShellCommandResult,
   ShellCompletionRequest,
@@ -868,6 +885,15 @@ export interface LspRange {
   end: LspPosition;
 }
 
+export interface LspDocumentSymbol {
+  name: string;
+  detail: string | null;
+  kind: number;
+  range: LspRange;
+  selection_range: LspRange;
+  depth: number;
+}
+
 export interface LspTextEdit {
   range: LspRange;
   new_text: string;
@@ -959,6 +985,31 @@ export async function lspGotoDefinition(
     "lsp_goto_definition",
     { workspaceId, serverId, filePath, position },
     IPC_POLICIES.lspRead,
+  );
+}
+
+export async function lspReferences(
+  workspaceId: string,
+  serverId: string,
+  filePath: string,
+  position: LspPosition,
+): Promise<LspLocation[]> {
+  return invokeWithPolicy<LspLocation[]>(
+    "lsp_references",
+    { workspaceId, serverId, filePath, position },
+    IPC_POLICIES.lspInteractive,
+  );
+}
+
+export async function lspDocumentSymbols(
+  workspaceId: string,
+  serverId: string,
+  filePath: string,
+): Promise<LspDocumentSymbol[]> {
+  return invokeWithPolicy<LspDocumentSymbol[]>(
+    "lsp_document_symbols",
+    { workspaceId, serverId, filePath },
+    IPC_POLICIES.lspInteractive,
   );
 }
 

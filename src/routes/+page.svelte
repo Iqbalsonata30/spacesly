@@ -89,6 +89,7 @@
   import "./page.css";
   import {
     addJiraComment,
+    applyWorkspaceReplace,
     assignJiraIssue,
     cancelAiWorkerTask,
     chatAiWorker,
@@ -101,22 +102,26 @@
     listDirectory,
     lspCloseDocument,
     lspDiagnostics,
+    lspDocumentSymbols,
     lspCompletion,
     lspCodeActions,
     lspGotoDefinition,
     lspHover,
+    lspReferences,
     lspStartServer,
     lspStopServer,
     lspSyncDocument,
     loadAppSecrets,
     onWorkspaceFileChange,
     openPtyTerminal,
+    previewWorkspaceReplace,
     closePtyTerminal,
     disconnectMcpServer,
     readFile,
     resizePtyTerminal,
     saveAppSecrets,
     saveExecutionRun,
+    searchWorkspace,
     listActiveExecutionRuns,
     releaseAiWorkerRun,
     reserveAiWorkerRun,
@@ -146,11 +151,15 @@
     type JiraMcpConfig,
     type JiraBoard,
     type LspDiagnostic,
+    type LspDocumentSymbol,
+    type LspLocation,
     type LspCodeAction,
     type LspCompletionResult,
     type LspServerConfig,
     type WorkspaceProjection,
     type WorkspaceFileChange,
+    type WorkspaceSearchResult,
+    type WorkspaceReplacePreviewResponse,
     testJiraMcpConnection,
   } from "$lib/ipc";
   import { lspConfigForPath } from "$lib/lspConfig";
@@ -375,6 +384,12 @@
   );
   let gitActionsRuntime: Promise<typeof import("$lib/components/GitActionsPane.svelte")> | null =
     null;
+  let workspaceSearchModule = $state<
+    typeof import("$lib/components/WorkspaceSearchPane.svelte") | null
+  >(null);
+  let workspaceSearchRuntime: Promise<
+    typeof import("$lib/components/WorkspaceSearchPane.svelte")
+  > | null = null;
   let workspaceChatModule = $state<
     typeof import("$lib/components/WorkspaceChatPane.svelte") | null
   >(null);
@@ -420,9 +435,25 @@
   let expandingFilePaths = $state<Record<string, true>>({});
   let fileTreeRevision = 0;
   let fileSidebarCollapsed = $state(false);
-  let workspaceSidebarTab = $state<"explorer" | "source-control">("explorer");
+  let workspaceSidebarTab = $state<"explorer" | "search" | "source-control">("explorer");
   let workspaceFilesRoot = $state(initialUiState.workspaceFilesRoot);
   let workspaceFilesDirectory = $state(initialUiState.workspaceFilesDirectory);
+  let workspaceSearchQuery = $state("");
+  let workspaceSearchCaseSensitive = $state(false);
+  let workspaceSearchResults = $state<WorkspaceSearchResult[]>([]);
+  let workspaceSearchLoading = $state(false);
+  let workspaceSearchError = $state<string | null>(null);
+  let workspaceSearchFilesSearched = $state(0);
+  let workspaceSearchTruncated = $state(false);
+  let workspaceSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let workspaceSearchRequestId = 0;
+  let workspaceReplaceOpen = $state(false);
+  let workspaceReplacement = $state("");
+  let workspaceReplacePreview = $state<WorkspaceReplacePreviewResponse | null>(null);
+  let workspaceReplaceLoading = $state(false);
+  let workspaceReplaceApplying = $state(false);
+  let workspaceReplaceError = $state<string | null>(null);
+  let workspaceReplaceRequestId = 0;
   let openEditorFiles = $state<OpenEditorFile[]>([]);
   let activeEditorPath = $state<string | null>(null);
   let activeEditorHandle = $state<CodeEditorHandle | null>(null);
@@ -448,6 +479,13 @@
   let editorDiagnosticTimer: ReturnType<typeof setTimeout> | null = null;
   let editorDiagnosticRequestId = 0;
   let activeLspDiagnostics = $state<LspDiagnostic[]>([]);
+  let activeLspSymbols = $state<LspDocumentSymbol[]>([]);
+  let activeLspReferences = $state<LspLocation[]>([]);
+  let lspReferencesLoading = $state(false);
+  let lspReferenceRequestId = 0;
+  let activeLspSymbolRevision: number | null = null;
+  let lspSymbolsLoading = $state(false);
+  let lspSymbolRequestId = 0;
   let activeLspCodeActions = $state<LspCodeAction[]>([]);
   let lspCodeActionsLoading = $state(false);
   let lspCodeActionRevision: number | null = null;
@@ -499,6 +537,7 @@
       editorCommands.register("editor.quickFix", requestLspCodeActions),
       editorCommands.register("editor.navigateBack", () => navigateEditorHistory(-1)),
       editorCommands.register("editor.navigateForward", () => navigateEditorHistory(1)),
+      editorCommands.register("editor.findReferences", findReferences),
     ];
     const editorKeydown = (event: KeyboardEvent) => {
       if (workspaceMode !== "files" || settingsOpen) return;
@@ -593,6 +632,7 @@
       void loadFileBrowserRuntime();
       void loadEditorWorkspaceRuntime();
       void loadGitActionsRuntime();
+      void loadWorkspaceSearchRuntime();
     } else if (workspaceMode === "term") {
       void loadWorkspaceChatRuntime();
     }
@@ -1508,6 +1548,7 @@
 
     await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, selected);
+    resetWorkspaceSearch();
     fileDirectory = "";
     workspaceFilesDirectory = "";
     openEditorFiles = [];
@@ -1542,6 +1583,7 @@
     const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
     await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, parent);
+    resetWorkspaceSearch();
     fileDirectory = "";
     workspaceFilesDirectory = "";
     expandedFileEntries = {};
@@ -1559,6 +1601,194 @@
     await refreshWorkspaceGitState();
     saveUiState();
     appNotice = { tone: "success", message: `Opened ${name}` };
+  }
+
+  function updateWorkspaceSearchQuery(query: string) {
+    workspaceSearchQuery = query;
+    invalidateWorkspaceReplacePreview();
+    scheduleWorkspaceSearch();
+  }
+
+  function resetWorkspaceSearch() {
+    if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer);
+    workspaceSearchTimer = null;
+    workspaceSearchRequestId += 1;
+    workspaceSearchQuery = "";
+    workspaceSearchResults = [];
+    workspaceSearchLoading = false;
+    workspaceSearchError = null;
+    workspaceSearchFilesSearched = 0;
+    workspaceSearchTruncated = false;
+    workspaceReplaceRequestId += 1;
+    workspaceReplacePreview = null;
+    workspaceReplaceLoading = false;
+    workspaceReplaceApplying = false;
+    workspaceReplaceError = null;
+  }
+
+  function updateWorkspaceSearchCaseSensitive(enabled: boolean) {
+    workspaceSearchCaseSensitive = enabled;
+    invalidateWorkspaceReplacePreview();
+    scheduleWorkspaceSearch(0);
+  }
+
+  function updateWorkspaceReplacement(replacement: string) {
+    workspaceReplacement = replacement;
+    invalidateWorkspaceReplacePreview();
+  }
+
+  function invalidateWorkspaceReplacePreview() {
+    workspaceReplaceRequestId += 1;
+    workspaceReplacePreview = null;
+    workspaceReplaceLoading = false;
+    workspaceReplaceError = null;
+  }
+
+  async function previewWorkspaceReplacement() {
+    if (!workspace || workspaceSearchQuery.trim().length < 2) return;
+    const query = workspaceSearchQuery.trim();
+    const replacement = workspaceReplacement;
+    const caseSensitive = workspaceSearchCaseSensitive;
+    const requestId = ++workspaceReplaceRequestId;
+    workspaceReplaceLoading = true;
+    workspaceReplaceError = null;
+    try {
+      const preview = await previewWorkspaceReplace({
+        workspace_id: workspace.id,
+        query,
+        replacement,
+        case_sensitive: caseSensitive,
+      });
+      if (
+        requestId !== workspaceReplaceRequestId ||
+        workspaceSearchQuery.trim() !== query ||
+        workspaceReplacement !== replacement ||
+        workspaceSearchCaseSensitive !== caseSensitive
+      )
+        return;
+      workspaceReplacePreview = preview;
+    } catch (reason: unknown) {
+      if (requestId !== workspaceReplaceRequestId) return;
+      workspaceReplaceError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (requestId === workspaceReplaceRequestId) workspaceReplaceLoading = false;
+    }
+  }
+
+  async function applyWorkspaceReplacement() {
+    if (!workspace || !workspaceReplacePreview || workspaceReplacePreview.truncated) return;
+    const preview = workspaceReplacePreview;
+    const affectedPaths = new Set(preview.files.map((file) => file.file_path));
+    const dirtyFiles = openEditorFiles.filter((file) => file.dirty && affectedPaths.has(file.path));
+    if (dirtyFiles.length > 0) {
+      workspaceReplaceError = `Save or discard changes in ${dirtyFiles.map((file) => file.name).join(", ")} before replacing.`;
+      return;
+    }
+    if (
+      !window.confirm(
+        `Apply ${preview.total_replacements} replacements across ${preview.files.length} files? Each file write is atomic, but this multi-file operation cannot be rolled back as one filesystem transaction.`,
+      )
+    )
+      return;
+
+    workspaceReplaceApplying = true;
+    workspaceReplaceError = null;
+    try {
+      const result = await applyWorkspaceReplace({
+        workspace_id: workspace.id,
+        query: workspaceSearchQuery.trim(),
+        replacement: workspaceReplacement,
+        case_sensitive: workspaceSearchCaseSensitive,
+        files: preview.files.map((file) => ({
+          file_path: file.file_path,
+          version: file.version,
+          replacement_count: file.replacement_count,
+        })),
+        truncated: preview.truncated,
+      });
+      const changedPaths = new Set(result.files.map((file) => file.file_path));
+      workspaceReplacePreview = null;
+      await refreshOpenEditorFilesFromDisk(changedPaths);
+      await Promise.all([refreshFileDirectory(fileDirectory), refreshWorkspaceGitState()]);
+      await runWorkspaceSearch();
+      appNotice = {
+        tone: "success",
+        message: `Applied ${result.total_replacements} replacements across ${result.files.length} files.`,
+      };
+    } catch (reason: unknown) {
+      workspaceReplaceError = reason instanceof Error ? reason.message : String(reason);
+      await refreshOpenEditorFilesFromDisk();
+      void refreshWorkspaceGitState();
+    } finally {
+      workspaceReplaceApplying = false;
+    }
+  }
+
+  function scheduleWorkspaceSearch(delay = 250) {
+    if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer);
+    const query = workspaceSearchQuery.trim();
+    if (query.length < 2) {
+      workspaceSearchRequestId += 1;
+      workspaceSearchLoading = false;
+      workspaceSearchResults = [];
+      workspaceSearchError = null;
+      workspaceSearchFilesSearched = 0;
+      workspaceSearchTruncated = false;
+      return;
+    }
+    workspaceSearchTimer = setTimeout(() => {
+      workspaceSearchTimer = null;
+      void runWorkspaceSearch();
+    }, delay);
+  }
+
+  async function runWorkspaceSearch() {
+    if (!workspace) return;
+    const query = workspaceSearchQuery.trim();
+    if (query.length < 2) return;
+    const caseSensitive = workspaceSearchCaseSensitive;
+    const requestId = ++workspaceSearchRequestId;
+    workspaceSearchLoading = true;
+    workspaceSearchError = null;
+    try {
+      const response = await searchWorkspace({
+        workspace_id: workspace.id,
+        query,
+        case_sensitive: caseSensitive,
+        max_results: 500,
+      });
+      if (
+        requestId !== workspaceSearchRequestId ||
+        workspaceSearchQuery.trim() !== query ||
+        workspaceSearchCaseSensitive !== caseSensitive
+      )
+        return;
+      workspaceSearchResults = response.results;
+      workspaceSearchFilesSearched = response.files_searched;
+      workspaceSearchTruncated = response.truncated;
+    } catch (reason: unknown) {
+      if (requestId !== workspaceSearchRequestId) return;
+      workspaceSearchError = reason instanceof Error ? reason.message : String(reason);
+      workspaceSearchResults = [];
+    } finally {
+      if (requestId === workspaceSearchRequestId) workspaceSearchLoading = false;
+    }
+  }
+
+  async function openWorkspaceSearchResult(result: WorkspaceSearchResult) {
+    const source =
+      activeEditorFile && activeEditorHandle
+        ? { path: activeEditorFile.path, ...activeEditorHandle.getCursorPosition() }
+        : null;
+    const target = {
+      path: result.file_path,
+      line: result.line,
+      character: result.character,
+    };
+    if (!(await navigateToEditorLocation(target))) return;
+    editorNavigation = source
+      ? pushEditorLocation(pushEditorLocation(editorNavigation, source), target)
+      : pushEditorLocation(editorNavigation, target);
   }
 
   async function createNewFile() {
@@ -1700,6 +1930,10 @@
     if (path === activeEditorPath) {
       activeLspCodeActions = [];
       lspCodeActionRevision = null;
+      activeLspSymbolRevision = null;
+      activeLspReferences = [];
+      lspReferenceRequestId += 1;
+      lspReferencesLoading = false;
       scheduleEditorDiagnostics();
     }
     scheduleLspSync(path);
@@ -1713,6 +1947,11 @@
     if (activeEditorPath === path) return;
     activeEditorHandle = null;
     activeLspDiagnostics = [];
+    activeLspSymbols = [];
+    activeLspSymbolRevision = null;
+    activeLspReferences = [];
+    lspReferenceRequestId += 1;
+    lspReferencesLoading = false;
     activeLspCodeActions = [];
     lspCodeActionRevision = null;
     activeLspStatus = lspConfigForPath(path) ? "loading" : "unsupported";
@@ -1727,6 +1966,7 @@
 
   function scheduleLspSync(path: string) {
     if (lspSyncTimer) clearTimeout(lspSyncTimer);
+    if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer);
     lspSyncTimer = setTimeout(() => {
       lspSyncTimer = null;
       void syncDocumentWithLsp(path);
@@ -1797,6 +2037,7 @@
       if (path === activeEditorPath) {
         activeLspStatus = "running";
         window.setTimeout(() => void refreshActiveLspDiagnostics(), 400);
+        void refreshActiveLspSymbols();
       }
     } catch (reason: unknown) {
       if (path === activeEditorPath) {
@@ -1820,6 +2061,32 @@
       activeLspStatus = "running";
     } catch {
       activeLspStatus = "error";
+    }
+  }
+
+  async function refreshActiveLspSymbols(force = false) {
+    if (!workspace || !activeEditorFile) return;
+    const file = activeEditorFile;
+    const revision = file.revision;
+    if (!force && activeLspSymbolRevision === revision) return;
+    const config = lspConfigForPath(file.path);
+    if (!config || lspServerStates[config.server_id] !== "running") return;
+    const requestId = ++lspSymbolRequestId;
+    lspSymbolsLoading = true;
+    try {
+      const symbols = await lspDocumentSymbols(workspace.id, config.server_id, file.path);
+      if (
+        requestId !== lspSymbolRequestId ||
+        activeEditorPath !== file.path ||
+        file.revision !== revision
+      )
+        return;
+      activeLspSymbols = symbols;
+      activeLspSymbolRevision = revision;
+    } catch {
+      if (requestId === lspSymbolRequestId && activeEditorPath === file.path) activeLspSymbols = [];
+    } finally {
+      if (requestId === lspSymbolRequestId) lspSymbolsLoading = false;
     }
   }
 
@@ -1863,10 +2130,74 @@
     }
   }
 
+  async function findReferences() {
+    if (!workspace || !activeEditorFile || !activeEditorHandle) return;
+    const file = activeEditorFile;
+    const revision = file.revision;
+    const position = activeEditorHandle.getCursorPosition();
+    const config = lspConfigForPath(file.path);
+    if (!config) {
+      appNotice = { tone: "info", message: "No language server is configured for this file." };
+      return;
+    }
+    if (!(await ensureLspServer(config))) return;
+    const requestId = ++lspReferenceRequestId;
+    lspReferencesLoading = true;
+    activeLspReferences = [];
+    try {
+      await syncDocumentWithLsp(file.path);
+      const references = await lspReferences(workspace.id, config.server_id, file.path, position);
+      if (
+        requestId !== lspReferenceRequestId ||
+        activeEditorPath !== file.path ||
+        file.revision !== revision
+      )
+        return;
+      activeLspReferences = references;
+      if (references.length === 0) {
+        appNotice = { tone: "info", message: "No references found at the cursor." };
+      }
+    } catch (reason: unknown) {
+      if (requestId !== lspReferenceRequestId) return;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: `Could not find references: ${message}` };
+    } finally {
+      if (requestId === lspReferenceRequestId) lspReferencesLoading = false;
+    }
+  }
+
   async function navigateEditorHistory(direction: -1 | 1) {
     const target = editorNavigationTarget(editorNavigation, direction);
     if (!target || !(await navigateToEditorLocation(target.location))) return;
     editorNavigation = target.state;
+  }
+
+  async function navigateToDocumentSymbol(symbol: LspDocumentSymbol) {
+    if (!activeEditorFile || !activeEditorHandle) return;
+    const source = { path: activeEditorFile.path, ...activeEditorHandle.getCursorPosition() };
+    const target = {
+      path: activeEditorFile.path,
+      line: symbol.selection_range.start.line,
+      character: symbol.selection_range.start.character,
+    };
+    if (!(await navigateToEditorLocation(target))) return;
+    editorNavigation = pushEditorLocation(pushEditorLocation(editorNavigation, source), target);
+  }
+
+  async function navigateToReference(location: LspLocation) {
+    const source =
+      activeEditorFile && activeEditorHandle
+        ? { path: activeEditorFile.path, ...activeEditorHandle.getCursorPosition() }
+        : null;
+    const target = {
+      path: location.file_path,
+      line: location.line,
+      character: location.character,
+    };
+    if (!(await navigateToEditorLocation(target))) return;
+    editorNavigation = source
+      ? pushEditorLocation(pushEditorLocation(editorNavigation, source), target)
+      : pushEditorLocation(editorNavigation, target);
   }
 
   async function navigateToEditorLocation(location: EditorLocation): Promise<boolean> {
@@ -1985,6 +2316,12 @@
     lspServerStates = {};
     lspStartPromises.clear();
     activeLspDiagnostics = [];
+    activeLspSymbols = [];
+    activeLspSymbolRevision = null;
+    lspSymbolRequestId += 1;
+    activeLspReferences = [];
+    lspReferenceRequestId += 1;
+    lspReferencesLoading = false;
     activeLspStatus = "idle";
   }
 
@@ -2019,6 +2356,12 @@
       activeEditorPath =
         openEditorFiles[Math.max(0, index - 1)]?.path ?? openEditorFiles[0]?.path ?? null;
       activeLspDiagnostics = [];
+      activeLspSymbols = [];
+      activeLspSymbolRevision = null;
+      lspSymbolRequestId += 1;
+      activeLspReferences = [];
+      lspReferenceRequestId += 1;
+      lspReferencesLoading = false;
       if (activeEditorPath) scheduleLspSync(activeEditorPath);
       else activeLspStatus = "idle";
     }
@@ -2901,6 +3244,16 @@
     });
 
     return gitActionsRuntime;
+  }
+
+  function loadWorkspaceSearchRuntime() {
+    workspaceSearchRuntime ??= import("$lib/components/WorkspaceSearchPane.svelte").then(
+      (module) => {
+        workspaceSearchModule = module;
+        return module;
+      },
+    );
+    return workspaceSearchRuntime;
   }
 
   function loadWorkspaceChatRuntime() {
@@ -6562,6 +6915,11 @@
               items={[
                 { value: "explorer", label: "Explorer" },
                 {
+                  value: "search",
+                  label: "Search",
+                  badge: workspaceSearchResults.length || undefined,
+                },
+                {
                   value: "source-control",
                   label: "Source Control",
                   badge: sourceControlChangedCount > 0 ? sourceControlChangedCount : undefined,
@@ -6605,6 +6963,35 @@
                   </header>
                   <div class="file-empty">Preparing file browser only when Files mode is used.</div>
                 </aside>
+              {/if}
+            {:else if workspaceSidebarTab === "search"}
+              {#if workspaceSearchModule}
+                {@const WorkspaceSearchPane = workspaceSearchModule.default}
+                <WorkspaceSearchPane
+                  query={workspaceSearchQuery}
+                  caseSensitive={workspaceSearchCaseSensitive}
+                  results={workspaceSearchResults}
+                  loading={workspaceSearchLoading}
+                  error={workspaceSearchError}
+                  filesSearched={workspaceSearchFilesSearched}
+                  truncated={workspaceSearchTruncated}
+                  replaceOpen={workspaceReplaceOpen}
+                  replacement={workspaceReplacement}
+                  replacePreview={workspaceReplacePreview}
+                  replaceLoading={workspaceReplaceLoading}
+                  replaceApplying={workspaceReplaceApplying}
+                  replaceError={workspaceReplaceError}
+                  onQueryChange={updateWorkspaceSearchQuery}
+                  onCaseSensitiveChange={updateWorkspaceSearchCaseSensitive}
+                  onOpenResult={(result) => void openWorkspaceSearchResult(result)}
+                  onToggleReplace={() => {
+                    workspaceReplaceOpen = !workspaceReplaceOpen;
+                    if (!workspaceReplaceOpen) invalidateWorkspaceReplacePreview();
+                  }}
+                  onReplacementChange={updateWorkspaceReplacement}
+                  onPreviewReplace={() => void previewWorkspaceReplacement()}
+                  onApplyReplace={() => void applyWorkspaceReplacement()}
+                />
               {/if}
             {:else}
               {#if gitActionsModule}
@@ -6715,6 +7102,18 @@
               onRejectAiEdit={rejectAiEdit}
               canNavigateBack={canNavigateEditorBack}
               canNavigateForward={canNavigateEditorForward}
+              lspSymbols={activeLspSymbols}
+              {lspSymbolsLoading}
+              onRefreshLspSymbols={() => void refreshActiveLspSymbols(true)}
+              onSelectLspSymbol={(symbol) => void navigateToDocumentSymbol(symbol)}
+              lspReferences={activeLspReferences}
+              {lspReferencesLoading}
+              onSelectLspReference={(location) => void navigateToReference(location)}
+              onCloseLspReferences={() => {
+                activeLspReferences = [];
+                lspReferenceRequestId += 1;
+                lspReferencesLoading = false;
+              }}
             />
           {:else}
             <section class="code-editor-pane editor-loading" aria-label="Code editor loading">

@@ -27,8 +27,8 @@ use infrastructure::git::{
 };
 use infrastructure::lsp::{
     LspCodeAction, LspCodeActionRequest, LspCompletionRequest, LspCompletionResult,
-    LspDiagnosticReport, LspHoverResult, LspLocation, LspPosition, LspRegistry, LspServerConfig,
-    LspServerStatus,
+    LspDiagnosticReport, LspDocumentSymbol, LspHoverResult, LspLocation, LspPosition, LspRegistry,
+    LspServerConfig, LspServerStatus,
 };
 use infrastructure::mcp::{
     close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
@@ -52,6 +52,13 @@ use infrastructure::shell::{
 use infrastructure::workspace_cache::{
     load_cached_workspace as load_cached_workspace_impl,
     save_cached_workspace as save_cached_workspace_impl, CachedWorkspace,
+};
+use infrastructure::workspace_search::{
+    apply_workspace_replace as apply_workspace_replace_impl,
+    preview_workspace_replace as preview_workspace_replace_impl,
+    search_workspace as search_workspace_impl, WorkspaceReplaceApplyRequest,
+    WorkspaceReplaceApplyResponse, WorkspaceReplacePreviewRequest, WorkspaceReplacePreviewResponse,
+    WorkspaceSearchRequest, WorkspaceSearchResponse,
 };
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
@@ -127,7 +134,13 @@ fn file_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
         || lower.contains("interrupted")
     {
         ("transient", true)
-    } else if lower.contains("path") || lower.contains("directory") || lower.contains("file name") {
+    } else if lower.contains("path")
+        || lower.contains("directory")
+        || lower.contains("file name")
+        || lower.contains("query")
+        || lower.contains("replacement")
+        || lower.contains("truncated")
+    {
         ("validation", false)
     } else {
         ("unknown", false)
@@ -357,6 +370,66 @@ async fn read_file(
     .await
     .map_err(|error| file_ipc_error("File read task failed", error))?;
     result.map_err(|error| file_ipc_error("File read failed", error))
+}
+
+#[tauri::command]
+async fn search_workspace(
+    request: WorkspaceSearchRequest,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<WorkspaceSearchResponse, String> {
+    let root = workspace_root.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let workspace_path = root.path(&request.workspace_id)?;
+        search_workspace_impl(
+            &workspace_path,
+            &request.query,
+            request.case_sensitive,
+            request.max_results,
+        )
+    })
+    .await
+    .map_err(|error| file_ipc_error("Workspace search task failed", error))?;
+    result.map_err(|error| file_ipc_error("Workspace search failed", error))
+}
+
+#[tauri::command]
+async fn preview_workspace_replace(
+    request: WorkspaceReplacePreviewRequest,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<WorkspaceReplacePreviewResponse, String> {
+    let root = workspace_root.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let workspace_path = root.path(&request.workspace_id)?;
+        preview_workspace_replace_impl(
+            &workspace_path,
+            &request.query,
+            &request.replacement,
+            request.case_sensitive,
+        )
+    })
+    .await
+    .map_err(|error| file_ipc_error("Workspace replace preview task failed", error))?;
+    result.map_err(|error| file_ipc_error("Workspace replace preview failed", error))
+}
+
+#[tauri::command]
+async fn apply_workspace_replace(
+    request: WorkspaceReplaceApplyRequest,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<WorkspaceReplaceApplyResponse, String> {
+    let root = workspace_root.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(
+        move || -> Result<WorkspaceReplaceApplyResponse, String> {
+            let workspace_id = request.workspace_id.clone();
+            let workspace_path = root.path(&workspace_id)?;
+            let response = apply_workspace_replace_impl(&workspace_path, request)?;
+            let _ = invalidate_workspace_git_status(&root, workspace_id);
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| file_ipc_error("Workspace replace apply task failed", error))?;
+    result.map_err(|error| file_ipc_error("Workspace replace apply failed", error))
 }
 
 #[tauri::command]
@@ -858,6 +931,39 @@ async fn lsp_goto_definition(
 }
 
 #[tauri::command]
+async fn lsp_references(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    position: LspPosition,
+    lsp: State<'_, LspRegistry>,
+) -> Result<Vec<LspLocation>, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.references(&workspace_id, &server_id, &file_path, position)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP references task failed", error))?
+    .map_err(|error| file_ipc_error("LSP references failed", error))
+}
+
+#[tauri::command]
+async fn lsp_document_symbols(
+    workspace_id: String,
+    server_id: String,
+    file_path: String,
+    lsp: State<'_, LspRegistry>,
+) -> Result<Vec<LspDocumentSymbol>, String> {
+    let registry = lsp.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.document_symbols(&workspace_id, &server_id, &file_path)
+    })
+    .await
+    .map_err(|error| file_ipc_error("LSP document symbols task failed", error))?
+    .map_err(|error| file_ipc_error("LSP document symbols failed", error))
+}
+
+#[tauri::command]
 async fn lsp_completion(
     workspace_id: String,
     server_id: String,
@@ -963,6 +1069,9 @@ pub fn run() {
             propose_ai_edit,
             list_directory,
             read_file,
+            search_workspace,
+            preview_workspace_replace,
+            apply_workspace_replace,
             write_file,
             workspace_root_path,
             set_workspace_root,
@@ -1003,6 +1112,8 @@ pub fn run() {
             lsp_diagnostics,
             lsp_hover,
             lsp_goto_definition,
+            lsp_references,
+            lsp_document_symbols,
             lsp_completion,
             lsp_code_actions
         ])

@@ -119,6 +119,16 @@ pub struct LspLocation {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct LspDocumentSymbol {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: u32,
+    pub range: LspRange,
+    pub selection_range: LspRange,
+    pub depth: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct LspServerStatus {
     pub workspace_id: String,
     pub server_id: String,
@@ -243,6 +253,8 @@ impl LspRegistry {
                         "publishDiagnostics": { "versionSupport": true },
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": { "linkSupport": true },
+                        "references": { "dynamicRegistration": false },
+                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                         "completion": {
                             "contextSupport": true,
                             "completionItem": {
@@ -372,6 +384,27 @@ impl LspRegistry {
     ) -> Result<Option<LspLocation>, String> {
         self.client(workspace_id, server_id)?
             .definition(file_path, position)
+    }
+
+    pub fn references(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        file_path: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, String> {
+        self.client(workspace_id, server_id)?
+            .references(file_path, position)
+    }
+
+    pub fn document_symbols(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        file_path: &str,
+    ) -> Result<Vec<LspDocumentSymbol>, String> {
+        self.client(workspace_id, server_id)?
+            .document_symbols(file_path)
     }
 
     pub fn completion(
@@ -532,6 +565,32 @@ impl LspClient {
             json!({ "textDocument": { "uri": uri }, "position": position }),
         )?;
         Ok(parse_location(&value, &self.root))
+    }
+
+    fn references(
+        &self,
+        file_path: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, String> {
+        let uri = self.file_uri(file_path)?;
+        let value = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": position,
+                "context": { "includeDeclaration": true }
+            }),
+        )?;
+        Ok(parse_locations(&value, &self.root))
+    }
+
+    fn document_symbols(&self, file_path: &str) -> Result<Vec<LspDocumentSymbol>, String> {
+        let uri = self.file_uri(file_path)?;
+        let value = self.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": uri } }),
+        )?;
+        Ok(parse_document_symbols(&value, &uri))
     }
 
     fn completion(&self, request: LspCompletionRequest) -> Result<LspCompletionResult, String> {
@@ -1035,17 +1094,34 @@ fn parse_hover(value: &Value) -> Option<LspHoverResult> {
 }
 
 fn parse_location(value: &Value, root: &Path) -> Option<LspLocation> {
-    let location = value
+    value
         .as_array()
-        .and_then(|items| items.first())
-        .unwrap_or(value);
+        .map(|locations| {
+            locations
+                .iter()
+                .find_map(|location| parse_location_item(location, root))
+        })
+        .unwrap_or_else(|| parse_location_item(value, root))
+}
+
+fn parse_locations(value: &Value, root: &Path) -> Vec<LspLocation> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|location| parse_location_item(location, root))
+        .collect()
+}
+
+fn parse_location_item(location: &Value, root: &Path) -> Option<LspLocation> {
     let uri = location
         .get("uri")
         .or_else(|| location.get("targetUri"))?
         .as_str()?;
     let range = location
         .get("range")
-        .or_else(|| location.get("targetSelectionRange"))?;
+        .or_else(|| location.get("targetSelectionRange"))
+        .or_else(|| location.get("targetRange"))?;
     let start = range.get("start")?;
     let path = Url::parse(uri).ok()?.to_file_path().ok()?;
     let relative = path
@@ -1055,16 +1131,100 @@ fn parse_location(value: &Value, root: &Path) -> Option<LspLocation> {
         .replace('\\', "/");
     Some(LspLocation {
         file_path: relative,
-        line: start.get("line")?.as_u64()? as u32,
-        character: start.get("character")?.as_u64()? as u32,
+        line: start
+            .get("line")?
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())?,
+        character: start
+            .get("character")?
+            .as_u64()
+            .and_then(|character| u32::try_from(character).ok())?,
+    })
+}
+
+fn parse_document_symbols(value: &Value, document_uri: &str) -> Vec<LspDocumentSymbol> {
+    let mut symbols = Vec::new();
+    for value in value.as_array().into_iter().flatten() {
+        if value.get("location").is_some() {
+            if let Some(symbol) = parse_symbol_information(value, document_uri) {
+                symbols.push(symbol);
+            }
+        } else {
+            append_document_symbol(value, 0, &mut symbols);
+        }
+    }
+    symbols
+}
+
+fn append_document_symbol(value: &Value, depth: u32, symbols: &mut Vec<LspDocumentSymbol>) {
+    let Some(name) = value.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(kind) = value
+        .get("kind")
+        .and_then(Value::as_u64)
+        .and_then(|kind| u32::try_from(kind).ok())
+    else {
+        return;
+    };
+    let Some(range) = value
+        .get("range")
+        .cloned()
+        .and_then(|range| serde_json::from_value(range).ok())
+    else {
+        return;
+    };
+    let Some(selection_range) = value
+        .get("selectionRange")
+        .cloned()
+        .and_then(|range| serde_json::from_value(range).ok())
+    else {
+        return;
+    };
+
+    symbols.push(LspDocumentSymbol {
+        name: name.to_string(),
+        detail: string_field(value, "detail"),
+        kind,
+        range,
+        selection_range,
+        depth,
+    });
+    for child in value
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        append_document_symbol(child, depth + 1, symbols);
+    }
+}
+
+fn parse_symbol_information(value: &Value, document_uri: &str) -> Option<LspDocumentSymbol> {
+    let location = value.get("location")?;
+    if location.get("uri")?.as_str()? != document_uri {
+        return None;
+    }
+    let range: LspRange = serde_json::from_value(location.get("range")?.clone()).ok()?;
+    Some(LspDocumentSymbol {
+        name: value.get("name")?.as_str()?.to_string(),
+        detail: None,
+        kind: value
+            .get("kind")?
+            .as_u64()
+            .and_then(|kind| u32::try_from(kind).ok())?,
+        selection_range: range.clone(),
+        range,
+        depth: 0,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        incremental_content_change, parse_code_actions, parse_completion, parse_hover,
-        read_message, server_request_result, text_document_sync_kind, LspDiagnostic,
+        incremental_content_change, parse_code_actions, parse_completion, parse_document_symbols,
+        parse_hover, parse_locations, read_message, server_request_result, text_document_sync_kind,
+        LspDiagnostic,
     };
     use serde_json::json;
     use std::io::Cursor;
@@ -1263,5 +1423,143 @@ mod tests {
         .expect("diagnostic should parse");
 
         assert_eq!(diagnostic.data, Some(json!({ "fixId": 42 })));
+    }
+
+    #[test]
+    fn normalizes_reference_locations_and_location_links() {
+        let references = parse_locations(
+            &json!([
+                {
+                    "uri": "file:///workspace/src/main.rs",
+                    "range": {
+                        "start": { "line": 2, "character": 4 },
+                        "end": { "line": 2, "character": 8 }
+                    }
+                },
+                {
+                    "targetUri": "file:///workspace/src/lib.rs",
+                    "targetRange": {
+                        "start": { "line": 5, "character": 0 },
+                        "end": { "line": 7, "character": 1 }
+                    },
+                    "targetSelectionRange": {
+                        "start": { "line": 5, "character": 3 },
+                        "end": { "line": 5, "character": 7 }
+                    }
+                },
+                {
+                    "targetUri": "file:///workspace/src/fallback.rs",
+                    "targetRange": {
+                        "start": { "line": 8, "character": 1 },
+                        "end": { "line": 9, "character": 0 }
+                    }
+                }
+            ]),
+            std::path::Path::new("/workspace"),
+        );
+
+        assert_eq!(references.len(), 3);
+        assert_eq!(references[0].file_path, "src/main.rs");
+        assert_eq!(references[0].line, 2);
+        assert_eq!(references[1].file_path, "src/lib.rs");
+        assert_eq!(references[1].line, 5);
+        assert_eq!(references[1].character, 3);
+        assert_eq!(references[2].file_path, "src/fallback.rs");
+        assert_eq!(references[2].line, 8);
+    }
+
+    #[test]
+    fn reference_locations_exclude_targets_outside_workspace() {
+        let references = parse_locations(
+            &json!([
+                {
+                    "uri": "file:///outside/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    }
+                },
+                {
+                    "uri": "https://example.com/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    }
+                },
+                { "uri": "file:///workspace/src/malformed.rs" }
+            ]),
+            std::path::Path::new("/workspace"),
+        );
+
+        assert!(references.is_empty());
+    }
+
+    #[test]
+    fn flattens_hierarchical_document_symbols_with_depth() {
+        let range = json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 5, "character": 1 }
+        });
+        let selection_range = json!({
+            "start": { "line": 1, "character": 3 },
+            "end": { "line": 1, "character": 7 }
+        });
+        let symbols = parse_document_symbols(
+            &json!([{
+                "name": "outer",
+                "detail": "fn()",
+                "kind": 12,
+                "range": range,
+                "selectionRange": selection_range,
+                "children": [{
+                    "name": "inner",
+                    "kind": 13,
+                    "range": range,
+                    "selectionRange": selection_range
+                }]
+            }]),
+            "file:///workspace/src/main.rs",
+        );
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "outer");
+        assert_eq!(symbols[0].detail.as_deref(), Some("fn()"));
+        assert_eq!(symbols[0].depth, 0);
+        assert_eq!(symbols[1].name, "inner");
+        assert_eq!(symbols[1].depth, 1);
+        assert_eq!(symbols[1].selection_range.start.character, 3);
+    }
+
+    #[test]
+    fn normalizes_flat_symbols_only_for_requested_document() {
+        let uri = "file:///workspace/src/main.rs";
+        let range = json!({
+            "start": { "line": 2, "character": 4 },
+            "end": { "line": 2, "character": 9 }
+        });
+        let symbols = parse_document_symbols(
+            &json!([
+                {
+                    "name": "local",
+                    "kind": 13,
+                    "location": { "uri": uri, "range": range }
+                },
+                {
+                    "name": "foreign",
+                    "kind": 13,
+                    "location": {
+                        "uri": "file:///workspace/src/other.rs",
+                        "range": range
+                    }
+                }
+            ]),
+            uri,
+        );
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "local");
+        assert_eq!(symbols[0].depth, 0);
+        assert_eq!(symbols[0].range.start.character, 4);
+        assert_eq!(symbols[0].selection_range.start.character, 4);
     }
 }
