@@ -53,6 +53,14 @@
     onApplySelectedAiEdit: () => void;
     onAcceptAllAiEdit: () => void;
     onRejectAiEdit: () => void;
+    aiEditContextDocuments: Array<{
+      id: string;
+      path: string;
+      pinned: boolean;
+      characters: number;
+    }>;
+    aiEditContextCharacters: number;
+    onToggleAiEditContext: (documentId: string) => void;
     canNavigateBack: boolean;
     canNavigateForward: boolean;
     lspSymbols: LspDocumentSymbol[];
@@ -103,6 +111,9 @@
     onApplySelectedAiEdit,
     onAcceptAllAiEdit,
     onRejectAiEdit,
+    aiEditContextDocuments,
+    aiEditContextCharacters,
+    onToggleAiEditContext,
     canNavigateBack,
     canNavigateForward,
     lspSymbols,
@@ -329,6 +340,10 @@
       onApplySelected={onApplySelectedAiEdit}
       onAcceptAll={onAcceptAllAiEdit}
       onReject={onRejectAiEdit}
+      contextDocuments={aiEditContextDocuments}
+      contextCharacters={aiEditContextCharacters}
+      diagnosticCount={lspDiagnostics.length}
+      onToggleContext={onToggleAiEditContext}
     />
   {/if}
   {#if editorDiagnostic}

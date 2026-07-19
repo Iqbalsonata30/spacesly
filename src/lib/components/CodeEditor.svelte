@@ -11,6 +11,7 @@
     type CodeEditorHandle,
     type DocumentSession,
     type EditorTransactionOrigin,
+    type EditorSelectionSnapshot,
   } from "$lib/editorDocument";
   import { editorLanguagePluginForPath } from "$lib/editorPlugins";
   import type { EditorCommandId } from "$lib/editorCommands";
@@ -380,6 +381,32 @@
     return true;
   }
 
+  export function getSelectionSnapshot(): EditorSelectionSnapshot | null {
+    if (view) {
+      const selection = view.state.selection.main;
+      if (selection.empty) return null;
+      const start = offsetToLspPosition(view.state.doc, selection.from);
+      const end = offsetToLspPosition(view.state.doc, selection.to);
+      return {
+        start_line: start.line,
+        start_character: start.character,
+        end_line: end.line,
+        end_character: end.character,
+        text: view.state.sliceDoc(selection.from, selection.to),
+      };
+    }
+    if (!fallback || fallback.selectionStart === fallback.selectionEnd) return null;
+    const start = stringOffsetPosition(fallbackValue, fallback.selectionStart);
+    const end = stringOffsetPosition(fallbackValue, fallback.selectionEnd);
+    return {
+      start_line: start.line,
+      start_character: start.character,
+      end_line: end.line,
+      end_character: end.character,
+      text: fallbackValue.slice(fallback.selectionStart, fallback.selectionEnd),
+    };
+  }
+
   function editorHandle(): CodeEditorHandle {
     return {
       getValue,
@@ -390,6 +417,7 @@
       getCursorPosition,
       setCursorPosition,
       applyTextEdits,
+      getSelectionSnapshot,
     };
   }
 
@@ -553,6 +581,14 @@
       .replace(/\$\{\d+:([^}]*)\}/g, "$1")
       .replace(/\$\{\d+\}/g, "")
       .replace(/\$\d+/g, "");
+  }
+
+  function stringOffsetPosition(value: string, offset: number) {
+    const clamped = Math.max(0, Math.min(value.length, offset));
+    const prefix = value.slice(0, clamped);
+    const line = prefix.split("\n").length - 1;
+    const lineStart = prefix.lastIndexOf("\n") + 1;
+    return { line, character: clamped - lineStart };
   }
 </script>
 

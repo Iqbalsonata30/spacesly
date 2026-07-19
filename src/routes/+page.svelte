@@ -468,6 +468,7 @@
   let aiEditGenerating = $state(false);
   let aiEditError = $state<string | null>(null);
   let aiEditRequestId = 0;
+  let aiEditPinnedDocumentIds = $state<string[]>([]);
   let editorNavigation = $state(createEditorNavigation());
   let workspaceRoot = $state<string | null>(null);
   let workspaceGitInfo = $state<GitWorkspaceInfo | null>(null);
@@ -837,11 +838,34 @@
     Boolean(
       aiEditProposal &&
       (!activeEditorFile ||
-        aiEditProposalIsStale(aiEditProposal, activeEditorFile.id, activeEditorFile.revision)),
+        aiEditProposalIsStale(
+          aiEditProposal,
+          activeEditorFile.id,
+          activeEditorFile.revision,
+          Object.fromEntries(openEditorFiles.map((file) => [file.id, file.revision])),
+        )),
     ),
   );
   let canNavigateEditorBack = $derived(canNavigateEditor(editorNavigation, -1));
   let canNavigateEditorForward = $derived(canNavigateEditor(editorNavigation, 1));
+  let aiEditContextOptions = $derived(
+    openEditorFiles
+      .filter((file) => file.id !== activeEditorFile?.id)
+      .map((file) => ({
+        id: file.id,
+        path: file.path,
+        pinned: aiEditPinnedDocumentIds.includes(file.id),
+        characters: file.state?.doc.length ?? file.initialValue.length,
+      })),
+  );
+  let aiEditContextCharacters = $derived(
+    (activeEditorFile?.state?.doc.length ?? activeEditorFile?.initialValue.length ?? 0) +
+      openEditorFiles
+        .filter(
+          (file) => file.id !== activeEditorFile?.id && aiEditPinnedDocumentIds.includes(file.id),
+        )
+        .reduce((total, file) => total + (file.state?.doc.length ?? file.initialValue.length), 0),
+  );
   let hasDirtyEditorFiles = $derived(openEditorFiles.some((file) => file.dirty));
 
   let fileStatusLabel = $derived(
@@ -1552,6 +1576,7 @@
     fileDirectory = "";
     workspaceFilesDirectory = "";
     openEditorFiles = [];
+    aiEditPinnedDocumentIds = [];
     editorNavigation = createEditorNavigation();
     activeEditorHandle = null;
     activeEditorPath = null;
@@ -1589,6 +1614,7 @@
     expandedFileEntries = {};
     expandingFilePaths = {};
     openEditorFiles = [];
+    aiEditPinnedDocumentIds = [];
     editorNavigation = createEditorNavigation();
     activeEditorHandle = null;
     activeEditorPath = null;
@@ -2350,6 +2376,7 @@
       void lspCloseDocument(workspace.id, lspConfig.server_id, path).catch(() => {});
     }
     const index = openEditorFiles.findIndex((file) => file.path === path);
+    if (target) aiEditPinnedDocumentIds = aiEditPinnedDocumentIds.filter((id) => id !== target.id);
     openEditorFiles = openEditorFiles.filter((file) => file.path !== path);
     if (activeEditorPath === path) {
       activeEditorHandle = null;
@@ -2474,6 +2501,19 @@
     const config = buildAiWorkerConfig();
     if (!file || !config) return;
     const snapshot = documentSnapshot(file);
+    const contextFiles = openEditorFiles.filter(
+      (entry) => entry.id !== file.id && aiEditPinnedDocumentIds.includes(entry.id),
+    );
+    const contextSnapshots = contextFiles.map((entry) => ({
+      file: entry,
+      snapshot: documentSnapshot(entry),
+    }));
+    const contextRevisions = Object.fromEntries(
+      contextSnapshots.map(({ file: entry, snapshot: contextSnapshot }) => [
+        entry.id,
+        contextSnapshot.revision,
+      ]),
+    );
     const requestId = ++aiEditRequestId;
     aiEditGenerating = true;
     aiEditError = null;
@@ -2484,6 +2524,20 @@
         file_path: file.path,
         instruction,
         content: snapshot.value,
+        selection: activeEditorHandle?.getSelectionSnapshot() ?? null,
+        context_files: contextSnapshots.map(({ file: entry, snapshot: contextSnapshot }) => ({
+          file_path: entry.path,
+          content: contextSnapshot.value,
+        })),
+        diagnostics: activeLspDiagnostics.map((diagnostic) =>
+          [
+            diagnostic.source,
+            diagnostic.code === null ? null : String(diagnostic.code),
+            `${diagnostic.message} (line ${diagnostic.range.start.line + 1})`,
+          ]
+            .filter(Boolean)
+            .join(": "),
+        ),
       });
       if (requestId !== aiEditRequestId) return;
       const proposal = createAiEditProposal({
@@ -2493,6 +2547,7 @@
         baseValue: snapshot.value,
         proposedValue: result.content,
         summary: result.summary,
+        contextRevisions,
       });
       if (proposal.hunks.length === 0) {
         aiEditError = "The model returned no changes.";
@@ -2506,6 +2561,39 @@
     } finally {
       if (requestId === aiEditRequestId) aiEditGenerating = false;
     }
+  }
+
+  function toggleAiEditContext(documentId: string) {
+    if (aiEditPinnedDocumentIds.includes(documentId)) {
+      aiEditPinnedDocumentIds = aiEditPinnedDocumentIds.filter((id) => id !== documentId);
+      return;
+    }
+    const document = openEditorFiles.find((file) => file.id === documentId);
+    if (!document) return;
+    if (new TextEncoder().encode(documentSnapshot(document).value).byteLength > 128 * 1024) {
+      aiEditError = `${document.name} exceeds the 128 KiB context-file limit.`;
+      return;
+    }
+    if (aiEditPinnedDocumentIds.length >= 8) {
+      aiEditError = "AI Edit supports at most 8 pinned context files.";
+      return;
+    }
+    const activeBytes = activeEditorFile
+      ? new TextEncoder().encode(documentSnapshot(activeEditorFile).value).byteLength
+      : 0;
+    const contextBytes = openEditorFiles
+      .filter((file) => aiEditPinnedDocumentIds.includes(file.id) || file.id === documentId)
+      .filter((file) => file.id !== activeEditorFile?.id)
+      .reduce(
+        (total, file) => total + new TextEncoder().encode(documentSnapshot(file).value).byteLength,
+        0,
+      );
+    if (activeBytes + contextBytes > 512 * 1024) {
+      aiEditError = "Active and pinned AI context exceeds the 512 KiB combined limit.";
+      return;
+    }
+    aiEditPinnedDocumentIds = [...aiEditPinnedDocumentIds, documentId];
+    aiEditError = null;
   }
 
   function cancelAiEdit() {
@@ -2523,7 +2611,16 @@
   function applyAiEdit(selectedHunkIds: string[]) {
     const proposal = aiEditProposal;
     const file = activeEditorFile;
-    if (!proposal || !file || aiEditProposalIsStale(proposal, file.id, file.revision)) {
+    if (
+      !proposal ||
+      !file ||
+      aiEditProposalIsStale(
+        proposal,
+        file.id,
+        file.revision,
+        Object.fromEntries(openEditorFiles.map((entry) => [entry.id, entry.revision])),
+      )
+    ) {
       aiEditError = "The document changed after this proposal was generated. Regenerate it first.";
       return;
     }
@@ -7100,6 +7197,9 @@
               onAcceptAllAiEdit={() =>
                 applyAiEdit(aiEditProposal?.hunks.map((hunk) => hunk.id) ?? [])}
               onRejectAiEdit={rejectAiEdit}
+              aiEditContextDocuments={aiEditContextOptions}
+              {aiEditContextCharacters}
+              onToggleAiEditContext={toggleAiEditContext}
               canNavigateBack={canNavigateEditorBack}
               canNavigateForward={canNavigateEditorForward}
               lspSymbols={activeLspSymbols}

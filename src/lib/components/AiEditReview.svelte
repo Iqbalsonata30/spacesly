@@ -13,6 +13,15 @@
     onApplySelected: () => void;
     onAcceptAll: () => void;
     onReject: () => void;
+    contextDocuments: Array<{
+      id: string;
+      path: string;
+      pinned: boolean;
+      characters: number;
+    }>;
+    contextCharacters: number;
+    diagnosticCount: number;
+    onToggleContext: (documentId: string) => void;
   };
 
   let {
@@ -27,6 +36,10 @@
     onApplySelected,
     onAcceptAll,
     onReject,
+    contextDocuments,
+    contextCharacters,
+    diagnosticCount,
+    onToggleContext,
   }: Props = $props();
   let instruction = $state("");
 
@@ -57,6 +70,34 @@
       <button type="submit" disabled={!instruction.trim()}>Generate</button>
     {/if}
   </form>
+
+  <details class="ai-context">
+    <summary>
+      <span>Context</span>
+      <small
+        >~{contextCharacters.toLocaleString()} / 524,288 characters · {diagnosticCount}
+        diagnostics</small
+      >
+    </summary>
+    <p>The current selection and diagnostics are included automatically when you generate.</p>
+    <div>
+      {#each contextDocuments as document (document.id)}
+        <button
+          type="button"
+          class:pinned={document.pinned}
+          aria-pressed={document.pinned}
+          onclick={() => onToggleContext(document.id)}
+        >
+          <span>{document.path}</span>
+          <small
+            >{document.pinned ? "Pinned" : `${document.characters.toLocaleString()} chars`}</small
+          >
+        </button>
+      {:else}
+        <p>Open another file to make it available as context.</p>
+      {/each}
+    </div>
+  </details>
 
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -117,6 +158,70 @@
     color: var(--text-primary);
     background: color-mix(in srgb, var(--bg-card) 92%, transparent);
     border-top: 1px solid var(--border-light);
+  }
+
+  .ai-context {
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    background: var(--bg-base);
+  }
+
+  .ai-context summary,
+  .ai-context button {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .ai-context summary {
+    padding: 7px 9px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 750;
+  }
+
+  .ai-context summary small,
+  .ai-context button small {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .ai-context > p {
+    margin: 0;
+    padding: 0 9px 7px;
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .ai-context > div {
+    display: grid;
+    max-height: 150px;
+    overflow: auto;
+    border-top: 1px solid var(--border-light);
+  }
+
+  .ai-context button {
+    border: 0;
+    border-radius: 0;
+    padding: 6px 9px;
+    color: var(--text-secondary);
+    background: transparent;
+    text-align: left;
+  }
+
+  .ai-context button:hover,
+  .ai-context button:focus-visible,
+  .ai-context button.pinned {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .ai-context button span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   form,

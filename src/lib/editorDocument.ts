@@ -4,6 +4,14 @@ import type { LspTextEdit } from "$lib/ipc";
 
 export type EditorTransactionOrigin = "user" | "disk" | "format" | "ai" | "restore";
 
+export type EditorSelectionSnapshot = {
+  start_line: number;
+  start_character: number;
+  end_line: number;
+  end_character: number;
+  text: string;
+};
+
 export type CodeEditorHandle = {
   getValue: () => string;
   getSnapshot: () => { value: string; revision: number };
@@ -13,6 +21,7 @@ export type CodeEditorHandle = {
   getCursorPosition: () => { line: number; character: number };
   setCursorPosition: (line: number, character: number) => void;
   applyTextEdits: (edits: LspTextEdit[]) => boolean;
+  getSelectionSnapshot: () => EditorSelectionSnapshot | null;
 };
 
 export type DocumentSession = {

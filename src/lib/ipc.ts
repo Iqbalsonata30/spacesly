@@ -5,8 +5,10 @@ import type { FileEntry } from "$lib/ipc/files";
 export type {
   AiWorkerChatResult,
   AiWorkerChatRequest,
+  AiEditContextFile,
   AiEditRequest,
   AiEditResult,
+  AiEditSelection,
   AiWorkerConfig,
   AiWorkerStatus,
   AiWorkerTask,

@@ -167,6 +167,24 @@ assertEqual(
   { current: false, changed: true },
   "AI proposals should become stale when document revisions change",
 );
+const contextualProposal = createAiEditProposal({
+  documentId: "doc-1",
+  path: "src/main.ts",
+  baseRevision: 4,
+  baseValue: "old",
+  proposedValue: "new",
+  summary: "Use pinned context",
+  contextRevisions: { "doc-context": 7 },
+});
+assertEqual(
+  {
+    current: aiEditProposalIsStale(contextualProposal, "doc-1", 4, { "doc-context": 7 }),
+    changed: aiEditProposalIsStale(contextualProposal, "doc-1", 4, { "doc-context": 8 }),
+    closed: aiEditProposalIsStale(contextualProposal, "doc-1", 4, {}),
+  },
+  { current: false, changed: true, closed: true },
+  "AI proposals should become stale when pinned context changes or closes",
+);
 
 const unicodeDoc = EditorState.create({ doc: "a😀b\nnext" }).doc;
 assertEqual(

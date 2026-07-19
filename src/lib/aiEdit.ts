@@ -14,12 +14,21 @@ export type AiEditProposal = {
   proposedValue: string;
   summary: string;
   hunks: AiEditHunk[];
+  contextRevisions: Record<string, number>;
 };
 
 const ANCHOR_WINDOW = 80;
 
-export function createAiEditProposal(values: Omit<AiEditProposal, "hunks">): AiEditProposal {
-  return { ...values, hunks: diffAiEditLines(values.baseValue, values.proposedValue) };
+export function createAiEditProposal(
+  values: Omit<AiEditProposal, "hunks" | "contextRevisions"> & {
+    contextRevisions?: Record<string, number>;
+  },
+): AiEditProposal {
+  return {
+    ...values,
+    contextRevisions: values.contextRevisions ?? {},
+    hunks: diffAiEditLines(values.baseValue, values.proposedValue),
+  };
 }
 
 export function diffAiEditLines(previous: string, current: string): AiEditHunk[] {
@@ -74,8 +83,15 @@ export function aiEditProposalIsStale(
   proposal: AiEditProposal,
   documentId: string,
   revision: number,
+  contextRevisions: Readonly<Record<string, number>> = {},
 ): boolean {
-  return proposal.documentId !== documentId || proposal.baseRevision !== revision;
+  return (
+    proposal.documentId !== documentId ||
+    proposal.baseRevision !== revision ||
+    Object.entries(proposal.contextRevisions).some(
+      ([id, contextRevision]) => contextRevisions[id] !== contextRevision,
+    )
+  );
 }
 
 function nextAnchor(

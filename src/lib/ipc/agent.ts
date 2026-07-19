@@ -115,6 +115,22 @@ export interface AiEditRequest {
   file_path: string;
   instruction: string;
   content: string;
+  selection?: AiEditSelection | null;
+  context_files?: AiEditContextFile[];
+  diagnostics?: string[];
+}
+
+export interface AiEditSelection {
+  start_line: number;
+  start_character: number;
+  end_line: number;
+  end_character: number;
+  text: string;
+}
+
+export interface AiEditContextFile {
+  file_path: string;
+  content: string;
 }
 
 export interface AiEditResult {
