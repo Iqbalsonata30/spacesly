@@ -38,6 +38,9 @@ impl AppSecretsStore {
             .clone();
         secrets.ai_api_keys.clear();
         secrets.mcp_env.clear();
+        secrets.jira_api_token.clear();
+        secrets.jira_personal_access_token.clear();
+        secrets.jira_password.clear();
         Ok(secrets)
     }
 
@@ -110,6 +113,15 @@ impl AppSecretsStore {
 
     pub fn save_from_renderer(&self, mut incoming: AppSecrets) -> Result<(), String> {
         let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        if incoming.jira_api_token.is_empty() {
+            incoming.jira_api_token = current.jira_api_token.clone();
+        }
+        if incoming.jira_personal_access_token.is_empty() {
+            incoming.jira_personal_access_token = current.jira_personal_access_token.clone();
+        }
+        if incoming.jira_password.is_empty() {
+            incoming.jira_password = current.jira_password.clone();
+        }
         if incoming.ai_api_keys.is_empty() {
             incoming.ai_api_keys = current.ai_api_keys.clone();
         } else {
@@ -148,6 +160,48 @@ impl AppSecretsStore {
         let server_id = server_name.strip_prefix("spacesly-").unwrap_or(server_name);
         let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
         Ok(secrets.mcp_env.get(server_id).cloned().unwrap_or_default())
+    }
+
+    pub fn jira_credentials(&self) -> Result<(String, String, String), String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        Ok((
+            secrets.jira_api_token.clone(),
+            secrets.jira_personal_access_token.clone(),
+            secrets.jira_password.clone(),
+        ))
+    }
+
+    pub fn jira_secret_statuses(&self) -> Result<HashMap<String, bool>, String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        Ok(HashMap::from([
+            (
+                "api_token".to_string(),
+                !secrets.jira_api_token.trim().is_empty(),
+            ),
+            (
+                "personal_access_token".to_string(),
+                !secrets.jira_personal_access_token.trim().is_empty(),
+            ),
+            (
+                "password".to_string(),
+                !secrets.jira_password.trim().is_empty(),
+            ),
+        ]))
+    }
+
+    pub fn save_jira_secret(&self, secret_type: &str, value: Option<&str>) -> Result<(), String> {
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        let target = match secret_type {
+            "api_token" => &mut next.jira_api_token,
+            "personal_access_token" => &mut next.jira_personal_access_token,
+            "password" => &mut next.jira_password,
+            _ => return Err("Unknown Jira secret type.".to_string()),
+        };
+        *target = value.unwrap_or_default().trim().to_string();
+        save_app_secrets(next.clone())?;
+        *current = next;
+        Ok(())
     }
 }
 
@@ -222,6 +276,7 @@ mod tests {
                     "jira".to_string(),
                     HashMap::from([("JIRA_TOKEN".to_string(), "secret".to_string())]),
                 )]),
+                jira_api_token: "jira-token".to_string(),
                 ..AppSecrets::default()
             })),
         };
@@ -239,5 +294,7 @@ mod tests {
             vec!["JIRA_TOKEN"]
         );
         assert!(store.redacted_snapshot().unwrap().mcp_env.is_empty());
+        assert!(store.redacted_snapshot().unwrap().jira_api_token.is_empty());
+        assert!(store.jira_secret_statuses().unwrap()["api_token"]);
     }
 }

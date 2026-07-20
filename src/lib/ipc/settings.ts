@@ -46,3 +46,22 @@ export async function saveMcpEnvironmentSecret(
     IPC_POLICIES.secret,
   );
 }
+
+export async function jiraSecretStatuses(): Promise<Record<string, boolean>> {
+  return invokeWithPolicy<Record<string, boolean>>(
+    "jira_secret_statuses",
+    undefined,
+    IPC_POLICIES.secret,
+  );
+}
+
+export async function saveJiraSecret(
+  secretType: "api_token" | "personal_access_token" | "password",
+  value: string | null,
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "save_jira_secret",
+    { secretType, value },
+    IPC_POLICIES.secret,
+  );
+}

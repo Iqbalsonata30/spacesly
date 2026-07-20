@@ -124,8 +124,8 @@
     lspStartServer,
     lspStopServer,
     lspSyncDocument,
-    loadAppSecrets,
     aiProviderSecretStatuses,
+    jiraSecretStatuses,
     mcpEnvironmentSecretStatuses,
     onWorkspaceFileChange,
     openPtyTerminal,
@@ -134,8 +134,8 @@
     disconnectMcpServer,
     readFile,
     resizePtyTerminal,
-    saveAppSecrets,
     saveAiProviderSecret,
+    saveJiraSecret,
     saveMcpEnvironmentSecret,
     saveExecutionRun,
     searchWorkspace,
@@ -190,8 +190,6 @@
     loadLegacySettingsSecrets,
     loadSettings,
     saveSettings,
-    hasAnySecret,
-    mergeAppSecrets,
     secretsFromSettings,
     settingsWithoutSecrets,
     type AppSettings,
@@ -353,6 +351,7 @@
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let aiProviderSecrets = $state<Record<string, boolean>>({});
   let mcpEnvironmentSecrets = $state<Record<string, string[]>>({});
+  let jiraSecrets = $state<Record<string, boolean>>({});
   let secretsHydrated = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
@@ -1053,7 +1052,6 @@
   async function hydrateSecrets() {
     const localSecrets = appSecrets;
     try {
-      const storedSecrets = await loadAppSecrets();
       const legacyAiKeys = localSecrets.ai_api_keys;
       for (const [providerId, apiKey] of Object.entries(legacyAiKeys)) {
         if (apiKey.trim()) await saveAiProviderSecret(providerId, apiKey);
@@ -1063,20 +1061,28 @@
           await saveMcpEnvironmentSecret(serverId, environment);
         }
       }
-      const redactedLocalSecrets = { ...localSecrets, ai_api_keys: {}, mcp_env: {} };
-      const mergedSecrets = hasAnySecret(redactedLocalSecrets)
-        ? mergeAppSecrets(redactedLocalSecrets, storedSecrets)
-        : storedSecrets;
-
-      if (hasAnySecret(redactedLocalSecrets)) {
-        await saveAppSecrets({ ...mergedSecrets, ai_api_keys: {}, mcp_env: {} });
-        saveSettings(settingsWithoutSecrets(settings));
+      if (localSecrets.jira_api_token.trim()) {
+        await saveJiraSecret("api_token", localSecrets.jira_api_token);
+      }
+      if (localSecrets.jira_personal_access_token.trim()) {
+        await saveJiraSecret("personal_access_token", localSecrets.jira_personal_access_token);
+      }
+      if (localSecrets.jira_password.trim()) {
+        await saveJiraSecret("password", localSecrets.jira_password);
       }
 
       aiProviderSecrets = await aiProviderSecretStatuses();
       mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
-      appSecrets = { ...mergedSecrets, ai_api_keys: {}, mcp_env: {} };
+      jiraSecrets = await jiraSecretStatuses();
+      appSecrets = {
+        jira_api_token: "",
+        jira_personal_access_token: "",
+        jira_password: "",
+        ai_api_keys: {},
+        mcp_env: {},
+      };
       settings = settingsWithoutSecrets(settings);
+      saveSettings(settings);
       secretsHydrated = true;
     } catch (reason: unknown) {
       appNotice = {
@@ -1189,7 +1195,6 @@
   }
 
   async function persistSettingsAndSecrets(value: AppSettings) {
-    const storedSecrets = await loadAppSecrets();
     for (const [providerId, apiKey] of Object.entries(appSecrets.ai_api_keys)) {
       await saveAiProviderSecret(providerId, apiKey);
     }
@@ -1198,19 +1203,25 @@
         await saveMcpEnvironmentSecret(server.id, server.env);
       }
     }
-    const redactedSecrets = { ...appSecrets, ai_api_keys: {}, mcp_env: {} };
-    const mergedSecrets = hasAnySecret(redactedSecrets)
-      ? mergeAppSecrets(redactedSecrets, storedSecrets)
-      : storedSecrets;
-    const nextSecrets = {
-      ...mergedSecrets,
+    if (appSecrets.jira_api_token.trim()) {
+      await saveJiraSecret("api_token", appSecrets.jira_api_token);
+    }
+    if (appSecrets.jira_personal_access_token.trim()) {
+      await saveJiraSecret("personal_access_token", appSecrets.jira_personal_access_token);
+    }
+    if (appSecrets.jira_password.trim()) {
+      await saveJiraSecret("password", appSecrets.jira_password);
+    }
+    aiProviderSecrets = await aiProviderSecretStatuses();
+    mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
+    jiraSecrets = await jiraSecretStatuses();
+    appSecrets = {
+      jira_api_token: "",
+      jira_personal_access_token: "",
+      jira_password: "",
       ai_api_keys: {},
       mcp_env: {},
     };
-    await saveAppSecrets(nextSecrets);
-    aiProviderSecrets = await aiProviderSecretStatuses();
-    mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
-    appSecrets = { ...nextSecrets, ai_api_keys: {}, mcp_env: {} };
     saveSettings(settingsWithoutSecrets(value));
   }
 
@@ -3195,9 +3206,7 @@
   function buildJiraConfig(): JiraMcpConfig | null {
     const server = settings.mcpServers.find((entry) => entry.id === settings.jira.serverId);
 
-    const credential = credentialValue();
-
-    if (!settings.jira.baseUrl.trim() || !credential) {
+    if (!settings.jira.baseUrl.trim() || !hasJiraCredential()) {
       syncError = "Open Settings and fill Jira URL plus the selected credential before syncing.";
       openSettings("jira");
       return null;
@@ -3216,23 +3225,19 @@
         args: server?.args ?? [],
         scope_id: workspace?.id ?? "workspace-personal",
         env: {
-          ...(server?.env ?? {}),
           JIRA_URL: settings.jira.baseUrl,
           JIRA_BASE_URL: settings.jira.baseUrl,
           ATLASSIAN_SITE_URL: settings.jira.baseUrl,
           JIRA_USERNAME: settings.jira.username,
           JIRA_EMAIL: settings.jira.username,
           ATLASSIAN_EMAIL: settings.jira.username,
-          ...authEnv(),
         },
       },
+      secret_id: "jira-default",
       auth: {
         base_url: settings.jira.baseUrl,
         auth_mode: settings.jira.authMode,
         username: settings.jira.username,
-        api_token: appSecrets.jira_api_token,
-        personal_access_token: appSecrets.jira_personal_access_token,
-        password: appSecrets.jira_password,
       },
       tool_name: settings.jira.toolName,
       board_tool_name: settings.jira.boardToolName,
@@ -3887,33 +3892,14 @@
     return activeColumnByIntent.get(intent)?.id ?? null;
   }
 
-  function credentialValue(): string {
-    if (settings.jira.authMode === "pat") return appSecrets.jira_personal_access_token.trim();
-    if (settings.jira.authMode === "password") return appSecrets.jira_password.trim();
-    return appSecrets.jira_api_token.trim();
-  }
-
-  function authEnv(): Record<string, string> {
+  function hasJiraCredential(): boolean {
     if (settings.jira.authMode === "pat") {
-      return {
-        JIRA_PAT: appSecrets.jira_personal_access_token,
-        JIRA_PERSONAL_ACCESS_TOKEN: appSecrets.jira_personal_access_token,
-        ATLASSIAN_PAT: appSecrets.jira_personal_access_token,
-        ATLASSIAN_PERSONAL_ACCESS_TOKEN: appSecrets.jira_personal_access_token,
-      };
+      return Boolean(appSecrets.jira_personal_access_token.trim()) || jiraSecrets.personal_access_token;
     }
-
     if (settings.jira.authMode === "password") {
-      return {
-        JIRA_PASSWORD: appSecrets.jira_password,
-        ATLASSIAN_PASSWORD: appSecrets.jira_password,
-      };
+      return Boolean(appSecrets.jira_password.trim()) || jiraSecrets.password;
     }
-
-    return {
-      JIRA_API_TOKEN: appSecrets.jira_api_token,
-      ATLASSIAN_API_TOKEN: appSecrets.jira_api_token,
-    };
+    return Boolean(appSecrets.jira_api_token.trim()) || jiraSecrets.api_token;
   }
 
   function applyConfiguredBoardName(projection: WorkspaceProjection): WorkspaceProjection {
@@ -6824,7 +6810,9 @@
                         <span>Jira API Token</span>
                         <input
                           type="password"
-                          placeholder="Paste API token here"
+                          placeholder={jiraSecrets.api_token
+                            ? "Saved securely. Enter a new token to replace it."
+                            : "Paste API token here"}
                           value={appSecrets.jira_api_token}
                           oninput={(event) =>
                             (appSecrets = {
@@ -6838,7 +6826,9 @@
                         <span>Personal Access Token</span>
                         <input
                           type="password"
-                          placeholder="Paste PAT here"
+                          placeholder={jiraSecrets.personal_access_token
+                            ? "Saved securely. Enter a new token to replace it."
+                            : "Paste PAT here"}
                           value={appSecrets.jira_personal_access_token}
                           oninput={(event) =>
                             (appSecrets = {
@@ -6852,7 +6842,9 @@
                         <span>Password</span>
                         <input
                           type="password"
-                          placeholder="Jira password"
+                          placeholder={jiraSecrets.password
+                            ? "Saved securely. Enter a new password to replace it."
+                            : "Jira password"}
                           value={appSecrets.jira_password}
                           oninput={(event) =>
                             (appSecrets = {

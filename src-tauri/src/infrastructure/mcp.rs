@@ -97,6 +97,8 @@ pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatu
 pub struct JiraMcpConfig {
     pub server: McpServerConfig,
     pub auth: JiraAuthConfig,
+    #[serde(default)]
+    pub secret_id: String,
     pub tool_name: String,
     #[serde(default = "default_board_tool_name")]
     pub board_tool_name: String,
@@ -123,18 +125,18 @@ fn default_max_pages() -> u32 {
     1
 }
 
-/// Jira credentials supplied by the UI.
+/// Jira connection metadata; credential fields are populated by the backend.
 #[derive(Clone, Debug, Deserialize)]
 pub struct JiraAuthConfig {
     pub base_url: String,
     pub auth_mode: String,
     #[serde(default)]
     pub username: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub api_token: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub personal_access_token: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub password: String,
 }
 

@@ -160,7 +160,11 @@ fn get_workspace() -> Workspace {
 }
 
 #[tauri::command]
-async fn get_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String> {
+async fn get_jira_issues(
+    mut config: JiraMcpConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<Vec<JiraIssue>, String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || JiraService::new().issues(config))
         .await
         .map_err(|error| mcp_ipc_error("Jira issue task failed", error))?;
@@ -168,7 +172,11 @@ async fn get_jira_issues(config: JiraMcpConfig) -> Result<Vec<JiraIssue>, String
 }
 
 #[tauri::command]
-async fn get_jira_boards(config: JiraMcpConfig) -> Result<Vec<JiraBoard>, String> {
+async fn get_jira_boards(
+    mut config: JiraMcpConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<Vec<JiraBoard>, String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || JiraService::new().boards(config))
         .await
         .map_err(|error| mcp_ipc_error("Jira board task failed", error))?;
@@ -176,7 +184,11 @@ async fn get_jira_boards(config: JiraMcpConfig) -> Result<Vec<JiraBoard>, String
 }
 
 #[tauri::command]
-async fn test_jira_mcp_connection(config: JiraMcpConfig) -> Result<JiraConnectionStatus, String> {
+async fn test_jira_mcp_connection(
+    mut config: JiraMcpConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<JiraConnectionStatus, String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().test_jira_connection(config)
     })
@@ -260,7 +272,11 @@ async fn disconnect_mcp_server(
 }
 
 #[tauri::command]
-async fn sync_jira_workspace(config: JiraMcpConfig) -> Result<Workspace, String> {
+async fn sync_jira_workspace(
+    mut config: JiraMcpConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<Workspace, String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result =
         tauri::async_runtime::spawn_blocking(move || JiraService::new().sync_workspace(config))
             .await
@@ -270,10 +286,12 @@ async fn sync_jira_workspace(config: JiraMcpConfig) -> Result<Workspace, String>
 
 #[tauri::command]
 async fn transition_jira_issue(
-    config: JiraMcpConfig,
+    mut config: JiraMcpConfig,
     issue_key: String,
     target_status: String,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<(), String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().transition_issue(config, issue_key, target_status)
     })
@@ -283,7 +301,12 @@ async fn transition_jira_issue(
 }
 
 #[tauri::command]
-async fn assign_jira_issue(config: JiraMcpConfig, issue_key: String) -> Result<(), String> {
+async fn assign_jira_issue(
+    mut config: JiraMcpConfig,
+    issue_key: String,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().assign_issue(config, issue_key)
     })
@@ -294,10 +317,12 @@ async fn assign_jira_issue(config: JiraMcpConfig, issue_key: String) -> Result<(
 
 #[tauri::command]
 async fn add_jira_comment(
-    config: JiraMcpConfig,
+    mut config: JiraMcpConfig,
     issue_key: String,
     comment: String,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<(), String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().add_comment(config, issue_key, comment)
     })
@@ -623,6 +648,52 @@ fn resolve_mcp_secret_environment(
     Ok(())
 }
 
+fn resolve_jira_secrets(
+    config: &mut JiraMcpConfig,
+    secrets: &AppSecretsStore,
+) -> Result<(), String> {
+    if config.secret_id.trim().is_empty() {
+        return Err("Jira secret ID is required.".to_string());
+    }
+    let (api_token, personal_access_token, password) = secrets.jira_credentials()?;
+    config.auth.api_token = api_token;
+    config.auth.personal_access_token = personal_access_token;
+    config.auth.password = password;
+    let env = &mut config.server.env;
+    env.insert("JIRA_URL".to_string(), config.auth.base_url.clone());
+    env.insert("JIRA_BASE_URL".to_string(), config.auth.base_url.clone());
+    env.insert(
+        "ATLASSIAN_SITE_URL".to_string(),
+        config.auth.base_url.clone(),
+    );
+    env.insert("JIRA_USERNAME".to_string(), config.auth.username.clone());
+    env.insert("JIRA_EMAIL".to_string(), config.auth.username.clone());
+    env.insert("ATLASSIAN_EMAIL".to_string(), config.auth.username.clone());
+    match config.auth.auth_mode.as_str() {
+        "pat" => {
+            for key in [
+                "JIRA_PAT",
+                "JIRA_PERSONAL_ACCESS_TOKEN",
+                "ATLASSIAN_PAT",
+                "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
+            ] {
+                env.insert(key.to_string(), config.auth.personal_access_token.clone());
+            }
+        }
+        "password" => {
+            for key in ["JIRA_PASSWORD", "ATLASSIAN_PASSWORD"] {
+                env.insert(key.to_string(), config.auth.password.clone());
+            }
+        }
+        _ => {
+            for key in ["JIRA_API_TOKEN", "ATLASSIAN_API_TOKEN"] {
+                env.insert(key.to_string(), config.auth.api_token.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn list_directory(
     workspace_id: String,
@@ -812,6 +883,27 @@ fn mcp_environment_secret_statuses(
     store: State<'_, AppSecretsStore>,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
     store.mcp_environment_statuses()
+}
+
+#[tauri::command]
+fn jira_secret_statuses(
+    store: State<'_, AppSecretsStore>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    store.jira_secret_statuses()
+}
+
+#[tauri::command]
+async fn save_jira_secret(
+    secret_type: String,
+    value: Option<String>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.save_jira_secret(&secret_type, value.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Save Jira secret task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1424,6 +1516,8 @@ pub fn run() {
             save_ai_provider_secret,
             mcp_environment_secret_statuses,
             save_mcp_environment_secret,
+            jira_secret_statuses,
+            save_jira_secret,
             load_cached_workspace,
             save_cached_workspace,
             save_execution_run,

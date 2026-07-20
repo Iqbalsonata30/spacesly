@@ -48,13 +48,14 @@ export interface McpConnectionStatus {
 
 export interface JiraMcpConfig {
   server: JiraMcpServerConfig;
+  secret_id: string;
   auth: {
     base_url: string;
     auth_mode: string;
     username: string;
-    api_token: string;
-    personal_access_token: string;
-    password: string;
+    api_token?: string;
+    personal_access_token?: string;
+    password?: string;
   };
   tool_name: string;
   board_tool_name: string;
