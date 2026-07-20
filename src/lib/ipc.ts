@@ -80,7 +80,12 @@ export {
   testMcpServerConnection,
   transitionJiraIssue,
 } from "$lib/ipc/jira";
-export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
+export {
+  aiProviderSecretStatuses,
+  loadAppSecrets,
+  saveAiProviderSecret,
+  saveAppSecrets,
+} from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";
 export {

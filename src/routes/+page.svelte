@@ -125,6 +125,7 @@
     lspStopServer,
     lspSyncDocument,
     loadAppSecrets,
+    aiProviderSecretStatuses,
     onWorkspaceFileChange,
     openPtyTerminal,
     previewWorkspaceReplace,
@@ -133,6 +134,7 @@
     readFile,
     resizePtyTerminal,
     saveAppSecrets,
+    saveAiProviderSecret,
     saveExecutionRun,
     searchWorkspace,
     listActiveExecutionRuns,
@@ -348,6 +350,7 @@
   let settingsError = $state<string | null>(null);
   let settings = $state<AppSettings>(initialSettings);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
+  let aiProviderSecrets = $state<Record<string, boolean>>({});
   let secretsHydrated = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
@@ -1049,17 +1052,25 @@
     const localSecrets = appSecrets;
     try {
       const storedSecrets = await loadAppSecrets();
-      const mergedSecrets = hasAnySecret(localSecrets)
-        ? mergeAppSecrets(localSecrets, storedSecrets)
+      const legacyAiKeys = localSecrets.ai_api_keys;
+      for (const [providerId, apiKey] of Object.entries(legacyAiKeys)) {
+        if (apiKey.trim()) await saveAiProviderSecret(providerId, apiKey);
+      }
+      const mergedSecrets = hasAnySecret({ ...localSecrets, ai_api_keys: {} })
+        ? mergeAppSecrets({ ...localSecrets, ai_api_keys: {} }, storedSecrets)
         : storedSecrets;
 
-      if (hasAnySecret(localSecrets)) {
-        await saveAppSecrets(mergedSecrets);
+      if (hasAnySecret({ ...localSecrets, ai_api_keys: {} })) {
+        await saveAppSecrets({ ...mergedSecrets, ai_api_keys: {} });
         saveSettings(settingsWithoutSecrets(settings));
       }
 
-      appSecrets = mergedSecrets;
-      settings = mergeMcpSecretsIntoSettings(settingsWithoutSecrets(settings), mergedSecrets);
+      aiProviderSecrets = await aiProviderSecretStatuses();
+      appSecrets = { ...mergedSecrets, ai_api_keys: {} };
+      settings = mergeMcpSecretsIntoSettings(settingsWithoutSecrets(settings), {
+        ...mergedSecrets,
+        ai_api_keys: {},
+      });
       secretsHydrated = true;
     } catch (reason: unknown) {
       appNotice = {
@@ -1173,11 +1184,15 @@
 
   async function persistSettingsAndSecrets(value: AppSettings) {
     const storedSecrets = await loadAppSecrets();
-    const mergedSecrets = hasAnySecret(appSecrets)
-      ? mergeAppSecrets(appSecrets, storedSecrets)
+    for (const [providerId, apiKey] of Object.entries(appSecrets.ai_api_keys)) {
+      await saveAiProviderSecret(providerId, apiKey);
+    }
+    const mergedSecrets = hasAnySecret({ ...appSecrets, ai_api_keys: {} })
+      ? mergeAppSecrets({ ...appSecrets, ai_api_keys: {} }, storedSecrets)
       : storedSecrets;
     const nextSecrets = {
       ...mergedSecrets,
+      ai_api_keys: {},
       mcp_env: Object.fromEntries(
         value.mcpServers
           .filter((server) => Object.keys(server.env).length > 0)
@@ -1185,7 +1200,8 @@
       ),
     };
     await saveAppSecrets(nextSecrets);
-    appSecrets = nextSecrets;
+    aiProviderSecrets = await aiProviderSecretStatuses();
+    appSecrets = { ...nextSecrets, ai_api_keys: {} };
     saveSettings(value);
   }
 
@@ -3226,8 +3242,10 @@
     const effectiveProvider = providerById(effectiveSettings.aiWorker.providerId);
     const effectiveModel = modelById(effectiveProvider, effectiveSettings.aiWorker.modelId);
     const effectiveApiKey = appSecrets.ai_api_keys[effectiveProvider.id] ?? "";
+    const hasConfiguredApiKey =
+      Boolean(effectiveApiKey.trim()) || aiProviderSecrets[effectiveProvider.id] === true;
 
-    if (effectiveSettings.aiWorker.runtime === "api" && !effectiveApiKey.trim()) {
+    if (effectiveSettings.aiWorker.runtime === "api" && !hasConfiguredApiKey) {
       openSettings("agent");
       appNotice = {
         tone: "error",
@@ -6461,7 +6479,11 @@
                           <span>{selectedAiProvider.apiKeyLabel}</span>
                           <input
                             type="password"
-                            placeholder={selectedAiProvider.apiKeyPlaceholder}
+                            placeholder={
+                              aiProviderSecrets[selectedAiProvider.id]
+                                ? "Saved securely. Enter a new key to replace it."
+                                : selectedAiProvider.apiKeyPlaceholder
+                            }
                             value={selectedAiApiKey}
                             oninput={(event) =>
                               (appSecrets = {

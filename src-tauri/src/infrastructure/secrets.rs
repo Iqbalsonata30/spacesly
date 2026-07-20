@@ -36,6 +36,63 @@ impl AppSecretsStore {
         Ok(())
     }
 
+    pub fn redacted_snapshot(&self) -> Result<AppSecrets, String> {
+        let mut secrets = self
+            .secrets
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        secrets.ai_api_keys.clear();
+        Ok(secrets)
+    }
+
+    pub fn ai_provider_statuses(&self) -> Result<HashMap<String, bool>, String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        Ok(secrets
+            .ai_api_keys
+            .iter()
+            .map(|(provider_id, value)| (provider_id.clone(), !value.trim().is_empty()))
+            .collect())
+    }
+
+    pub fn save_ai_api_key(&self, provider_id: &str, api_key: Option<&str>) -> Result<(), String> {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Err("AI provider ID is required.".to_string());
+        }
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        match api_key.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => {
+                next.ai_api_keys
+                    .insert(provider_id.to_string(), value.to_string());
+            }
+            None => {
+                next.ai_api_keys.remove(provider_id);
+            }
+        }
+        save_app_secrets(next.clone())?;
+        *current = next;
+        Ok(())
+    }
+
+    pub fn save_from_renderer(&self, mut incoming: AppSecrets) -> Result<(), String> {
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        if incoming.ai_api_keys.is_empty() {
+            incoming.ai_api_keys = current.ai_api_keys.clone();
+        } else {
+            incoming.ai_api_keys = current
+                .ai_api_keys
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .chain(incoming.ai_api_keys)
+                .collect();
+        }
+        save_app_secrets(incoming.clone())?;
+        *current = incoming;
+        Ok(())
+    }
+
     pub fn ai_api_key(&self, provider_id: &str) -> Result<String, String> {
         let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
         Ok(secrets
@@ -133,5 +190,7 @@ mod tests {
             "secret"
         );
         assert!(store.ai_api_key("missing").unwrap().is_empty());
+        assert!(store.redacted_snapshot().unwrap().ai_api_keys.is_empty());
+        assert_eq!(store.ai_provider_statuses().unwrap()["openai"], true);
     }
 }

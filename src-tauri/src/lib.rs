@@ -43,10 +43,7 @@ use infrastructure::pty::{
     PtyRegistry, PtyState,
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
-use infrastructure::secrets::{
-    load_app_secrets as load_app_secrets_impl, save_app_secrets as save_app_secrets_impl,
-    AppSecrets, AppSecretsStore,
-};
+use infrastructure::secrets::{AppSecrets, AppSecretsStore};
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
     ShellCommandRequest, ShellCommandResult, ShellCompletionRequest, ShellCompletionResult,
@@ -782,10 +779,29 @@ fn unwatch_workspace_files(
 }
 
 #[tauri::command]
-async fn load_app_secrets() -> Result<AppSecrets, String> {
-    tauri::async_runtime::spawn_blocking(load_app_secrets_impl)
-        .await
-        .map_err(|error| format!("Load secrets task failed: {error}"))?
+async fn load_app_secrets(store: State<'_, AppSecretsStore>) -> Result<AppSecrets, String> {
+    store.redacted_snapshot()
+}
+
+#[tauri::command]
+fn ai_provider_secret_statuses(
+    store: State<'_, AppSecretsStore>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    store.ai_provider_statuses()
+}
+
+#[tauri::command]
+async fn save_ai_provider_secret(
+    provider_id: String,
+    api_key: Option<String>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.save_ai_api_key(&provider_id, api_key.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Save AI provider secret task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -793,13 +809,10 @@ async fn save_app_secrets(
     secrets: AppSecrets,
     store: State<'_, AppSecretsStore>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking({
-        let secrets = secrets.clone();
-        move || save_app_secrets_impl(secrets)
-    })
-    .await
-    .map_err(|error| format!("Save secrets task failed: {error}"))??;
-    store.replace(secrets)
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save_from_renderer(secrets))
+        .await
+        .map_err(|error| format!("Save secrets task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1369,6 +1382,8 @@ pub fn run() {
             unwatch_workspace_files,
             load_app_secrets,
             save_app_secrets,
+            ai_provider_secret_statuses,
+            save_ai_provider_secret,
             load_cached_workspace,
             save_cached_workspace,
             save_execution_run,
