@@ -3,16 +3,17 @@ import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 export interface AiWorkerMcpServer {
   name: string;
   command: string[];
-  environment: Record<string, string>;
+  environment?: Record<string, string>;
 }
 
 export interface AiWorkerConfig {
   workspace_id: string;
   runtime: "api" | "opencode";
   provider_name: string;
+  provider_id: string;
   base_url: string;
   api_style: "openai_chat" | "openai_responses" | "anthropic_messages";
-  api_key: string;
+  api_key?: string;
   model: string;
   opencode_command: string;
   opencode_model: string;

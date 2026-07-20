@@ -220,8 +220,11 @@ pub struct AiWorkerConfig {
     pub workspace_id: String,
     pub runtime: String,
     pub provider_name: String,
+    #[serde(default)]
+    pub provider_id: String,
     pub base_url: String,
     pub api_style: String,
+    #[serde(default)]
     pub api_key: String,
     pub model: String,
     pub opencode_command: String,
@@ -239,6 +242,7 @@ pub struct AiWorkerConfig {
 pub struct AiWorkerMcpServer {
     pub name: String,
     pub command: Vec<String>,
+    #[serde(default)]
     pub environment: HashMap<String, String>,
 }
 
@@ -2011,6 +2015,7 @@ mod tests {
             workspace_id: "workspace-personal".to_string(),
             runtime: "api".to_string(),
             provider_name: "OpenAI".to_string(),
+            provider_id: "openai".to_string(),
             base_url: "https://example.invalid".to_string(),
             api_style: "openai_chat".to_string(),
             api_key: "token".to_string(),

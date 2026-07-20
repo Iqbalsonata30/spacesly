@@ -3249,9 +3249,9 @@
       workspace_id: workspace?.id ?? "workspace-personal",
       runtime: effectiveSettings.aiWorker.runtime,
       provider_name: effectiveProvider.label,
+      provider_id: effectiveProvider.id,
       base_url: effectiveProvider.baseUrl,
       api_style: effectiveProvider.apiStyle,
-      api_key: effectiveApiKey,
       model:
         effectiveSettings.aiWorker.runtime === "opencode"
           ? effectiveSettings.aiWorker.opencodeModel
@@ -3270,7 +3270,6 @@
           {
             name: `spacesly-${server.id}`,
             command,
-            environment: server.env,
           },
         ];
       }),

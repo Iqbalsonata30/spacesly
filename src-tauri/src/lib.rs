@@ -45,7 +45,7 @@ use infrastructure::pty::{
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
 use infrastructure::secrets::{
     load_app_secrets as load_app_secrets_impl, save_app_secrets as save_app_secrets_impl,
-    AppSecrets,
+    AppSecrets, AppSecretsStore,
 };
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
@@ -304,7 +304,11 @@ async fn add_jira_comment(
 }
 
 #[tauri::command]
-async fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String> {
+async fn test_ai_worker(
+    mut config: AiWorkerConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<AiWorkerStatus, String> {
+    resolve_ai_secrets(&mut config, secrets.inner())?;
     tauri::async_runtime::spawn_blocking(move || test_ai_worker_impl(config))
         .await
         .map_err(|error| format!("Agent diagnostic task failed: {error}"))?
@@ -348,8 +352,10 @@ async fn execute_ai_worker_task(
     execution_store: State<'_, ExecutionStore>,
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<AiWorkerTaskResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
+    resolve_ai_secrets(&mut config, secrets.inner())?;
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
@@ -443,8 +449,10 @@ async fn chat_ai_worker(
     ai_runs: State<'_, AiRunRegistry>,
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<AiWorkerChatResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
+    resolve_ai_secrets(&mut config, secrets.inner())?;
     let run_id = request
         .run_id
         .clone()
@@ -532,7 +540,10 @@ async fn propose_ai_edit(
     config: AiWorkerConfig,
     request: AiEditRequest,
     ai_runs: State<'_, AiRunRegistry>,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<AiEditResult, String> {
+    let mut config = config;
+    resolve_ai_secrets(&mut config, secrets.inner())?;
     let run_id = request
         .run_id
         .clone()
@@ -578,6 +589,19 @@ async fn propose_ai_edit(
             Err(error)
         }
     }
+}
+
+fn resolve_ai_secrets(
+    config: &mut AiWorkerConfig,
+    secrets: &AppSecretsStore,
+) -> Result<(), String> {
+    if config.api_key.trim().is_empty() {
+        config.api_key = secrets.ai_api_key(&config.provider_id)?;
+    }
+    for server in &mut config.mcp_servers {
+        server.environment = secrets.mcp_environment(&server.name)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -760,10 +784,17 @@ async fn load_app_secrets() -> Result<AppSecrets, String> {
 }
 
 #[tauri::command]
-async fn save_app_secrets(secrets: AppSecrets) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || save_app_secrets_impl(secrets))
-        .await
-        .map_err(|error| format!("Save secrets task failed: {error}"))?
+async fn save_app_secrets(
+    secrets: AppSecrets,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking({
+        let secrets = secrets.clone();
+        move || save_app_secrets_impl(secrets)
+    })
+    .await
+    .map_err(|error| format!("Save secrets task failed: {error}"))??;
+    store.replace(secrets)
 }
 
 #[tauri::command]
@@ -1281,6 +1312,7 @@ pub fn run() {
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
     let lsp_registry = LspRegistry::default();
+    let app_secrets = AppSecretsStore::load().expect("failed to initialize app secrets");
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
         .manage(pty_state)
@@ -1291,6 +1323,7 @@ pub fn run() {
         .manage(workspace_trust)
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
+        .manage(app_secrets)
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
