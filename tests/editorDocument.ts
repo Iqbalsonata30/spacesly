@@ -1,6 +1,7 @@
 import {
   applySavedSnapshot,
   createDocumentSession,
+  createRecoveredDocumentSession,
   documentSnapshot,
   markDocumentSaved,
   markDocumentExternalConflict,
@@ -72,6 +73,37 @@ assertEqual(
 
 markDocumentSaved(session, "changed");
 assertEqual(session.dirty, false, "saving the current document session should clear dirty state");
+
+const recoveredSession = createRecoveredDocumentSession({
+  workspaceId: "workspace-one",
+  path: "src/recovered.ts",
+  name: "recovered.ts",
+  content: "dirty recovered",
+  persistedContent: "disk baseline",
+  version: "v2",
+  rootRevision: 4,
+  encoding: "utf8",
+  lineEnding: "lf",
+  revision: 6,
+  scrollTop: 120,
+});
+assertEqual(
+  {
+    value: documentSnapshot(recoveredSession),
+    persisted: recoveredSession.persistedValue,
+    dirty: recoveredSession.dirty,
+    origin: recoveredSession.lastOrigin,
+    scrollTop: recoveredSession.scrollTop,
+  },
+  {
+    value: { value: "dirty recovered", revision: 6 },
+    persisted: "disk baseline",
+    dirty: true,
+    origin: "restore",
+    scrollTop: 120,
+  },
+  "recovered document sessions should preserve dirty content separately from disk baseline",
+);
 
 const statefulSession = createDocumentSession({
   workspaceId: "workspace-one",

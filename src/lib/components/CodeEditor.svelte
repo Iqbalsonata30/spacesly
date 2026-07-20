@@ -261,6 +261,7 @@
             },
           }),
           EditorView.updateListener.of((update) => {
+            session.scrollTop = update.view.scrollDOM.scrollTop;
             if (!update.docChanged) return;
             const previousDirty = session.dirty;
             updateDocumentState(session, update.state, dispatchOrigin);

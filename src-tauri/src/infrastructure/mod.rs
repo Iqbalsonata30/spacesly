@@ -8,6 +8,7 @@ pub mod jira_rest;
 pub mod lsp;
 pub mod mcp;
 pub mod pty;
+pub mod recovery_store;
 pub mod secrets;
 pub mod shell;
 mod shell_env;

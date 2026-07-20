@@ -75,6 +75,41 @@ export function createDocumentSession(values: {
   };
 }
 
+export function createRecoveredDocumentSession(values: {
+  workspaceId: string;
+  path: string;
+  name: string;
+  content: string;
+  persistedContent: string;
+  version: string;
+  rootRevision: number;
+  encoding: TextEncoding;
+  lineEnding: LineEnding;
+  revision: number;
+  scrollTop: number;
+  externalConflict?: boolean;
+}): DocumentSession {
+  return {
+    id: `${values.workspaceId}:${values.rootRevision}:${values.path}`,
+    workspaceId: values.workspaceId,
+    path: values.path,
+    name: values.name,
+    state: null,
+    initialValue: values.content,
+    persistedValue: values.persistedContent,
+    persistedDoc: null,
+    version: values.version,
+    rootRevision: values.rootRevision,
+    encoding: values.encoding,
+    lineEnding: values.lineEnding,
+    revision: values.revision,
+    dirty: editorIsDirty(values.content, values.persistedContent),
+    externalConflict: values.externalConflict ?? false,
+    scrollTop: values.scrollTop,
+    lastOrigin: "restore",
+  };
+}
+
 export function documentValue(session: DocumentSession): string {
   return session.state?.doc.toString() ?? session.initialValue;
 }

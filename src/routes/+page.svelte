@@ -10,6 +10,7 @@
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
   import {
+    createRecoveredDocumentSession,
     createDocumentSession,
     documentSnapshot,
     markDocumentExternalConflict,
@@ -99,7 +100,9 @@
     getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
+    deleteRecoverySnapshot,
     listDirectory,
+    listRecoverySnapshots,
     lspCloseDocument,
     lspDiagnostics,
     lspDocumentSymbols,
@@ -127,6 +130,7 @@
     reserveAiWorkerRun,
     setWorkspaceRoot,
     syncJiraWorkspace,
+    syncRecoverySnapshots,
     testAiWorker,
     testMcpServerConnection,
     transitionJiraIssue,
@@ -160,6 +164,8 @@
     type WorkspaceFileChange,
     type WorkspaceSearchResult,
     type WorkspaceReplacePreviewResponse,
+    type RecoverySnapshot,
+    type RecoverySnapshotInput,
     testJiraMcpConnection,
   } from "$lib/ipc";
   import { lspConfigForPath } from "$lib/lspConfig";
@@ -206,6 +212,8 @@
   const SYNC_RETAIN_MISSING_CARD_MS = 3 * 24 * 60 * 60 * 1_000;
   const LEGACY_SEED_CARD_ID = "local-list-current-directory";
   const UI_STATE_WRITE_DELAY_MS = 200;
+  const RECOVERY_SYNC_DELAY_MS = 500;
+  const RECOVERY_MAX_CONTENT_BYTES = 1_000_000;
   const NOTICE_AUTO_DISMISS_MS = 3_000;
   const ERROR_NOTICE_AUTO_DISMISS_MS = 5_000;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
@@ -495,6 +503,11 @@
   let lspStartPromises = new SvelteMap<string, Promise<boolean>>();
   let lspSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
+  let recoverySyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let recoveryRestoreChecked = false;
+  let recoverySyncRequestId = 0;
+  let recoverySyncDisabled = false;
+  let recoverySyncPromise: Promise<void> = Promise.resolve();
   let pendingWorkspaceFilePaths = new SvelteSet<string>();
   let unlistenWorkspaceFileChanges: (() => void) | null = null;
   let workspaceGitInfoRequestId = 0;
@@ -568,6 +581,8 @@
             if (allowWindowClose) return;
             event.preventDefault();
             if (!(await resolveDirtyEditors(openEditorFiles, "closing Spacesly"))) return;
+            recoverySyncDisabled = true;
+            await clearCurrentRecoverySnapshots();
             allowWindowClose = true;
             await appWindow.close();
           });
@@ -768,10 +783,12 @@
 
   onDestroy(() => {
     if (appNoticeTimer) clearTimeout(appNoticeTimer);
+    if (recoverySyncTimer) clearTimeout(recoverySyncTimer);
     if (terminalFrameId !== null) window.cancelAnimationFrame(terminalFrameId);
     if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
     resolveBacklogStartConfirmation(false);
     flushUiState();
+    if (!recoverySyncDisabled) void syncDirtyRecoverySnapshots();
     workspaceTerminalResizeObserver?.disconnect();
     void closePtyTerminal(workspaceTerminalId).catch(() => {});
     workspaceTerminal?.dispose();
@@ -1539,6 +1556,14 @@
       await refreshFileDirectory(targetDirectory);
     }
 
+    const restoredPath = await restoreRecoveredEditorSnapshots();
+    if (restoredPath) {
+      activeEditorPath = restoredPath;
+      await expandFileAncestors(restoredPath);
+      saveUiState();
+      return;
+    }
+
     if (savedActivePath) {
       const existingFile = openEditorFiles.find((file) => file.path === savedActivePath);
       if (existingFile) {
@@ -1559,6 +1584,67 @@
     saveUiState();
   }
 
+  async function restoreRecoveredEditorSnapshots(): Promise<string | null> {
+    if (!workspace || recoveryRestoreChecked) return null;
+    const workspaceId = workspace.id;
+    recoveryRestoreChecked = true;
+    let snapshots: RecoverySnapshot[];
+    try {
+      snapshots = await listRecoverySnapshots(workspace.id);
+    } catch (reason: unknown) {
+      console.warn("Failed to load recovery snapshots", reason);
+      return null;
+    }
+    if (snapshots.length === 0) return null;
+
+    const changedCount = snapshots.filter((snapshot) => snapshot.disk_status === "changed").length;
+    const missingCount = snapshots.filter((snapshot) => snapshot.disk_status === "missing").length;
+    const detail = [
+      changedCount ? `${changedCount} changed on disk` : "",
+      missingCount ? `${missingCount} missing on disk` : "",
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const restore = window.confirm(
+      `Spacesly found ${snapshots.length} unsaved recovery snapshot${snapshots.length === 1 ? "" : "s"}${detail ? ` (${detail})` : ""}. Press OK to restore them, or Cancel to discard recovery data.`,
+    );
+    if (!restore) {
+      await Promise.allSettled(
+        snapshots.map((snapshot) => deleteRecoverySnapshot(workspaceId, snapshot.path)),
+      );
+      await syncDirtyRecoverySnapshots();
+      return null;
+    }
+
+    const existingPaths = new Set(openEditorFiles.map((file) => file.path));
+    const recovered = snapshots
+      .filter((snapshot) => !existingPaths.has(snapshot.path))
+      .map((snapshot) =>
+        createRecoveredDocumentSession({
+          workspaceId,
+          path: snapshot.path,
+          name: snapshot.name,
+          content: snapshot.content,
+          persistedContent: snapshot.persisted_content,
+          version: snapshot.persisted_version,
+          rootRevision: snapshot.root_revision,
+          encoding: snapshot.encoding,
+          lineEnding: snapshot.line_ending,
+          revision: Math.max(1, snapshot.revision),
+          scrollTop: snapshot.scroll_top,
+          externalConflict: snapshot.disk_status !== "unchanged",
+        }),
+      );
+    if (recovered.length === 0) return null;
+    openEditorFiles = [...openEditorFiles, ...recovered];
+    appNotice = {
+      tone: "info",
+      message: `Restored ${recovered.length} unsaved editor snapshot${recovered.length === 1 ? "" : "s"}.`,
+    };
+    scheduleRecoverySync();
+    return recovered[0].path;
+  }
+
   async function openFolderFromDialog() {
     if (!workspace) return;
     workspaceSidebarTab = "explorer";
@@ -1570,6 +1656,7 @@
     if (typeof selected !== "string") return;
     if (!(await resolveDirtyEditors(openEditorFiles, "opening another folder"))) return;
 
+    await clearCurrentRecoverySnapshots();
     await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, selected);
     resetWorkspaceSearch();
@@ -1606,6 +1693,7 @@
     const separator = normalized.lastIndexOf("/");
     const parent = separator > 0 ? normalized.slice(0, separator) : normalized;
     const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
+    await clearCurrentRecoverySnapshots();
     await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, parent);
     resetWorkspaceSearch();
@@ -1946,6 +2034,7 @@
     openEditorFiles = openEditorFiles.map((file) =>
       file.path === path ? { ...file, dirty } : file,
     );
+    scheduleRecoverySync();
     if (path === activeEditorPath) {
       scheduleEditorDiagnostics();
     }
@@ -1963,6 +2052,62 @@
       scheduleEditorDiagnostics();
     }
     scheduleLspSync(path);
+    scheduleRecoverySync();
+  }
+
+  function scheduleRecoverySync() {
+    if (!workspace || recoverySyncDisabled) return;
+    if (recoverySyncTimer) clearTimeout(recoverySyncTimer);
+    recoverySyncTimer = setTimeout(() => {
+      recoverySyncTimer = null;
+      void syncDirtyRecoverySnapshots();
+    }, RECOVERY_SYNC_DELAY_MS);
+  }
+
+  async function syncDirtyRecoverySnapshots() {
+    if (!workspace || recoverySyncDisabled) return;
+    const requestId = ++recoverySyncRequestId;
+    const snapshots = openEditorFiles.flatMap(recoverySnapshotForSession);
+    const workspaceId = workspace.id;
+    const sync = recoverySyncPromise
+      .catch(() => {})
+      .then(() => syncRecoverySnapshots(workspaceId, snapshots));
+    recoverySyncPromise = sync;
+    try {
+      await sync;
+    } catch (reason: unknown) {
+      if (requestId !== recoverySyncRequestId) return;
+      console.warn("Failed to sync recovery snapshots", reason);
+    }
+  }
+
+  async function clearCurrentRecoverySnapshots() {
+    if (!workspace) return;
+    if (recoverySyncTimer) {
+      clearTimeout(recoverySyncTimer);
+      recoverySyncTimer = null;
+    }
+    await recoverySyncPromise.catch(() => {});
+    await syncRecoverySnapshots(workspace.id, []);
+  }
+
+  function recoverySnapshotForSession(file: OpenEditorFile): RecoverySnapshotInput[] {
+    if (!file.dirty) return [];
+    const content = documentSnapshot(file).value;
+    if (new TextEncoder().encode(content).length > RECOVERY_MAX_CONTENT_BYTES) return [];
+    return [
+      {
+        path: file.path,
+        name: file.name,
+        content,
+        persisted_version: file.version,
+        root_revision: file.rootRevision,
+        encoding: file.encoding,
+        line_ending: file.lineEnding,
+        revision: file.revision,
+        scroll_top: Math.max(0, Math.trunc(file.scrollTop)),
+      },
+    ];
   }
 
   function onEditorReady(handle: CodeEditorHandle | null) {
@@ -2378,6 +2523,7 @@
     const index = openEditorFiles.findIndex((file) => file.path === path);
     if (target) aiEditPinnedDocumentIds = aiEditPinnedDocumentIds.filter((id) => id !== target.id);
     openEditorFiles = openEditorFiles.filter((file) => file.path !== path);
+    scheduleRecoverySync();
     if (activeEditorPath === path) {
       activeEditorHandle = null;
       activeEditorPath =
@@ -2413,7 +2559,7 @@
         workspaceId,
         path,
         snapshot.value,
-        file.version,
+        file.version || null,
         file.rootRevision,
         file.encoding,
         file.lineEnding,
@@ -2435,6 +2581,7 @@
         tone: dirty ? "info" : "success",
         message: dirty ? `Saved ${path}; newer edits remain unsaved.` : `Saved ${path}`,
       };
+      void syncDirtyRecoverySnapshots();
       if (path === activeEditorPath) await validateActiveEditorSyntax();
       await refreshWorkspaceGitState();
       void refreshFileDirectory(fileDirectory);

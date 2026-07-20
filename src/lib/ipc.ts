@@ -73,6 +73,12 @@ export {
 } from "$lib/ipc/jira";
 export { loadAppSecrets, saveAppSecrets } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
+export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";
+export {
+  deleteRecoverySnapshot,
+  listRecoverySnapshots,
+  syncRecoverySnapshots,
+} from "$lib/ipc/recovery";
 export { IpcPolicyError } from "$lib/ipc/policy";
 export type {
   WorkspaceReplaceAppliedFile,

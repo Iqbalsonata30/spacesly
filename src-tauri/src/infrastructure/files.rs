@@ -81,6 +81,10 @@ impl WorkspaceRoot {
         Ok(self.snapshot(workspace_id)?.0)
     }
 
+    pub fn revision(&self, workspace_id: &str) -> Result<u64, String> {
+        Ok(self.snapshot(workspace_id)?.1)
+    }
+
     fn snapshot(&self, workspace_id: &str) -> Result<(PathBuf, u64), String> {
         let paths = self.paths.lock().map_err(|error| error.to_string())?;
         let entry = paths

@@ -41,6 +41,7 @@ use infrastructure::pty::{
     resize_pty_terminal as resize_pty_terminal_impl, write_pty_terminal as write_pty_terminal_impl,
     PtyRegistry, PtyState,
 };
+use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
 use infrastructure::secrets::{
     load_app_secrets as load_app_secrets_impl, save_app_secrets as save_app_secrets_impl,
     AppSecrets,
@@ -183,6 +184,52 @@ async fn test_jira_mcp_connection(config: JiraMcpConfig) -> Result<JiraConnectio
     .await
     .map_err(|error| mcp_ipc_error("Jira MCP test task failed", error))?;
     result.map_err(|error| mcp_ipc_error("Jira MCP test failed", error))
+}
+
+#[tauri::command]
+async fn sync_recovery_snapshots(
+    workspace_id: String,
+    snapshots: Vec<RecoverySnapshotInput>,
+    workspace_root: State<'_, WorkspaceRoot>,
+    recovery_store: State<'_, RecoveryStore>,
+) -> Result<(), String> {
+    let root = workspace_root.inner().clone();
+    let store = recovery_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.sync_workspace(&root, workspace_id, snapshots)
+    })
+    .await
+    .map_err(|error| file_ipc_error("Recovery snapshot sync failed", error))?
+    .map_err(|error| file_ipc_error("Recovery snapshot sync failed", error))
+}
+
+#[tauri::command]
+async fn list_recovery_snapshots(
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+    recovery_store: State<'_, RecoveryStore>,
+) -> Result<Vec<RecoverySnapshot>, String> {
+    let root = workspace_root.inner().clone();
+    let store = recovery_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list_workspace(&root, workspace_id))
+        .await
+        .map_err(|error| file_ipc_error("Recovery snapshot load failed", error))?
+        .map_err(|error| file_ipc_error("Recovery snapshot load failed", error))
+}
+
+#[tauri::command]
+async fn delete_recovery_snapshot(
+    workspace_id: String,
+    path: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+    recovery_store: State<'_, RecoveryStore>,
+) -> Result<(), String> {
+    let root = workspace_root.inner().clone();
+    let store = recovery_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.delete_snapshot(&root, workspace_id, path))
+        .await
+        .map_err(|error| file_ipc_error("Recovery snapshot delete failed", error))?
+        .map_err(|error| file_ipc_error("Recovery snapshot delete failed", error))
 }
 
 #[tauri::command]
@@ -1039,12 +1086,14 @@ pub fn run() {
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
     let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
+    let recovery_store = RecoveryStore::open().expect("failed to initialize recovery store");
     let lsp_registry = LspRegistry::default();
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
         .manage(pty_state)
         .manage(workspace_root)
         .manage(execution_store)
+        .manage(recovery_store)
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
         .manage(AgentRunRegistry::default())
@@ -1067,6 +1116,9 @@ pub fn run() {
             cancel_ai_worker_task,
             chat_ai_worker,
             propose_ai_edit,
+            sync_recovery_snapshots,
+            list_recovery_snapshots,
+            delete_recovery_snapshot,
             list_directory,
             read_file,
             search_workspace,
