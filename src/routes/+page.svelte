@@ -463,6 +463,7 @@
   let workspaceReplaceError = $state<string | null>(null);
   let workspaceReplaceRequestId = 0;
   let openEditorFiles = $state<OpenEditorFile[]>([]);
+  let editorStateVersion = $state(0);
   let activeEditorPath = $state<string | null>(null);
   let activeEditorHandle = $state<CodeEditorHandle | null>(null);
   let editorVimMode = $state(
@@ -844,11 +845,11 @@
   let selectedCardAgentSession = $derived<AgentRunSession | null>(
     selectedCardId ? (agentRunSessions[selectedCardId] ?? null) : null,
   );
-  let activeEditorFile = $derived<OpenEditorFile | null>(
-    activeEditorPath
+  let activeEditorFile = $derived.by((): OpenEditorFile | null => {
+    return editorStateVersion >= 0 && activeEditorPath
       ? (openEditorFiles.find((file) => file.path === activeEditorPath) ?? null)
-      : null,
-  );
+      : null;
+  });
   let activeEditorReady = $derived(Boolean(activeEditorHandle));
   let activeEditorDirty = $derived(Boolean(activeEditorFile?.dirty));
   let aiEditStale = $derived(
@@ -2041,7 +2042,9 @@
   }
 
   function onEditorChange(path: string) {
-    openEditorFiles = openEditorFiles.map((file) => (file.path === path ? { ...file } : file));
+    // DocumentSession is already mutated by CodeMirror; invalidate derived editor state without
+    // cloning the entire tab collection on every transaction.
+    editorStateVersion += 1;
     if (path === activeEditorPath) {
       activeLspCodeActions = [];
       lspCodeActionRevision = null;
