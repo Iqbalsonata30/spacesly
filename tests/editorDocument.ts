@@ -17,6 +17,7 @@ import {
   lspPositionToOffset,
   lspTextEditsToChanges,
   offsetToLspPosition,
+  shouldPollLspDiagnostics,
 } from "../src/lib/lspEditor";
 import {
   canNavigateEditor,
@@ -269,6 +270,16 @@ assertEqual(
   ]),
   null,
   "overlapping LSP edits should be rejected instead of partially applied",
+);
+
+assertEqual(
+  {
+    active: shouldPollLspDiagnostics(true, true),
+    terminal: shouldPollLspDiagnostics(false, true),
+    hidden: shouldPollLspDiagnostics(true, false),
+  },
+  { active: true, terminal: false, hidden: false },
+  "LSP diagnostics polling should stop outside a visible editor",
 );
 
 let navigation = createEditorNavigation();

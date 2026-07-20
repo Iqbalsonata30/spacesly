@@ -174,6 +174,7 @@
     testJiraMcpConnection,
   } from "$lib/ipc";
   import { lspConfigForPath } from "$lib/lspConfig";
+  import { shouldPollLspDiagnostics } from "$lib/lspEditor";
   import {
     createMcpServer,
     loadLegacySettingsSecrets,
@@ -2231,6 +2232,11 @@
   }
 
   async function refreshActiveLspDiagnostics() {
+    if (
+      !shouldPollLspDiagnostics(workspaceMode === "files", document.visibilityState === "visible")
+    ) {
+      return;
+    }
     if (!workspace || !activeEditorFile) return;
     const file = activeEditorFile;
     const config = lspConfigForPath(file.path);

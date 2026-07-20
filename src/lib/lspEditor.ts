@@ -1,6 +1,10 @@
 import type { Text } from "@codemirror/state";
 import type { LspPosition, LspRange, LspTextEdit } from "$lib/ipc";
 
+export function shouldPollLspDiagnostics(editorVisible: boolean, appVisible: boolean): boolean {
+  return editorVisible && appVisible;
+}
+
 export type EditorTextChange = { from: number; to: number; insert: string };
 
 export function offsetToLspPosition(doc: Text, offset: number): LspPosition {
