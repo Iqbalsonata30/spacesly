@@ -35,6 +35,9 @@ impl FileWatchRegistry {
             let Ok(event) = result else {
                 return;
             };
+            if is_atomic_save_rename(&event.kind, &event.paths) {
+                return;
+            }
             let Some(kind) = event_kind(&event.kind) else {
                 return;
             };
@@ -72,6 +75,15 @@ impl FileWatchRegistry {
     }
 }
 
+fn is_atomic_save_rename(kind: &EventKind, paths: &[PathBuf]) -> bool {
+    matches!(kind, EventKind::Modify(ModifyKind::Name(_)))
+        && paths.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".spacesly-save-") && name.ends_with(".tmp"))
+        })
+}
+
 fn event_kind(kind: &EventKind) -> Option<&'static str> {
     match kind {
         EventKind::Create(_) => Some("created"),
@@ -102,7 +114,7 @@ fn relative_event_paths(root: &Path, paths: Vec<PathBuf>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_kind, relative_event_paths};
+    use super::{event_kind, is_atomic_save_rename, relative_event_paths};
     use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::EventKind;
     use std::path::PathBuf;
@@ -143,5 +155,22 @@ mod tests {
             ),
             vec!["src/main.rs"]
         );
+    }
+
+    #[test]
+    fn suppresses_only_atomic_save_rename_events() {
+        let rename = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+        let modify = EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content));
+        let paths = vec![
+            PathBuf::from("/workspace/.spacesly-save-1-2-3.tmp"),
+            PathBuf::from("/workspace/src/main.rs"),
+        ];
+
+        assert!(is_atomic_save_rename(&rename, &paths));
+        assert!(!is_atomic_save_rename(&modify, &paths));
+        assert!(!is_atomic_save_rename(
+            &rename,
+            &[PathBuf::from("/workspace/src/main.rs")]
+        ));
     }
 }
