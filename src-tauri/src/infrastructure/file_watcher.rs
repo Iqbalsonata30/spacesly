@@ -1,4 +1,5 @@
 use super::files::WorkspaceRoot;
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -74,6 +75,7 @@ impl FileWatchRegistry {
 fn event_kind(kind: &EventKind) -> Option<&'static str> {
     match kind {
         EventKind::Create(_) => Some("created"),
+        EventKind::Modify(ModifyKind::Name(_)) => Some("renamed"),
         EventKind::Modify(_) => Some("modified"),
         EventKind::Remove(_) => Some("removed"),
         EventKind::Access(_) | EventKind::Other | EventKind::Any => None,
@@ -101,7 +103,7 @@ fn relative_event_paths(root: &Path, paths: Vec<PathBuf>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{event_kind, relative_event_paths};
-    use notify::event::{CreateKind, ModifyKind};
+    use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::EventKind;
     use std::path::PathBuf;
 
@@ -116,6 +118,10 @@ mod tests {
                 notify::event::DataChange::Content
             ))),
             Some("modified")
+        );
+        assert_eq!(
+            event_kind(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            Some("renamed")
         );
         assert_eq!(
             event_kind(&EventKind::Access(notify::event::AccessKind::Any)),

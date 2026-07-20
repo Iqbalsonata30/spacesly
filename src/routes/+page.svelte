@@ -34,7 +34,12 @@
     type AiEditProposal,
   } from "$lib/aiEdit";
   import { chatTitleForCard, isGenericChatTitle, summarizeChatTitle } from "$lib/chatSession";
-  import { displayPath, fileName, normalizeAbsolutePath } from "$lib/filesFeature";
+  import {
+    displayPath,
+    fileName,
+    normalizeAbsolutePath,
+    workspaceFileChangeIsStructural,
+  } from "$lib/filesFeature";
   import { collectAncestorPaths, pruneExpandedFolderTree } from "$lib/fileBrowser";
   import {
     agentActionLabel,
@@ -510,6 +515,7 @@
   let recoverySyncDisabled = false;
   let recoverySyncPromise: Promise<void> = Promise.resolve();
   let pendingWorkspaceFilePaths = new SvelteSet<string>();
+  let pendingWorkspaceStructuralChange = false;
   let unlistenWorkspaceFileChanges: (() => void) | null = null;
   let workspaceGitInfoRequestId = 0;
   let workspaceGitStatusRequestId = 0;
@@ -1268,13 +1274,16 @@
   function queueWorkspaceFileChange(change: WorkspaceFileChange) {
     if (!workspace || change.workspace_id !== workspace.id) return;
     for (const path of change.paths) pendingWorkspaceFilePaths.add(path);
+    pendingWorkspaceStructuralChange ||= workspaceFileChangeIsStructural(change.kind);
     if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
     workspaceFileChangeTimer = setTimeout(() => {
       workspaceFileChangeTimer = null;
       const changedPaths = pendingWorkspaceFilePaths;
+      const refreshExplorer = pendingWorkspaceStructuralChange;
       pendingWorkspaceFilePaths = new SvelteSet<string>();
+      pendingWorkspaceStructuralChange = false;
       void refreshOpenEditorFilesFromDisk(changedPaths);
-      void refreshFileDirectory(fileDirectory);
+      if (refreshExplorer) void refreshFileDirectory(fileDirectory);
       void refreshWorkspaceGitState();
     }, 250);
   }

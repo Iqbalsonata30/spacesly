@@ -10,6 +10,7 @@ import {
 import { EditorState } from "@codemirror/state";
 import { createEditorCommandRegistry } from "../src/lib/editorCommands";
 import { fileTreeNavigationIndex } from "../src/lib/fileBrowser";
+import { workspaceFileChangeIsStructural } from "../src/lib/filesFeature";
 import { lspConfigForPath } from "../src/lib/lspConfig";
 import { aiEditProposalIsStale, applyAiEditHunks, createAiEditProposal } from "../src/lib/aiEdit";
 import {
@@ -161,6 +162,17 @@ assertEqual(
   },
   { child: 1, parent: 0, end: 2 },
   "file tree navigation should follow hierarchical keyboard semantics",
+);
+
+assertEqual(
+  {
+    modified: workspaceFileChangeIsStructural("modified"),
+    created: workspaceFileChangeIsStructural("created"),
+    removed: workspaceFileChangeIsStructural("removed"),
+    renamed: workspaceFileChangeIsStructural("renamed"),
+  },
+  { modified: false, created: true, removed: true, renamed: true },
+  "only structural workspace changes should rescan the explorer",
 );
 
 assertEqual(

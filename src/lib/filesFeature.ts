@@ -1,4 +1,5 @@
 import type { UiState } from "$lib/uiState";
+import type { WorkspaceFileChange } from "$lib/ipc/files";
 
 export function normalizeAbsolutePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -17,6 +18,10 @@ export function parentDirectory(path: string): string | null {
 
 export function fileName(path: string): string {
   return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+export function workspaceFileChangeIsStructural(kind: WorkspaceFileChange["kind"]): boolean {
+  return kind !== "modified";
 }
 
 export function directoryBreadcrumbs(path: string): Array<{ label: string; path: string }> {

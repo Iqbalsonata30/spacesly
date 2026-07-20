@@ -26,7 +26,7 @@ export interface FileWriteResult {
 
 export interface WorkspaceFileChange {
   workspace_id: string;
-  kind: "created" | "modified" | "removed";
+  kind: "created" | "modified" | "removed" | "renamed";
   paths: string[];
 }
 
