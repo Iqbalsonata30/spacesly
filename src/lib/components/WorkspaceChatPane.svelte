@@ -13,6 +13,7 @@
     onSwitchSession: (sessionId: string) => void;
     messages: WorkspaceChatMessage[];
     running: boolean;
+    onCancel: () => void;
     onTextareaReady: (element: HTMLTextAreaElement | null) => void;
     onEndReady: (element: HTMLDivElement | null) => void;
     onSubmit: () => void;
@@ -28,6 +29,7 @@
     onSwitchSession,
     messages,
     running,
+    onCancel,
     onTextareaReady,
     onEndReady,
     onSubmit,
@@ -310,7 +312,11 @@
       disabled={running}
       rows="2"
       onkeydown={onKeydown}></textarea>
-    <button type="submit" disabled={running}>{running ? "Working" : "Run"}</button>
+    {#if running}
+      <button type="button" onclick={onCancel}>Stop</button>
+    {:else}
+      <button type="submit">Run</button>
+    {/if}
   </form>
 </section>
 

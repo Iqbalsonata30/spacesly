@@ -85,6 +85,7 @@ export interface ExecutionContractStep {
 }
 
 export interface AiWorkerChatRequest {
+  run_id?: string;
   message: string;
   terminal_context: string | null;
   session_context: string | null;
@@ -125,6 +126,7 @@ export interface AiRun {
 }
 
 export interface AiEditRequest {
+  run_id?: string;
   file_path: string;
   instruction: string;
   content: string;
@@ -160,6 +162,14 @@ export async function getAiRun(runId: string): Promise<AiRun | null> {
   return invokeWithPolicy<AiRun | null>("get_ai_run", { runId }, IPC_POLICIES.fileRead);
 }
 
+export async function cancelAiRun(runId: string): Promise<boolean> {
+  return invokeWithPolicy<boolean>("cancel_ai_run", { runId }, IPC_POLICIES.pty);
+}
+
+export async function beginAiRun(kind: AiRunKind): Promise<AiRun> {
+  return invokeWithPolicy<AiRun>("begin_ai_run", { kind }, IPC_POLICIES.fileWrite);
+}
+
 export async function executeAiWorkerTask(
   runId: string,
   config: AiWorkerConfig,
@@ -189,9 +199,10 @@ export async function chatAiWorker(
   config: AiWorkerConfig,
   request: AiWorkerChatRequest,
 ): Promise<AiWorkerChatResult> {
+  const runId = request.run_id ?? (await beginAiRun("chat")).run_id;
   return invokeWithPolicy<AiWorkerChatResult>(
     "chat_ai_worker",
-    { config, request },
+    { config, request: { ...request, run_id: runId } },
     IPC_POLICIES.aiChat,
   );
 }
@@ -200,9 +211,10 @@ export async function proposeAiEdit(
   config: AiWorkerConfig,
   request: AiEditRequest,
 ): Promise<AiEditResult> {
+  const runId = request.run_id ?? (await beginAiRun("edit")).run_id;
   return invokeWithPolicy<AiEditResult>(
     "propose_ai_edit",
-    { config, request },
+    { config, request: { ...request, run_id: runId } },
     IPC_POLICIES.aiEdit,
   );
 }

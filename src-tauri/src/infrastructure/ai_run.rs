@@ -1,12 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RETAINED_RUNS: usize = 256;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiRunKind {
     Chat,
@@ -38,6 +38,7 @@ pub struct AiRun {
 #[derive(Clone, Default)]
 pub struct AiRunRegistry {
     state: Arc<Mutex<HashMap<String, AiRun>>>,
+    cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     sequence: Arc<AtomicU64>,
 }
 
@@ -59,6 +60,10 @@ impl AiRunRegistry {
             return Err("AI run already exists.".to_string());
         }
         state.insert(run_id, run.clone());
+        self.cancellations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(run.run_id.clone(), Arc::new(AtomicBool::new(false)));
         Ok(run)
     }
 
@@ -87,7 +92,24 @@ impl AiRunRegistry {
         }
         run.status = AiRunStatus::Cancelling;
         run.updated_at = now_millis();
+        if let Some(token) = self
+            .cancellations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(run_id)
+        {
+            token.store(true, Ordering::Release);
+        }
         Ok(true)
+    }
+
+    pub fn cancellation(&self, run_id: &str) -> Result<Arc<AtomicBool>, String> {
+        self.cancellations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| "AI run cancellation token was not found.".to_string())
     }
 
     pub fn finish(&self, run_id: &str, status: AiRunStatus) -> Result<AiRun, String> {
@@ -107,6 +129,10 @@ impl AiRunRegistry {
         run.status = status;
         run.updated_at = now_millis();
         let finished = run.clone();
+        self.cancellations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(run_id);
         prune_runs(&mut state);
         Ok(finished)
     }

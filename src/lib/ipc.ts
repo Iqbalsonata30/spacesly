@@ -27,6 +27,8 @@ export {
   reserveAiWorkerRun,
   testAiWorker,
   getAiRun,
+  beginAiRun,
+  cancelAiRun,
 } from "$lib/ipc/agent";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {

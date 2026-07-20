@@ -330,6 +330,11 @@ fn get_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<Optio
 }
 
 #[tauri::command]
+fn begin_ai_run(kind: AiRunKind, ai_runs: State<'_, AiRunRegistry>) -> Result<AiRun, String> {
+    ai_runs.begin_generated(kind)
+}
+
+#[tauri::command]
 async fn execute_ai_worker_task(
     run_id: String,
     config: AiWorkerConfig,
@@ -339,12 +344,13 @@ async fn execute_ai_worker_task(
     execution_store: State<'_, ExecutionStore>,
 ) -> Result<AiWorkerTaskResult, String> {
     let registry = agent_runs.inner().clone();
-    let cancellation = registry.start(&run_id)?;
+    registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
     if let Err(error) = runtime.start(&run_id) {
         let _ = registry.finish(&run_id);
         return Err(error);
     }
+    let cancellation = runtime.cancellation(&run_id)?;
     let store = execution_store.inner().clone();
     let worker_run_id = run_id.clone();
     if let Err(error) = store.claim_step(&run_id, "worker.execute", &run_id, 15 * 60 * 1000) {
@@ -419,33 +425,58 @@ fn cancel_ai_worker_task(
 }
 
 #[tauri::command]
+fn cancel_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<bool, String> {
+    ai_runs.cancel(&run_id)
+}
+
+#[tauri::command]
 async fn chat_ai_worker(
     config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<AiWorkerChatResult, String> {
-    let run = ai_runs.begin_generated(AiRunKind::Chat)?;
+    let run_id = request
+        .run_id
+        .clone()
+        .ok_or_else(|| "AI chat run ID is required.".to_string())?;
+    let run = ai_runs
+        .get(&run_id)?
+        .ok_or_else(|| "AI chat run was not registered.".to_string())?;
     ai_runs.start(&run.run_id)?;
+    let cancellation = ai_runs.cancellation(&run.run_id)?;
     let run_id = run.run_id.clone();
     let runtime = ai_runs.inner().clone();
-    let result =
-        match tauri::async_runtime::spawn_blocking(move || chat_ai_worker_impl(config, request))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = runtime.finish(&run_id, AiRunStatus::Failed);
-                return Err(format!("Agent chat task failed: {error}"));
-            }
-        };
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        chat_ai_worker_impl(config, request, cancellation)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            return Err(format!("Agent chat task failed: {error}"));
+        }
+    };
     match result {
         Ok(mut value) => {
+            if ai_runs
+                .get(&run_id)?
+                .is_some_and(|run| run.status == AiRunStatus::Cancelling)
+            {
+                let _ = runtime.finish(&run_id, AiRunStatus::Cancelled);
+                return Err("AI chat run was cancelled.".to_string());
+            }
             value.run_id = run_id.clone();
             let _ = runtime.finish(&run_id, AiRunStatus::Completed);
             Ok(value)
         }
         Err(error) => {
-            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            let status = if error.to_lowercase().contains("cancelled") {
+                AiRunStatus::Cancelled
+            } else {
+                AiRunStatus::Failed
+            };
+            let _ = runtime.finish(&run_id, status);
             Err(error)
         }
     }
@@ -457,28 +488,48 @@ async fn propose_ai_edit(
     request: AiEditRequest,
     ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<AiEditResult, String> {
-    let run = ai_runs.begin_generated(AiRunKind::Edit)?;
+    let run_id = request
+        .run_id
+        .clone()
+        .ok_or_else(|| "AI edit run ID is required.".to_string())?;
+    let run = ai_runs
+        .get(&run_id)?
+        .ok_or_else(|| "AI edit run was not registered.".to_string())?;
     ai_runs.start(&run.run_id)?;
+    let cancellation = ai_runs.cancellation(&run.run_id)?;
     let run_id = run.run_id.clone();
     let runtime = ai_runs.inner().clone();
-    let result =
-        match tauri::async_runtime::spawn_blocking(move || propose_ai_edit_impl(config, request))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = runtime.finish(&run_id, AiRunStatus::Failed);
-                return Err(format!("AI edit proposal task failed: {error}"));
-            }
-        };
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        propose_ai_edit_impl(config, request, cancellation)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            return Err(format!("AI edit proposal task failed: {error}"));
+        }
+    };
     match result {
         Ok(mut value) => {
+            if ai_runs
+                .get(&run_id)?
+                .is_some_and(|run| run.status == AiRunStatus::Cancelling)
+            {
+                let _ = runtime.finish(&run_id, AiRunStatus::Cancelled);
+                return Err("AI edit run was cancelled.".to_string());
+            }
             value.run_id = run_id.clone();
             let _ = runtime.finish(&run_id, AiRunStatus::Completed);
             Ok(value)
         }
         Err(error) => {
-            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            let status = if error.to_lowercase().contains("cancelled") {
+                AiRunStatus::Cancelled
+            } else {
+                AiRunStatus::Failed
+            };
+            let _ = runtime.finish(&run_id, status);
             Err(error)
         }
     }
@@ -1209,9 +1260,11 @@ pub fn run() {
             test_ai_worker,
             reserve_ai_worker_run,
             get_ai_run,
+            begin_ai_run,
             execute_ai_worker_task,
             release_ai_worker_run,
             cancel_ai_worker_task,
+            cancel_ai_run,
             chat_ai_worker,
             propose_ai_edit,
             sync_recovery_snapshots,

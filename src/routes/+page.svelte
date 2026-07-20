@@ -97,6 +97,8 @@
     addJiraComment,
     applyWorkspaceReplace,
     assignJiraIssue,
+    beginAiRun,
+    cancelAiRun,
     cancelAiWorkerTask,
     chatAiWorker,
     proposeAiEdit,
@@ -428,6 +430,8 @@
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRunning = $state(false);
+  let workspaceChatRunId = $state<string | null>(null);
+  let workspaceChatRequestId = 0;
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
   let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
   let workspaceChatActiveSessionId = $state<string>(
@@ -482,6 +486,7 @@
   let aiEditProposal = $state<AiEditProposal | null>(null);
   let aiEditSelectedHunkIds = $state<string[]>([]);
   let aiEditGenerating = $state(false);
+  let aiEditRunId = $state<string | null>(null);
   let aiEditError = $state<string | null>(null);
   let aiEditRequestId = 0;
   let aiEditPinnedDocumentIds = $state<string[]>([]);
@@ -2707,11 +2712,19 @@
     );
     const requestId = ++aiEditRequestId;
     aiEditGenerating = true;
+    aiEditRunId = null;
     aiEditError = null;
     aiEditProposal = null;
     aiEditSelectedHunkIds = [];
     try {
+      const run = await beginAiRun("edit");
+      if (requestId !== aiEditRequestId) {
+        await cancelAiRun(run.run_id).catch(() => false);
+        return;
+      }
+      aiEditRunId = run.run_id;
       const result = await proposeAiEdit(config, {
+        run_id: run.run_id,
         file_path: file.path,
         instruction,
         content: snapshot.value,
@@ -2748,6 +2761,9 @@
       aiEditSelectedHunkIds = proposal.hunks.map((hunk) => hunk.id);
     } catch (reason: unknown) {
       if (requestId !== aiEditRequestId) return;
+      const runId = aiEditRunId;
+      aiEditRunId = null;
+      if (runId) void cancelAiRun(runId).catch(() => {});
       aiEditError = reason instanceof Error ? reason.message : String(reason);
     } finally {
       if (requestId === aiEditRequestId) aiEditGenerating = false;
@@ -2791,6 +2807,9 @@
     aiEditRequestId += 1;
     aiEditGenerating = false;
     aiEditError = null;
+    const runId = aiEditRunId;
+    aiEditRunId = null;
+    if (runId) void cancelAiRun(runId).catch(() => {});
   }
 
   function toggleAiEditHunk(id: string) {
@@ -3593,14 +3612,23 @@
     if (!config) return;
 
     workspaceChatRunning = true;
+    const requestId = ++workspaceChatRequestId;
 
     try {
+      const run = await beginAiRun("chat");
+      if (requestId !== workspaceChatRequestId) {
+        await cancelAiRun(run.run_id).catch(() => false);
+        return;
+      }
+      workspaceChatRunId = run.run_id;
       const result = await chatAiWorker(config, {
+        run_id: run.run_id,
         message,
         terminal_context: workspaceAgentContext(activeBoard),
         session_context: workspaceChatSessionPromptContext(),
         session_key: `chat:${workspaceChatSession.id}`,
       });
+      if (requestId !== workspaceChatRequestId) return;
       const response = result.message;
       const actions = extractWorkspaceActions(response);
       appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(response) });
@@ -3609,14 +3637,30 @@
         appendWorkspaceChat({ role: "system", text: actionSummary });
       }
     } catch (reason) {
+      if (requestId !== workspaceChatRequestId) return;
+      const runId = workspaceChatRunId;
+      workspaceChatRunId = null;
+      if (runId) void cancelAiRun(runId).catch(() => {});
       appendWorkspaceChat({
         role: "system",
         text: reason instanceof Error ? reason.message : String(reason),
       });
     } finally {
-      workspaceChatRunning = false;
+      if (requestId === workspaceChatRequestId) {
+        workspaceChatRunId = null;
+        workspaceChatRunning = false;
+      }
       focusWorkspaceChatInput();
     }
+  }
+
+  function cancelWorkspaceChat() {
+    workspaceChatRequestId += 1;
+    workspaceChatRunning = false;
+    const runId = workspaceChatRunId;
+    workspaceChatRunId = null;
+    if (runId) void cancelAiRun(runId).catch(() => {});
+    focusWorkspaceChatInput();
   }
 
   async function applyWorkspaceChatActions(actions: WorkspaceChatAction[]): Promise<string> {
@@ -7464,6 +7508,7 @@
               onSwitchSession={activateWorkspaceChatSession}
               messages={workspaceChatMessages}
               running={workspaceChatRunning}
+              onCancel={cancelWorkspaceChat}
               onTextareaReady={(element) => {
                 workspaceChatTextarea = element;
               }}
