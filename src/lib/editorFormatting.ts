@@ -9,7 +9,10 @@ type PrettierModules = {
   plugins: Array<string | URL | object>;
 };
 
-let prettierModulesPromise: Promise<PrettierModules> | null = null;
+type PrettierPlugin = string | URL | object;
+
+let prettierPromise: Promise<typeof import("prettier/standalone")> | null = null;
+const prettierPluginPromises = new Map<string, Promise<PrettierPlugin[]>>();
 
 export function prettierParserForPath(path: string): string | null {
   const name = path.toLowerCase();
@@ -52,7 +55,7 @@ export async function formatEditorText(path: string, source: string): Promise<st
   const parser = prettierParserForPath(path);
   if (!parser) throw new Error(`No Prettier parser configured for ${path}.`);
 
-  const prettier = await loadPrettierModules();
+  const prettier = await loadPrettierModules(parser);
   return prettier.format(source, { parser, plugins: prettier.plugins });
 }
 
@@ -61,7 +64,7 @@ export async function validateEditorSyntax(path: string, source: string): Promis
   if (!parser || source.length > 200_000) return null;
 
   try {
-    const prettier = await loadPrettierModules();
+    const prettier = await loadPrettierModules(parser);
     await prettier.format(source, { parser, plugins: prettier.plugins });
     return null;
   } catch (reason: unknown) {
@@ -69,22 +72,47 @@ export async function validateEditorSyntax(path: string, source: string): Promis
   }
 }
 
-function loadPrettierModules(): Promise<PrettierModules> {
-  if (prettierModulesPromise) return prettierModulesPromise;
-  prettierModulesPromise = Promise.all([
-    import("prettier/standalone"),
-    import("prettier/plugins/babel"),
-    import("prettier/plugins/estree"),
-    import("prettier/plugins/html"),
-    import("prettier/plugins/markdown"),
-    import("prettier/plugins/postcss"),
-    import("prettier/plugins/typescript"),
-    import("prettier/plugins/yaml"),
-  ]).then(([prettier, babel, estree, html, markdown, postcss, typescript, yaml]) => ({
-    format: (source, options) => prettier.default.format(source, options),
-    plugins: [babel, estree, html, markdown, postcss, typescript, yaml] as Array<
-      string | URL | object
-    >,
-  }));
-  return prettierModulesPromise;
+export function prettierPluginGroupForParser(parser: string): string {
+  if (parser === "typescript") return "typescript";
+  if (parser === "babel" || parser === "json") return "babel";
+  if (parser === "html") return "html";
+  if (parser === "css") return "postcss";
+  if (parser === "markdown") return "markdown";
+  if (parser === "yaml") return "yaml";
+  throw new Error(`Unsupported Prettier parser: ${parser}.`);
+}
+
+async function loadPrettierModules(parser: string): Promise<PrettierModules> {
+  prettierPromise ??= import("prettier/standalone");
+  const [prettier, plugins] = await Promise.all([prettierPromise, loadPrettierPlugins(parser)]);
+  return {
+    format: (source, options) => prettier.format(source, options),
+    plugins,
+  };
+}
+
+function loadPrettierPlugins(parser: string): Promise<PrettierPlugin[]> {
+  const group = prettierPluginGroupForParser(parser);
+  const cached = prettierPluginPromises.get(group);
+  if (cached) return cached;
+
+  let plugins: Promise<PrettierPlugin[]>;
+  if (group === "typescript") {
+    plugins = Promise.all([
+      import("prettier/plugins/typescript"),
+      import("prettier/plugins/estree"),
+    ]);
+  } else if (group === "babel") {
+    plugins = Promise.all([import("prettier/plugins/babel"), import("prettier/plugins/estree")]);
+  } else if (group === "html") {
+    plugins = import("prettier/plugins/html").then((plugin) => [plugin]);
+  } else if (group === "postcss") {
+    plugins = import("prettier/plugins/postcss").then((plugin) => [plugin]);
+  } else if (group === "markdown") {
+    plugins = import("prettier/plugins/markdown").then((plugin) => [plugin]);
+  } else {
+    plugins = import("prettier/plugins/yaml").then((plugin) => [plugin]);
+  }
+  prettierPluginPromises.set(group, plugins);
+  return plugins;
 }

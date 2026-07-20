@@ -9,6 +9,7 @@ import {
 } from "../src/lib/editorDocument";
 import { EditorState } from "@codemirror/state";
 import { createEditorCommandRegistry } from "../src/lib/editorCommands";
+import { prettierPluginGroupForParser } from "../src/lib/editorFormatting";
 import { fileTreeNavigationIndex } from "../src/lib/fileBrowser";
 import { workspaceFileChangeIsStructural } from "../src/lib/filesFeature";
 import { lspConfigForPath } from "../src/lib/lspConfig";
@@ -44,6 +45,17 @@ assertEqual(
   applySavedSnapshot("saved", "saved"),
   { savedValue: "saved", dirty: false },
   "the persisted current snapshot should be clean",
+);
+
+assertEqual(
+  {
+    typescript: prettierPluginGroupForParser("typescript"),
+    javascript: prettierPluginGroupForParser("babel"),
+    json: prettierPluginGroupForParser("json"),
+    css: prettierPluginGroupForParser("css"),
+  },
+  { typescript: "typescript", javascript: "babel", json: "babel", css: "postcss" },
+  "Prettier should load only the plugin group required by the active parser",
 );
 
 const session = createDocumentSession({
