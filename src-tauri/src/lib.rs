@@ -595,9 +595,14 @@ fn resolve_ai_secrets(
     config: &mut AiWorkerConfig,
     secrets: &AppSecretsStore,
 ) -> Result<(), String> {
-    if config.api_key.trim().is_empty() {
-        config.api_key = secrets.ai_api_key(&config.provider_id)?;
+    let api_key = secrets.ai_api_key(&config.provider_id)?;
+    if config.runtime == "api" && api_key.trim().is_empty() {
+        return Err(format!(
+            "No API key is configured for provider '{}'.",
+            config.provider_id
+        ));
     }
+    config.api_key = api_key;
     for server in &mut config.mcp_servers {
         server.environment = secrets.mcp_environment(&server.name)?;
     }

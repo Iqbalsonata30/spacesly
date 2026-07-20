@@ -13,7 +13,6 @@ export interface AiWorkerConfig {
   provider_id: string;
   base_url: string;
   api_style: "openai_chat" | "openai_responses" | "anthropic_messages";
-  api_key?: string;
   model: string;
   opencode_command: string;
   opencode_model: string;
