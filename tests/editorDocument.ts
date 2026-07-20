@@ -13,6 +13,10 @@ import { prettierPluginGroupForParser } from "../src/lib/editorFormatting";
 import { fileTreeNavigationIndex } from "../src/lib/fileBrowser";
 import { workspaceFileChangeIsStructural } from "../src/lib/filesFeature";
 import { lspConfigForPath } from "../src/lib/lspConfig";
+import {
+  workspaceChatActionDescription,
+  workspaceChatActionRequiresConfirmation,
+} from "../src/lib/workspaceChat";
 import { aiEditProposalIsStale, applyAiEditHunks, createAiEditProposal } from "../src/lib/aiEdit";
 import {
   lspPositionToOffset,
@@ -292,6 +296,21 @@ assertEqual(
   },
   { active: true, terminal: false, hidden: false },
   "LSP diagnostics polling should stop outside a visible editor",
+);
+
+assertEqual(
+  {
+    select: workspaceChatActionRequiresConfirmation({ type: "select_card", card_id: "card-1" }),
+    delete: workspaceChatActionRequiresConfirmation({ type: "delete_card", card_id: "card-1" }),
+    agent: workspaceChatActionRequiresConfirmation({ type: "start_agent", ticket: "ABC-1" }),
+    description: workspaceChatActionDescription({
+      type: "move_card",
+      ticket: "ABC-1",
+      target: "done",
+    }),
+  },
+  { select: false, delete: true, agent: true, description: "Move ABC-1 to Done" },
+  "mutating chat actions should require explicit review",
 );
 
 let navigation = createEditorNavigation();

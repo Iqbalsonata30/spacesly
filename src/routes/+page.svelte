@@ -86,10 +86,12 @@
     extractWorkspaceActions,
     fastWorkspaceChatActions,
     ticketLabel,
+    workspaceChatActionRequiresConfirmation,
     workspaceAgentContext,
     stripWorkspaceActions,
     type WorkspaceChatAction,
     type WorkspaceChatActionContext,
+    type WorkspaceChatActionProposal,
   } from "$lib/workspaceChat";
   import { createSourceControlStore } from "$lib/sourceControlStore.svelte";
   import "./page.css";
@@ -432,6 +434,7 @@
   let workspaceChatRunning = $state(false);
   let workspaceChatRunId = $state<string | null>(null);
   let workspaceChatRequestId = 0;
+  let workspaceChatActionProposal = $state<WorkspaceChatActionProposal | null>(null);
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
   let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
   let workspaceChatActiveSessionId = $state<string>(
@@ -3602,6 +3605,15 @@
 
     const localActions = fastWorkspaceChatActions(message, workspaceChatActionContext());
     if (localActions.length > 0) {
+      if (localActions.some(workspaceChatActionRequiresConfirmation)) {
+        proposeWorkspaceChatActions(localActions, "command", null);
+        appendWorkspaceChat({
+          role: "system",
+          text: "Review and approve the proposed workspace actions before they run.",
+        });
+        focusWorkspaceChatInput();
+        return;
+      }
       const actionSummary = await applyWorkspaceChatActions(localActions);
       appendWorkspaceChat({ role: "system", text: actionSummary });
       focusWorkspaceChatInput();
@@ -3633,8 +3645,16 @@
       const actions = extractWorkspaceActions(response);
       appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(response) });
       if (actions.length > 0) {
-        const actionSummary = await applyWorkspaceChatActions(actions);
-        appendWorkspaceChat({ role: "system", text: actionSummary });
+        if (actions.some(workspaceChatActionRequiresConfirmation)) {
+          proposeWorkspaceChatActions(actions, "model", result.run_id);
+          appendWorkspaceChat({
+            role: "system",
+            text: "The AI proposed workspace mutations. Review them before applying.",
+          });
+        } else {
+          const actionSummary = await applyWorkspaceChatActions(actions);
+          appendWorkspaceChat({ role: "system", text: actionSummary });
+        }
       }
     } catch (reason) {
       if (requestId !== workspaceChatRequestId) return;
@@ -3661,6 +3681,35 @@
     workspaceChatRunId = null;
     if (runId) void cancelAiRun(runId).catch(() => {});
     focusWorkspaceChatInput();
+  }
+
+  function proposeWorkspaceChatActions(
+    actions: WorkspaceChatAction[],
+    source: WorkspaceChatActionProposal["source"],
+    runId: string | null,
+  ) {
+    workspaceChatActionProposal = {
+      id: crypto.randomUUID(),
+      sessionId: workspaceChatSession.id,
+      runId,
+      source,
+      actions,
+    };
+  }
+
+  async function applyWorkspaceChatActionProposal() {
+    const proposal = workspaceChatActionProposal;
+    if (!proposal || proposal.sessionId !== workspaceChatSession.id) return;
+    workspaceChatActionProposal = null;
+    const actionSummary = await applyWorkspaceChatActions(proposal.actions);
+    appendWorkspaceChat({ role: "system", text: actionSummary });
+  }
+
+  function rejectWorkspaceChatActionProposal() {
+    const proposal = workspaceChatActionProposal;
+    if (!proposal || proposal.sessionId !== workspaceChatSession.id) return;
+    workspaceChatActionProposal = null;
+    appendWorkspaceChat({ role: "system", text: "Proposed workspace actions were rejected." });
   }
 
   async function applyWorkspaceChatActions(actions: WorkspaceChatAction[]): Promise<string> {
@@ -7508,6 +7557,11 @@
               onSwitchSession={activateWorkspaceChatSession}
               messages={workspaceChatMessages}
               running={workspaceChatRunning}
+              actionProposal={workspaceChatActionProposal?.sessionId === workspaceChatSession.id
+                ? workspaceChatActionProposal
+                : null}
+              onApplyActionProposal={() => void applyWorkspaceChatActionProposal()}
+              onRejectActionProposal={rejectWorkspaceChatActionProposal}
               onCancel={cancelWorkspaceChat}
               onTextareaReady={(element) => {
                 workspaceChatTextarea = element;

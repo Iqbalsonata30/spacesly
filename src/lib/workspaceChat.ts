@@ -22,6 +22,28 @@ export type WorkspaceChatActionContext = {
   lastCreatedCardId?: string | null;
 };
 
+export type WorkspaceChatActionProposal = {
+  id: string;
+  sessionId: string;
+  runId: string | null;
+  source: "command" | "model";
+  actions: WorkspaceChatAction[];
+};
+
+export function workspaceChatActionRequiresConfirmation(action: WorkspaceChatAction): boolean {
+  return action.type !== "select_card";
+}
+
+export function workspaceChatActionDescription(action: WorkspaceChatAction): string {
+  if (action.type === "create_task") return `Create task: ${action.title}`;
+  if (action.type === "sync_jira") return "Synchronize Jira workspace";
+  const target = action.card_id ?? action.ticket ?? action.title ?? "unresolved card";
+  if (action.type === "move_card") return `Move ${target} to ${chatTargetLabel(action.target)}`;
+  if (action.type === "start_agent") return `Start Agent on ${target}`;
+  if (action.type === "delete_card") return `Delete ${target}`;
+  return `Select ${target}`;
+}
+
 export function terminalContext(): string {
   return "PTY terminal is active. Ask about visible terminal output or paste relevant output into chat when needed.";
 }

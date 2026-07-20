@@ -3,6 +3,10 @@
   import { scale } from "svelte/transition";
   import type { WorkspaceChatMessage } from "$lib/uiState";
   import type { WorkspaceChatSession } from "$lib/uiState";
+  import {
+    workspaceChatActionDescription,
+    type WorkspaceChatActionProposal,
+  } from "$lib/workspaceChat";
 
   type Props = {
     title: string;
@@ -14,6 +18,9 @@
     messages: WorkspaceChatMessage[];
     running: boolean;
     onCancel: () => void;
+    actionProposal: WorkspaceChatActionProposal | null;
+    onApplyActionProposal: () => void;
+    onRejectActionProposal: () => void;
     onTextareaReady: (element: HTMLTextAreaElement | null) => void;
     onEndReady: (element: HTMLDivElement | null) => void;
     onSubmit: () => void;
@@ -30,6 +37,9 @@
     messages,
     running,
     onCancel,
+    actionProposal,
+    onApplyActionProposal,
+    onRejectActionProposal,
     onTextareaReady,
     onEndReady,
     onSubmit,
@@ -299,6 +309,23 @@
     {/each}
     <div class="workspace-chat-end" bind:this={end}></div>
   </div>
+  {#if actionProposal}
+    <section class="workspace-chat-proposal" aria-label="Proposed workspace actions">
+      <header>
+        <strong>Review proposed actions</strong>
+        <span>{actionProposal.source === "model" ? "AI proposal" : "Command proposal"}</span>
+      </header>
+      <ul>
+        {#each actionProposal.actions as action, index (`${action.type}:${index}`)}
+          <li>{workspaceChatActionDescription(action)}</li>
+        {/each}
+      </ul>
+      <div>
+        <button type="button" onclick={onRejectActionProposal}>Reject</button>
+        <button type="button" onclick={onApplyActionProposal}>Apply actions</button>
+      </div>
+    </section>
+  {/if}
   <form
     class="workspace-chat-input"
     onsubmit={(event) => {
@@ -331,6 +358,27 @@
 
   .workspace-chat-session-picker {
     position: relative;
+  }
+
+  .workspace-chat-proposal {
+    margin: 0 14px 10px;
+    padding: 12px;
+    border: 1px solid rgba(216, 167, 137, 0.38);
+    border-radius: 10px;
+    background: rgba(216, 167, 137, 0.08);
+  }
+
+  .workspace-chat-proposal header,
+  .workspace-chat-proposal > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .workspace-chat-proposal ul {
+    margin: 10px 0;
+    padding-left: 20px;
   }
 
   .workspace-chat-sessions {
