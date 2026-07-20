@@ -220,6 +220,7 @@
   const UI_STATE_WRITE_DELAY_MS = 200;
   const RECOVERY_SYNC_DELAY_MS = 500;
   const RECOVERY_MAX_CONTENT_BYTES = 1_000_000;
+  const LSP_DIAGNOSTIC_POLL_MS = 1_500;
   const NOTICE_AUTO_DISMISS_MS = 3_000;
   const ERROR_NOTICE_AUTO_DISMISS_MS = 5_000;
   const LAYOUT_PREFS_KEY = "spacesly.layout.v1";
@@ -509,6 +510,7 @@
   let lspServerStates = $state<Record<string, "starting" | "running" | "error">>({});
   let lspStartPromises = new SvelteMap<string, Promise<boolean>>();
   let lspSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let lspDiagnosticPollTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
   let recoverySyncTimer: ReturnType<typeof setTimeout> | null = null;
   let recoveryRestoreChecked = false;
@@ -547,6 +549,8 @@
       event.returnValue = true;
     };
     window.addEventListener("beforeunload", beforeUnload);
+    const visibilityChange = () => scheduleLspDiagnosticsPoll(0);
+    document.addEventListener("visibilitychange", visibilityChange);
     const unregisterEditorCommands = [
       editorCommands.register("editor.save", saveActiveFile),
       editorCommands.register("editor.format", formatActiveFile),
@@ -606,18 +610,15 @@
     const timer = window.setInterval(() => {
       now = new Date();
     }, 60_000);
-    const lspDiagnosticTimer = window.setInterval(() => {
-      void refreshActiveLspDiagnostics();
-    }, 1_500);
-
     return () => {
       disposed = true;
       window.clearTimeout(fallbackWorkspaceTimer);
       window.clearInterval(timer);
-      window.clearInterval(lspDiagnosticTimer);
       if (lspSyncTimer) clearTimeout(lspSyncTimer);
+      if (lspDiagnosticPollTimer) clearTimeout(lspDiagnosticPollTimer);
       window.removeEventListener("beforeunload", beforeUnload);
       window.removeEventListener("keydown", editorKeydown);
+      document.removeEventListener("visibilitychange", visibilityChange);
       for (const unregister of unregisterEditorCommands) unregister();
       if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
       unlistenWindowClose?.();
@@ -769,6 +770,10 @@
     if (secretsHydrated) return;
     secretsHydrated = true;
     void hydrateSecrets();
+  });
+
+  $effect(() => {
+    scheduleLspDiagnosticsPoll();
   });
 
   $effect(() => {
@@ -2220,7 +2225,7 @@
       );
       if (path === activeEditorPath) {
         activeLspStatus = "running";
-        window.setTimeout(() => void refreshActiveLspDiagnostics(), 400);
+        scheduleLspDiagnosticsPoll(400);
         void refreshActiveLspSymbols();
       }
     } catch (reason: unknown) {
@@ -2251,6 +2256,27 @@
     } catch {
       activeLspStatus = "error";
     }
+  }
+
+  function scheduleLspDiagnosticsPoll(delay = LSP_DIAGNOSTIC_POLL_MS) {
+    if (lspDiagnosticPollTimer) {
+      clearTimeout(lspDiagnosticPollTimer);
+      lspDiagnosticPollTimer = null;
+    }
+    const path = activeEditorPath;
+    const config = path ? lspConfigForPath(path) : null;
+    if (
+      !config ||
+      lspServerStates[config.server_id] !== "running" ||
+      !shouldPollLspDiagnostics(workspaceMode === "files", document.visibilityState === "visible")
+    ) {
+      return;
+    }
+    lspDiagnosticPollTimer = setTimeout(async () => {
+      lspDiagnosticPollTimer = null;
+      await refreshActiveLspDiagnostics();
+      scheduleLspDiagnosticsPoll();
+    }, delay);
   }
 
   async function refreshActiveLspSymbols(force = false) {
