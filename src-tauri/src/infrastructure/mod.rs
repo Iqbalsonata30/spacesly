@@ -1,3 +1,4 @@
+pub mod ai_run;
 pub mod ai_worker;
 pub mod execution_store;
 pub mod file_watcher;

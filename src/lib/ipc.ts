@@ -4,6 +4,9 @@ import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import type { FileEntry } from "$lib/ipc/files";
 export type {
   AiWorkerChatResult,
+  AiRun,
+  AiRunKind,
+  AiRunStatus,
   AiWorkerChatRequest,
   AiEditContextFile,
   AiEditRequest,
@@ -23,6 +26,7 @@ export {
   releaseAiWorkerRun,
   reserveAiWorkerRun,
   testAiWorker,
+  getAiRun,
 } from "$lib/ipc/agent";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {

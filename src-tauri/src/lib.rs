@@ -8,6 +8,7 @@ use application::git_service::GitService;
 use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
+use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, close_all_opencode_servers,
     execute_ai_worker_task as execute_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
@@ -313,8 +314,19 @@ fn reserve_ai_worker_run(
     run_id: String,
     config: AiWorkerConfig,
     agent_runs: State<'_, AgentRunRegistry>,
+    ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<(), String> {
-    agent_runs.reserve(&run_id, &config)
+    ai_runs.begin(run_id.clone(), AiRunKind::Agent)?;
+    if let Err(error) = agent_runs.reserve(&run_id, &config) {
+        let _ = ai_runs.finish(&run_id, AiRunStatus::Failed);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<Option<AiRun>, String> {
+    ai_runs.get(&run_id)
 }
 
 #[tauri::command]
@@ -323,13 +335,21 @@ async fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     agent_runs: State<'_, AgentRunRegistry>,
+    ai_runs: State<'_, AiRunRegistry>,
     execution_store: State<'_, ExecutionStore>,
 ) -> Result<AiWorkerTaskResult, String> {
     let registry = agent_runs.inner().clone();
     let cancellation = registry.start(&run_id)?;
+    let runtime = ai_runs.inner().clone();
+    if let Err(error) = runtime.start(&run_id) {
+        let _ = registry.finish(&run_id);
+        return Err(error);
+    }
     let store = execution_store.inner().clone();
+    let worker_run_id = run_id.clone();
     if let Err(error) = store.claim_step(&run_id, "worker.execute", &run_id, 15 * 60 * 1000) {
         let _ = registry.finish(&run_id);
+        let _ = runtime.finish(&run_id, AiRunStatus::Failed);
         return Err(error);
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -342,14 +362,33 @@ async fn execute_ai_worker_task(
                 ("completed", Some(value.summary.as_str()))
             }
             Ok(value) => ("blocked", Some(value.summary.as_str())),
+            Err(error) if error.to_lowercase().contains("cancelled") => {
+                ("cancelled", Some(error.as_str()))
+            }
             Err(error) => ("failed", Some(error.as_str())),
         };
-        let _ = store.finish_step(&run_id, "worker.execute", &run_id, status, summary);
-        let _ = registry.finish(&run_id);
+        let _ = store.finish_step(
+            &worker_run_id,
+            "worker.execute",
+            &worker_run_id,
+            status,
+            summary,
+        );
+        let _ = registry.finish(&worker_run_id);
+        let runtime_status = match status {
+            "completed" => AiRunStatus::Completed,
+            "blocked" => AiRunStatus::Blocked,
+            "cancelled" => AiRunStatus::Cancelled,
+            _ => AiRunStatus::Failed,
+        };
+        let _ = runtime.finish(&worker_run_id, runtime_status);
         result
     })
     .await
     .map_err(|error| format!("Agent execution task failed: {error}"))?;
+    if result.is_err() {
+        let _ = ai_runs.finish(&run_id, AiRunStatus::Failed);
+    }
     result
 }
 
@@ -357,36 +396,92 @@ async fn execute_ai_worker_task(
 fn release_ai_worker_run(
     run_id: String,
     agent_runs: State<'_, AgentRunRegistry>,
+    ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<bool, String> {
-    agent_runs.release_reservation(&run_id)
+    let released = agent_runs.release_reservation(&run_id)?;
+    if released {
+        let _ = ai_runs.finish(&run_id, AiRunStatus::Cancelled);
+    }
+    Ok(released)
 }
 
 #[tauri::command]
 fn cancel_ai_worker_task(
     run_id: String,
     agent_runs: State<'_, AgentRunRegistry>,
+    ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<bool, String> {
-    agent_runs.cancel(&run_id)
+    let cancelled = agent_runs.cancel(&run_id)?;
+    if cancelled {
+        let _ = ai_runs.cancel(&run_id);
+    }
+    Ok(cancelled)
 }
 
 #[tauri::command]
 async fn chat_ai_worker(
     config: AiWorkerConfig,
     request: AiWorkerChatRequest,
+    ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<AiWorkerChatResult, String> {
-    tauri::async_runtime::spawn_blocking(move || chat_ai_worker_impl(config, request))
-        .await
-        .map_err(|error| format!("Agent chat task failed: {error}"))?
+    let run = ai_runs.begin_generated(AiRunKind::Chat)?;
+    ai_runs.start(&run.run_id)?;
+    let run_id = run.run_id.clone();
+    let runtime = ai_runs.inner().clone();
+    let result =
+        match tauri::async_runtime::spawn_blocking(move || chat_ai_worker_impl(config, request))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+                return Err(format!("Agent chat task failed: {error}"));
+            }
+        };
+    match result {
+        Ok(mut value) => {
+            value.run_id = run_id.clone();
+            let _ = runtime.finish(&run_id, AiRunStatus::Completed);
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 async fn propose_ai_edit(
     config: AiWorkerConfig,
     request: AiEditRequest,
+    ai_runs: State<'_, AiRunRegistry>,
 ) -> Result<AiEditResult, String> {
-    tauri::async_runtime::spawn_blocking(move || propose_ai_edit_impl(config, request))
-        .await
-        .map_err(|error| format!("AI edit proposal task failed: {error}"))?
+    let run = ai_runs.begin_generated(AiRunKind::Edit)?;
+    ai_runs.start(&run.run_id)?;
+    let run_id = run.run_id.clone();
+    let runtime = ai_runs.inner().clone();
+    let result =
+        match tauri::async_runtime::spawn_blocking(move || propose_ai_edit_impl(config, request))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+                return Err(format!("AI edit proposal task failed: {error}"));
+            }
+        };
+    match result {
+        Ok(mut value) => {
+            value.run_id = run_id.clone();
+            let _ = runtime.finish(&run_id, AiRunStatus::Completed);
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1087,6 +1182,7 @@ pub fn run() {
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
     let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
     let recovery_store = RecoveryStore::open().expect("failed to initialize recovery store");
+    let ai_run_registry = AiRunRegistry::default();
     let lsp_registry = LspRegistry::default();
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
@@ -1094,6 +1190,7 @@ pub fn run() {
         .manage(workspace_root)
         .manage(execution_store)
         .manage(recovery_store)
+        .manage(ai_run_registry)
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
         .manage(AgentRunRegistry::default())
@@ -1111,6 +1208,7 @@ pub fn run() {
             add_jira_comment,
             test_ai_worker,
             reserve_ai_worker_run,
+            get_ai_run,
             execute_ai_worker_task,
             release_ai_worker_run,
             cancel_ai_worker_task,

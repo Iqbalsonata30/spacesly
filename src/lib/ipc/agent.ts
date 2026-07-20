@@ -108,7 +108,20 @@ export interface AiWorkerTaskResult {
 }
 
 export interface AiWorkerChatResult {
+  run_id: string;
   message: string;
+}
+
+export type AiRunKind = "chat" | "edit" | "agent";
+export type AiRunStatus =
+  "queued" | "running" | "cancelling" | "completed" | "blocked" | "failed" | "cancelled";
+
+export interface AiRun {
+  run_id: string;
+  kind: AiRunKind;
+  status: AiRunStatus;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface AiEditRequest {
@@ -134,12 +147,17 @@ export interface AiEditContextFile {
 }
 
 export interface AiEditResult {
+  run_id: string;
   summary: string;
   content: string;
 }
 
 export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStatus> {
   return invokeWithPolicy<AiWorkerStatus>("test_ai_worker", { config }, IPC_POLICIES.aiTest);
+}
+
+export async function getAiRun(runId: string): Promise<AiRun | null> {
+  return invokeWithPolicy<AiRun | null>("get_ai_run", { runId }, IPC_POLICIES.fileRead);
 }
 
 export async function executeAiWorkerTask(

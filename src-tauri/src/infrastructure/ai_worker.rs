@@ -297,6 +297,8 @@ pub enum AiWorkerCompletionStatus {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AiWorkerChatResult {
+    #[serde(default)]
+    pub run_id: String,
     pub message: String,
 }
 
@@ -330,6 +332,8 @@ pub struct AiEditContextFile {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AiEditResult {
+    #[serde(default)]
+    pub run_id: String,
     pub summary: String,
     pub content: String,
 }
@@ -523,6 +527,7 @@ pub fn chat_ai_worker(
             remember_opencode_session(server, request.session_key.as_deref(), &response.session_id);
         }
         return Ok(AiWorkerChatResult {
+            run_id: String::new(),
             message: response.text,
         });
     }
@@ -540,7 +545,10 @@ pub fn chat_ai_worker(
     );
     let response = call_model(&config, &system_prompt, &user_prompt, 550)?;
 
-    Ok(AiWorkerChatResult { message: response })
+    Ok(AiWorkerChatResult {
+        run_id: String::new(),
+        message: response,
+    })
 }
 
 pub fn propose_ai_edit(
