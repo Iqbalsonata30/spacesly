@@ -216,6 +216,8 @@ fn agent_execution_scope(config: &AiWorkerConfig) -> Result<Option<String>, Stri
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiWorkerConfig {
+    #[serde(default)]
+    pub workspace_id: String,
     pub runtime: String,
     pub provider_name: String,
     pub base_url: String,
@@ -2006,6 +2008,7 @@ mod tests {
 
     fn config_with_governance(rules: &str, skills: &str) -> AiWorkerConfig {
         AiWorkerConfig {
+            workspace_id: "workspace-personal".to_string(),
             runtime: "api".to_string(),
             provider_name: "OpenAI".to_string(),
             base_url: "https://example.invalid".to_string(),

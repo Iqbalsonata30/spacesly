@@ -7,6 +7,7 @@ export type {
   AiRun,
   AiRunKind,
   AiRunStatus,
+  AiWorkspaceTrustStatus,
   AiWorkerChatRequest,
   AiEditContextFile,
   AiEditRequest,
@@ -29,6 +30,8 @@ export {
   getAiRun,
   beginAiRun,
   cancelAiRun,
+  aiWorkspaceTrustStatus,
+  trustAiWorkspace,
 } from "$lib/ipc/agent";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {

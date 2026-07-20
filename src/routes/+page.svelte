@@ -97,6 +97,7 @@
   import "./page.css";
   import {
     addJiraComment,
+    aiWorkspaceTrustStatus,
     applyWorkspaceReplace,
     assignJiraIssue,
     beginAiRun,
@@ -143,6 +144,7 @@
     testAiWorker,
     testMcpServerConnection,
     transitionJiraIssue,
+    trustAiWorkspace,
     unwatchWorkspaceFiles,
     watchWorkspaceFiles,
     writeFile,
@@ -3244,6 +3246,7 @@
     }
 
     return {
+      workspace_id: workspace?.id ?? "workspace-personal",
       runtime: effectiveSettings.aiWorker.runtime,
       provider_name: effectiveProvider.label,
       base_url: effectiveProvider.baseUrl,
@@ -3272,6 +3275,27 @@
         ];
       }),
     };
+  }
+
+  async function ensureAiWorkspaceTrusted(config: AiWorkerConfig): Promise<boolean> {
+    if (config.runtime !== "opencode") return true;
+    if (!workspace) return false;
+    try {
+      const status = await aiWorkspaceTrustStatus(workspace.id);
+      if (status.trusted) return true;
+      const confirmed = window.confirm(
+        `Trust ${status.path} for AI tool execution? OpenCode agents may read and modify files and run commands inside this workspace.`,
+      );
+      if (!confirmed) return false;
+      await trustAiWorkspace(workspace.id);
+      return true;
+    } catch (reason: unknown) {
+      appNotice = {
+        tone: "error",
+        message: reason instanceof Error ? reason.message : String(reason),
+      };
+      return false;
+    }
   }
 
   function appendWorkspaceChat(message: Omit<WorkspaceChatMessage, "id">) {
@@ -3622,6 +3646,7 @@
 
     const config = buildAiWorkerConfig();
     if (!config) return;
+    if (!(await ensureAiWorkspaceTrusted(config))) return;
 
     workspaceChatRunning = true;
     const requestId = ++workspaceChatRequestId;
@@ -5680,6 +5705,10 @@
 
     const config = buildAiWorkerConfig();
     if (!config) {
+      finishWorkerRun(cardId, runId);
+      return;
+    }
+    if (!(await ensureAiWorkspaceTrusted(config))) {
       finishWorkerRun(cardId, runId);
       return;
     }

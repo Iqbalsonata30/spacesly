@@ -62,6 +62,7 @@ use infrastructure::workspace_search::{
     WorkspaceReplaceApplyResponse, WorkspaceReplacePreviewRequest, WorkspaceReplacePreviewResponse,
     WorkspaceSearchRequest, WorkspaceSearchResponse,
 };
+use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
@@ -312,10 +313,13 @@ async fn test_ai_worker(config: AiWorkerConfig) -> Result<AiWorkerStatus, String
 #[tauri::command]
 fn reserve_ai_worker_run(
     run_id: String,
-    config: AiWorkerConfig,
+    mut config: AiWorkerConfig,
     agent_runs: State<'_, AgentRunRegistry>,
     ai_runs: State<'_, AiRunRegistry>,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
 ) -> Result<(), String> {
+    bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     ai_runs.begin(run_id.clone(), AiRunKind::Agent)?;
     if let Err(error) = agent_runs.reserve(&run_id, &config) {
         let _ = ai_runs.finish(&run_id, AiRunStatus::Failed);
@@ -337,12 +341,15 @@ fn begin_ai_run(kind: AiRunKind, ai_runs: State<'_, AiRunRegistry>) -> Result<Ai
 #[tauri::command]
 async fn execute_ai_worker_task(
     run_id: String,
-    config: AiWorkerConfig,
+    mut config: AiWorkerConfig,
     task: AiWorkerTask,
     agent_runs: State<'_, AgentRunRegistry>,
     ai_runs: State<'_, AiRunRegistry>,
     execution_store: State<'_, ExecutionStore>,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
 ) -> Result<AiWorkerTaskResult, String> {
+    bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
@@ -431,10 +438,13 @@ fn cancel_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<bo
 
 #[tauri::command]
 async fn chat_ai_worker(
-    config: AiWorkerConfig,
+    mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     ai_runs: State<'_, AiRunRegistry>,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
 ) -> Result<AiWorkerChatResult, String> {
+    bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     let run_id = request
         .run_id
         .clone()
@@ -480,6 +490,41 @@ async fn chat_ai_worker(
             Err(error)
         }
     }
+}
+
+fn bind_tool_capable_ai_workspace(
+    config: &mut AiWorkerConfig,
+    roots: &WorkspaceRoot,
+    trust: &WorkspaceTrustRegistry,
+) -> Result<(), String> {
+    if config.runtime != "opencode" {
+        return Ok(());
+    }
+    let workspace_id = config.workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err("AI workspace ID is required for OpenCode execution.".to_string());
+    }
+    let path = trust.require_trusted(roots, workspace_id)?;
+    config.opencode_workdir = Some(path.to_string_lossy().to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn ai_workspace_trust_status(
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
+) -> Result<WorkspaceTrustStatus, String> {
+    workspace_trust.status(&workspace_root, &workspace_id)
+}
+
+#[tauri::command]
+fn trust_ai_workspace(
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
+) -> Result<WorkspaceTrustStatus, String> {
+    workspace_trust.trust(&workspace_root, &workspace_id)
 }
 
 #[tauri::command]
@@ -1234,6 +1279,7 @@ pub fn run() {
     let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
     let recovery_store = RecoveryStore::open().expect("failed to initialize recovery store");
     let ai_run_registry = AiRunRegistry::default();
+    let workspace_trust = WorkspaceTrustRegistry::default();
     let lsp_registry = LspRegistry::default();
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
@@ -1242,6 +1288,7 @@ pub fn run() {
         .manage(execution_store)
         .manage(recovery_store)
         .manage(ai_run_registry)
+        .manage(workspace_trust)
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
         .manage(AgentRunRegistry::default())
@@ -1261,6 +1308,8 @@ pub fn run() {
             reserve_ai_worker_run,
             get_ai_run,
             begin_ai_run,
+            ai_workspace_trust_status,
+            trust_ai_workspace,
             execute_ai_worker_task,
             release_ai_worker_run,
             cancel_ai_worker_task,

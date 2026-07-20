@@ -7,6 +7,7 @@ export interface AiWorkerMcpServer {
 }
 
 export interface AiWorkerConfig {
+  workspace_id: string;
   runtime: "api" | "opencode";
   provider_name: string;
   base_url: string;
@@ -125,6 +126,11 @@ export interface AiRun {
   updated_at: number;
 }
 
+export interface AiWorkspaceTrustStatus {
+  path: string;
+  trusted: boolean;
+}
+
 export interface AiEditRequest {
   run_id?: string;
   file_path: string;
@@ -164,6 +170,22 @@ export async function getAiRun(runId: string): Promise<AiRun | null> {
 
 export async function cancelAiRun(runId: string): Promise<boolean> {
   return invokeWithPolicy<boolean>("cancel_ai_run", { runId }, IPC_POLICIES.pty);
+}
+
+export async function aiWorkspaceTrustStatus(workspaceId: string): Promise<AiWorkspaceTrustStatus> {
+  return invokeWithPolicy<AiWorkspaceTrustStatus>(
+    "ai_workspace_trust_status",
+    { workspaceId },
+    IPC_POLICIES.fileRead,
+  );
+}
+
+export async function trustAiWorkspace(workspaceId: string): Promise<AiWorkspaceTrustStatus> {
+  return invokeWithPolicy<AiWorkspaceTrustStatus>(
+    "trust_ai_workspace",
+    { workspaceId },
+    IPC_POLICIES.fileWrite,
+  );
 }
 
 export async function beginAiRun(kind: AiRunKind): Promise<AiRun> {

@@ -15,3 +15,4 @@ pub mod shell;
 mod shell_env;
 pub mod workspace_cache;
 pub mod workspace_search;
+pub mod workspace_trust;
