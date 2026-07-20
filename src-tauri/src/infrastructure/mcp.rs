@@ -73,6 +73,8 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub scope_id: Option<String>,
+    #[serde(default)]
+    pub secret_id: Option<String>,
 }
 
 /// Validates any stdio MCP server by initializing it and listing tools.
@@ -1222,12 +1224,14 @@ mod tests {
             args: vec!["--stdio".to_string()],
             env: first_env,
             scope_id: None,
+            secret_id: None,
         };
         let second = McpServerConfig {
             command: "server".to_string(),
             args: vec!["--stdio".to_string()],
             env: second_env,
             scope_id: None,
+            secret_id: None,
         };
 
         assert_eq!(mcp_server_key(&first), mcp_server_key(&second));

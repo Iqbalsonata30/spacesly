@@ -30,12 +30,6 @@ impl AppSecretsStore {
         })
     }
 
-    pub fn replace(&self, secrets: AppSecrets) -> Result<(), String> {
-        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
-        *current = secrets;
-        Ok(())
-    }
-
     pub fn redacted_snapshot(&self) -> Result<AppSecrets, String> {
         let mut secrets = self
             .secrets
@@ -43,6 +37,7 @@ impl AppSecretsStore {
             .map_err(|error| error.to_string())?
             .clone();
         secrets.ai_api_keys.clear();
+        secrets.mcp_env.clear();
         Ok(secrets)
     }
 
@@ -53,6 +48,43 @@ impl AppSecretsStore {
             .iter()
             .map(|(provider_id, value)| (provider_id.clone(), !value.trim().is_empty()))
             .collect())
+    }
+
+    pub fn mcp_environment_statuses(&self) -> Result<HashMap<String, Vec<String>>, String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        Ok(secrets
+            .mcp_env
+            .iter()
+            .map(|(server_id, values)| {
+                let mut keys = values.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                (server_id.clone(), keys)
+            })
+            .collect())
+    }
+
+    pub fn save_mcp_environment(
+        &self,
+        server_id: &str,
+        environment: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let server_id = server_id.trim();
+        if server_id.is_empty() {
+            return Err("MCP server ID is required.".to_string());
+        }
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        if !environment.is_empty() {
+            let values = next.mcp_env.entry(server_id.to_string()).or_default();
+            values.extend(
+                environment
+                    .into_iter()
+                    .filter(|(_, value)| !value.trim().is_empty()),
+            );
+        }
+        save_app_secrets(next.clone())?;
+        *current = next;
+        Ok(())
     }
 
     pub fn save_ai_api_key(&self, provider_id: &str, api_key: Option<&str>) -> Result<(), String> {
@@ -86,6 +118,16 @@ impl AppSecretsStore {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .chain(incoming.ai_api_keys)
+                .collect();
+        }
+        if incoming.mcp_env.is_empty() {
+            incoming.mcp_env = current.mcp_env.clone();
+        } else {
+            incoming.mcp_env = current
+                .mcp_env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .chain(incoming.mcp_env)
                 .collect();
         }
         save_app_secrets(incoming.clone())?;
@@ -192,5 +234,10 @@ mod tests {
         assert!(store.ai_api_key("missing").unwrap().is_empty());
         assert!(store.redacted_snapshot().unwrap().ai_api_keys.is_empty());
         assert_eq!(store.ai_provider_statuses().unwrap()["openai"], true);
+        assert_eq!(
+            store.mcp_environment_statuses().unwrap()["jira"],
+            vec!["JIRA_TOKEN"]
+        );
+        assert!(store.redacted_snapshot().unwrap().mcp_env.is_empty());
     }
 }

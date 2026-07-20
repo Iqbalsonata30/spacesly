@@ -83,8 +83,10 @@ export {
 export {
   aiProviderSecretStatuses,
   loadAppSecrets,
+  mcpEnvironmentSecretStatuses,
   saveAiProviderSecret,
   saveAppSecrets,
+  saveMcpEnvironmentSecret,
 } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";

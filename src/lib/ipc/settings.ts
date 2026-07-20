@@ -27,3 +27,22 @@ export async function saveAiProviderSecret(
     IPC_POLICIES.secret,
   );
 }
+
+export async function mcpEnvironmentSecretStatuses(): Promise<Record<string, string[]>> {
+  return invokeWithPolicy<Record<string, string[]>>(
+    "mcp_environment_secret_statuses",
+    undefined,
+    IPC_POLICIES.secret,
+  );
+}
+
+export async function saveMcpEnvironmentSecret(
+  serverId: string,
+  environment: Record<string, string>,
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "save_mcp_environment_secret",
+    { serverId, environment },
+    IPC_POLICIES.secret,
+  );
+}

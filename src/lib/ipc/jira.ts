@@ -37,6 +37,7 @@ export interface JiraMcpServerConfig {
   args: string[];
   env: Record<string, string>;
   scope_id?: string;
+  secret_id?: string;
 }
 
 export interface McpConnectionStatus {

@@ -126,6 +126,7 @@
     lspSyncDocument,
     loadAppSecrets,
     aiProviderSecretStatuses,
+    mcpEnvironmentSecretStatuses,
     onWorkspaceFileChange,
     openPtyTerminal,
     previewWorkspaceReplace,
@@ -135,6 +136,7 @@
     resizePtyTerminal,
     saveAppSecrets,
     saveAiProviderSecret,
+    saveMcpEnvironmentSecret,
     saveExecutionRun,
     searchWorkspace,
     listActiveExecutionRuns,
@@ -189,7 +191,6 @@
     loadSettings,
     saveSettings,
     hasAnySecret,
-    mergeMcpSecretsIntoSettings,
     mergeAppSecrets,
     secretsFromSettings,
     settingsWithoutSecrets,
@@ -351,6 +352,7 @@
   let settings = $state<AppSettings>(initialSettings);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let aiProviderSecrets = $state<Record<string, boolean>>({});
+  let mcpEnvironmentSecrets = $state<Record<string, string[]>>({});
   let secretsHydrated = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
@@ -1056,21 +1058,25 @@
       for (const [providerId, apiKey] of Object.entries(legacyAiKeys)) {
         if (apiKey.trim()) await saveAiProviderSecret(providerId, apiKey);
       }
-      const mergedSecrets = hasAnySecret({ ...localSecrets, ai_api_keys: {} })
-        ? mergeAppSecrets({ ...localSecrets, ai_api_keys: {} }, storedSecrets)
+      for (const [serverId, environment] of Object.entries(localSecrets.mcp_env)) {
+        if (Object.keys(environment).length > 0) {
+          await saveMcpEnvironmentSecret(serverId, environment);
+        }
+      }
+      const redactedLocalSecrets = { ...localSecrets, ai_api_keys: {}, mcp_env: {} };
+      const mergedSecrets = hasAnySecret(redactedLocalSecrets)
+        ? mergeAppSecrets(redactedLocalSecrets, storedSecrets)
         : storedSecrets;
 
-      if (hasAnySecret({ ...localSecrets, ai_api_keys: {} })) {
-        await saveAppSecrets({ ...mergedSecrets, ai_api_keys: {} });
+      if (hasAnySecret(redactedLocalSecrets)) {
+        await saveAppSecrets({ ...mergedSecrets, ai_api_keys: {}, mcp_env: {} });
         saveSettings(settingsWithoutSecrets(settings));
       }
 
       aiProviderSecrets = await aiProviderSecretStatuses();
-      appSecrets = { ...mergedSecrets, ai_api_keys: {} };
-      settings = mergeMcpSecretsIntoSettings(settingsWithoutSecrets(settings), {
-        ...mergedSecrets,
-        ai_api_keys: {},
-      });
+      mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
+      appSecrets = { ...mergedSecrets, ai_api_keys: {}, mcp_env: {} };
+      settings = settingsWithoutSecrets(settings);
       secretsHydrated = true;
     } catch (reason: unknown) {
       appNotice = {
@@ -1187,22 +1193,25 @@
     for (const [providerId, apiKey] of Object.entries(appSecrets.ai_api_keys)) {
       await saveAiProviderSecret(providerId, apiKey);
     }
-    const mergedSecrets = hasAnySecret({ ...appSecrets, ai_api_keys: {} })
-      ? mergeAppSecrets({ ...appSecrets, ai_api_keys: {} }, storedSecrets)
+    for (const server of value.mcpServers) {
+      if (Object.keys(server.env).length > 0) {
+        await saveMcpEnvironmentSecret(server.id, server.env);
+      }
+    }
+    const redactedSecrets = { ...appSecrets, ai_api_keys: {}, mcp_env: {} };
+    const mergedSecrets = hasAnySecret(redactedSecrets)
+      ? mergeAppSecrets(redactedSecrets, storedSecrets)
       : storedSecrets;
     const nextSecrets = {
       ...mergedSecrets,
       ai_api_keys: {},
-      mcp_env: Object.fromEntries(
-        value.mcpServers
-          .filter((server) => Object.keys(server.env).length > 0)
-          .map((server) => [server.id, { ...server.env }]),
-      ),
+      mcp_env: {},
     };
     await saveAppSecrets(nextSecrets);
     aiProviderSecrets = await aiProviderSecretStatuses();
-    appSecrets = { ...nextSecrets, ai_api_keys: {} };
-    saveSettings(value);
+    mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
+    appSecrets = { ...nextSecrets, ai_api_keys: {}, mcp_env: {} };
+    saveSettings(settingsWithoutSecrets(value));
   }
 
   function flushUiState() {
@@ -4052,6 +4061,10 @@
   async function testSelectedMcpConnection() {
     if (!selectedServer) return;
     const serverId = selectedServer.id;
+    if (selectedServer.kind !== "jira" && Object.keys(selectedServer.env).length > 0) {
+      await saveMcpEnvironmentSecret(serverId, selectedServer.env);
+      mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
+    }
 
     const serverConfig =
       selectedServer.kind === "jira"
@@ -4060,7 +4073,8 @@
             command: selectedServer.command,
             args: selectedServer.args,
             scope_id: workspace?.id ?? "workspace-personal",
-            env: selectedServer.env,
+            env: {},
+            secret_id: serverId,
           };
     if (!serverConfig) return;
 
@@ -4096,6 +4110,10 @@
   async function disconnectSelectedMcpServer(): Promise<boolean> {
     if (!selectedServer) return false;
     const serverId = selectedServer.id;
+    if (selectedServer.kind !== "jira" && Object.keys(selectedServer.env).length > 0) {
+      await saveMcpEnvironmentSecret(serverId, selectedServer.env);
+      mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
+    }
     const serverConfig =
       selectedServer.kind === "jira"
         ? buildJiraConfig()?.server
@@ -4103,7 +4121,8 @@
             command: selectedServer.command,
             args: selectedServer.args,
             scope_id: workspace?.id ?? "workspace-personal",
-            env: selectedServer.env,
+            env: {},
+            secret_id: serverId,
           };
     if (!serverConfig) return false;
 
@@ -6357,6 +6376,7 @@
                       jiraBaseUrl={settings.jira.baseUrl}
                       jiraPrincipal={settings.jira.username}
                       jiraAuthMode={settings.jira.authMode}
+                      configuredEnvKeys={mcpEnvironmentSecrets[selectedServer.id] ?? []}
                       onUpdate={updateSelectedServer}
                       onError={(message) => (settingsError = message)}
                     />

@@ -233,8 +233,10 @@ async fn delete_recovery_snapshot(
 
 #[tauri::command]
 async fn test_mcp_server_connection(
-    config: McpServerConfig,
+    mut config: McpServerConfig,
+    secrets: State<'_, AppSecretsStore>,
 ) -> Result<McpConnectionStatus, String> {
+    resolve_mcp_secret_environment(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().test_mcp_connection(config)
     })
@@ -244,7 +246,11 @@ async fn test_mcp_server_connection(
 }
 
 #[tauri::command]
-async fn disconnect_mcp_server(config: McpServerConfig) -> Result<bool, String> {
+async fn disconnect_mcp_server(
+    mut config: McpServerConfig,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<bool, String> {
+    resolve_mcp_secret_environment(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().disconnect_mcp_server(config)
     })
@@ -606,6 +612,17 @@ fn resolve_ai_secrets(
     Ok(())
 }
 
+fn resolve_mcp_secret_environment(
+    config: &mut McpServerConfig,
+    secrets: &AppSecretsStore,
+) -> Result<(), String> {
+    let Some(secret_id) = config.secret_id.as_deref() else {
+        return Ok(());
+    };
+    config.env = secrets.mcp_environment(secret_id)?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn list_directory(
     workspace_id: String,
@@ -788,6 +805,27 @@ fn ai_provider_secret_statuses(
     store: State<'_, AppSecretsStore>,
 ) -> Result<std::collections::HashMap<String, bool>, String> {
     store.ai_provider_statuses()
+}
+
+#[tauri::command]
+fn mcp_environment_secret_statuses(
+    store: State<'_, AppSecretsStore>,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    store.mcp_environment_statuses()
+}
+
+#[tauri::command]
+async fn save_mcp_environment_secret(
+    server_id: String,
+    environment: std::collections::HashMap<String, String>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.save_mcp_environment(&server_id, environment)
+    })
+    .await
+    .map_err(|error| format!("Save MCP environment task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1384,6 +1422,8 @@ pub fn run() {
             save_app_secrets,
             ai_provider_secret_statuses,
             save_ai_provider_secret,
+            mcp_environment_secret_statuses,
+            save_mcp_environment_secret,
             load_cached_workspace,
             save_cached_workspace,
             save_execution_run,

@@ -6,6 +6,7 @@
     jiraBaseUrl = "",
     jiraPrincipal = "",
     jiraAuthMode = "api_token",
+    configuredEnvKeys = [],
     onUpdate,
     onError,
   }: {
@@ -13,6 +14,7 @@
     jiraBaseUrl?: string;
     jiraPrincipal?: string;
     jiraAuthMode?: "api_token" | "pat" | "password";
+    configuredEnvKeys?: string[];
     onUpdate: (values: Partial<McpServerSettings>) => void;
     onError: (message: string | null) => void;
   } = $props();
@@ -50,6 +52,16 @@
 
   function envValue(key: string): string {
     return server.env[key] ?? "";
+  }
+
+  function envPlaceholder(key: string, placeholder: string): string {
+    return configuredEnvKeys.includes(key) ? "Saved securely. Enter a new value to replace it." : placeholder;
+  }
+
+  function genericEnvPlaceholder(): string {
+    return configuredEnvKeys.length
+      ? `Saved securely: ${configuredEnvKeys.join(", ")}`
+      : "API_URL=https://service.company.id\nAPI_TOKEN=...";
   }
 </script>
 
@@ -138,7 +150,7 @@
       <label>
         <span>Kubeconfig Path</span>
         <input
-          placeholder="/home/user/.kube/config"
+           placeholder={envPlaceholder("KUBECONFIG", "/home/user/.kube/config")}
           value={envValue("KUBECONFIG")}
           oninput={(event) => updateEnvKey("KUBECONFIG", event.currentTarget.value)}
         />
@@ -147,7 +159,7 @@
         <label>
           <span>Cluster API Server</span>
           <input
-            placeholder="https://api.cluster:6443"
+           placeholder={envPlaceholder("OPENSHIFT_SERVER", "https://api.cluster:6443")}
             value={envValue("OPENSHIFT_SERVER")}
             oninput={(event) => updateEnvKey("OPENSHIFT_SERVER", event.currentTarget.value)}
           />
@@ -156,7 +168,7 @@
           <span>Token</span>
           <input
             type="password"
-            placeholder="OpenShift/Kubernetes token"
+             placeholder={envPlaceholder("OPENSHIFT_TOKEN", "OpenShift/Kubernetes token")}
             value={envValue("OPENSHIFT_TOKEN")}
             oninput={(event) => updateEnvKey("OPENSHIFT_TOKEN", event.currentTarget.value)}
           />
@@ -167,7 +179,7 @@
       <label>
         <span>Bamboo URL</span>
         <input
-          placeholder="https://bamboo.company.id"
+           placeholder={envPlaceholder("BAMBOO_URL", "https://bamboo.company.id")}
           value={envValue("BAMBOO_URL")}
           oninput={(event) => updateEnvKey("BAMBOO_URL", event.currentTarget.value)}
         />
@@ -176,7 +188,7 @@
         <label>
           <span>Username</span>
           <input
-            placeholder="user"
+           placeholder={envPlaceholder("BAMBOO_USERNAME", "user")}
             value={envValue("BAMBOO_USERNAME")}
             oninput={(event) => updateEnvKey("BAMBOO_USERNAME", event.currentTarget.value)}
           />
@@ -185,7 +197,7 @@
           <span>Token</span>
           <input
             type="password"
-            placeholder="Bamboo token"
+             placeholder={envPlaceholder("BAMBOO_TOKEN", "Bamboo token")}
             value={envValue("BAMBOO_TOKEN")}
             oninput={(event) => updateEnvKey("BAMBOO_TOKEN", event.currentTarget.value)}
           />
@@ -197,7 +209,7 @@
         <span>Environment</span>
         <textarea
           class="env-config"
-          placeholder="API_URL=https://service.company.id&#10;API_TOKEN=..."
+           placeholder={genericEnvPlaceholder()}
           oninput={(event) => updateEnv(event.currentTarget.value)}
           value={Object.entries(server.env)
             .map(([key, value]) => `${key}=${value}`)
