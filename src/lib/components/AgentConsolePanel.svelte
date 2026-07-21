@@ -100,7 +100,12 @@
   );
 
   function latestActivities() {
-    return logs.slice(-8).reverse();
+    const recent = logs.slice(-10);
+    return recent.filter((log, index) => {
+      if (index === 0) return true;
+      const previous = recent[index - 1];
+      return log.tone !== previous.tone || log.label !== previous.label || log.message !== previous.message;
+    });
   }
 
   function humanActivity(log: AgentRunLog): string {
@@ -109,7 +114,6 @@
       continue: "Agent continued the task",
       board: "Task moved into active work",
       model: "Agent is ready to work",
-      jira: "Task status updated",
       local: "Task prepared",
       context: "Task context prepared",
       agent: "Agent returned a result",
@@ -118,11 +122,28 @@
       approval: "Approval recorded",
       operator: "Note added",
       "manual-done": "Task marked complete",
+      files: "Workspace activity",
+      commands: "Command activity",
+      git: "Repository activity",
+      jira: "Jira activity",
+      kubernetes: "Kubernetes activity",
+      bamboo: "Deployment activity",
+      external: "External tool activity",
+      runtime: "Runtime activity",
     };
     return (
       labels[log.label] ??
       (log.tone === "error" ? "Task needs attention" : "Task activity recorded")
     );
+  }
+
+  function activityPresentation(log: AgentRunLog): { title: string; summary: string } {
+    const summary = log.message.match(/^SUMMARY:\s*(.+)$/im)?.[1]?.trim();
+    const title = humanActivity(log);
+    return {
+      title,
+      summary: summary || cleanLine(log.message.split("\n")[0]) || "Execution activity recorded.",
+    };
   }
 
   function userFacingActivity(
@@ -204,6 +225,18 @@
       failed: "Failed",
       skipped: "Skipped",
     }[status] ?? status;
+  }
+
+  function stepSummary(status: string): string {
+    return {
+      pending: "Waiting for the previous step to finish.",
+      ready: "Ready to begin.",
+      running: "This step is currently in progress.",
+      completed: "This step finished successfully.",
+      blocked: "This step needs attention before the task can continue.",
+      failed: "This step did not complete successfully.",
+      skipped: "This step was not needed.",
+    }[status] ?? "Execution status is being determined.";
   }
 
   function stepIcon(status: string) {
@@ -296,7 +329,7 @@
   {#if executionRun}
     <section class="console-section timeline-section" aria-label="Execution contract steps">
       <div class="section-heading static-heading">
-        <span>Execution contract</span><small>{executionRun.run_id}</small>
+        <span>Execution plan</span><small>{executionRun.contract.workflow.length} steps</small>
       </div>
       <div class="timeline">
         {#each executionRun.contract.workflow as step, index (step.step_id)}
@@ -316,7 +349,7 @@
               <div class="timeline-title">
                 <strong>{step.title}</strong><span>{stepStatusLabel(stepRun?.status ?? "pending")}</span>
               </div>
-              <p>{stepRun?.summary ?? `Step type: ${step.type}`}</p>
+              <p>{stepRun?.summary ?? stepSummary(stepRun?.status ?? "pending")}</p>
             </div>
           </article>
         {/each}
@@ -381,6 +414,7 @@
         <div class="empty-activity">The Agent will show meaningful progress here as it works.</div>
       {:else}
         {#each latestActivities() as log (log.id)}
+          {@const activity = activityPresentation(log)}
           <article
             class="activity-item"
             class:error={log.tone === "error"}
@@ -388,16 +422,20 @@
           >
             <span class="activity-marker"><span></span></span>
             <div class="activity-copy">
-              <div><strong>{humanActivity(log)}</strong><time>{log.at}</time></div>
-              {#if expandedActivities[log.id]}<details open>
-                  <summary>Details</summary>
+              <div class="activity-heading"><strong>{activity.title}</strong><time>{log.at}</time></div>
+              <p class="activity-summary">{activity.summary}</p>
+              {#if expandedActivities[log.id]}
+                <div class="activity-details">
+                  <span>Technical details</span>
                   <pre>{log.message}</pre>
-                </details>{/if}
+                </div>
+              {/if}
             </div>
             <button
               class="activity-expand"
               type="button"
-              aria-label="Show activity details"
+              aria-label={expandedActivities[log.id] ? "Hide activity details" : "Show activity details"}
+              aria-expanded={expandedActivities[log.id] ?? false}
               onclick={() => toggleActivity(log.id)}
               ><ChevronDown size={14} class={expandedActivities[log.id] ? "rotated" : ""} /></button
             >
@@ -894,6 +932,9 @@
     justify-content: space-between;
     gap: 8px;
   }
+  .activity-heading {
+    min-height: 16px;
+  }
   .activity-copy strong {
     display: block;
     overflow: hidden;
@@ -907,19 +948,30 @@
     color: #70687a;
     font-size: 10px;
   }
+  .activity-summary {
+    margin: 3px 0 0;
+    color: #a9a1b7;
+    font-size: 11px;
+    line-height: 1.4;
+  }
   .activity-expand {
     display: inline-flex;
     border: 0;
     background: transparent;
     color: #777080;
   }
-  .activity-copy details {
+  .activity-details {
     margin-top: 6px;
+    padding: 7px 8px;
+    border-left: 2px solid #393246;
+    background: rgba(23, 20, 31, 0.7);
   }
-  .activity-copy summary {
-    color: #978ca5;
-    font-size: 10px;
-    cursor: pointer;
+  .activity-details > span {
+    color: #756d80;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
   .activity-copy pre,
   .technical-body pre {
