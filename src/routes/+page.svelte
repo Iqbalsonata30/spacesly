@@ -2787,6 +2787,7 @@
     aiEditError = null;
     aiEditProposal = null;
     aiEditSelectedHunkIds = [];
+    let lastEditEventSequence = 0;
     try {
       const run = await beginAiRun("edit");
       if (requestId !== aiEditRequestId) {
@@ -2813,6 +2814,15 @@
             .filter(Boolean)
             .join(": "),
         ),
+      }, (event) => {
+        if (event.run_id !== run.run_id || requestId !== aiEditRequestId) return;
+        if (event.sequence <= lastEditEventSequence) return;
+        lastEditEventSequence = event.sequence;
+        if (event.type === "run_failed") {
+          aiEditError = "AI Edit generation failed in the backend runtime.";
+        } else if (event.type === "run_cancelled") {
+          aiEditError = "AI Edit generation was cancelled.";
+        }
       });
       if (requestId !== aiEditRequestId) return;
       const proposal = createAiEditProposal({

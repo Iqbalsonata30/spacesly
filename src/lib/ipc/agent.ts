@@ -266,11 +266,14 @@ export async function chatAiWorker(
 export async function proposeAiEdit(
   config: AiWorkerConfig,
   request: AiEditRequest,
+  onEvent: (event: AiRuntimeEvent) => void,
 ): Promise<AiEditResult> {
   const runId = request.run_id ?? (await beginAiRun("edit")).run_id;
+  const channel = new Channel<AiRuntimeEvent>();
+  channel.onmessage = onEvent;
   return invokeWithPolicy<AiEditResult>(
     "propose_ai_edit",
-    { config, request: { ...request, run_id: runId } },
+    { config, request: { ...request, run_id: runId }, onEvent: channel },
     IPC_POLICIES.aiEdit,
   );
 }

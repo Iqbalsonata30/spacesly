@@ -705,6 +705,7 @@ async fn propose_ai_edit(
     request: AiEditRequest,
     ai_runs: State<'_, AiRunRegistry>,
     secrets: State<'_, AppSecretsStore>,
+    on_event: Channel<AiRuntimeEvent>,
 ) -> Result<AiEditResult, String> {
     let mut config = config;
     resolve_ai_secrets(&mut config, secrets.inner())?;
@@ -716,6 +717,13 @@ async fn propose_ai_edit(
         .get(&run_id)?
         .ok_or_else(|| "AI edit run was not registered.".to_string())?;
     ai_runs.start(&run.run_id)?;
+    emit_ai_event(
+        Some(&on_event),
+        AiRuntimeEvent::RunStarted {
+            run_id: run.run_id.clone(),
+            sequence: 1,
+        },
+    );
     let cancellation = ai_runs.cancellation(&run.run_id)?;
     let run_id = run.run_id.clone();
     let runtime = ai_runs.inner().clone();
@@ -727,6 +735,14 @@ async fn propose_ai_edit(
         Ok(result) => result,
         Err(error) => {
             let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            emit_ai_event(
+                Some(&on_event),
+                AiRuntimeEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    sequence: 2,
+                    error_code: "edit_worker_join_failed".to_string(),
+                },
+            );
             return Err(format!("AI edit proposal task failed: {error}"));
         }
     };
@@ -737,10 +753,24 @@ async fn propose_ai_edit(
                 .is_some_and(|run| run.status == AiRunStatus::Cancelling)
             {
                 let _ = runtime.finish(&run_id, AiRunStatus::Cancelled);
+                emit_ai_event(
+                    Some(&on_event),
+                    AiRuntimeEvent::RunCancelled {
+                        run_id: run_id.clone(),
+                        sequence: 2,
+                    },
+                );
                 return Err("AI edit run was cancelled.".to_string());
             }
             value.run_id = run_id.clone();
             let _ = runtime.finish(&run_id, AiRunStatus::Completed);
+            emit_ai_event(
+                Some(&on_event),
+                AiRuntimeEvent::RunCompleted {
+                    run_id: run_id.clone(),
+                    sequence: 2,
+                },
+            );
             Ok(value)
         }
         Err(error) => {
@@ -750,6 +780,19 @@ async fn propose_ai_edit(
                 AiRunStatus::Failed
             };
             let _ = runtime.finish(&run_id, status);
+            let event = if status == AiRunStatus::Cancelled {
+                AiRuntimeEvent::RunCancelled {
+                    run_id: run_id.clone(),
+                    sequence: 2,
+                }
+            } else {
+                AiRuntimeEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    sequence: 2,
+                    error_code: "edit_generation_failed".to_string(),
+                }
+            };
+            emit_ai_event(Some(&on_event), event);
             Err(error)
         }
     }
