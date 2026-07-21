@@ -3357,46 +3357,71 @@
     }
   }
 
-  function appendWorkspaceChat(message: Omit<WorkspaceChatMessage, "id">) {
+  function appendWorkspaceChat(
+    message: Omit<WorkspaceChatMessage, "id">,
+    targetSessionId = workspaceChatActiveSessionId,
+  ) {
+    const session = workspaceChatSessions.find((entry) => entry.id === targetSessionId);
+    if (!session) return;
     const entry: WorkspaceChatMessage = {
       ...message,
-      id: `chat-${Date.now().toString(36)}-${workspaceChatMessages.length}`,
+      id: `chat-${Date.now().toString(36)}-${session.messages.length}`,
     };
-    workspaceChatMessages = capList([...workspaceChatMessages, entry], MAX_WORKSPACE_CHAT_MESSAGES);
-    workspaceChatSession = {
-      ...workspaceChatSession,
+    const updatedSession = {
+      ...session,
       updatedAt: Date.now(),
-      messages: workspaceChatMessages,
+      messages: capList([...session.messages, entry], MAX_WORKSPACE_CHAT_MESSAGES),
       title:
-        isGenericChatTitle(workspaceChatSession.title) && message.role === "user"
+        isGenericChatTitle(session.title) && message.role === "user"
           ? summarizeChatTitle(message.text)
-          : workspaceChatSession.title,
+          : session.title,
     };
-    syncWorkspaceChatSession();
+    workspaceChatSessions = [
+      updatedSession,
+      ...workspaceChatSessions.filter((entry) => entry.id !== targetSessionId),
+    ].slice(0, MAX_CHAT_SESSIONS);
+    if (targetSessionId === workspaceChatActiveSessionId) {
+      workspaceChatSession = updatedSession;
+      workspaceChatMessages = updatedSession.messages;
+    }
     appendWorkspaceChatActivity({
       kind: "message",
       label: message.role,
       text: message.text,
-    });
+    }, targetSessionId);
     saveUiState();
     scrollWorkspaceChatToLatest();
   }
 
-  function appendWorkspaceChatActivity(activity: Omit<WorkspaceChatActivity, "id" | "at">) {
+  function appendWorkspaceChatActivity(
+    activity: Omit<WorkspaceChatActivity, "id" | "at">,
+    targetSessionId = workspaceChatActiveSessionId,
+  ) {
+    const session = workspaceChatSessions.find((entry) => entry.id === targetSessionId);
+    if (!session) return;
     const entry: WorkspaceChatActivity = {
       ...activity,
-      id: `chat-activity-${Date.now().toString(36)}-${workspaceChatSession.activities.length}`,
+      id: `chat-activity-${Date.now().toString(36)}-${session.activities.length}`,
       at: Date.now(),
     };
-    workspaceChatSession = {
-      ...workspaceChatSession,
+    const updatedSession = {
+      ...session,
       updatedAt: Date.now(),
       activities: capList(
-        [...workspaceChatSession.activities, entry],
+        [...session.activities, entry],
         MAX_WORKSPACE_CHAT_ACTIVITIES,
       ),
     };
-    syncWorkspaceChatSession();
+    workspaceChatSessions = [
+      updatedSession,
+      ...workspaceChatSessions.filter((entry) => entry.id !== targetSessionId),
+    ].slice(0, MAX_CHAT_SESSIONS);
+    if (targetSessionId === workspaceChatActiveSessionId) {
+      workspaceChatSession = {
+        ...workspaceChatSession,
+        ...updatedSession,
+      };
+    }
     saveUiState();
   }
 
@@ -3408,19 +3433,26 @@
     };
     workspaceChatSession = normalizedSession;
     workspaceChatActiveSessionId = normalizedSession.id;
-    workspaceChatSessions = capList(
-      [
-        normalizedSession,
-        ...workspaceChatSessions.filter((session) => session.id !== normalizedSession.id),
-      ],
-      MAX_CHAT_SESSIONS,
-    );
+    workspaceChatSessions = [
+      normalizedSession,
+      ...workspaceChatSessions.filter((session) => session.id !== normalizedSession.id),
+    ].slice(0, MAX_CHAT_SESSIONS);
+  }
+
+  function cancelWorkspaceChatOnSessionChange() {
+    if (!workspaceChatRunning) return;
+    workspaceChatRequestId += 1;
+    const runId = workspaceChatRunId;
+    workspaceChatRunId = null;
+    workspaceChatRunning = false;
+    if (runId) void cancelAiRun(runId).catch(() => {});
   }
 
   function activateWorkspaceChatSession(sessionId: string) {
     const session = workspaceChatSessions.find((entry) => entry.id === sessionId);
     if (!session || session.id === workspaceChatActiveSessionId) return;
 
+    cancelWorkspaceChatOnSessionChange();
     workspaceChatActiveSessionId = session.id;
     workspaceChatSession = {
       ...session,
@@ -3434,9 +3466,10 @@
   }
 
   function startWorkspaceChatSession() {
+    cancelWorkspaceChatOnSessionChange();
     const sessionNumber = workspaceChatSessions.length + 1;
     const session = createWorkspaceChatSession([], `Chat ${sessionNumber}`);
-    workspaceChatSessions = capList([session, ...workspaceChatSessions], MAX_CHAT_SESSIONS);
+    workspaceChatSessions = [session, ...workspaceChatSessions].slice(0, MAX_CHAT_SESSIONS);
     workspaceChatActiveSessionId = session.id;
     workspaceChatSession = session;
     workspaceChatMessages = session.messages;
@@ -3681,9 +3714,12 @@
   async function sendWorkspaceChat() {
     const message = workspaceChatTextarea?.value.trim() ?? "";
     if (!message || workspaceChatRunning) return;
+    const requestSessionId = workspaceChatActiveSessionId;
+    const requestSessionContext = workspaceChatSessionPromptContext();
+    const requestTerminalContext = workspaceAgentContext(activeBoard);
 
     if (workspaceChatTextarea) workspaceChatTextarea.value = "";
-    appendWorkspaceChat({ role: "user", text: message });
+    appendWorkspaceChat({ role: "user", text: message }, requestSessionId);
     focusWorkspaceChatInput();
 
     const localActions = fastWorkspaceChatActions(message, workspaceChatActionContext());
@@ -3693,12 +3729,12 @@
         appendWorkspaceChat({
           role: "system",
           text: "Review and approve the proposed workspace actions before they run.",
-        });
+        }, requestSessionId);
         focusWorkspaceChatInput();
         return;
       }
       const actionSummary = await applyWorkspaceChatActions(localActions);
-      appendWorkspaceChat({ role: "system", text: actionSummary });
+      appendWorkspaceChat({ role: "system", text: actionSummary }, requestSessionId);
       focusWorkspaceChatInput();
       return;
     }
@@ -3720,24 +3756,27 @@
       const result = await chatAiWorker(config, {
         run_id: run.run_id,
         message,
-        terminal_context: workspaceAgentContext(activeBoard),
-        session_context: workspaceChatSessionPromptContext(),
-        session_key: `chat:${workspaceChatSession.id}`,
+        terminal_context: requestTerminalContext,
+        session_context: requestSessionContext,
+        session_key: `chat:${requestSessionId}`,
       });
       if (requestId !== workspaceChatRequestId) return;
       const response = result.message;
       const actions = extractWorkspaceActions(response);
-      appendWorkspaceChat({ role: "agent", text: stripWorkspaceActions(response) });
+      appendWorkspaceChat(
+        { role: "agent", text: stripWorkspaceActions(response) },
+        requestSessionId,
+      );
       if (actions.length > 0) {
         if (actions.some(workspaceChatActionRequiresConfirmation)) {
           proposeWorkspaceChatActions(actions, "model", result.run_id);
-          appendWorkspaceChat({
-            role: "system",
-            text: "The AI proposed workspace mutations. Review them before applying.",
-          });
+            appendWorkspaceChat({
+              role: "system",
+              text: "The AI proposed workspace mutations. Review them before applying.",
+            }, requestSessionId);
         } else {
           const actionSummary = await applyWorkspaceChatActions(actions);
-          appendWorkspaceChat({ role: "system", text: actionSummary });
+          appendWorkspaceChat({ role: "system", text: actionSummary }, requestSessionId);
         }
       }
     } catch (reason) {
@@ -3748,7 +3787,7 @@
       appendWorkspaceChat({
         role: "system",
         text: reason instanceof Error ? reason.message : String(reason),
-      });
+      }, requestSessionId);
     } finally {
       if (requestId === workspaceChatRequestId) {
         workspaceChatRunId = null;

@@ -158,13 +158,21 @@ export function loadUiState(
       ? parsed.workspaceChatSessions.filter(isWorkspaceChatSession)
       : [];
     const sessions = dedupeChatSessions(
-      sessionEntries.length > 0
+        sessionEntries.length > 0
         ? sessionEntries
         : legacySession
-          ? [legacySession]
+          ? [
+              {
+                ...legacySession,
+                messages:
+                  legacySession.messages.length > 0
+                    ? legacySession.messages
+                    : messages.length > 0
+                      ? messages
+                      : defaults.chatMessages,
+              },
+            ]
           : [fallbackSession],
-      messages,
-      defaults.chatMessages,
     );
     const activeSessionId =
       typeof parsed.workspaceChatActiveSessionId === "string"
@@ -172,12 +180,7 @@ export function loadUiState(
         : (sessions[0]?.id ?? fallbackSession.id);
     const activeSession =
       sessions.find((session) => session.id === activeSessionId) ?? sessions[0] ?? fallbackSession;
-    const sessionMessages =
-      activeSession.messages.length > 0
-        ? activeSession.messages
-        : messages.length > 0
-          ? messages
-          : defaults.chatMessages;
+    const sessionMessages = activeSession.messages;
 
     return {
       workspaceMode: normalizeWorkspaceMode(parsed.workspaceMode),
@@ -216,19 +219,12 @@ export function loadUiState(
 
 function dedupeChatSessions(
   sessions: WorkspaceChatSession[],
-  messages: WorkspaceChatMessage[],
-  fallbackMessages: WorkspaceChatMessage[],
 ): WorkspaceChatSession[] {
   const merged = new Map<string, WorkspaceChatSession>();
   for (const session of sessions) {
     merged.set(session.id, {
       ...session,
-      messages:
-        session.messages.length > 0
-          ? session.messages
-          : messages.length > 0
-            ? messages
-            : fallbackMessages,
+      messages: session.messages,
     });
   }
 

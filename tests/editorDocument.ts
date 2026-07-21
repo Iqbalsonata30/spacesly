@@ -30,6 +30,11 @@ import {
   editorNavigationTarget,
   pushEditorLocation,
 } from "../src/lib/editorNavigation";
+import {
+  createWorkspaceChatSession,
+  loadUiState,
+  type WorkspaceChatMessage,
+} from "../src/lib/uiState";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -331,4 +336,44 @@ assertEqual(
     backCanForward: true,
   },
   "editor definition navigation should preserve back and forward history",
+);
+
+const chatSessions = Array.from({ length: 7 }, (_, index) => {
+  const session = createWorkspaceChatSession([] , `Chat ${index + 1}`);
+  return { ...session, id: `session-${index + 1}`, updatedAt: index + 1 };
+});
+const chatStorage = {
+  getItem: () =>
+    JSON.stringify({
+      workspaceChatSessions: chatSessions,
+      workspaceChatActiveSessionId: "session-7",
+      workspaceChatMessages: [],
+    }),
+} as unknown as Storage;
+const loadedChatState = loadUiState(chatStorage, { chatMessages: [] });
+assertEqual(
+  loadedChatState.workspaceChatSessions.map((session) => session.id),
+  ["session-7", "session-6", "session-5", "session-4", "session-3", "session-2"],
+  "chat session retention should keep the six newest sessions",
+);
+
+const emptySession = createWorkspaceChatSession([], "Empty");
+const fullSession = createWorkspaceChatSession(
+  [{ id: "full-message", role: "user", text: "Full session history" } satisfies WorkspaceChatMessage],
+  "Full",
+);
+fullSession.id = "session-full";
+const isolatedStorage = {
+  getItem: () =>
+    JSON.stringify({
+      workspaceChatSessions: [emptySession, fullSession],
+      workspaceChatActiveSessionId: emptySession.id,
+      workspaceChatMessages: fullSession.messages,
+    }),
+} as unknown as Storage;
+const isolatedState = loadUiState(isolatedStorage, { chatMessages: [] });
+assertEqual(
+  isolatedState.workspaceChatSessions.find((session) => session.id === emptySession.id)?.messages,
+  [],
+  "explicitly empty chat sessions should not inherit another session history",
 );
