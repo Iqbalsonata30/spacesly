@@ -35,6 +35,7 @@ import {
   loadUiState,
   type WorkspaceChatMessage,
 } from "../src/lib/uiState";
+import { formatJiraExecutionComment } from "../src/lib/jiraComment";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -376,4 +377,71 @@ assertEqual(
   isolatedState.workspaceChatSessions.find((session) => session.id === emptySession.id)?.messages,
   [],
   "explicitly empty chat sessions should not inherit another session history",
+);
+
+const jiraComment = formatJiraExecutionComment({
+  request: "Deploy the three services to prerelease",
+  result: {
+    summary: "Three services were deployed and the required configuration was verified.",
+    evidence: [
+      "All pods are ready",
+      "contract_id=contract-123 current_step=worker.execute",
+      "Automated checks passed",
+    ],
+    details: [
+      "Added BG_MAPPING_SERVICE to the required ConfigMaps",
+      "worker.execute completed",
+    ],
+    next: [],
+    completion_status: "completed",
+    blocked_reason: null,
+  },
+  runtime: "OpenCode",
+  model: "deepseek-v4-flash-free",
+  environment: "prerelease",
+  revision: "9a66bb095",
+});
+assertEqual(
+  [
+    jiraComment.indexOf("h3. Executive Summary"),
+    jiraComment.indexOf("h3. Result"),
+    jiraComment.indexOf("h3. What Changed"),
+    jiraComment.indexOf("h3. Verification"),
+    jiraComment.indexOf("h3. Required Action"),
+  ].every((index, position, values) => index >= 0 && (position === 0 || index > values[position - 1])),
+  true,
+  "Jira execution comments should use outcome-first section ordering",
+);
+assertEqual(
+  {
+    success: jiraComment.includes("✅ Success"),
+    none: jiraComment.includes("None."),
+    hidesInternalState: !jiraComment.includes("contract-123") && !jiraComment.includes("worker.execute"),
+    technicalEvidence: jiraComment.includes("Technical Evidence"),
+  },
+  { success: true, none: true, hidesInternalState: true, technicalEvidence: true },
+  "Jira execution comments should prioritize readable outcomes and hide internal state",
+);
+
+const partialJiraComment = formatJiraExecutionComment({
+  request: "Update the deployment configuration",
+  result: {
+    summary: "Configuration was updated, but deployment verification was blocked.",
+    evidence: ["Configuration file was updated"],
+    details: [],
+    next: [],
+    completion_status: "blocked",
+    blocked_reason: "Deployment health could not be verified.",
+  },
+  runtime: "OpenCode",
+  model: "model",
+  environment: "prerelease",
+});
+assertEqual(
+  {
+    partial: partialJiraComment.includes("⚠️ Partial Success"),
+    action: partialJiraComment.includes("Deployment health could not be verified."),
+  },
+  { partial: true, action: true },
+  "blocked execution comments should communicate partial outcome and required action",
 );

@@ -198,6 +198,7 @@
     type AppSecrets,
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
+  import { formatJiraExecutionComment } from "$lib/jiraComment";
   import { opencodeModelOptions } from "$lib/opencodeModels";
   import {
     cachedWorkspaceSizeBytes,
@@ -5392,89 +5393,24 @@
   function agentJiraComment(
     result: AiWorkerTaskResult,
     config: AiWorkerConfig,
+    request: string,
     gitInfo: GitWorkspaceInfo | null = null,
   ): string {
     const runtime = config.runtime === "opencode" ? "OpenCode" : config.provider_name;
     const model = config.runtime === "opencode" ? config.opencode_model : config.model;
-    const verification =
-      result.evidence.length > 0
-        ? uniqueLines(result.evidence.map(userFacingVerification).filter(Boolean)).slice(0, 4)
-        : ["Verification was not reported."];
-    const nextSteps = result.next
-      .map((line) => singleLine(line, 300))
-      .filter(
-        (line) =>
-          line &&
-          !/^review the (result|evidence)/i.test(line) &&
-          !/^keep or sync the completed/i.test(line),
-      );
-    const operationalDetails = [
-      `Runtime: ${runtime}`,
-      `Model: ${model}`,
-      `Environment: ${config.runtime === "opencode" ? config.opencode_workdir || "OpenCode workspace" : "API Agent"}`,
-      ...(gitInfo?.current_branch ? [`Branch: ${gitInfo.current_branch}`] : []),
-      ...(gitInfo?.head_commit ? [`Revision: ${gitInfo.head_commit}`] : []),
-      ...(gitInfo?.upstream_branch ? [`Upstream: ${gitInfo.upstream_branch}`] : []),
-    ];
-    const evidence = [
-      `Completion status: ${result.completion_status}`,
-      ...(result.evidence.length > 0
-        ? [
-            "Verification evidence:",
-            ...result.evidence.map((line) => `* ${jiraWikiText(line, 900)}`),
-          ]
-        : []),
-      ...(result.details.length > 0
-        ? ["Execution details:", ...result.details.map((line) => `* ${jiraWikiText(line, 900)}`)]
-        : []),
-      ...(result.blocked_reason
-        ? [`Blocked reason: ${jiraWikiText(result.blocked_reason, 900)}`]
-        : []),
-      ...(result.next.length > 0
-        ? ["Reported follow-up:", ...result.next.map((line) => `* ${jiraWikiText(line, 900)}`)]
-        : []),
-    ];
-
-    return [
-      "h3. Task completed",
-      "",
-      `*${jiraWikiText(result.summary, 500)}*`,
-      "",
-      result.evidence.length > 0 ? "Verification passed." : "Verification was not reported.",
-      ...verification.map((line) => `* ${jiraWikiText(line, 300)}`),
-      "",
-      "Action needed: " + (nextSteps.length > 0 ? "see below." : "No action is required."),
-      ...(nextSteps.length > 0 ? nextSteps.map((line) => `* ${jiraWikiText(line, 300)}`) : []),
-      "",
-      "{expand:title=Operational details}",
-      ...operationalDetails.map((line) => `* ${jiraWikiText(line, 500)}`),
-      "{expand}",
-      "",
-      "{expand:title=Execution evidence}",
-      ...evidence,
-      "{expand}",
-    ].join("\n");
-  }
-
-  function userFacingVerification(value: string): string {
-    const line = singleLine(value, 300);
-    const normalized = line.toLowerCase();
-    if (/(bamboo|pipeline|build)/i.test(normalized))
-      return "Build pipeline completed successfully.";
-    if (/(openshift|kubernetes|ocp|pod|deployment|rollout)/i.test(normalized))
-      return "Deployment health was verified.";
-    if (/(test|lint|check|typecheck|compile)/i.test(normalized)) return "Automated checks passed.";
-    if (/(commit|push|upstream|branch)/i.test(normalized))
-      return "Repository changes were committed and synchronized.";
-    return line;
-  }
-
-  function uniqueLines(lines: string[]): string[] {
-    return [...new Set(lines.map((line) => line.trim()).filter(Boolean))];
-  }
-
-  function jiraWikiText(value: string, maxLength: number): string {
-    return singleLine(value, maxLength).replaceAll("{", "&#123;").replaceAll("}", "&#125;");
+    return formatJiraExecutionComment({
+      request,
+      result,
+      runtime,
+      model,
+      environment:
+        config.runtime === "opencode"
+          ? config.opencode_workdir || "OpenCode workspace"
+          : "API Agent",
+      branch: gitInfo?.current_branch,
+      revision: gitInfo?.head_commit,
+      upstream: gitInfo?.upstream_branch,
+    });
   }
 
   function agentWritebackRequiresPushedCommit(card: CardProjection): boolean {
@@ -6209,7 +6145,7 @@
           await addJiraComment(
             jiraConfig,
             issueKey,
-            agentJiraComment(result, config, gitWritebackInfo),
+            agentJiraComment(result, config, card.title, gitWritebackInfo),
           );
           updateExecutionRunForCard(cardId, (run) =>
             updateExecutionStep(
