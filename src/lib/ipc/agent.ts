@@ -177,6 +177,7 @@ export async function grantAiRunCapabilities(
     | "shell"
     | "git"
     | "external_tools"
+    | `external_tools:${string}`
   )[],
 ): Promise<void> {
   return invokeWithPolicy<void>(

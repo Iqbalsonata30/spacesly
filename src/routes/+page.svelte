@@ -5780,7 +5780,7 @@
         "workspace_write",
         "shell",
         "git",
-        ...(config.mcp_servers.length > 0 ? ["external_tools"] : []),
+        ...config.mcp_servers.map((server) => `external_tools:${server.secret_id}`),
       ] as ("workspace_read" | "workspace_write" | "shell" | "git" | "external_tools")[];
       await grantAiRunCapabilities(runId, grantedCapabilities);
     } catch (reason) {

@@ -58,8 +58,17 @@ impl ExecutionStore {
                    PRIMARY KEY (run_id, step_id),
                    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE CASCADE
                  );
-                 CREATE INDEX IF NOT EXISTS idx_execution_runs_status
-                   ON execution_runs(status);",
+                  CREATE INDEX IF NOT EXISTS idx_execution_runs_status
+                    ON execution_runs(status);
+                  CREATE TABLE IF NOT EXISTS ai_audit_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_ai_audit_events_run
+                    ON ai_audit_events(run_id, event_id);",
             )
             .map_err(|error| format!("Failed to initialize execution database: {error}"))?;
         // Keep databases created by earlier builds usable without destructive migrations.
@@ -250,6 +259,25 @@ impl ExecutionStore {
     pub fn get(&self, run_id: &str) -> Result<Option<ExecutionRun>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         load_run(&connection, run_id)
+    }
+
+    pub fn record_ai_audit(
+        &self,
+        run_id: Option<&str>,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|error| format!("Failed to encode AI audit payload: {error}"))?;
+        connection
+            .execute(
+                "INSERT INTO ai_audit_events (run_id, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![run_id, event_type, payload_json, now_millis()?.to_string()],
+            )
+            .map_err(|error| format!("Failed to record AI audit event: {error}"))?;
+        Ok(())
     }
 
     pub fn list_active(&self) -> Result<Vec<ExecutionRun>, String> {

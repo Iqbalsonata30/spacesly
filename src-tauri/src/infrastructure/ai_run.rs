@@ -118,13 +118,7 @@ impl AiRunRegistry {
         run_id: &str,
         capabilities: Vec<String>,
     ) -> Result<(), String> {
-        const ALLOWED: [&str; 5] = [
-            "workspace_read",
-            "workspace_write",
-            "shell",
-            "git",
-            "external_tools",
-        ];
+        const ALLOWED: [&str; 4] = ["workspace_read", "workspace_write", "shell", "git"];
         let state = self.state.lock().map_err(|error| error.to_string())?;
         let run = state
             .get(run_id)
@@ -137,9 +131,11 @@ impl AiRunRegistry {
             .map(|value| value.trim().to_string())
             .collect::<HashSet<_>>();
         if capabilities.is_empty()
-            || capabilities
-                .iter()
-                .any(|value| !ALLOWED.contains(&value.as_str()))
+            || capabilities.iter().any(|value| {
+                !ALLOWED.contains(&value.as_str())
+                    && !value.starts_with("external_tools:")
+                    && value.len() > "external_tools:".len()
+            })
         {
             return Err("AI capability grant contains an unsupported capability.".to_string());
         }
@@ -159,7 +155,10 @@ impl AiRunRegistry {
         let granted = grants
             .get(run_id)
             .ok_or_else(|| "Agent capability approval is required before execution.".to_string())?;
-        if required.iter().any(|value| !granted.contains(*value)) {
+        if required.iter().any(|value| {
+            !granted.contains(*value)
+                && !(value.starts_with("external_tools:") && granted.contains(*value))
+        }) {
             return Err("Agent capability approval does not cover this execution.".to_string());
         }
         Ok(())

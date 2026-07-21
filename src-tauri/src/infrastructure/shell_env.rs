@@ -6,7 +6,34 @@ use std::sync::OnceLock;
 /// Injects the user's login shell environment into a spawned command.
 pub fn inject_shell_env(command: &mut Command) {
     let env = shell_env();
-    command.envs(&env.vars);
+    command.env_clear();
+    command.envs(
+        env.vars
+            .iter()
+            .filter(|(key, _)| is_safe_runtime_env_key(key)),
+    );
+}
+
+fn is_safe_runtime_env_key(key: &str) -> bool {
+    let normalized = key.to_ascii_uppercase();
+    matches!(
+        normalized.as_str(),
+        "PATH"
+            | "HOME"
+            | "USERPROFILE"
+            | "TEMP"
+            | "TMP"
+            | "TMPDIR"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "LC_COLLATE"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_CACHE_HOME"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+    )
 }
 
 fn shell_env() -> &'static ShellEnv {
@@ -75,4 +102,18 @@ fn parse_env_output(stdout: &str, delimiter: &str) -> Option<HashMap<String, Str
     }
 
     Some(vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_runtime_env_key;
+
+    #[test]
+    fn shell_environment_allowlist_excludes_credentials() {
+        assert!(is_safe_runtime_env_key("PATH"));
+        assert!(is_safe_runtime_env_key("lc_all"));
+        assert!(!is_safe_runtime_env_key("AWS_ACCESS_KEY_ID"));
+        assert!(!is_safe_runtime_env_key("OPENAI_API_KEY"));
+        assert!(!is_safe_runtime_env_key("SSH_AUTH_SOCK"));
+    }
 }

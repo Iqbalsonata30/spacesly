@@ -370,8 +370,14 @@ fn grant_ai_run_capabilities(
     run_id: String,
     capabilities: Vec<String>,
     ai_runs: State<'_, AiRunRegistry>,
+    execution_store: State<'_, ExecutionStore>,
 ) -> Result<(), String> {
-    ai_runs.grant_capabilities(&run_id, capabilities)
+    ai_runs.grant_capabilities(&run_id, capabilities.clone())?;
+    let payload = serde_json::json!({
+        "capabilities": capabilities,
+        "source": "operator_confirmation",
+    });
+    execution_store.record_ai_audit(Some(&run_id), "capabilities_granted", &payload)
 }
 
 #[tauri::command]
@@ -403,11 +409,14 @@ async fn execute_ai_worker_task(
     if submitted_contract != &persisted_run.contract {
         return Err("Execution contract does not match the persisted run.".to_string());
     }
-    let mut required_capabilities = vec!["workspace_read", "workspace_write", "shell", "git"];
-    if !config.mcp_servers.is_empty() {
-        required_capabilities.push("external_tools");
+    ai_runs.require_capabilities(
+        &run_id,
+        &["workspace_read", "workspace_write", "shell", "git"],
+    )?;
+    for server in &config.mcp_servers {
+        let capability = format!("external_tools:{}", server.secret_id);
+        ai_runs.require_capabilities(&run_id, &[capability.as_str()])?;
     }
-    ai_runs.require_capabilities(&run_id, &required_capabilities)?;
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
