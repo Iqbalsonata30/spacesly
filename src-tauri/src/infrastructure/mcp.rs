@@ -116,7 +116,7 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
 fn validate_proxy_tool_call(
     message: &Value,
     exposed_tools: &Mutex<Vec<String>>,
-) -> Result<(), String> {
+) -> Result<super::tool_broker::ToolRisk, String> {
     let params = message
         .get("params")
         .ok_or_else(|| "MCP tool call did not include params.".to_string())?;
@@ -647,6 +647,7 @@ struct McpSessionEntry {
 #[derive(Default)]
 struct McpSessionManager {
     sessions: Mutex<HashMap<String, McpSessionEntry>>,
+    initializations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 static MCP_SESSIONS: OnceLock<McpSessionManager> = OnceLock::new();
@@ -704,15 +705,29 @@ where
     let session = if let Some(session) = session {
         session
     } else {
-        let client = StdioMcpClient::start(server)?;
-        client.initialize()?;
-        client.tools()?;
-        let candidate = Arc::new(client);
-        let (session, evicted) = {
-            let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
-            if let Some(existing) = sessions.get(&key) {
-                (Arc::clone(&existing.client), Vec::new())
-            } else {
+        let initialization = manager
+            .initializations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _initialization_guard = initialization.lock().map_err(|error| error.to_string())?;
+        if let Some(existing) = manager
+            .sessions
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(&key)
+            .map(|entry| Arc::clone(&entry.client))
+        {
+            existing
+        } else {
+            let client = StdioMcpClient::start(server)?;
+            client.initialize()?;
+            client.tools()?;
+            let candidate = Arc::new(client);
+            let evicted = {
+                let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
                 let evicted = evict_oldest_idle_session(&mut sessions, now);
                 if sessions.len() >= MCP_MAX_SESSIONS {
                     return Err(format!(
@@ -726,11 +741,11 @@ where
                         last_used: now,
                     },
                 );
-                (candidate, evicted)
-            }
-        };
-        drop(evicted);
-        session
+                evicted
+            };
+            drop(evicted);
+            candidate
+        }
     };
 
     let result = operation(&session).map_err(|error| redact_mcp_diagnostic(&error, &server.env));
@@ -739,14 +754,28 @@ where
     let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
     if let Some(entry) = sessions.get_mut(&key) {
         if Arc::ptr_eq(&entry.client, &session) {
-            if alive && result.is_ok() {
+            if alive
+                && result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|error| !mcp_error_invalidates_session(error))
+            {
                 entry.last_used = Instant::now();
-            } else if !alive || result.is_err() {
+            } else {
                 sessions.remove(&key);
             }
         }
     }
     result
+}
+
+fn mcp_error_invalidates_session(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out waiting for mcp response")
+        || error.contains("mcp protocol reader failed")
+        || error.contains("mcp stdout closed")
+        || error.contains("failed to write mcp")
+        || error.contains("failed to flush mcp")
 }
 
 fn reap_idle_sessions(
@@ -1447,5 +1476,21 @@ mod tests {
 
         assert_eq!(output.last(), Some(&b'\n'));
         assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn only_transport_failures_invalidate_reusable_mcp_sessions() {
+        assert!(!mcp_error_invalidates_session(
+            "MCP request failed: tool rejected the arguments"
+        ));
+        assert!(!mcp_error_invalidates_session(
+            "Failed to parse Jira issues from the tool result"
+        ));
+        assert!(mcp_error_invalidates_session(
+            "Timed out waiting for MCP response after 45s"
+        ));
+        assert!(mcp_error_invalidates_session(
+            "MCP protocol reader failed: invalid JSON"
+        ));
     }
 }

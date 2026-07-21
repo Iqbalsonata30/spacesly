@@ -1,5 +1,6 @@
 use crate::domain::execution::{ExecutionRun, StepRun};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -7,9 +8,65 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
+       conversation_id TEXT PRIMARY KEY,
+       workspace_id TEXT NOT NULL,
+       title TEXT NOT NULL,
+       created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_conversations_workspace
+       ON conversations(workspace_id, updated_at DESC);
+     CREATE TABLE IF NOT EXISTS conversation_messages (
+       message_id TEXT PRIMARY KEY,
+       conversation_id TEXT NOT NULL,
+       sequence INTEGER NOT NULL,
+       role TEXT NOT NULL,
+       text TEXT NOT NULL,
+       created_at INTEGER NOT NULL,
+       UNIQUE(conversation_id, sequence),
+       FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+         ON DELETE CASCADE
+     );
+     CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
+       ON conversation_messages(conversation_id, sequence);";
+
 #[derive(Clone)]
 pub struct ExecutionStore {
     connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationRecord {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConversationMessageInput {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConversationImportInput {
+    pub id: String,
+    pub title: String,
+    pub messages: Vec<ConversationMessageInput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationMessageRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub sequence: u64,
+    pub role: String,
+    pub text: String,
+    pub created_at: u64,
 }
 
 impl ExecutionStore {
@@ -67,10 +124,13 @@ impl ExecutionStore {
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                   );
-                  CREATE INDEX IF NOT EXISTS idx_ai_audit_events_run
-                    ON ai_audit_events(run_id, event_id);",
+                   CREATE INDEX IF NOT EXISTS idx_ai_audit_events_run
+                     ON ai_audit_events(run_id, event_id);",
             )
             .map_err(|error| format!("Failed to initialize execution database: {error}"))?;
+        connection
+            .execute_batch(CONVERSATION_SCHEMA)
+            .map_err(|error| format!("Failed to initialize conversation database: {error}"))?;
         // Keep databases created by earlier builds usable without destructive migrations.
         let _ = connection.execute(
             "ALTER TABLE execution_runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
@@ -280,6 +340,196 @@ impl ExecutionStore {
         Ok(())
     }
 
+    pub fn list_conversations(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ConversationRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT conversation_id, workspace_id, title, created_at, updated_at
+                 FROM conversations WHERE workspace_id = ?1 ORDER BY updated_at DESC",
+            )
+            .map_err(|error| format!("Failed to prepare conversation query: {error}"))?;
+        let conversations = statement
+            .query_map(params![workspace_id], |row| {
+                Ok(ConversationRecord {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    title: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("Failed to query conversations: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to decode conversation: {error}"))?;
+        Ok(conversations)
+    }
+
+    pub fn load_conversation_messages(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationMessageRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM conversations WHERE conversation_id = ?1 AND workspace_id = ?2",
+                params![conversation_id, workspace_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to verify conversation scope: {error}"))?;
+        if exists.is_none() {
+            return Err("Conversation does not belong to this workspace.".to_string());
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT message_id, conversation_id, sequence, role, text, created_at
+                 FROM conversation_messages WHERE conversation_id = ?1 ORDER BY sequence",
+            )
+            .map_err(|error| format!("Failed to prepare message query: {error}"))?;
+        let messages = statement
+            .query_map(params![conversation_id], |row| {
+                Ok(ConversationMessageRecord {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    role: row.get(3)?,
+                    text: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|error| format!("Failed to query conversation messages: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to decode conversation message: {error}"))?;
+        Ok(messages)
+    }
+
+    pub fn append_conversation_message(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        title: &str,
+        input: &ConversationMessageInput,
+    ) -> Result<ConversationMessageRecord, String> {
+        validate_conversation_message(input)?;
+        let now = now_millis()?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Failed to start conversation transaction: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO conversations (conversation_id, workspace_id, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                   title = excluded.title, updated_at = excluded.updated_at
+                 WHERE conversations.workspace_id = excluded.workspace_id",
+                params![conversation_id, workspace_id, title.trim(), now],
+            )
+            .map_err(|error| format!("Failed to save conversation: {error}"))?;
+        let conversation_scope = transaction
+            .query_row(
+                "SELECT workspace_id FROM conversations WHERE conversation_id = ?1",
+                params![conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Failed to verify conversation ownership: {error}"))?;
+        if conversation_scope != workspace_id {
+            return Err("Conversation does not belong to this workspace.".to_string());
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT conversation_id, sequence, role, text, created_at
+                 FROM conversation_messages WHERE message_id = ?1",
+                params![input.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to check message idempotency: {error}"))?;
+        if let Some((existing_conversation, sequence, role, text, created_at)) = existing {
+            if existing_conversation != conversation_id || role != input.role || text != input.text
+            {
+                return Err("Message ID is already bound to different content.".to_string());
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit idempotent message: {error}"))?;
+            return Ok(ConversationMessageRecord {
+                id: input.id.clone(),
+                conversation_id: existing_conversation,
+                sequence,
+                role,
+                text,
+                created_at,
+            });
+        }
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM conversation_messages
+                 WHERE conversation_id = ?1",
+                params![conversation_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| format!("Failed to allocate message sequence: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO conversation_messages
+                 (message_id, conversation_id, sequence, role, text, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    input.id,
+                    conversation_id,
+                    sequence,
+                    input.role,
+                    input.text,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Failed to append conversation message: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit conversation message: {error}"))?;
+        Ok(ConversationMessageRecord {
+            id: input.id.clone(),
+            conversation_id: conversation_id.to_string(),
+            sequence,
+            role: input.role.clone(),
+            text: input.text.clone(),
+            created_at: now,
+        })
+    }
+
+    pub fn import_conversations(
+        &self,
+        workspace_id: &str,
+        conversations: &[ConversationImportInput],
+    ) -> Result<usize, String> {
+        let mut imported = 0;
+        for conversation in conversations {
+            for message in &conversation.messages {
+                self.append_conversation_message(
+                    workspace_id,
+                    &conversation.id,
+                    &conversation.title,
+                    message,
+                )?;
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
     pub fn list_active(&self) -> Result<Vec<ExecutionRun>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
@@ -362,6 +612,22 @@ fn save_contract(transaction: &Transaction<'_>, contract: &Value) -> Result<(), 
             ],
         )
         .map_err(|error| format!("Failed to save execution contract: {error}"))?;
+    Ok(())
+}
+
+fn validate_conversation_message(input: &ConversationMessageInput) -> Result<(), String> {
+    if input.id.trim().is_empty() {
+        return Err("Conversation message ID is required.".to_string());
+    }
+    if !matches!(input.role.as_str(), "user" | "agent" | "system") {
+        return Err("Conversation message role is invalid.".to_string());
+    }
+    if input.text.trim().is_empty() {
+        return Err("Conversation message text is required.".to_string());
+    }
+    if input.text.len() > 256 * 1024 {
+        return Err("Conversation message exceeds the 256 KiB limit.".to_string());
+    }
     Ok(())
 }
 
@@ -488,4 +754,84 @@ fn now_millis() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
         .as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> ExecutionStore {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CONVERSATION_SCHEMA).unwrap();
+        ExecutionStore {
+            connection: Arc::new(Mutex::new(connection)),
+        }
+    }
+
+    #[test]
+    fn conversation_messages_are_ordered_and_idempotent() {
+        let store = test_store();
+        let first = ConversationMessageInput {
+            id: "message-1".to_string(),
+            role: "user".to_string(),
+            text: "Hello".to_string(),
+        };
+        let second = ConversationMessageInput {
+            id: "message-2".to_string(),
+            role: "agent".to_string(),
+            text: "Hi".to_string(),
+        };
+
+        let saved_first = store
+            .append_conversation_message("workspace-a", "conversation-a", "Chat", &first)
+            .unwrap();
+        let repeated = store
+            .append_conversation_message("workspace-a", "conversation-a", "Chat", &first)
+            .unwrap();
+        store
+            .append_conversation_message("workspace-a", "conversation-a", "Chat", &second)
+            .unwrap();
+
+        assert_eq!(saved_first.sequence, 1);
+        assert_eq!(repeated.sequence, 1);
+        let messages = store
+            .load_conversation_messages("workspace-a", "conversation-a")
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn conversation_scope_rejects_cross_workspace_reads_and_replays() {
+        let store = test_store();
+        let message = ConversationMessageInput {
+            id: "message-1".to_string(),
+            role: "user".to_string(),
+            text: "Private".to_string(),
+        };
+        store
+            .append_conversation_message("workspace-a", "conversation-a", "Chat", &message)
+            .unwrap();
+
+        assert!(store
+            .load_conversation_messages("workspace-b", "conversation-a")
+            .is_err());
+        assert!(store
+            .append_conversation_message(
+                "workspace-b",
+                "conversation-b",
+                "Chat",
+                &ConversationMessageInput {
+                    id: "message-1".to_string(),
+                    role: "agent".to_string(),
+                    text: "Replay".to_string(),
+                },
+            )
+            .is_err());
+    }
 }

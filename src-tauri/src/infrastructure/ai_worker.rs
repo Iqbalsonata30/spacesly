@@ -1,4 +1,6 @@
+use super::provider_registry::ApiStyle;
 use super::shell_env::inject_shell_env;
+use super::tool_broker::{argument_digest, ToolBroker};
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
@@ -37,8 +39,10 @@ const MAX_AI_EDIT_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 static ACTIVE_CHAT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static AGENT_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 static ASYNC_AI_HTTP_CLIENT: OnceLock<Result<AsyncClient, String>> = OnceLock::new();
+static OPENCODE_HEALTH_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 static OPENCODE_MCP_CONFIGS: OnceLock<Mutex<HashMap<String, Arc<String>>>> = OnceLock::new();
 static OPENCODE_SERVERS: OnceLock<Mutex<HashMap<u64, Arc<OpenCodeServer>>>> = OnceLock::new();
+static OPENCODE_SERVER_STARTUP: OnceLock<Mutex<()>> = OnceLock::new();
 static OPENCODE_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const MAX_OPENCODE_SERVERS: usize = 4;
 
@@ -324,11 +328,15 @@ pub enum AiWorkerStreamEvent {
     ToolStarted {
         tool_call_id: String,
         tool_name: String,
+        risk: String,
+        arguments_digest: String,
     },
     ToolCompleted {
         tool_call_id: String,
         tool_name: String,
         success: bool,
+        risk: String,
+        arguments_digest: String,
     },
     UsageUpdated {
         input_tokens: u64,
@@ -460,14 +468,9 @@ pub fn execute_ai_worker_task(
 
     validate_config(&config)?;
 
-    let system_prompt = format!(
-        "You are an execution-only Worker inside Spacesly. Planning already happened exactly once and is encoded in the immutable Execution Contract. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step and return structured evidence. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the contract current_step requires unavailable tools or credentials, set completion_status to blocked and explain the missing runtime/tool. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
-        governance_context(&config, true),
-    );
-    let user_prompt = format!(
-        "Execution Contract (authoritative, immutable):\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually executed and verified for the contract current_step\"],\n  \"details\": [\"concise execution notes; include contract_id/current_step if relevant\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
-        execution_contract_context(&task),
-    );
+    let context = ContextBuilder::new(&config);
+    let system_prompt = context.agent_api_system_prompt();
+    let user_prompt = context.agent_api_user_prompt(&task);
 
     check_cancelled(&cancellation)?;
     let response = call_model(&config, &system_prompt, &user_prompt, 700)?;
@@ -510,22 +513,13 @@ pub fn chat_ai_worker(
         } else {
             request.session_context.as_deref().unwrap_or("none")
         };
-        let prompt = if session.is_some() {
-            format!(
-                "Continue the existing Spacesly workspace chat session. Keep the established chat rules and history; use only the current context below to resolve the latest request. If the user asks for a board mutation, append a final SPACESLY_ACTIONS line. Keep answers concise and practical.\n\nCurrent session context:\n{}\n\nCurrent workspace context:\n{}\n\nLatest user message:\n{}",
-                session_context,
-                request.terminal_context.as_deref().unwrap_or("none"),
-                message,
-            )
-        } else {
-            format!(
-                "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}\n\nSession context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
-                governance_context(&config, false),
-                session_context,
-                request.terminal_context.as_deref().unwrap_or("none"),
-                message,
-            )
-        };
+        let context = ContextBuilder::new(&config);
+        let prompt = context.opencode_chat_prompt(
+            &session_context,
+            request.terminal_context.as_deref().unwrap_or("none"),
+            message,
+            session.is_some(),
+        );
         let mut command = opencode_command(&config);
         command.args([
             "run",
@@ -588,12 +582,9 @@ pub fn chat_ai_worker(
     }
 
     validate_config(&config)?;
-    let system_prompt = format!(
-        "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}",
-        governance_context(&config, false),
-    );
-    let user_prompt = format!(
-        "Session context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+    let context = ContextBuilder::new(&config);
+    let system_prompt = context.chat_system_prompt();
+    let user_prompt = context.chat_user_prompt(
         request.session_context.as_deref().unwrap_or("none"),
         request.terminal_context.as_deref().unwrap_or("none"),
         message,
@@ -622,12 +613,9 @@ pub async fn chat_ai_worker_streaming(
     }
     validate_config(&config)?;
     let _chat_run = acquire_chat_run()?;
-    let system_prompt = format!(
-        "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}",
-        governance_context(&config, false),
-    );
-    let user_prompt = format!(
-        "Session context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+    let context = ContextBuilder::new(&config);
+    let system_prompt = context.chat_system_prompt();
+    let user_prompt = context.chat_user_prompt(
         request.session_context.as_deref().unwrap_or("none"),
         request.terminal_context.as_deref().unwrap_or("none"),
         message,
@@ -832,6 +820,10 @@ fn validate_config(config: &AiWorkerConfig) -> Result<(), String> {
         return Err("Agent model is required.".to_string());
     }
 
+    if ApiStyle::parse(&config.api_style).is_none() {
+        return Err(format!("Unsupported AI API style '{}'.", config.api_style));
+    }
+
     Ok(())
 }
 
@@ -852,6 +844,75 @@ fn validate_opencode_config(config: &AiWorkerConfig) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+struct ContextBuilder<'a> {
+    config: &'a AiWorkerConfig,
+}
+
+impl<'a> ContextBuilder<'a> {
+    fn new(config: &'a AiWorkerConfig) -> Self {
+        Self { config }
+    }
+
+    fn chat_system_prompt(&self) -> String {
+        format!(
+            "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups like 'it', 'that', and 'run it' grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}",
+            governance_context(self.config, false),
+        )
+    }
+
+    fn chat_user_prompt(
+        &self,
+        session_context: &str,
+        workspace_context: &str,
+        message: &str,
+    ) -> String {
+        format!(
+            "Session context:\n{session_context}\n\nWorkspace context:\n{workspace_context}\n\nUser message:\n{message}"
+        )
+    }
+
+    fn opencode_chat_prompt(
+        &self,
+        session_context: &str,
+        workspace_context: &str,
+        message: &str,
+        has_session: bool,
+    ) -> String {
+        if has_session {
+            format!(
+                "Continue the existing Spacesly workspace chat session. Keep the established chat rules and history; use only the current context below to resolve the latest request. If the user asks for a board mutation, append a final SPACESLY_ACTIONS line. Keep answers concise and practical.\n\nCurrent session context:\n{session_context}\n\nCurrent workspace context:\n{workspace_context}\n\nLatest user message:\n{message}"
+            )
+        } else {
+            format!(
+                "{}\n\nSession context:\n{session_context}\n\nWorkspace context:\n{workspace_context}\n\nUser message:\n{message}",
+                self.chat_system_prompt()
+            )
+        }
+    }
+
+    fn agent_api_system_prompt(&self) -> String {
+        format!(
+            "You are an execution-only Worker inside Spacesly. Planning already happened exactly once and is encoded in the immutable Execution Contract. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step and return structured evidence. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the contract current_step requires unavailable tools or credentials, set completion_status to blocked and explain the missing runtime/tool. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
+            governance_context(self.config, true),
+        )
+    }
+
+    fn agent_api_user_prompt(&self, task: &AiWorkerTask) -> String {
+        format!(
+            "Execution Contract (authoritative, immutable):\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually executed and verified for the contract current_step\"],\n  \"details\": [\"concise execution notes; include contract_id/current_step if relevant\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
+            execution_contract_context(task),
+        )
+    }
+
+    fn opencode_agent_prompt(&self, task: &AiWorkerTask) -> String {
+        format!(
+            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
+            governance_context(self.config, true),
+            execution_contract_context(task),
+        )
+    }
 }
 
 fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
@@ -987,11 +1048,8 @@ fn execute_opencode_task(
     require_execution_contract(&task)?;
     check_cancelled(&cancellation)?;
     let start_head = git_head(&config);
-    let prompt = format!(
-        "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
-        governance_context(&config, true),
-        execution_contract_context(&task),
-    );
+    let context = ContextBuilder::new(&config);
+    let prompt = context.opencode_agent_prompt(&task);
     let (server, server_startup_error) = match opencode_server(&config) {
         Ok(server) => (Some(server), None),
         Err(error) => (None, Some(error)),
@@ -1753,22 +1811,35 @@ fn opencode_server(config: &AiWorkerConfig) -> Result<Arc<OpenCodeServer>, Strin
     let mcp_config = opencode_mcp_config(config);
     let key = opencode_server_key(config, mcp_config.as_deref().map(String::as_str));
     let servers = OPENCODE_SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut servers = servers.lock().map_err(|error| error.to_string())?;
-    servers.retain(|_, server| server.is_alive());
-    if let Some(server) = servers.get(&key).filter(|server| server.is_alive()) {
-        return Ok(Arc::clone(server));
+    {
+        let mut cached = servers.lock().map_err(|error| error.to_string())?;
+        cached.retain(|_, server| server.is_alive());
+        if let Some(server) = cached.get(&key).filter(|server| server.is_alive()) {
+            return Ok(Arc::clone(server));
+        }
     }
 
-    if servers.len() >= MAX_OPENCODE_SERVERS {
-        let idle_key = servers
-            .iter()
-            .find_map(|(key, server)| (Arc::strong_count(server) == 1).then_some(*key))
-            .ok_or_else(|| {
-                format!(
-                    "Spacesly already has {MAX_OPENCODE_SERVERS} active OpenCode servers. Wait for an Agent request to finish."
-                )
-            })?;
-        servers.remove(&idle_key);
+    let _startup_guard = OPENCODE_SERVER_STARTUP
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|error| error.to_string())?;
+    {
+        let mut cached = servers.lock().map_err(|error| error.to_string())?;
+        cached.retain(|_, server| server.is_alive());
+        if let Some(server) = cached.get(&key).filter(|server| server.is_alive()) {
+            return Ok(Arc::clone(server));
+        }
+        if cached.len() >= MAX_OPENCODE_SERVERS {
+            let idle_key = cached
+                .iter()
+                .find_map(|(key, server)| (Arc::strong_count(server) == 1).then_some(*key))
+                .ok_or_else(|| {
+                    format!(
+                        "Spacesly already has {MAX_OPENCODE_SERVERS} active OpenCode servers. Wait for an Agent request to finish."
+                    )
+                })?;
+            cached.remove(&idle_key);
+        }
     }
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -1808,12 +1879,7 @@ fn opencode_server(config: &AiWorkerConfig) -> Result<Arc<OpenCodeServer>, Strin
         startup_logs,
     });
 
-    let health_client = Client::builder()
-        .no_proxy()
-        .connect_timeout(OPENCODE_HEALTH_TIMEOUT)
-        .timeout(OPENCODE_HEALTH_TIMEOUT)
-        .build()
-        .map_err(|error| format!("Failed to create OpenCode health client: {error}"))?;
+    let health_client = opencode_health_client()?;
     let deadline = Instant::now() + OPENCODE_STARTUP_TIMEOUT;
     loop {
         if !server.is_alive() {
@@ -1841,8 +1907,25 @@ fn opencode_server(config: &AiWorkerConfig) -> Result<Arc<OpenCodeServer>, Strin
         thread::sleep(Duration::from_millis(100));
     }
 
-    servers.insert(key, Arc::clone(&server));
+    servers
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(key, Arc::clone(&server));
     Ok(server)
+}
+
+fn opencode_health_client() -> Result<&'static Client, String> {
+    match OPENCODE_HEALTH_CLIENT.get_or_init(|| {
+        Client::builder()
+            .no_proxy()
+            .connect_timeout(OPENCODE_HEALTH_TIMEOUT)
+            .timeout(OPENCODE_HEALTH_TIMEOUT)
+            .build()
+            .map_err(|error| format!("Failed to create OpenCode health client: {error}"))
+    }) {
+        Ok(client) => Ok(client),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn capture_opencode_startup_logs(
@@ -1991,8 +2074,10 @@ async fn stream_model_response(
     on_event: &mut (dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send),
 ) -> Result<String, String> {
     let client = async_ai_http_client()?;
-    let (endpoint, body) = match config.api_style.as_str() {
-        "openai_responses" => (
+    let api_style = ApiStyle::parse(&config.api_style)
+        .ok_or_else(|| format!("Unsupported AI API style '{}'.", config.api_style))?;
+    let (endpoint, body) = match api_style {
+        ApiStyle::OpenAiResponses => (
             responses_endpoint(&config.base_url),
             serde_json::json!({
                 "model": config.model,
@@ -2004,7 +2089,7 @@ async fn stream_model_response(
                 ]
             }),
         ),
-        "anthropic_messages" => (
+        ApiStyle::AnthropicMessages => (
             anthropic_endpoint(&config.base_url),
             serde_json::json!({
                 "model": config.model,
@@ -2034,7 +2119,7 @@ async fn stream_model_response(
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
         .json(&body);
-    request = if config.api_style == "anthropic_messages" {
+    request = if api_style == ApiStyle::AnthropicMessages {
         request
             .header("x-api-key", config.api_key.trim())
             .header("anthropic-version", "2023-06-01")
@@ -2071,7 +2156,7 @@ async fn stream_model_response(
             if data == "[DONE]" {
                 continue;
             }
-            if let Some(delta) = provider_stream_delta(&config.api_style, &data) {
+            if let Some(delta) = provider_stream_delta(api_style, &data) {
                 if output.len().saturating_add(delta.len()) > CHAT_OUTPUT_LIMIT {
                     return Err(format!(
                         "AI chat output exceeded the {CHAT_OUTPUT_LIMIT} byte limit."
@@ -2080,7 +2165,7 @@ async fn stream_model_response(
                 output.push_str(&delta);
                 on_event(AiWorkerStreamEvent::TextDelta(delta))?;
             }
-            if let Some((input, output)) = provider_stream_usage(&config.api_style, &data) {
+            if let Some((input, output)) = provider_stream_usage(api_style, &data) {
                 input_tokens = input.unwrap_or(input_tokens);
                 output_tokens = output.unwrap_or(output_tokens);
                 on_event(AiWorkerStreamEvent::UsageUpdated {
@@ -2091,7 +2176,7 @@ async fn stream_model_response(
         }
     }
     for data in decoder.finish() {
-        if let Some(delta) = provider_stream_delta(&config.api_style, &data) {
+        if let Some(delta) = provider_stream_delta(api_style, &data) {
             if output.len().saturating_add(delta.len()) > CHAT_OUTPUT_LIMIT {
                 return Err(format!(
                     "AI chat output exceeded the {CHAT_OUTPUT_LIMIT} byte limit."
@@ -2100,7 +2185,7 @@ async fn stream_model_response(
             output.push_str(&delta);
             on_event(AiWorkerStreamEvent::TextDelta(delta))?;
         }
-        if let Some((input, output)) = provider_stream_usage(&config.api_style, &data) {
+        if let Some((input, output)) = provider_stream_usage(api_style, &data) {
             input_tokens = input.unwrap_or(input_tokens);
             output_tokens = output.unwrap_or(output_tokens);
             on_event(AiWorkerStreamEvent::UsageUpdated {
@@ -2173,10 +2258,10 @@ fn sse_event_data(event: &[u8]) -> Option<String> {
     (!data.is_empty()).then_some(data)
 }
 
-fn provider_stream_delta(api_style: &str, data: &str) -> Option<String> {
+fn provider_stream_delta(api_style: ApiStyle, data: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(data).ok()?;
     match api_style {
-        "openai_responses" => (value.get("type").and_then(Value::as_str)
+        ApiStyle::OpenAiResponses => (value.get("type").and_then(Value::as_str)
             == Some("response.output_text.delta"))
         .then(|| {
             value
@@ -2185,7 +2270,7 @@ fn provider_stream_delta(api_style: &str, data: &str) -> Option<String> {
                 .map(str::to_string)
         })
         .flatten(),
-        "anthropic_messages" => value
+        ApiStyle::AnthropicMessages => value
             .get("delta")
             .filter(|delta| delta.get("type").and_then(Value::as_str) == Some("text_delta"))
             .and_then(|delta| delta.get("text"))
@@ -2202,11 +2287,11 @@ fn provider_stream_delta(api_style: &str, data: &str) -> Option<String> {
     }
 }
 
-fn provider_stream_usage(api_style: &str, data: &str) -> Option<(Option<u64>, Option<u64>)> {
+fn provider_stream_usage(api_style: ApiStyle, data: &str) -> Option<(Option<u64>, Option<u64>)> {
     let value = serde_json::from_str::<Value>(data).ok()?;
     let usage = match api_style {
-        "openai_responses" => value.get("response")?.get("usage")?,
-        "anthropic_messages" => value
+        ApiStyle::OpenAiResponses => value.get("response")?.get("usage")?,
+        ApiStyle::AnthropicMessages => value
             .get("message")
             .and_then(|message| message.get("usage"))
             .or_else(|| value.get("usage"))?,
@@ -2229,9 +2314,13 @@ fn call_model(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String, String> {
-    match config.api_style.as_str() {
-        "openai_responses" => call_openai_responses(config, system_prompt, user_prompt, max_tokens),
-        "anthropic_messages" => {
+    match ApiStyle::parse(&config.api_style)
+        .ok_or_else(|| format!("Unsupported AI API style '{}'.", config.api_style))?
+    {
+        ApiStyle::OpenAiResponses => {
+            call_openai_responses(config, system_prompt, user_prompt, max_tokens)
+        }
+        ApiStyle::AnthropicMessages => {
             call_anthropic_messages(config, system_prompt, user_prompt, max_tokens)
         }
         _ => call_chat_completion(config, system_prompt, user_prompt, max_tokens),
@@ -2529,20 +2618,34 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .and_then(|state| state.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("pending");
+    let risk = ToolBroker::risk_for_tool(&tool_name).as_str().to_string();
+    let arguments = part
+        .get("state")
+        .and_then(|state| state.get("input"))
+        .filter(|input| input.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let arguments_digest = argument_digest(&arguments).ok()?;
     match status {
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success: true,
+            risk,
+            arguments_digest,
         }),
         "error" | "failed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success: false,
+            risk,
+            arguments_digest,
         }),
         _ => Some(AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
             tool_name,
+            risk,
+            arguments_digest,
         }),
     }
 }
@@ -2854,7 +2957,7 @@ mod tests {
         let events = decoder.push(b"tent\":\"hi\"}}]}\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(
-            provider_stream_delta("openai_chat", &events[0]).as_deref(),
+            provider_stream_delta(ApiStyle::OpenAiChat, &events[0]).as_deref(),
             Some("hi")
         );
     }
@@ -2863,7 +2966,7 @@ mod tests {
     fn provider_sse_delta_parsers_cover_responses_and_anthropic() {
         assert_eq!(
             provider_stream_delta(
-                "openai_responses",
+                ApiStyle::OpenAiResponses,
                 r#"{"type":"response.output_text.delta","delta":"hello"}"#,
             )
             .as_deref(),
@@ -2871,7 +2974,7 @@ mod tests {
         );
         assert_eq!(
             provider_stream_delta(
-                "anthropic_messages",
+                ApiStyle::AnthropicMessages,
                 r#"{"delta":{"type":"text_delta","text":"hello"}}"#,
             )
             .as_deref(),
@@ -2961,6 +3064,30 @@ mod tests {
 
         assert!(context.contains("Never guess."));
         assert!(!context.contains("Skill: Deploy safely"));
+    }
+
+    #[test]
+    fn context_builder_keeps_chat_and_agent_context_boundaries() {
+        let config = config_with_governance("Never guess.", "Skill: Deploy safely");
+        let builder = ContextBuilder::new(&config);
+
+        let chat = builder.chat_system_prompt();
+        assert!(chat.contains("Never guess."));
+        assert!(!chat.contains("Skill: Deploy safely"));
+
+        let agent = builder.agent_api_system_prompt();
+        assert!(agent.contains("Never guess."));
+        assert!(agent.contains("Skill: Deploy safely"));
+    }
+
+    #[test]
+    fn context_builder_preserves_session_and_workspace_ordering() {
+        let config = config_with_governance("", "");
+        let prompt =
+            ContextBuilder::new(&config).chat_user_prompt("SESSION", "WORKSPACE", "MESSAGE");
+
+        assert!(prompt.find("SESSION").unwrap() < prompt.find("WORKSPACE").unwrap());
+        assert!(prompt.find("WORKSPACE").unwrap() < prompt.find("MESSAGE").unwrap());
     }
 
     #[test]
@@ -3229,6 +3356,9 @@ mod tests {
             Some(AiWorkerStreamEvent::ToolStarted {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
+                risk: "mutation".to_string(),
+                arguments_digest: argument_digest(&serde_json::json!({"command": "secret"}))
+                    .unwrap(),
             })
         );
 
@@ -3241,6 +3371,8 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
                 success: true,
+                risk: "mutation".to_string(),
+                arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
             })
         );
     }
@@ -3249,14 +3381,14 @@ mod tests {
     fn extracts_provider_usage_from_supported_stream_shapes() {
         assert_eq!(
             provider_stream_usage(
-                "openai_chat",
+                ApiStyle::OpenAiChat,
                 r#"{"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
             ),
             Some((Some(12), Some(7)))
         );
         assert_eq!(
             provider_stream_usage(
-                "anthropic_messages",
+                ApiStyle::AnthropicMessages,
                 r#"{"type":"message_delta","usage":{"output_tokens":9}}"#,
             ),
             Some((None, Some(9)))

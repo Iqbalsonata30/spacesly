@@ -17,6 +17,9 @@ pub enum AiRuntimeEvent {
         sequence: u64,
         tool_call_id: String,
         tool_name: String,
+        risk: String,
+        operation_id: String,
+        arguments_digest: String,
     },
     ToolCompleted {
         run_id: String,
@@ -24,12 +27,18 @@ pub enum AiRuntimeEvent {
         tool_call_id: String,
         tool_name: String,
         success: bool,
+        risk: String,
+        operation_id: String,
+        arguments_digest: String,
     },
     ApprovalRequired {
         run_id: String,
         sequence: u64,
         capability: String,
         operation: String,
+        risk: String,
+        operation_id: String,
+        arguments_digest: String,
     },
     UsageUpdated {
         run_id: String,

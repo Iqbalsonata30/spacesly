@@ -116,6 +116,13 @@ export interface AiWorkerChatResult {
   message: string;
 }
 
+export type ToolOperationRisk =
+  | "read"
+  | "mutation"
+  | "destructive"
+  | "credential_sensitive"
+  | "unknown";
+
 export type AiRuntimeEvent =
   | { type: "run_started"; run_id: string; sequence: number }
   | { type: "text_delta"; run_id: string; sequence: number; delta: string }
@@ -125,6 +132,9 @@ export type AiRuntimeEvent =
       sequence: number;
       tool_call_id: string;
       tool_name: string;
+      risk: ToolOperationRisk;
+      operation_id: string;
+      arguments_digest: string;
     }
   | {
       type: "tool_completed";
@@ -133,6 +143,9 @@ export type AiRuntimeEvent =
       tool_call_id: string;
       tool_name: string;
       success: boolean;
+      risk: ToolOperationRisk;
+      operation_id: string;
+      arguments_digest: string;
     }
   | {
       type: "approval_required";
@@ -140,6 +153,9 @@ export type AiRuntimeEvent =
       sequence: number;
       capability: string;
       operation: string;
+      risk: ToolOperationRisk;
+      operation_id: string;
+      arguments_digest: string;
     }
   | {
       type: "usage_updated";
@@ -197,6 +213,70 @@ export interface AiEditResult {
   run_id: string;
   summary: string;
   content: string;
+}
+
+export interface ConversationRecord {
+  id: string;
+  workspace_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ConversationMessageRecord {
+  id: string;
+  conversation_id: string;
+  sequence: number;
+  role: "user" | "agent" | "system";
+  text: string;
+  created_at: number;
+}
+
+export async function listConversations(workspaceId: string): Promise<ConversationRecord[]> {
+  return invokeWithPolicy<ConversationRecord[]>(
+    "list_conversations",
+    { workspaceId },
+    IPC_POLICIES.fileRead,
+  );
+}
+
+export async function loadConversationMessages(
+  workspaceId: string,
+  conversationId: string,
+): Promise<ConversationMessageRecord[]> {
+  return invokeWithPolicy<ConversationMessageRecord[]>(
+    "load_conversation_messages",
+    { workspaceId, conversationId },
+    IPC_POLICIES.fileRead,
+  );
+}
+
+export async function appendConversationMessage(
+  workspaceId: string,
+  conversationId: string,
+  title: string,
+  message: Pick<ConversationMessageRecord, "id" | "role" | "text">,
+): Promise<ConversationMessageRecord> {
+  return invokeWithPolicy<ConversationMessageRecord>(
+    "append_conversation_message",
+    { workspaceId, conversationId, title, message },
+    IPC_POLICIES.fileWrite,
+  );
+}
+
+export async function importConversations(
+  workspaceId: string,
+  conversations: Array<{
+    id: string;
+    title: string;
+    messages: Array<Pick<ConversationMessageRecord, "id" | "role" | "text">>;
+  }>,
+): Promise<number> {
+  return invokeWithPolicy<number>(
+    "import_conversations",
+    { workspaceId, conversations },
+    IPC_POLICIES.fileWrite,
+  );
 }
 
 export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStatus> {

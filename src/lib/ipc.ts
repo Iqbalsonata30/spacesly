@@ -18,6 +18,8 @@ export type {
   AiWorkerStatus,
   AiWorkerTask,
   AiWorkerTaskResult,
+  ConversationMessageRecord,
+  ConversationRecord,
   ExecutionContract,
 } from "$lib/ipc/agent";
 export {
@@ -34,6 +36,10 @@ export {
   cancelAiRun,
   aiWorkspaceTrustStatus,
   trustAiWorkspace,
+  appendConversationMessage,
+  importConversations,
+  listConversations,
+  loadConversationMessages,
 } from "$lib/ipc/agent";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {

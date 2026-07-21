@@ -22,7 +22,9 @@ use infrastructure::ai_worker::{
     AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerStreamEvent,
     AiWorkerTask, AiWorkerTaskResult,
 };
-use infrastructure::execution_store::ExecutionStore;
+use infrastructure::execution_store::{
+    ConversationImportInput, ConversationMessageInput, ExecutionStore,
+};
 use infrastructure::file_watcher::FileWatchRegistry;
 use infrastructure::files::{
     FileEntry, FileSnapshot, FileWriteResult, LineEnding, TextEncoding, WorkspaceRoot,
@@ -41,6 +43,7 @@ use infrastructure::mcp::{
     close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
     McpConnectionStatus, McpServerConfig,
 };
+use infrastructure::provider_registry::profile as provider_profile;
 use infrastructure::pty::{
     close_all_terminals, close_pty_terminal as close_pty_terminal_impl,
     open_pty_terminal as open_pty_terminal_impl,
@@ -54,7 +57,7 @@ use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
     ShellCommandRequest, ShellCommandResult, ShellCompletionRequest, ShellCompletionResult,
 };
-use infrastructure::tool_broker::{ToolAuthorization, ToolBroker};
+use infrastructure::tool_broker::{operation_id, ToolAuthorization, ToolBroker};
 use infrastructure::workspace_cache::{
     load_cached_workspace as load_cached_workspace_impl,
     save_cached_workspace as save_cached_workspace_impl, CachedWorkspace,
@@ -464,12 +467,38 @@ async fn execute_ai_worker_task(
         let worker_callback: Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send> =
             Box::new(move |event| {
                 if let AiWorkerStreamEvent::ToolStarted { tool_name, .. } = &event {
-                    if let ToolAuthorization::ApprovalRequired { capability } =
+                    if let ToolAuthorization::ApprovalRequired { capability, risk } =
                         tool_broker.authorize(tool_name)
                     {
+                        let operation_id = operation_id(
+                            &worker_stream_run_id,
+                            match &event {
+                                AiWorkerStreamEvent::ToolStarted { tool_call_id, .. } => {
+                                    tool_call_id
+                                }
+                                _ => unreachable!(),
+                            },
+                            tool_name,
+                            risk,
+                            match &event {
+                                AiWorkerStreamEvent::ToolStarted {
+                                    arguments_digest, ..
+                                } => arguments_digest,
+                                _ => unreachable!(),
+                            },
+                        );
+                        let arguments_digest = match &event {
+                            AiWorkerStreamEvent::ToolStarted {
+                                arguments_digest, ..
+                            } => arguments_digest.clone(),
+                            _ => unreachable!(),
+                        };
                         let payload = serde_json::json!({
                             "capability": capability,
                             "operation": tool_name,
+                            "risk": risk,
+                            "operation_id": operation_id,
+                            "arguments_digest": arguments_digest,
                         });
                         let _ = worker_stream_store.record_ai_audit(
                             Some(&worker_stream_run_id),
@@ -484,6 +513,9 @@ async fn execute_ai_worker_task(
                                     .fetch_add(1, Ordering::Relaxed),
                                 capability: capability.clone(),
                                 operation: tool_name.clone(),
+                                risk: risk.as_str().to_string(),
+                                operation_id,
+                                arguments_digest,
                             },
                         );
                         return Err(format!(
@@ -588,6 +620,61 @@ fn cancel_ai_worker_task(
 #[tauri::command]
 fn cancel_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<bool, String> {
     ai_runs.cancel(&run_id)
+}
+
+#[tauri::command]
+async fn list_conversations(
+    workspace_id: String,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<Vec<infrastructure::execution_store::ConversationRecord>, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list_conversations(&workspace_id))
+        .await
+        .map_err(|error| format!("Conversation list task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn load_conversation_messages(
+    workspace_id: String,
+    conversation_id: String,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<Vec<infrastructure::execution_store::ConversationMessageRecord>, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.load_conversation_messages(&workspace_id, &conversation_id)
+    })
+    .await
+    .map_err(|error| format!("Conversation load task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn append_conversation_message(
+    workspace_id: String,
+    conversation_id: String,
+    title: String,
+    message: ConversationMessageInput,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<infrastructure::execution_store::ConversationMessageRecord, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.append_conversation_message(&workspace_id, &conversation_id, &title, &message)
+    })
+    .await
+    .map_err(|error| format!("Conversation append task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn import_conversations(
+    workspace_id: String,
+    conversations: Vec<ConversationImportInput>,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<usize, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.import_conversations(&workspace_id, &conversations)
+    })
+    .await
+    .map_err(|error| format!("Conversation import task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -738,11 +825,24 @@ fn emit_worker_stream_event(
         AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
             tool_name,
+            risk,
+            arguments_digest,
         } => {
+            let tool_risk = ToolBroker::risk_for_tool(&tool_name);
+            let operation_id = operation_id(
+                run_id,
+                &tool_call_id,
+                &tool_name,
+                tool_risk,
+                &arguments_digest,
+            );
             if let Some(store) = audit_store {
                 let payload = serde_json::json!({
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
+                    "risk": risk,
+                    "operation_id": operation_id,
+                    "arguments_digest": arguments_digest,
                 });
                 let _ = store.record_ai_audit(Some(run_id), "tool_started", &payload);
             }
@@ -751,18 +851,33 @@ fn emit_worker_stream_event(
                 sequence,
                 tool_call_id,
                 tool_name,
+                risk,
+                operation_id,
+                arguments_digest,
             }
         }
         AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success,
+            risk,
+            arguments_digest,
         } => {
+            let operation_id = operation_id(
+                run_id,
+                &tool_call_id,
+                &tool_name,
+                ToolBroker::risk_for_tool(&tool_name),
+                &arguments_digest,
+            );
             if let Some(store) = audit_store {
                 let payload = serde_json::json!({
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "success": success,
+                    "risk": risk,
+                    "operation_id": operation_id,
+                    "arguments_digest": arguments_digest,
                 });
                 let _ = store.record_ai_audit(Some(run_id), "tool_completed", &payload);
             }
@@ -772,6 +887,9 @@ fn emit_worker_stream_event(
                 tool_call_id,
                 tool_name,
                 success,
+                risk,
+                operation_id,
+                arguments_digest,
             }
         }
         AiWorkerStreamEvent::UsageUpdated {
@@ -953,43 +1071,17 @@ fn resolve_ai_secrets(
 }
 
 fn bind_backend_provider_profile(config: &mut AiWorkerConfig) -> Result<(), String> {
-    let (name, base_url, api_style, models): (&str, &str, &str, &[&str]) =
-        match config.provider_id.as_str() {
-            "openai" => (
-                "OpenAI",
-                "https://api.openai.com/v1",
-                "openai_responses",
-                &["gpt-5.5", "gpt-5.1", "gpt-4.1-mini"],
-            ),
-            "gemini" => (
-                "Gemini",
-                "https://generativelanguage.googleapis.com/v1beta/openai",
-                "openai_chat",
-                &["gemini-2.5-pro", "gemini-2.5-flash"],
-            ),
-            "deepseek" => (
-                "DeepSeek",
-                "https://api.deepseek.com/v1",
-                "openai_chat",
-                &["deepseek-v4-flash", "deepseek-chat"],
-            ),
-            "claude" => (
-                "Claude",
-                "https://api.anthropic.com/v1",
-                "anthropic_messages",
-                &["claude-sonnet-4-5", "claude-haiku-4-5"],
-            ),
-            _ => return Err("Unknown AI provider profile.".to_string()),
-        };
-    if !models.contains(&config.model.as_str()) {
+    let profile = provider_profile(&config.provider_id)
+        .ok_or_else(|| "Unknown AI provider profile.".to_string())?;
+    if !profile.models.contains(&config.model.as_str()) {
         return Err(format!(
             "Model '{}' is not allowed for provider '{}'.",
             config.model, config.provider_id
         ));
     }
-    config.provider_name = name.to_string();
-    config.base_url = base_url.to_string();
-    config.api_style = api_style.to_string();
+    config.provider_name = profile.name.to_string();
+    config.base_url = profile.base_url.to_string();
+    config.api_style = profile.api_style.as_str().to_string();
     Ok(())
 }
 
@@ -1929,6 +2021,10 @@ pub fn run() {
             release_ai_worker_run,
             cancel_ai_worker_task,
             cancel_ai_run,
+            list_conversations,
+            load_conversation_messages,
+            append_conversation_message,
+            import_conversations,
             chat_ai_worker,
             propose_ai_edit,
             sync_recovery_snapshots,

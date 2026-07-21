@@ -97,6 +97,7 @@
   import "./page.css";
   import {
     addJiraComment,
+    appendConversationMessage,
     aiWorkspaceTrustStatus,
     applyWorkspaceReplace,
     assignJiraIssue,
@@ -110,8 +111,11 @@
     getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
+    importConversations,
     deleteRecoverySnapshot,
     listDirectory,
+    listConversations,
+    loadConversationMessages,
     listRecoverySnapshots,
     lspCloseDocument,
     lspDiagnostics,
@@ -358,6 +362,7 @@
   let secretsHydrated = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
+  let durableConversationWorkspaceId = $state<string | null>(null);
   let filesStateHydrated = $state(false);
   let selectedServerId = $state(initialSettings.jira.serverId);
   let workspaceMode = $state<WorkspaceMode>(initialUiState.workspaceMode);
@@ -444,6 +449,8 @@
   let workspaceChatRunId = $state<string | null>(null);
   let workspaceChatStreamingText = $state("");
   let workspaceChatLastEventSequence = $state(0);
+  let workspaceChatStreamBuffer = "";
+  let workspaceChatStreamFrame: number | null = null;
   let workspaceChatRequestId = 0;
   let workspaceChatActionProposal = $state<WorkspaceChatActionProposal | null>(null);
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
@@ -622,16 +629,11 @@
         })
         .catch(() => {});
     }
-    const fallbackWorkspaceTimer = window.setTimeout(() => {
-      void loadDefaultWorkspaceProjection();
-    }, 500);
-
     const timer = window.setInterval(() => {
       now = new Date();
     }, 60_000);
     return () => {
       disposed = true;
-      window.clearTimeout(fallbackWorkspaceTimer);
       window.clearInterval(timer);
       if (lspSyncTimer) clearTimeout(lspSyncTimer);
       if (lspDiagnosticPollTimer) clearTimeout(lspDiagnosticPollTimer);
@@ -659,6 +661,11 @@
     if (!workspace || durableRunsHydrated) return;
     durableRunsHydrated = true;
     void hydrateDurableExecutionRuns();
+  });
+
+  $effect(() => {
+    if (!workspace || durableConversationWorkspaceId === workspace.id) return;
+    void hydrateDurableConversations(workspace.id);
   });
 
   $effect(() => {
@@ -3370,6 +3377,56 @@
     }
   }
 
+  async function hydrateDurableConversations(workspaceId: string) {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    durableConversationWorkspaceId = workspaceId;
+    try {
+      const records = await listConversations(workspaceId);
+      if (records.length === 0) {
+        await importConversations(
+          workspaceId,
+          workspaceChatSessions.slice(0, MAX_CHAT_SESSIONS).map((session) => ({
+            id: session.id,
+            title: session.title,
+            messages: session.messages,
+          })),
+        );
+        return;
+      }
+
+      const retainedRecords = records.slice(0, MAX_CHAT_SESSIONS);
+      const hydrated = await Promise.all(
+        retainedRecords.map(async (record) => {
+          const messages = await loadConversationMessages(workspaceId, record.id);
+          const existing = workspaceChatSessions.find((session) => session.id === record.id);
+          const fallback = existing ?? createWorkspaceChatSession([], record.title);
+          return {
+            ...fallback,
+            id: record.id,
+            title: record.title,
+            createdAt: record.created_at,
+            updatedAt: record.updated_at,
+            messages: messages.map(({ id, role, text }) => ({ id, role, text })),
+          } satisfies ChatSessionState;
+        }),
+      );
+      if (hydrated.length === 0) return;
+      const activeId = workspaceChatActiveSessionId ?? hydrated[0].id;
+      const active = hydrated.find((session) => session.id === activeId) ?? hydrated[0];
+      workspaceChatSessions = hydrated.slice(0, MAX_CHAT_SESSIONS);
+      workspaceChatActiveSessionId = active.id;
+      workspaceChatSession = active;
+      workspaceChatMessages = active.messages;
+      saveUiState();
+    } catch (reason: unknown) {
+      durableConversationWorkspaceId = null;
+      appNotice = {
+        tone: "error",
+        message: reason instanceof Error ? reason.message : String(reason),
+      };
+    }
+  }
+
   function appendWorkspaceChat(
     message: Omit<WorkspaceChatMessage, "id">,
     targetSessionId = workspaceChatActiveSessionId,
@@ -3378,7 +3435,7 @@
     if (!session) return;
     const entry: WorkspaceChatMessage = {
       ...message,
-      id: `chat-${Date.now().toString(36)}-${session.messages.length}`,
+      id: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
     };
     const updatedSession = {
       ...session,
@@ -3403,6 +3460,16 @@
       text: message.text,
     }, targetSessionId);
     saveUiState();
+    if (workspace?.id && ("__TAURI_INTERNALS__" in window)) {
+      void appendConversationMessage(workspace.id, targetSessionId, updatedSession.title, entry).catch(
+        (reason: unknown) => {
+          appNotice = {
+            tone: "error",
+            message: reason instanceof Error ? reason.message : String(reason),
+          };
+        },
+      );
+    }
     scrollWorkspaceChatToLatest();
   }
 
@@ -3724,6 +3791,26 @@
     return agentConsoleRuntime;
   }
 
+  function flushWorkspaceChatStream() {
+    workspaceChatStreamFrame = null;
+    if (!workspaceChatStreamBuffer) return;
+    workspaceChatStreamingText += workspaceChatStreamBuffer;
+    workspaceChatStreamBuffer = "";
+  }
+
+  function queueWorkspaceChatDelta(delta: string) {
+    workspaceChatStreamBuffer += delta;
+    if (workspaceChatStreamFrame !== null) return;
+    workspaceChatStreamFrame = requestAnimationFrame(flushWorkspaceChatStream);
+  }
+
+  function resetWorkspaceChatStream() {
+    if (workspaceChatStreamFrame !== null) cancelAnimationFrame(workspaceChatStreamFrame);
+    workspaceChatStreamFrame = null;
+    workspaceChatStreamBuffer = "";
+    workspaceChatStreamingText = "";
+  }
+
   async function sendWorkspaceChat() {
     const message = workspaceChatTextarea?.value.trim() ?? "";
     if (!message || workspaceChatRunning) return;
@@ -3757,7 +3844,7 @@
     if (!(await ensureAiWorkspaceTrusted(config))) return;
 
     workspaceChatRunning = true;
-    workspaceChatStreamingText = "";
+    resetWorkspaceChatStream();
     workspaceChatLastEventSequence = 0;
     const requestId = ++workspaceChatRequestId;
 
@@ -3779,7 +3866,7 @@
         if (event.sequence <= workspaceChatLastEventSequence) return;
         workspaceChatLastEventSequence = event.sequence;
         if (event.type === "text_delta") {
-          workspaceChatStreamingText += event.delta;
+          queueWorkspaceChatDelta(event.delta);
         }
       });
       if (requestId !== workspaceChatRequestId) return;
@@ -3811,7 +3898,7 @@
         text: reason instanceof Error ? reason.message : String(reason),
       }, requestSessionId);
     } finally {
-      workspaceChatStreamingText = "";
+      resetWorkspaceChatStream();
       workspaceChatLastEventSequence = 0;
       if (requestId === workspaceChatRequestId) {
         workspaceChatRunId = null;
@@ -3824,6 +3911,8 @@
   function cancelWorkspaceChat() {
     workspaceChatRequestId += 1;
     workspaceChatRunning = false;
+    resetWorkspaceChatStream();
+    workspaceChatLastEventSequence = 0;
     const runId = workspaceChatRunId;
     workspaceChatRunId = null;
     if (runId) void cancelAiRun(runId).catch(() => {});
@@ -5990,7 +6079,7 @@
               "info",
               "tool",
               `Tool started: ${event.tool_name}.`,
-              [`Tool call: ${event.tool_call_id}`],
+              [`Tool call: ${event.tool_call_id}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
               [],
               ["Wait for the runtime to report tool completion."],
             );
@@ -6000,7 +6089,7 @@
               event.success ? "info" : "error",
               "tool",
               `Tool ${event.success ? "completed" : "failed"}: ${event.tool_name}.`,
-              [`Tool call: ${event.tool_call_id}`],
+              [`Tool call: ${event.tool_call_id}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
               [],
               event.success ? [] : ["Review the tool failure evidence before continuing."],
             );
@@ -6010,7 +6099,7 @@
               "error",
               "approval",
               `Tool approval required: ${event.operation}.`,
-              [`Capability: ${event.capability}`],
+              [`Capability: ${event.capability}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
               ["The backend stopped the unapproved operation."],
               ["Grant the required capability and start a new execution run."],
             );
