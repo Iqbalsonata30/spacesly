@@ -318,6 +318,24 @@ pub struct AiWorkerChatResult {
     pub message: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AiWorkerStreamEvent {
+    TextDelta(String),
+    ToolStarted {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolCompleted {
+        tool_call_id: String,
+        tool_name: String,
+        success: bool,
+    },
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiEditRequest {
     #[serde(default)]
@@ -432,11 +450,12 @@ pub fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     cancellation: Arc<AtomicBool>,
+    on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
 ) -> Result<AiWorkerTaskResult, String> {
     check_cancelled(&cancellation)?;
     require_execution_contract(&task)?;
     if config.runtime == "opencode" {
-        return execute_opencode_task(config, task, cancellation);
+        return execute_opencode_task(config, task, cancellation, on_event);
     }
 
     validate_config(&config)?;
@@ -460,7 +479,7 @@ pub fn chat_ai_worker(
     mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     cancellation: Arc<AtomicBool>,
-    mut on_text: Option<Box<dyn FnMut(&str) + Send>>,
+    mut on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
 ) -> Result<AiWorkerChatResult, String> {
     let message = request.message.trim();
     if message.is_empty() {
@@ -535,11 +554,9 @@ pub fn chat_ai_worker(
             CHAT_OUTPUT_LIMIT,
             "OpenCode chat",
             |line| {
-                if let Some((_line_session, text, _error)) = parse_opencode_json_line(line) {
-                    if let Some(text) = text {
-                        if let Some(on_text) = on_text.as_mut() {
-                            on_text(&text);
-                        }
+                if let Some(event) = parse_opencode_stream_event(line) {
+                    if let Some(on_event) = on_event.as_mut() {
+                        on_event(event)?;
                     }
                 }
                 Ok(())
@@ -583,8 +600,8 @@ pub fn chat_ai_worker(
     );
     let response = call_model(&config, &system_prompt, &user_prompt, 550)?;
     check_cancelled(&cancellation)?;
-    if let Some(on_text) = on_text.as_mut() {
-        on_text(&response);
+    if let Some(on_event) = on_event.as_mut() {
+        on_event(AiWorkerStreamEvent::TextDelta(response.clone()))?;
     }
 
     Ok(AiWorkerChatResult {
@@ -597,7 +614,7 @@ pub async fn chat_ai_worker_streaming(
     config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     cancellation: Arc<AtomicBool>,
-    mut on_text: Box<dyn FnMut(&str) + Send>,
+    mut on_event: Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>,
 ) -> Result<AiWorkerChatResult, String> {
     let message = request.message.trim();
     if message.is_empty() {
@@ -621,7 +638,7 @@ pub async fn chat_ai_worker_streaming(
         &user_prompt,
         550,
         cancellation,
-        &mut on_text,
+        &mut on_event,
     )
     .await?;
     Ok(AiWorkerChatResult {
@@ -964,6 +981,7 @@ fn execute_opencode_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     cancellation: Arc<AtomicBool>,
+    mut on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
 ) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
     require_execution_contract(&task)?;
@@ -1002,7 +1020,21 @@ fn execute_opencode_task(
         .arg("--title")
         .arg(contract_title(&task))
         .arg(prompt);
-    let output = run_cancellable_command(command, cancellation)?;
+    let output = run_cancellable_jsonl_command(
+        command,
+        cancellation,
+        AGENT_TIMEOUT,
+        AGENT_OUTPUT_LIMIT,
+        "OpenCode Agent",
+        |line| {
+            if let Some(event) = parse_opencode_stream_event(line) {
+                if let Some(on_event) = on_event.as_mut() {
+                    on_event(event)?;
+                }
+            }
+            Ok(())
+        },
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -1027,6 +1059,7 @@ fn execute_opencode_task(
     Ok(result)
 }
 
+#[cfg(test)]
 fn run_cancellable_command(
     command: Command,
     cancellation: Arc<AtomicBool>,
@@ -1646,20 +1679,29 @@ fn async_ai_http_client() -> Result<&'static AsyncClient, String> {
 }
 
 fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
+    let proxy_executable = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
     let mcp = config
         .mcp_servers
         .iter()
         .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
-        .map(|server| {
-            (
+        .filter_map(|server| {
+            let proxy_executable = proxy_executable.as_ref()?;
+            let mut environment = server.environment.clone();
+            environment.insert(
+                "SPACESLY_MCP_PROXY_COMMAND".to_string(),
+                serde_json::to_string(&server.command).ok()?,
+            );
+            Some((
                 server.name.clone(),
                 serde_json::json!({
                     "type": "local",
-                    "command": server.command,
+                    "command": [proxy_executable, "--spacesly-mcp-proxy"],
                     "enabled": true,
-                    "environment": server.environment.iter().collect::<BTreeMap<_, _>>(),
+                    "environment": environment.iter().collect::<BTreeMap<_, _>>(),
                 }),
-            )
+            ))
         })
         .collect::<BTreeMap<_, _>>();
     if mcp.is_empty() && !config.restrict_tools {
@@ -1946,7 +1988,7 @@ async fn stream_model_response(
     user_prompt: &str,
     max_tokens: u32,
     cancellation: Arc<AtomicBool>,
-    on_text: &mut (dyn FnMut(&str) + Send),
+    on_event: &mut (dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send),
 ) -> Result<String, String> {
     let client = async_ai_http_client()?;
     let (endpoint, body) = match config.api_style.as_str() {
@@ -2017,6 +2059,8 @@ async fn stream_model_response(
 
     let mut decoder = SseDecoder::default();
     let mut output = String::new();
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
     loop {
         let chunk = tokio::select! {
             chunk = response.chunk() => chunk.map_err(|error| format!("Failed to read Agent stream: {error}"))?,
@@ -2034,7 +2078,15 @@ async fn stream_model_response(
                     ));
                 }
                 output.push_str(&delta);
-                on_text(&delta);
+                on_event(AiWorkerStreamEvent::TextDelta(delta))?;
+            }
+            if let Some((input, output)) = provider_stream_usage(&config.api_style, &data) {
+                input_tokens = input.unwrap_or(input_tokens);
+                output_tokens = output.unwrap_or(output_tokens);
+                on_event(AiWorkerStreamEvent::UsageUpdated {
+                    input_tokens,
+                    output_tokens,
+                })?;
             }
         }
     }
@@ -2046,7 +2098,15 @@ async fn stream_model_response(
                 ));
             }
             output.push_str(&delta);
-            on_text(&delta);
+            on_event(AiWorkerStreamEvent::TextDelta(delta))?;
+        }
+        if let Some((input, output)) = provider_stream_usage(&config.api_style, &data) {
+            input_tokens = input.unwrap_or(input_tokens);
+            output_tokens = output.unwrap_or(output_tokens);
+            on_event(AiWorkerStreamEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+            })?;
         }
     }
     if output.trim().is_empty() {
@@ -2140,6 +2200,27 @@ fn provider_stream_delta(api_style: &str, data: &str) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::to_string),
     }
+}
+
+fn provider_stream_usage(api_style: &str, data: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    let usage = match api_style {
+        "openai_responses" => value.get("response")?.get("usage")?,
+        "anthropic_messages" => value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .or_else(|| value.get("usage"))?,
+        _ => value.get("usage")?,
+    };
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_u64);
+    (input.is_some() || output.is_some()).then_some((input, output))
 }
 
 fn call_model(
@@ -2419,6 +2500,53 @@ fn parse_opencode_json_line(
     Some((session_id, text, error))
 }
 
+fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let part = value.get("part")?;
+    if part.get("type").and_then(Value::as_str) == Some("text") {
+        return part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| AiWorkerStreamEvent::TextDelta(text.to_string()));
+    }
+    if part.get("type").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+    let tool_call_id = part
+        .get("callID")
+        .or_else(|| part.get("callId"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let tool_name = part
+        .get("tool")
+        .or_else(|| part.get("toolName"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let status = part
+        .get("state")
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("pending");
+    match status {
+        "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            success: true,
+        }),
+        "error" | "failed" => Some(AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            success: false,
+        }),
+        _ => Some(AiWorkerStreamEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+        }),
+    }
+}
+
 fn describe_reqwest_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "The request timed out after 30 seconds. Check the model provider, VPN/proxy, or use a faster model.".to_string()
@@ -2677,9 +2805,16 @@ mod tests {
         let parsed: Value = serde_json::from_str(config_content).expect("valid OpenCode config");
 
         assert_eq!(
-            parsed["mcp"]["spacesly-jira"]["command"],
-            serde_json::json!(["npx", "-y", "jira-mcp"])
+            parsed["mcp"]["spacesly-jira"]["command"][1],
+            "--spacesly-mcp-proxy"
         );
+        let proxied_command: Vec<String> = serde_json::from_str(
+            parsed["mcp"]["spacesly-jira"]["environment"]["SPACESLY_MCP_PROXY_COMMAND"]
+                .as_str()
+                .expect("proxied command should be serialized"),
+        )
+        .expect("proxied command should be valid JSON");
+        assert_eq!(proxied_command, ["npx", "-y", "jira-mcp"]);
         assert_eq!(
             parsed["mcp"]["spacesly-jira"]["environment"]["JIRA_URL"],
             "https://jira.test"
@@ -3082,5 +3217,49 @@ mod tests {
 
         assert!(output.stdout.len() < 100);
         assert!(String::from_utf8_lossy(&output.stdout).contains("output truncated"));
+    }
+
+    #[test]
+    fn parses_opencode_tool_lifecycle_events_without_arguments() {
+        let started = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"call-1","tool":"shell","state":{"status":"running","input":{"command":"secret"}}}}"#,
+        );
+        assert_eq!(
+            started,
+            Some(AiWorkerStreamEvent::ToolStarted {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+            })
+        );
+
+        let completed = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"call-1","tool":"shell","state":{"status":"completed"}}}"#,
+        );
+        assert_eq!(
+            completed,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+                success: true,
+            })
+        );
+    }
+
+    #[test]
+    fn extracts_provider_usage_from_supported_stream_shapes() {
+        assert_eq!(
+            provider_stream_usage(
+                "openai_chat",
+                r#"{"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
+            ),
+            Some((Some(12), Some(7)))
+        );
+        assert_eq!(
+            provider_stream_usage(
+                "anthropic_messages",
+                r#"{"type":"message_delta","usage":{"output_tokens":9}}"#,
+            ),
+            Some((None, Some(9)))
+        );
     }
 }

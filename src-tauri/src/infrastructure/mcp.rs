@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -10,12 +10,149 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::jira_rest;
 use super::shell_env::inject_shell_env;
+use super::tool_broker::ToolBroker;
 
 const MCP_STDERR_LIMIT: usize = 64 * 1024;
 const MCP_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
 const MCP_HEADER_LINE_LIMIT: usize = 8 * 1024;
 const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MCP_MAX_SESSIONS: usize = 8;
+const MCP_PROXY_COMMAND_ENV: &str = "SPACESLY_MCP_PROXY_COMMAND";
+
+pub fn run_mcp_proxy_from_env() -> Result<(), String> {
+    let command_json = std::env::var(MCP_PROXY_COMMAND_ENV)
+        .map_err(|_| "MCP proxy connector command was not provided.".to_string())?;
+    let command_parts: Vec<String> = serde_json::from_str(&command_json)
+        .map_err(|error| format!("Invalid MCP proxy connector command: {error}"))?;
+    let (executable, args) = command_parts
+        .split_first()
+        .ok_or_else(|| "MCP proxy connector command is empty.".to_string())?;
+    if executable.trim().is_empty() {
+        return Err("MCP proxy connector executable is empty.".to_string());
+    }
+
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env_remove(MCP_PROXY_COMMAND_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start proxied MCP connector: {error}"))?;
+    let upstream_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open proxied MCP stdin.".to_string())?;
+    let upstream_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open proxied MCP stdout.".to_string())?;
+    let exposed_tools = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pending_tool_lists = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let client_stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let request_tools = Arc::clone(&exposed_tools);
+    let request_lists = Arc::clone(&pending_tool_lists);
+    let request_stdout = Arc::clone(&client_stdout);
+
+    std::thread::spawn(move || -> Result<(), String> {
+        let mut client_reader = BufReader::new(std::io::stdin());
+        let mut upstream_writer = upstream_stdin;
+        while let Some(message) = read_stdout_message(&mut client_reader)? {
+            let method = message.get("method").and_then(Value::as_str);
+            if method == Some("tools/list") {
+                if let Some(id) = message.get("id") {
+                    request_lists
+                        .lock()
+                        .map_err(|error| error.to_string())?
+                        .insert(id.to_string());
+                }
+            }
+            if method == Some("tools/call") {
+                if let Err(error) = validate_proxy_tool_call(&message, &request_tools) {
+                    write_proxy_error(&request_stdout, message.get("id"), &error)?;
+                    continue;
+                }
+            }
+            write_proxy_message(&mut upstream_writer, &message)?;
+        }
+        Ok(())
+    });
+
+    let mut upstream_reader = BufReader::new(upstream_stdout);
+    while let Some(message) = read_stdout_message(&mut upstream_reader)? {
+        if let Some(id) = message.get("id") {
+            let is_tool_list = pending_tool_lists
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&id.to_string());
+            if is_tool_list {
+                let tools = message
+                    .get("result")
+                    .and_then(|result| result.get("tools"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+                *exposed_tools.lock().map_err(|error| error.to_string())? = tools;
+            }
+        }
+        let mut stdout = client_stdout.lock().map_err(|error| error.to_string())?;
+        write_proxy_message(&mut *stdout, &message)?;
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Failed to wait for proxied MCP connector: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Proxied MCP connector exited with {status}."))
+    }
+}
+
+fn validate_proxy_tool_call(
+    message: &Value,
+    exposed_tools: &Mutex<Vec<String>>,
+) -> Result<(), String> {
+    let params = message
+        .get("params")
+        .ok_or_else(|| "MCP tool call did not include params.".to_string())?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "MCP tool call did not include a tool name.".to_string())?;
+    let arguments = params
+        .get("arguments")
+        .ok_or_else(|| "MCP tool call did not include arguments.".to_string())?;
+    let tools = exposed_tools.lock().map_err(|error| error.to_string())?;
+    ToolBroker::validate_mcp_call(name, &tools, arguments)
+}
+
+fn write_proxy_error(
+    stdout: &Mutex<std::io::Stdout>,
+    id: Option<&Value>,
+    message: &str,
+) -> Result<(), String> {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id.cloned().unwrap_or(Value::Null),
+        "error": { "code": -32001, "message": message },
+    });
+    let mut stdout = stdout.lock().map_err(|error| error.to_string())?;
+    write_proxy_message(&mut *stdout, &response)
+}
+
+fn write_proxy_message(writer: &mut impl Write, message: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, message)
+        .map_err(|error| format!("Failed to serialize proxied MCP message: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("Failed to write proxied MCP message: {error}"))
+}
 
 /// Jira issue data returned from a Jira MCP server.
 #[derive(Clone, Debug, Serialize)]
@@ -341,6 +478,7 @@ impl StdioMcpClient {
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        ToolBroker::validate_mcp_call(name, &self.tools()?, &arguments)?;
         self.request(
             "tools/call",
             json!({
@@ -1280,5 +1418,34 @@ mod tests {
         assert!(error.contains("ambiguous"));
         assert!(error.contains("jira_search"));
         assert!(error.contains("legacy_search"));
+    }
+
+    #[test]
+    fn proxy_rejects_tool_calls_before_upstream_dispatch() {
+        let tools = Mutex::new(vec!["jira_search".to_string()]);
+        let allowed = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "jira_search", "arguments": { "jql": "project = APP" } }
+        });
+        assert!(validate_proxy_tool_call(&allowed, &tools).is_ok());
+
+        let denied = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "jira_delete", "arguments": {} }
+        });
+        assert!(validate_proxy_tool_call(&denied, &tools).is_err());
+    }
+
+    #[test]
+    fn proxy_serializes_json_lines_for_stdio_compatibility() {
+        let mut output = Vec::new();
+        write_proxy_message(&mut output, &json!({ "id": 1, "result": {} })).unwrap();
+
+        assert_eq!(output.last(), Some(&b'\n'));
+        assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["id"], 1);
     }
 }

@@ -2,6 +2,10 @@ mod application;
 mod domain;
 mod infrastructure;
 
+pub fn run_mcp_proxy() -> Result<(), String> {
+    infrastructure::mcp::run_mcp_proxy_from_env()
+}
+
 use application::app::AppState;
 use application::files_service::FilesService;
 use application::git_service::GitService;
@@ -15,8 +19,8 @@ use infrastructure::ai_worker::{
     chat_ai_worker_streaming as chat_ai_worker_streaming_impl, close_all_opencode_servers,
     execute_ai_worker_task as execute_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
     test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiEditRequest, AiEditResult,
-    AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask,
-    AiWorkerTaskResult,
+    AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerStreamEvent,
+    AiWorkerTask, AiWorkerTaskResult,
 };
 use infrastructure::execution_store::ExecutionStore;
 use infrastructure::file_watcher::FileWatchRegistry;
@@ -50,6 +54,7 @@ use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
     ShellCommandRequest, ShellCommandResult, ShellCompletionRequest, ShellCompletionResult,
 };
+use infrastructure::tool_broker::{ToolAuthorization, ToolBroker};
 use infrastructure::workspace_cache::{
     load_cached_workspace as load_cached_workspace_impl,
     save_cached_workspace as save_cached_workspace_impl, CachedWorkspace,
@@ -421,6 +426,13 @@ async fn execute_ai_worker_task(
         let capability = format!("external_tools:{}", server.secret_id);
         ai_runs.require_capabilities(&run_id, &[capability.as_str()])?;
     }
+    let tool_broker = ToolBroker::new(
+        ai_runs.granted_capabilities(&run_id)?,
+        config
+            .mcp_servers
+            .iter()
+            .map(|server| (server.name.clone(), server.secret_id.clone())),
+    );
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
@@ -438,13 +450,57 @@ async fn execute_ai_worker_task(
     let cancellation = runtime.cancellation(&run_id)?;
     let store = execution_store.inner().clone();
     let worker_run_id = run_id.clone();
+    let worker_stream_channel = on_event.clone();
+    let worker_stream_sequence = Arc::new(AtomicU64::new(2));
+    let worker_stream_sequence_for_task = worker_stream_sequence.clone();
     if let Err(error) = store.claim_step(&run_id, "worker.execute", &run_id, 15 * 60 * 1000) {
         let _ = registry.finish(&run_id);
         let _ = runtime.finish(&run_id, AiRunStatus::Failed);
         return Err(error);
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let result = execute_ai_worker_task_impl(config, task, cancellation);
+        let worker_stream_run_id = worker_run_id.clone();
+        let worker_stream_store = store.clone();
+        let worker_callback: Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send> =
+            Box::new(move |event| {
+                if let AiWorkerStreamEvent::ToolStarted { tool_name, .. } = &event {
+                    if let ToolAuthorization::ApprovalRequired { capability } =
+                        tool_broker.authorize(tool_name)
+                    {
+                        let payload = serde_json::json!({
+                            "capability": capability,
+                            "operation": tool_name,
+                        });
+                        let _ = worker_stream_store.record_ai_audit(
+                            Some(&worker_stream_run_id),
+                            "approval_required",
+                            &payload,
+                        );
+                        emit_ai_event(
+                            Some(&worker_stream_channel),
+                            AiRuntimeEvent::ApprovalRequired {
+                                run_id: worker_stream_run_id.clone(),
+                                sequence: worker_stream_sequence_for_task
+                                    .fetch_add(1, Ordering::Relaxed),
+                                capability: capability.clone(),
+                                operation: tool_name.clone(),
+                            },
+                        );
+                        return Err(format!(
+                            "Tool operation '{tool_name}' requires the '{capability}' capability."
+                        ));
+                    }
+                }
+                emit_worker_stream_event(
+                    &worker_stream_channel,
+                    &worker_stream_run_id,
+                    &worker_stream_sequence_for_task,
+                    event,
+                    Some(&worker_stream_store),
+                );
+                Ok(())
+            });
+        let result = execute_ai_worker_task_impl(config, task, cancellation, Some(worker_callback));
         let (status, summary) = match &result {
             Ok(value)
                 if value.completion_status
@@ -476,19 +532,19 @@ async fn execute_ai_worker_task(
         let event = match status {
             "completed" => AiRuntimeEvent::RunCompleted {
                 run_id: worker_run_id.clone(),
-                sequence: 2,
+                sequence: worker_stream_sequence.fetch_add(1, Ordering::Relaxed),
             },
             "blocked" => AiRuntimeEvent::RunBlocked {
                 run_id: worker_run_id.clone(),
-                sequence: 2,
+                sequence: worker_stream_sequence.fetch_add(1, Ordering::Relaxed),
             },
             "cancelled" => AiRuntimeEvent::RunCancelled {
                 run_id: worker_run_id.clone(),
-                sequence: 2,
+                sequence: worker_stream_sequence.fetch_add(1, Ordering::Relaxed),
             },
             _ => AiRuntimeEvent::RunFailed {
                 run_id: worker_run_id.clone(),
-                sequence: 2,
+                sequence: worker_stream_sequence.fetch_add(1, Ordering::Relaxed),
                 error_code: "agent_execution_failed".to_string(),
             },
         };
@@ -568,21 +624,22 @@ async fn chat_ai_worker(
     let stream_channel = on_event.clone();
     let stream_run_id = run_id.clone();
     let stream_sequence = event_sequence.clone();
-    let on_text: Box<dyn FnMut(&str) + Send> = Box::new(move |delta| {
-        emit_ai_event(
-            Some(&stream_channel),
-            AiRuntimeEvent::TextDelta {
-                run_id: stream_run_id.clone(),
-                sequence: stream_sequence.fetch_add(1, Ordering::Relaxed),
-                delta: delta.to_string(),
-            },
-        );
-    });
+    let stream_callback: Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send> =
+        Box::new(move |event| {
+            emit_worker_stream_event(
+                &stream_channel,
+                &stream_run_id,
+                &stream_sequence,
+                event,
+                None,
+            );
+            Ok(())
+        });
     let result = if config.runtime == "api" {
-        chat_ai_worker_streaming_impl(config, request, cancellation, on_text).await
+        chat_ai_worker_streaming_impl(config, request, cancellation, stream_callback).await
     } else {
         match tauri::async_runtime::spawn_blocking(move || {
-            chat_ai_worker_impl(config, request, cancellation, Some(on_text))
+            chat_ai_worker_impl(config, request, cancellation, Some(stream_callback))
         })
         .await
         {
@@ -662,6 +719,72 @@ fn emit_ai_event(channel: Option<&Channel<AiRuntimeEvent>>, event: AiRuntimeEven
     if let Some(channel) = channel {
         let _ = channel.send(event);
     }
+}
+
+fn emit_worker_stream_event(
+    channel: &Channel<AiRuntimeEvent>,
+    run_id: &str,
+    sequence: &AtomicU64,
+    event: AiWorkerStreamEvent,
+    audit_store: Option<&ExecutionStore>,
+) {
+    let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+    let runtime_event = match event {
+        AiWorkerStreamEvent::TextDelta(delta) => AiRuntimeEvent::TextDelta {
+            run_id: run_id.to_string(),
+            sequence,
+            delta,
+        },
+        AiWorkerStreamEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+        } => {
+            if let Some(store) = audit_store {
+                let payload = serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                });
+                let _ = store.record_ai_audit(Some(run_id), "tool_started", &payload);
+            }
+            AiRuntimeEvent::ToolStarted {
+                run_id: run_id.to_string(),
+                sequence,
+                tool_call_id,
+                tool_name,
+            }
+        }
+        AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            success,
+        } => {
+            if let Some(store) = audit_store {
+                let payload = serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "success": success,
+                });
+                let _ = store.record_ai_audit(Some(run_id), "tool_completed", &payload);
+            }
+            AiRuntimeEvent::ToolCompleted {
+                run_id: run_id.to_string(),
+                sequence,
+                tool_call_id,
+                tool_name,
+                success,
+            }
+        }
+        AiWorkerStreamEvent::UsageUpdated {
+            input_tokens,
+            output_tokens,
+        } => AiRuntimeEvent::UsageUpdated {
+            run_id: run_id.to_string(),
+            sequence,
+            input_tokens,
+            output_tokens,
+        },
+    };
+    emit_ai_event(Some(channel), runtime_event);
 }
 
 fn bind_tool_capable_ai_workspace(

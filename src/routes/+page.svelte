@@ -5984,6 +5984,36 @@
               [],
               ["Review the blocked reason and resolve the missing requirement."],
             );
+          } else if (event.type === "tool_started") {
+            appendStructuredAgentLogForCard(
+              cardId,
+              "info",
+              "tool",
+              `Tool started: ${event.tool_name}.`,
+              [`Tool call: ${event.tool_call_id}`],
+              [],
+              ["Wait for the runtime to report tool completion."],
+            );
+          } else if (event.type === "tool_completed") {
+            appendStructuredAgentLogForCard(
+              cardId,
+              event.success ? "info" : "error",
+              "tool",
+              `Tool ${event.success ? "completed" : "failed"}: ${event.tool_name}.`,
+              [`Tool call: ${event.tool_call_id}`],
+              [],
+              event.success ? [] : ["Review the tool failure evidence before continuing."],
+            );
+          } else if (event.type === "approval_required") {
+            appendStructuredAgentLogForCard(
+              cardId,
+              "error",
+              "approval",
+              `Tool approval required: ${event.operation}.`,
+              [`Capability: ${event.capability}`],
+              ["The backend stopped the unapproved operation."],
+              ["Grant the required capability and start a new execution run."],
+            );
           }
         });
       } catch (reason) {

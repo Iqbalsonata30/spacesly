@@ -12,6 +12,31 @@ pub enum AiRuntimeEvent {
         sequence: u64,
         delta: String,
     },
+    ToolStarted {
+        run_id: String,
+        sequence: u64,
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolCompleted {
+        run_id: String,
+        sequence: u64,
+        tool_call_id: String,
+        tool_name: String,
+        success: bool,
+    },
+    ApprovalRequired {
+        run_id: String,
+        sequence: u64,
+        capability: String,
+        operation: String,
+    },
+    UsageUpdated {
+        run_id: String,
+        sequence: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     RunCompleted {
         run_id: String,
         sequence: u64,

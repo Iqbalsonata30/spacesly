@@ -119,6 +119,35 @@ export interface AiWorkerChatResult {
 export type AiRuntimeEvent =
   | { type: "run_started"; run_id: string; sequence: number }
   | { type: "text_delta"; run_id: string; sequence: number; delta: string }
+  | {
+      type: "tool_started";
+      run_id: string;
+      sequence: number;
+      tool_call_id: string;
+      tool_name: string;
+    }
+  | {
+      type: "tool_completed";
+      run_id: string;
+      sequence: number;
+      tool_call_id: string;
+      tool_name: string;
+      success: boolean;
+    }
+  | {
+      type: "approval_required";
+      run_id: string;
+      sequence: number;
+      capability: string;
+      operation: string;
+    }
+  | {
+      type: "usage_updated";
+      run_id: string;
+      sequence: number;
+      input_tokens: number;
+      output_tokens: number;
+    }
   | { type: "run_completed"; run_id: string; sequence: number }
   | { type: "run_blocked"; run_id: string; sequence: number }
   | { type: "run_failed"; run_id: string; sequence: number; error_code: string }

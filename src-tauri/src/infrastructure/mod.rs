@@ -14,6 +14,7 @@ pub mod recovery_store;
 pub mod secrets;
 pub mod shell;
 mod shell_env;
+pub mod tool_broker;
 pub mod workspace_cache;
 pub mod workspace_search;
 pub mod workspace_trust;

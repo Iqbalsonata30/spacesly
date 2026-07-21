@@ -133,8 +133,8 @@ impl AiRunRegistry {
         if capabilities.is_empty()
             || capabilities.iter().any(|value| {
                 !ALLOWED.contains(&value.as_str())
-                    && !value.starts_with("external_tools:")
-                    && value.len() > "external_tools:".len()
+                    && !(value.starts_with("external_tools:")
+                        && value.len() > "external_tools:".len())
             })
         {
             return Err("AI capability grant contains an unsupported capability.".to_string());
@@ -162,6 +162,15 @@ impl AiRunRegistry {
             return Err("Agent capability approval does not cover this execution.".to_string());
         }
         Ok(())
+    }
+
+    pub fn granted_capabilities(&self, run_id: &str) -> Result<HashSet<String>, String> {
+        self.capability_grants
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| "Agent capability approval is required before execution.".to_string())
     }
 
     pub fn finish(&self, run_id: &str, status: AiRunStatus) -> Result<AiRun, String> {
@@ -319,5 +328,23 @@ mod tests {
         assert!(registry
             .require_capabilities("agent-1", &["shell"])
             .is_err());
+    }
+
+    #[test]
+    fn capability_grants_reject_unknown_and_empty_connector_scopes() {
+        let registry = AiRunRegistry::default();
+        registry
+            .begin("agent-1".to_string(), AiRunKind::Agent)
+            .unwrap();
+
+        assert!(registry
+            .grant_capabilities("agent-1", vec!["foo".to_string()])
+            .is_err());
+        assert!(registry
+            .grant_capabilities("agent-1", vec!["external_tools:".to_string()])
+            .is_err());
+        registry
+            .grant_capabilities("agent-1", vec!["external_tools:jira".to_string()])
+            .unwrap();
     }
 }
