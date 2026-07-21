@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -457,6 +458,7 @@ pub fn chat_ai_worker(
     mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     cancellation: Arc<AtomicBool>,
+    mut on_text: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<AiWorkerChatResult, String> {
     let message = request.message.trim();
     if message.is_empty() {
@@ -524,12 +526,22 @@ pub fn chat_ai_worker(
         if let Some(session) = session {
             command.args(["--session", session.as_str()]);
         }
-        let output = run_cancellable_bounded_command(
+        let output = run_cancellable_jsonl_command(
             command,
             cancellation.clone(),
             CHAT_TIMEOUT,
             CHAT_OUTPUT_LIMIT,
             "OpenCode chat",
+            |line| {
+                if let Some((_line_session, text, _error)) = parse_opencode_json_line(line) {
+                    if let Some(text) = text {
+                        if let Some(on_text) = on_text.as_mut() {
+                            on_text(&text);
+                        }
+                    }
+                }
+                Ok(())
+            },
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -569,6 +581,9 @@ pub fn chat_ai_worker(
     );
     let response = call_model(&config, &system_prompt, &user_prompt, 550)?;
     check_cancelled(&cancellation)?;
+    if let Some(on_text) = on_text.as_mut() {
+        on_text(&response);
+    }
 
     Ok(AiWorkerChatResult {
         run_id: String::new(),
@@ -1000,6 +1015,124 @@ fn run_cancellable_bounded_command(
         output_limit,
         label,
     )
+}
+
+fn run_cancellable_jsonl_command<F>(
+    mut command: Command,
+    cancellation: Arc<AtomicBool>,
+    timeout: Duration,
+    output_limit: usize,
+    label: &str,
+    mut on_line: F,
+) -> Result<Output, String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to run Agent process: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Agent process stdout was not captured.".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Agent process stderr was not captured.".to_string())?;
+    let (line_tx, line_rx) = mpsc::channel::<Result<String, String>>();
+    let stdout_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if line_tx.send(Ok(line.clone())).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = line_tx.send(Err(format!("Failed to read Agent output: {error}")));
+                    break;
+                }
+            }
+        }
+    });
+    let stderr_thread = thread::spawn(move || read_limited_with_limit(&mut stderr, output_limit));
+    let started_at = Instant::now();
+    let mut stdout_bytes = Vec::new();
+    let mut process_line = |line: String| -> Result<(), String> {
+        stdout_bytes.extend_from_slice(line.as_bytes());
+        if stdout_bytes.len() > output_limit {
+            return Err(format!(
+                "{label} output exceeded the {output_limit} byte limit."
+            ));
+        }
+        on_line(line.trim_end_matches(['\r', '\n']))
+    };
+
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            terminate_agent_process(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(format!("{label} was cancelled."));
+        }
+        if started_at.elapsed() >= timeout {
+            terminate_agent_process(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(format!(
+                "{label} timed out after {} seconds.",
+                timeout.as_secs()
+            ));
+        }
+        while let Ok(line) = line_rx.try_recv() {
+            let line = line?;
+            if let Err(error) = process_line(line) {
+                terminate_agent_process(&mut child);
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(error);
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                while let Ok(line) = line_rx.try_recv() {
+                    process_line(line?)?;
+                }
+                let stderr = stderr_thread.join().unwrap_or_else(|_| Ok(Vec::new()))?;
+                let _ = stdout_thread.join();
+                return Ok(Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if let Ok(line) = line_rx.recv_timeout(Duration::from_millis(40)) {
+                    let line = line?;
+                    if let Err(error) = process_line(line) {
+                        terminate_agent_process(&mut child);
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                terminate_agent_process(&mut child);
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("Failed to monitor Agent process: {error}"));
+            }
+        }
+    }
 }
 
 fn run_bounded_command(
@@ -1986,26 +2119,15 @@ fn parse_opencode_run_output(stdout: &str) -> Result<OpenCodeRunOutput, String> 
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if session_id.is_none() {
-            session_id = value
-                .get("sessionID")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-        }
-        if value.get("type").and_then(Value::as_str) == Some("error") {
-            errors.push(value.to_string());
-        }
-        let Some(part) = value.get("part") else {
-            continue;
-        };
-        if part.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    text_parts.push(text.trim().to_string());
-                }
+        if let Some((line_session, text, error)) = parse_opencode_json_line(line) {
+            if session_id.is_none() {
+                session_id = line_session;
+            }
+            if let Some(error) = error {
+                errors.push(error);
+            }
+            if let Some(text) = text {
+                text_parts.push(text);
             }
         }
     }
@@ -2020,6 +2142,27 @@ fn parse_opencode_run_output(stdout: &str) -> Result<OpenCodeRunOutput, String> 
     let session_id =
         session_id.ok_or_else(|| "OpenCode did not report a session ID.".to_string())?;
     Ok(OpenCodeRunOutput { session_id, text })
+}
+
+fn parse_opencode_json_line(
+    line: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let session_id = value
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let error =
+        (value.get("type").and_then(Value::as_str) == Some("error")).then(|| value.to_string());
+    let text = value
+        .get("part")
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    Some((session_id, text, error))
 }
 
 fn describe_reqwest_error(error: &reqwest::Error) -> String {
@@ -2300,6 +2443,42 @@ mod tests {
 
         assert_eq!(output.session_id, "ses_123");
         assert_eq!(output.text, "STATUS: COMPLETE\nSUMMARY: Done");
+    }
+
+    #[test]
+    fn parses_incremental_opencode_text_lines() {
+        let (_, text, error) = parse_opencode_json_line(
+            r#"{"type":"text","sessionID":"ses_123","part":{"type":"text","text":"hello"}}"#,
+        )
+        .expect("valid OpenCode JSONL event");
+
+        assert_eq!(text.as_deref(), Some("hello"));
+        assert!(error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_runner_emits_lines_while_collecting_final_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '{\"part\":{\"type\":\"text\",\"text\":\"one\"}}\\n'; printf '{\"part\":{\"type\":\"text\",\"text\":\"two\"}}\\n'"]);
+        let mut streamed = Vec::new();
+
+        let output = run_cancellable_jsonl_command(
+            command,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(2),
+            4096,
+            "test",
+            |line| {
+                streamed.push(line.to_string());
+                Ok(())
+            },
+        )
+        .expect("streamed command");
+
+        assert!(output.status.success());
+        assert_eq!(streamed.len(), 2);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("one"));
     }
 
     #[test]

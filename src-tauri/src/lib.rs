@@ -61,6 +61,7 @@ use infrastructure::workspace_search::{
     WorkspaceSearchRequest, WorkspaceSearchResponse,
 };
 use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
@@ -524,19 +525,32 @@ async fn chat_ai_worker(
         .get(&run_id)?
         .ok_or_else(|| "AI chat run was not registered.".to_string())?;
     ai_runs.start(&run.run_id)?;
-    let mut sequence = 1;
     emit_ai_event(
         Some(&on_event),
         AiRuntimeEvent::RunStarted {
             run_id: run.run_id.clone(),
-            sequence,
+            sequence: 1,
         },
     );
+    let event_sequence = Arc::new(AtomicU64::new(2));
     let cancellation = ai_runs.cancellation(&run.run_id)?;
     let run_id = run.run_id.clone();
     let runtime = ai_runs.inner().clone();
+    let stream_channel = on_event.clone();
+    let stream_run_id = run_id.clone();
+    let stream_sequence = event_sequence.clone();
+    let on_text: Box<dyn FnMut(&str) + Send> = Box::new(move |delta| {
+        emit_ai_event(
+            Some(&stream_channel),
+            AiRuntimeEvent::TextDelta {
+                run_id: stream_run_id.clone(),
+                sequence: stream_sequence.fetch_add(1, Ordering::Relaxed),
+                delta: delta.to_string(),
+            },
+        );
+    });
     let result = match tauri::async_runtime::spawn_blocking(move || {
-        chat_ai_worker_impl(config, request, cancellation)
+        chat_ai_worker_impl(config, request, cancellation, Some(on_text))
     })
     .await
     {
@@ -547,7 +561,7 @@ async fn chat_ai_worker(
                 Some(&on_event),
                 AiRuntimeEvent::RunFailed {
                     run_id: run_id.clone(),
-                    sequence: sequence + 1,
+                    sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
                     error_code: "worker_join_failed".to_string(),
                 },
             );
@@ -565,27 +579,18 @@ async fn chat_ai_worker(
                     Some(&on_event),
                     AiRuntimeEvent::RunCancelled {
                         run_id: run_id.clone(),
-                        sequence: sequence + 1,
+                        sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
                     },
                 );
                 return Err("AI chat run was cancelled.".to_string());
             }
             value.run_id = run_id.clone();
-            sequence += 1;
-            emit_ai_event(
-                Some(&on_event),
-                AiRuntimeEvent::TextDelta {
-                    run_id: run_id.clone(),
-                    sequence,
-                    delta: value.message.clone(),
-                },
-            );
             let _ = runtime.finish(&run_id, AiRunStatus::Completed);
             emit_ai_event(
                 Some(&on_event),
                 AiRuntimeEvent::RunCompleted {
                     run_id: run_id.clone(),
-                    sequence: sequence + 1,
+                    sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
                 },
             );
             Ok(value)
@@ -602,7 +607,7 @@ async fn chat_ai_worker(
                     Some(&on_event),
                     AiRuntimeEvent::RunCancelled {
                         run_id: run_id.clone(),
-                        sequence: sequence + 1,
+                        sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
                     },
                 );
             } else {
@@ -610,7 +615,7 @@ async fn chat_ai_worker(
                     Some(&on_event),
                     AiRuntimeEvent::RunFailed {
                         run_id: run_id.clone(),
-                        sequence: sequence + 1,
+                        sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
                         error_code: "provider_failed".to_string(),
                     },
                 );
