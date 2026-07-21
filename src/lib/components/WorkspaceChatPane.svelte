@@ -16,6 +16,7 @@
     onNewSession: () => void;
     onSwitchSession: (sessionId: string) => void;
     messages: WorkspaceChatMessage[];
+    streamingText?: string;
     running: boolean;
     onCancel: () => void;
     actionProposal: WorkspaceChatActionProposal | null;
@@ -35,6 +36,7 @@
     onNewSession,
     onSwitchSession,
     messages,
+    streamingText = "",
     running,
     onCancel,
     actionProposal,
@@ -307,6 +309,12 @@
         <p>{message.text}</p>
       </article>
     {/each}
+    {#if streamingText}
+      <article class="workspace-chat-message agent streaming">
+        <strong>agent</strong>
+        <p>{streamingText}</p>
+      </article>
+    {/if}
     <div class="workspace-chat-end" bind:this={end}></div>
   </div>
   {#if actionProposal}

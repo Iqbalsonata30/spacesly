@@ -1,4 +1,5 @@
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
+import { Channel } from "@tauri-apps/api/core";
 
 export interface AiWorkerMcpServer {
   name: string;
@@ -114,6 +115,13 @@ export interface AiWorkerChatResult {
   run_id: string;
   message: string;
 }
+
+export type AiRuntimeEvent =
+  | { type: "run_started"; run_id: string; sequence: number }
+  | { type: "text_delta"; run_id: string; sequence: number; delta: string }
+  | { type: "run_completed"; run_id: string; sequence: number }
+  | { type: "run_failed"; run_id: string; sequence: number; error_code: string }
+  | { type: "run_cancelled"; run_id: string; sequence: number };
 
 export type AiRunKind = "chat" | "edit" | "agent";
 export type AiRunStatus =
@@ -239,11 +247,14 @@ export async function cancelAiWorkerTask(runId: string): Promise<boolean> {
 export async function chatAiWorker(
   config: AiWorkerConfig,
   request: AiWorkerChatRequest,
+  onEvent: (event: AiRuntimeEvent) => void,
 ): Promise<AiWorkerChatResult> {
   const runId = request.run_id ?? (await beginAiRun("chat")).run_id;
+  const channel = new Channel<AiRuntimeEvent>();
+  channel.onmessage = onEvent;
   return invokeWithPolicy<AiWorkerChatResult>(
     "chat_ai_worker",
-    { config, request: { ...request, run_id: runId } },
+    { config, request: { ...request, run_id: runId }, onEvent: channel },
     IPC_POLICIES.aiChat,
   );
 }

@@ -1,0 +1,46 @@
+use serde::Serialize;
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AiRuntimeEvent {
+    RunStarted {
+        run_id: String,
+        sequence: u64,
+    },
+    TextDelta {
+        run_id: String,
+        sequence: u64,
+        delta: String,
+    },
+    RunCompleted {
+        run_id: String,
+        sequence: u64,
+    },
+    RunFailed {
+        run_id: String,
+        sequence: u64,
+        error_code: String,
+    },
+    RunCancelled {
+        run_id: String,
+        sequence: u64,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AiRuntimeEvent;
+
+    #[test]
+    fn runtime_events_use_stable_tagged_wire_format() {
+        let event = AiRuntimeEvent::TextDelta {
+            run_id: "run-1".to_string(),
+            sequence: 2,
+            delta: "hello".to_string(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "text_delta");
+        assert_eq!(value["run_id"], "run-1");
+        assert_eq!(value["sequence"], 2);
+    }
+}

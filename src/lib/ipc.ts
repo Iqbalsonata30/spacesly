@@ -4,6 +4,7 @@ import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import type { FileEntry } from "$lib/ipc/files";
 export type {
   AiWorkerChatResult,
+  AiRuntimeEvent,
   AiRun,
   AiRunKind,
   AiRunStatus,

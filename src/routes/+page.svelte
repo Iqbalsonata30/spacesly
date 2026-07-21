@@ -441,6 +441,8 @@
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRunning = $state(false);
   let workspaceChatRunId = $state<string | null>(null);
+  let workspaceChatStreamingText = $state("");
+  let workspaceChatLastEventSequence = $state(0);
   let workspaceChatRequestId = 0;
   let workspaceChatActionProposal = $state<WorkspaceChatActionProposal | null>(null);
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
@@ -3744,6 +3746,8 @@
     if (!(await ensureAiWorkspaceTrusted(config))) return;
 
     workspaceChatRunning = true;
+    workspaceChatStreamingText = "";
+    workspaceChatLastEventSequence = 0;
     const requestId = ++workspaceChatRequestId;
 
     try {
@@ -3759,6 +3763,13 @@
         terminal_context: requestTerminalContext,
         session_context: requestSessionContext,
         session_key: `chat:${requestSessionId}`,
+      }, (event) => {
+        if (event.run_id !== run.run_id || requestId !== workspaceChatRequestId) return;
+        if (event.sequence <= workspaceChatLastEventSequence) return;
+        workspaceChatLastEventSequence = event.sequence;
+        if (event.type === "text_delta") {
+          workspaceChatStreamingText += event.delta;
+        }
       });
       if (requestId !== workspaceChatRequestId) return;
       const response = result.message;
@@ -3789,6 +3800,8 @@
         text: reason instanceof Error ? reason.message : String(reason),
       }, requestSessionId);
     } finally {
+      workspaceChatStreamingText = "";
+      workspaceChatLastEventSequence = 0;
       if (requestId === workspaceChatRequestId) {
         workspaceChatRunId = null;
         workspaceChatRunning = false;
@@ -7689,6 +7702,7 @@
               onNewSession={startWorkspaceChatSession}
               onSwitchSession={activateWorkspaceChatSession}
               messages={workspaceChatMessages}
+              streamingText={workspaceChatStreamingText}
               running={workspaceChatRunning}
               actionProposal={workspaceChatActionProposal?.sessionId === workspaceChatSession.id
                 ? workspaceChatActionProposal

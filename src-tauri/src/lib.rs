@@ -8,6 +8,7 @@ use application::git_service::GitService;
 use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
+use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl, close_all_opencode_servers,
@@ -511,6 +512,7 @@ async fn chat_ai_worker(
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
     secrets: State<'_, AppSecretsStore>,
+    on_event: Channel<AiRuntimeEvent>,
 ) -> Result<AiWorkerChatResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     resolve_ai_secrets(&mut config, secrets.inner())?;
@@ -522,6 +524,14 @@ async fn chat_ai_worker(
         .get(&run_id)?
         .ok_or_else(|| "AI chat run was not registered.".to_string())?;
     ai_runs.start(&run.run_id)?;
+    let mut sequence = 1;
+    emit_ai_event(
+        Some(&on_event),
+        AiRuntimeEvent::RunStarted {
+            run_id: run.run_id.clone(),
+            sequence,
+        },
+    );
     let cancellation = ai_runs.cancellation(&run.run_id)?;
     let run_id = run.run_id.clone();
     let runtime = ai_runs.inner().clone();
@@ -533,6 +543,14 @@ async fn chat_ai_worker(
         Ok(result) => result,
         Err(error) => {
             let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+            emit_ai_event(
+                Some(&on_event),
+                AiRuntimeEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    sequence: sequence + 1,
+                    error_code: "worker_join_failed".to_string(),
+                },
+            );
             return Err(format!("Agent chat task failed: {error}"));
         }
     };
@@ -543,10 +561,33 @@ async fn chat_ai_worker(
                 .is_some_and(|run| run.status == AiRunStatus::Cancelling)
             {
                 let _ = runtime.finish(&run_id, AiRunStatus::Cancelled);
+                emit_ai_event(
+                    Some(&on_event),
+                    AiRuntimeEvent::RunCancelled {
+                        run_id: run_id.clone(),
+                        sequence: sequence + 1,
+                    },
+                );
                 return Err("AI chat run was cancelled.".to_string());
             }
             value.run_id = run_id.clone();
+            sequence += 1;
+            emit_ai_event(
+                Some(&on_event),
+                AiRuntimeEvent::TextDelta {
+                    run_id: run_id.clone(),
+                    sequence,
+                    delta: value.message.clone(),
+                },
+            );
             let _ = runtime.finish(&run_id, AiRunStatus::Completed);
+            emit_ai_event(
+                Some(&on_event),
+                AiRuntimeEvent::RunCompleted {
+                    run_id: run_id.clone(),
+                    sequence: sequence + 1,
+                },
+            );
             Ok(value)
         }
         Err(error) => {
@@ -556,8 +597,32 @@ async fn chat_ai_worker(
                 AiRunStatus::Failed
             };
             let _ = runtime.finish(&run_id, status);
+            if status == AiRunStatus::Cancelled {
+                emit_ai_event(
+                    Some(&on_event),
+                    AiRuntimeEvent::RunCancelled {
+                        run_id: run_id.clone(),
+                        sequence: sequence + 1,
+                    },
+                );
+            } else {
+                emit_ai_event(
+                    Some(&on_event),
+                    AiRuntimeEvent::RunFailed {
+                        run_id: run_id.clone(),
+                        sequence: sequence + 1,
+                        error_code: "provider_failed".to_string(),
+                    },
+                );
+            }
             Err(error)
         }
+    }
+}
+
+fn emit_ai_event(channel: Option<&Channel<AiRuntimeEvent>>, event: AiRuntimeEvent) {
+    if let Some(channel) = channel {
+        let _ = channel.send(event);
     }
 }
 
