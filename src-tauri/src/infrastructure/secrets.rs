@@ -37,6 +37,150 @@ pub struct JiraConnectionProfile {
     pub args: Vec<String>,
 }
 
+const KEYRING_SERVICE: &str = "com.iqbalsonata.spacesly";
+
+fn keyring_entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, account)
+        .map_err(|error| format!("Failed to access OS secure storage: {error}"))
+}
+
+fn keyring_set(account: &str, value: &str) -> Result<(), String> {
+    keyring_entry(account)?
+        .set_password(value)
+        .map_err(|error| format!("Failed to store secret in OS secure storage: {error}"))
+}
+
+fn keyring_get(account: &str) -> Option<String> {
+    keyring_entry(account).ok()?.get_password().ok()
+}
+
+fn keyring_delete(account: &str) {
+    if let Ok(entry) = keyring_entry(account) {
+        let _ = entry.delete_credential();
+    }
+}
+
+fn secret_account(namespace: &str, id: &str) -> String {
+    format!("{namespace}:{id}")
+}
+
+fn redact_secrets(mut secrets: AppSecrets) -> AppSecrets {
+    secrets.jira_api_token.clear();
+    secrets.jira_personal_access_token.clear();
+    secrets.jira_password.clear();
+    secrets
+        .ai_api_keys
+        .values_mut()
+        .for_each(|value| value.clear());
+    secrets
+        .mcp_env
+        .values_mut()
+        .for_each(|values| values.values_mut().for_each(|value| value.clear()));
+    secrets
+}
+
+fn persist_secret_snapshot(secrets: &AppSecrets) -> Result<(), String> {
+    let mut write_failed = None;
+    let operations = [
+        ("jira:api_token", secrets.jira_api_token.as_str()),
+        (
+            "jira:personal_access_token",
+            secrets.jira_personal_access_token.as_str(),
+        ),
+        ("jira:password", secrets.jira_password.as_str()),
+    ];
+    for (account, value) in operations {
+        let result = if value.is_empty() {
+            keyring_delete(account);
+            Ok(())
+        } else {
+            keyring_set(account, value)
+        };
+        if let Err(error) = result {
+            write_failed = Some(error);
+        }
+    }
+    for (provider_id, value) in &secrets.ai_api_keys {
+        let account = secret_account("ai", provider_id);
+        let result = if value.trim().is_empty() {
+            keyring_delete(&account);
+            Ok(())
+        } else {
+            keyring_set(&account, value)
+        };
+        if let Err(error) = result {
+            write_failed = Some(error);
+        }
+    }
+    for (server_id, values) in &secrets.mcp_env {
+        for (key, value) in values {
+            let account = secret_account(&format!("mcp:{server_id}"), key);
+            let result = if value.trim().is_empty() {
+                keyring_delete(&account);
+                Ok(())
+            } else {
+                keyring_set(&account, value)
+            };
+            if let Err(error) = result {
+                write_failed = Some(error);
+            }
+        }
+    }
+    if let Some(error) = write_failed {
+        // Keep the legacy file usable when a platform has no configured vault.
+        save_app_secrets(secrets.clone())?;
+        return Err(error);
+    }
+    save_app_secrets(redact_secrets(secrets.clone()))
+}
+
+fn persist_secret_snapshot_best_effort(secrets: &AppSecrets) {
+    if let Err(error) = persist_secret_snapshot(secrets) {
+        eprintln!("OS secure storage unavailable; using legacy secret fallback: {error}");
+    }
+}
+
+fn load_secure_snapshot(mut secrets: AppSecrets) -> AppSecrets {
+    let legacy_has_values = !secrets.jira_api_token.is_empty()
+        || !secrets.jira_personal_access_token.is_empty()
+        || !secrets.jira_password.is_empty()
+        || !secrets.ai_api_keys.is_empty()
+        || !secrets.mcp_env.is_empty();
+    if legacy_has_values && persist_secret_snapshot(&secrets).is_ok() {
+        secrets = redact_secrets(secrets);
+    }
+
+    if secrets.jira_api_token.is_empty() {
+        secrets.jira_api_token = keyring_get("jira:api_token").unwrap_or_default();
+    }
+    if secrets.jira_personal_access_token.is_empty() {
+        secrets.jira_personal_access_token =
+            keyring_get("jira:personal_access_token").unwrap_or_default();
+    }
+    if secrets.jira_password.is_empty() {
+        secrets.jira_password = keyring_get("jira:password").unwrap_or_default();
+    }
+    for provider_id in ["openai", "gemini", "deepseek", "claude"] {
+        let account = secret_account("ai", provider_id);
+        if let Some(value) = keyring_get(&account) {
+            secrets.ai_api_keys.insert(provider_id.to_string(), value);
+        }
+    }
+    for (server_id, values) in secrets.mcp_env.clone() {
+        for key in values.keys() {
+            let account = secret_account(&format!("mcp:{server_id}"), key);
+            if let Some(value) = keyring_get(&account) {
+                secrets
+                    .mcp_env
+                    .entry(server_id.clone())
+                    .or_default()
+                    .insert(key.clone(), value);
+            }
+        }
+    }
+    secrets
+}
+
 #[derive(Clone)]
 pub struct AppSecretsStore {
     secrets: Arc<Mutex<AppSecrets>>,
@@ -45,7 +189,7 @@ pub struct AppSecretsStore {
 impl AppSecretsStore {
     pub fn load() -> Result<Self, String> {
         Ok(Self {
-            secrets: Arc::new(Mutex::new(load_app_secrets()?)),
+            secrets: Arc::new(Mutex::new(load_secure_snapshot(load_app_secrets()?))),
         })
     }
 
@@ -116,7 +260,7 @@ impl AppSecretsStore {
                     .filter(|(_, value)| !value.trim().is_empty()),
             );
         }
-        save_app_secrets(next.clone())?;
+        persist_secret_snapshot_best_effort(&next);
         *current = next;
         Ok(())
     }
@@ -134,10 +278,11 @@ impl AppSecretsStore {
                     .insert(provider_id.to_string(), value.to_string());
             }
             None => {
+                keyring_delete(&secret_account("ai", provider_id));
                 next.ai_api_keys.remove(provider_id);
             }
         }
-        save_app_secrets(next.clone())?;
+        persist_secret_snapshot_best_effort(&next);
         *current = next;
         Ok(())
     }
@@ -175,7 +320,7 @@ impl AppSecretsStore {
                 .chain(incoming.mcp_env)
                 .collect();
         }
-        save_app_secrets(incoming.clone())?;
+        persist_secret_snapshot_best_effort(&incoming);
         *current = incoming;
         Ok(())
     }
@@ -241,7 +386,7 @@ impl AppSecretsStore {
             _ => return Err("Unknown Jira secret type.".to_string()),
         };
         *target = value.unwrap_or_default().trim().to_string();
-        save_app_secrets(next.clone())?;
+        persist_secret_snapshot_best_effort(&next);
         *current = next;
         Ok(())
     }
@@ -258,7 +403,7 @@ impl AppSecretsStore {
         let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
         let mut next = current.clone();
         next.jira_profile = Some(profile);
-        save_app_secrets(next.clone())?;
+        persist_secret_snapshot_best_effort(&next);
         *current = next;
         Ok(())
     }
@@ -363,5 +508,9 @@ mod tests {
         assert!(store.redacted_snapshot().unwrap().mcp_env.is_empty());
         assert!(store.redacted_snapshot().unwrap().jira_api_token.is_empty());
         assert!(store.jira_secret_statuses().unwrap()["api_token"]);
+        let redacted = redact_secrets(store.secrets.lock().unwrap().clone());
+        assert_eq!(redacted.ai_api_keys["openai"], "");
+        assert_eq!(redacted.mcp_env["jira"]["JIRA_TOKEN"], "");
+        assert!(redacted.jira_api_token.is_empty());
     }
 }

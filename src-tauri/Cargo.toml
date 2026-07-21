@@ -27,6 +27,7 @@ libc = "0.2"
 portable-pty = "0.9"
 wait-timeout = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = "3"
 notify = "8"
 url = "2"
 ignore = "0.4"
