@@ -2,6 +2,7 @@ import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 
 export interface AiWorkerMcpServer {
   name: string;
+  secret_id: string;
   command: string[];
   environment?: Record<string, string>;
 }
@@ -166,6 +167,17 @@ export async function testAiWorker(config: AiWorkerConfig): Promise<AiWorkerStat
 
 export async function getAiRun(runId: string): Promise<AiRun | null> {
   return invokeWithPolicy<AiRun | null>("get_ai_run", { runId }, IPC_POLICIES.fileRead);
+}
+
+export async function grantAiRunCapabilities(
+  runId: string,
+  capabilities: ("workspace_read" | "workspace_write" | "shell" | "git")[],
+): Promise<void> {
+  return invokeWithPolicy<void>(
+    "grant_ai_run_capabilities",
+    { runId, capabilities },
+    IPC_POLICIES.aiExecution,
+  );
 }
 
 export async function cancelAiRun(runId: string): Promise<boolean> {

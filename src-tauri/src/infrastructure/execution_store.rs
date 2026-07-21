@@ -85,6 +85,27 @@ impl ExecutionStore {
         let transaction = connection
             .transaction()
             .map_err(|error| format!("Failed to start execution transaction: {error}"))?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM execution_runs WHERE run_id = ?1",
+                params![run.run_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to read execution revision: {error}"))?;
+        if let Some(current_revision) = current_revision {
+            if current_revision != run.revision {
+                return Err(format!(
+                    "Execution run '{}' is stale (expected revision {}, current revision {}). Reload before saving.",
+                    run.run_id, run.revision, current_revision
+                ));
+            }
+        } else if run.revision != 0 {
+            return Err(format!(
+                "New execution run '{}' must start at revision 0.",
+                run.run_id
+            ));
+        }
         save_contract(&transaction, &run.contract)?;
         let contract_id = contract_string(&run.contract, "contract_id")?;
         let now = now_millis()?.to_string();
@@ -99,16 +120,18 @@ impl ExecutionStore {
                    current_step_ids_json = excluded.current_step_ids_json,
                    completed_at = excluded.completed_at,
                    updated_at = excluded.updated_at,
-                   revision = execution_runs.revision + 1",
+                   revision = execution_runs.revision + 1
+                 WHERE execution_runs.revision = ?8",
                 params![
                     run.run_id,
                     contract_id,
                     run.status,
                     serde_json::to_string(&run.current_step_ids).map_err(|error| error.to_string())?,
                     run.started_at,
-                    run.completed_at,
-                    now,
-                ],
+                     run.completed_at,
+                     now,
+                     run.revision,
+                 ],
             )
             .map_err(|error| format!("Failed to save execution run: {error}"))?;
         transaction

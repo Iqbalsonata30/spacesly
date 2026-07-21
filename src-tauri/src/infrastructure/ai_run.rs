@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +39,7 @@ pub struct AiRun {
 pub struct AiRunRegistry {
     state: Arc<Mutex<HashMap<String, AiRun>>>,
     cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    capability_grants: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     sequence: Arc<AtomicU64>,
 }
 
@@ -112,6 +113,52 @@ impl AiRunRegistry {
             .ok_or_else(|| "AI run cancellation token was not found.".to_string())
     }
 
+    pub fn grant_capabilities(
+        &self,
+        run_id: &str,
+        capabilities: Vec<String>,
+    ) -> Result<(), String> {
+        const ALLOWED: [&str; 4] = ["workspace_read", "workspace_write", "shell", "git"];
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let run = state
+            .get(run_id)
+            .ok_or_else(|| "AI run was not found.".to_string())?;
+        if run.kind != AiRunKind::Agent || run.status != AiRunStatus::Queued {
+            return Err("Capabilities can only be granted to a queued Agent run.".to_string());
+        }
+        let capabilities = capabilities
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .collect::<HashSet<_>>();
+        if capabilities.is_empty()
+            || capabilities
+                .iter()
+                .any(|value| !ALLOWED.contains(&value.as_str()))
+        {
+            return Err("AI capability grant contains an unsupported capability.".to_string());
+        }
+        drop(state);
+        self.capability_grants
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(run_id.to_string(), capabilities);
+        Ok(())
+    }
+
+    pub fn require_capabilities(&self, run_id: &str, required: &[&str]) -> Result<(), String> {
+        let grants = self
+            .capability_grants
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let granted = grants
+            .get(run_id)
+            .ok_or_else(|| "Agent capability approval is required before execution.".to_string())?;
+        if required.iter().any(|value| !granted.contains(*value)) {
+            return Err("Agent capability approval does not cover this execution.".to_string());
+        }
+        Ok(())
+    }
+
     pub fn finish(&self, run_id: &str, status: AiRunStatus) -> Result<AiRun, String> {
         if !matches!(
             status,
@@ -126,10 +173,26 @@ impl AiRunRegistry {
         let run = state
             .get_mut(run_id)
             .ok_or_else(|| "AI run was not found.".to_string())?;
+        if matches!(
+            run.status,
+            AiRunStatus::Completed
+                | AiRunStatus::Blocked
+                | AiRunStatus::Failed
+                | AiRunStatus::Cancelled
+        ) {
+            if run.status == status {
+                return Ok(run.clone());
+            }
+            return Err("AI run terminal status is immutable.".to_string());
+        }
         run.status = status;
         run.updated_at = now_millis();
         let finished = run.clone();
         self.cancellations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(run_id);
+        self.capability_grants
             .lock()
             .map_err(|error| error.to_string())?
             .remove(run_id);
@@ -225,6 +288,31 @@ mod tests {
             .unwrap();
         assert!(registry
             .begin("run-1".to_string(), AiRunKind::Edit)
+            .is_err());
+    }
+
+    #[test]
+    fn agent_execution_requires_explicit_capability_grants() {
+        let registry = AiRunRegistry::default();
+        registry
+            .begin("agent-1".to_string(), AiRunKind::Agent)
+            .unwrap();
+        assert!(registry
+            .require_capabilities("agent-1", &["workspace_write"])
+            .is_err());
+
+        registry
+            .grant_capabilities(
+                "agent-1",
+                vec!["workspace_read".to_string(), "workspace_write".to_string()],
+            )
+            .unwrap();
+
+        registry
+            .require_capabilities("agent-1", &["workspace_read", "workspace_write"])
+            .unwrap();
+        assert!(registry
+            .require_capabilities("agent-1", &["shell"])
             .is_err());
     }
 }

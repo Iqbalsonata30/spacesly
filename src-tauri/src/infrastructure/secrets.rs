@@ -16,6 +16,25 @@ pub struct AppSecrets {
     pub ai_api_keys: HashMap<String, String>,
     #[serde(default)]
     pub mcp_env: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    pub mcp_connectors: HashMap<String, McpConnectorProfile>,
+    #[serde(default)]
+    pub jira_profile: Option<JiraConnectionProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpConnectorProfile {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JiraConnectionProfile {
+    pub base_url: String,
+    pub auth_mode: String,
+    pub username: String,
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -69,6 +88,8 @@ impl AppSecretsStore {
     pub fn save_mcp_environment(
         &self,
         server_id: &str,
+        command: String,
+        args: Vec<String>,
         environment: HashMap<String, String>,
     ) -> Result<(), String> {
         let server_id = server_id.trim();
@@ -77,6 +98,16 @@ impl AppSecretsStore {
         }
         let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
         let mut next = current.clone();
+        if command.trim().is_empty() {
+            return Err("MCP connector command is required.".to_string());
+        }
+        next.mcp_connectors.insert(
+            server_id.to_string(),
+            McpConnectorProfile {
+                command: command.trim().to_string(),
+                args,
+            },
+        );
         if !environment.is_empty() {
             let values = next.mcp_env.entry(server_id.to_string()).or_default();
             values.extend(
@@ -113,6 +144,8 @@ impl AppSecretsStore {
 
     pub fn save_from_renderer(&self, mut incoming: AppSecrets) -> Result<(), String> {
         let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        incoming.mcp_connectors = current.mcp_connectors.clone();
+        incoming.jira_profile = current.jira_profile.clone();
         if incoming.jira_api_token.is_empty() {
             incoming.jira_api_token = current.jira_api_token.clone();
         }
@@ -162,6 +195,15 @@ impl AppSecretsStore {
         Ok(secrets.mcp_env.get(server_id).cloned().unwrap_or_default())
     }
 
+    pub fn mcp_connector(&self, server_id: &str) -> Result<McpConnectorProfile, String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        secrets
+            .mcp_connectors
+            .get(server_id)
+            .cloned()
+            .ok_or_else(|| format!("MCP connector profile '{server_id}' was not found."))
+    }
+
     pub fn jira_credentials(&self) -> Result<(String, String, String), String> {
         let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
         Ok((
@@ -202,6 +244,31 @@ impl AppSecretsStore {
         save_app_secrets(next.clone())?;
         *current = next;
         Ok(())
+    }
+
+    pub fn save_jira_profile(&self, profile: JiraConnectionProfile) -> Result<(), String> {
+        let url = reqwest::Url::parse(profile.base_url.trim())
+            .map_err(|_| "Jira URL is invalid.".to_string())?;
+        if url.scheme() != "https" {
+            return Err("Jira URL must use HTTPS.".to_string());
+        }
+        if !matches!(profile.auth_mode.as_str(), "api_token" | "pat" | "password") {
+            return Err("Jira auth mode is invalid.".to_string());
+        }
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        next.jira_profile = Some(profile);
+        save_app_secrets(next.clone())?;
+        *current = next;
+        Ok(())
+    }
+
+    pub fn jira_profile(&self) -> Result<JiraConnectionProfile, String> {
+        let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
+        secrets
+            .jira_profile
+            .clone()
+            .ok_or_else(|| "Jira connection profile was not found.".to_string())
     }
 }
 

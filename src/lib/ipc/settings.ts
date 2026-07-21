@@ -38,11 +38,27 @@ export async function mcpEnvironmentSecretStatuses(): Promise<Record<string, str
 
 export async function saveMcpEnvironmentSecret(
   serverId: string,
+  command: string,
+  args: string[],
   environment: Record<string, string>,
 ): Promise<void> {
   return invokeWithPolicy<void>(
     "save_mcp_environment_secret",
-    { serverId, environment },
+    { serverId, command, args, environment },
+    IPC_POLICIES.secret,
+  );
+}
+
+export async function saveJiraConnectionProfile(profile: {
+  base_url: string;
+  auth_mode: "api_token" | "pat" | "password";
+  username: string;
+  command: string;
+  args: string[];
+}): Promise<void> {
+  return invokeWithPolicy<void>(
+    "save_jira_connection_profile",
+    { profile },
     IPC_POLICIES.secret,
   );
 }

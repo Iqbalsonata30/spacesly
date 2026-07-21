@@ -43,7 +43,7 @@ use infrastructure::pty::{
     PtyRegistry, PtyState,
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
-use infrastructure::secrets::{AppSecrets, AppSecretsStore};
+use infrastructure::secrets::{AppSecrets, AppSecretsStore, JiraConnectionProfile};
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
     ShellCommandRequest, ShellCommandResult, ShellCompletionRequest, ShellCompletionResult,
@@ -366,6 +366,15 @@ fn get_ai_run(run_id: String, ai_runs: State<'_, AiRunRegistry>) -> Result<Optio
 }
 
 #[tauri::command]
+fn grant_ai_run_capabilities(
+    run_id: String,
+    capabilities: Vec<String>,
+    ai_runs: State<'_, AiRunRegistry>,
+) -> Result<(), String> {
+    ai_runs.grant_capabilities(&run_id, capabilities)
+}
+
+#[tauri::command]
 fn begin_ai_run(kind: AiRunKind, ai_runs: State<'_, AiRunRegistry>) -> Result<AiRun, String> {
     ai_runs.begin_generated(kind)
 }
@@ -384,6 +393,20 @@ async fn execute_ai_worker_task(
 ) -> Result<AiWorkerTaskResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     resolve_ai_secrets(&mut config, secrets.inner())?;
+    let persisted_run = execution_store
+        .get(&run_id)?
+        .ok_or_else(|| "Durable execution run was not found.".to_string())?;
+    let submitted_contract = task
+        .execution_contract
+        .as_ref()
+        .ok_or_else(|| "Execution contract is required.".to_string())?;
+    if submitted_contract != &persisted_run.contract {
+        return Err("Execution contract does not match the persisted run.".to_string());
+    }
+    ai_runs.require_capabilities(
+        &run_id,
+        &["workspace_read", "workspace_write", "shell", "git"],
+    )?;
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();
@@ -623,6 +646,9 @@ fn resolve_ai_secrets(
     config: &mut AiWorkerConfig,
     secrets: &AppSecretsStore,
 ) -> Result<(), String> {
+    if config.runtime == "api" {
+        bind_backend_provider_profile(config)?;
+    }
     let api_key = secrets.ai_api_key(&config.provider_id)?;
     if config.runtime == "api" && api_key.trim().is_empty() {
         return Err(format!(
@@ -632,8 +658,59 @@ fn resolve_ai_secrets(
     }
     config.api_key = api_key;
     for server in &mut config.mcp_servers {
-        server.environment = secrets.mcp_environment(&server.name)?;
+        if server.secret_id.trim().is_empty() {
+            return Err(format!(
+                "MCP server '{}' has no secret profile ID.",
+                server.name
+            ));
+        }
+        let profile = secrets.mcp_connector(&server.secret_id)?;
+        server.command = std::iter::once(profile.command)
+            .chain(profile.args)
+            .collect();
+        server.environment = secrets.mcp_environment(&server.secret_id)?;
     }
+    Ok(())
+}
+
+fn bind_backend_provider_profile(config: &mut AiWorkerConfig) -> Result<(), String> {
+    let (name, base_url, api_style, models): (&str, &str, &str, &[&str]) =
+        match config.provider_id.as_str() {
+            "openai" => (
+                "OpenAI",
+                "https://api.openai.com/v1",
+                "openai_responses",
+                &["gpt-5.5", "gpt-5.1", "gpt-4.1-mini"],
+            ),
+            "gemini" => (
+                "Gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "openai_chat",
+                &["gemini-2.5-pro", "gemini-2.5-flash"],
+            ),
+            "deepseek" => (
+                "DeepSeek",
+                "https://api.deepseek.com/v1",
+                "openai_chat",
+                &["deepseek-v4-flash", "deepseek-chat"],
+            ),
+            "claude" => (
+                "Claude",
+                "https://api.anthropic.com/v1",
+                "anthropic_messages",
+                &["claude-sonnet-4-5", "claude-haiku-4-5"],
+            ),
+            _ => return Err("Unknown AI provider profile.".to_string()),
+        };
+    if !models.contains(&config.model.as_str()) {
+        return Err(format!(
+            "Model '{}' is not allowed for provider '{}'.",
+            config.model, config.provider_id
+        ));
+    }
+    config.provider_name = name.to_string();
+    config.base_url = base_url.to_string();
+    config.api_style = api_style.to_string();
     Ok(())
 }
 
@@ -644,6 +721,9 @@ fn resolve_mcp_secret_environment(
     let Some(secret_id) = config.secret_id.as_deref() else {
         return Ok(());
     };
+    let profile = secrets.mcp_connector(secret_id)?;
+    config.command = profile.command;
+    config.args = profile.args;
     config.env = secrets.mcp_environment(secret_id)?;
     Ok(())
 }
@@ -656,6 +736,12 @@ fn resolve_jira_secrets(
         return Err("Jira secret ID is required.".to_string());
     }
     let (api_token, personal_access_token, password) = secrets.jira_credentials()?;
+    let profile = secrets.jira_profile()?;
+    config.auth.base_url = profile.base_url.clone();
+    config.auth.auth_mode = profile.auth_mode;
+    config.auth.username = profile.username;
+    config.server.command = profile.command;
+    config.server.args = profile.args;
     config.auth.api_token = api_token;
     config.auth.personal_access_token = personal_access_token;
     config.auth.password = password;
@@ -909,15 +995,28 @@ async fn save_jira_secret(
 #[tauri::command]
 async fn save_mcp_environment_secret(
     server_id: String,
+    command: String,
+    args: Vec<String>,
     environment: std::collections::HashMap<String, String>,
     store: State<'_, AppSecretsStore>,
 ) -> Result<(), String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.save_mcp_environment(&server_id, environment)
+        store.save_mcp_environment(&server_id, command, args, environment)
     })
     .await
     .map_err(|error| format!("Save MCP environment task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_jira_connection_profile(
+    profile: JiraConnectionProfile,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save_jira_profile(profile))
+        .await
+        .map_err(|error| format!("Save Jira profile task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1414,7 +1513,8 @@ async fn lsp_code_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_ipc_error, mcp_ipc_error};
+    use super::{bind_backend_provider_profile, file_ipc_error, mcp_ipc_error};
+    use crate::infrastructure::ai_worker::AiWorkerConfig;
     use serde_json::Value;
 
     #[test]
@@ -1447,6 +1547,60 @@ mod tests {
         assert_eq!(conflict["category"], "conflict");
         assert_eq!(conflict["retryable"], false);
         assert_eq!(encoding["category"], "encoding");
+    }
+
+    #[test]
+    fn provider_profile_overrides_renderer_controlled_destination() {
+        let mut config = AiWorkerConfig {
+            workspace_id: "workspace-personal".to_string(),
+            runtime: "api".to_string(),
+            provider_name: "Attacker".to_string(),
+            provider_id: "openai".to_string(),
+            base_url: "https://attacker.invalid".to_string(),
+            api_style: "anthropic_messages".to_string(),
+            api_key: String::new(),
+            model: "gpt-4.1-mini".to_string(),
+            opencode_command: "opencode".to_string(),
+            opencode_model: "openai/gpt-4.1-mini".to_string(),
+            opencode_workdir: None,
+            opencode_auto_approve: false,
+            agent_rules: String::new(),
+            agent_skills: String::new(),
+            temperature: 0.2,
+            restrict_tools: false,
+            mcp_servers: Vec::new(),
+        };
+
+        bind_backend_provider_profile(&mut config).unwrap();
+
+        assert_eq!(config.provider_name, "OpenAI");
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.api_style, "openai_responses");
+    }
+
+    #[test]
+    fn provider_profile_rejects_unknown_models() {
+        let mut config = AiWorkerConfig {
+            workspace_id: String::new(),
+            runtime: "api".to_string(),
+            provider_name: String::new(),
+            provider_id: "openai".to_string(),
+            base_url: String::new(),
+            api_style: String::new(),
+            api_key: String::new(),
+            model: "other-provider-model".to_string(),
+            opencode_command: String::new(),
+            opencode_model: String::new(),
+            opencode_workdir: None,
+            opencode_auto_approve: false,
+            agent_rules: String::new(),
+            agent_skills: String::new(),
+            temperature: 0.0,
+            restrict_tools: false,
+            mcp_servers: Vec::new(),
+        };
+
+        assert!(bind_backend_provider_profile(&mut config).is_err());
     }
 }
 
@@ -1488,6 +1642,7 @@ pub fn run() {
             test_ai_worker,
             reserve_ai_worker_run,
             get_ai_run,
+            grant_ai_run_capabilities,
             begin_ai_run,
             ai_workspace_trust_status,
             trust_ai_workspace,
@@ -1516,6 +1671,7 @@ pub fn run() {
             save_ai_provider_secret,
             mcp_environment_secret_statuses,
             save_mcp_environment_secret,
+            save_jira_connection_profile,
             jira_secret_statuses,
             save_jira_secret,
             load_cached_workspace,

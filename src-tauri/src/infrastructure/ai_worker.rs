@@ -234,6 +234,8 @@ pub struct AiWorkerConfig {
     pub agent_rules: String,
     pub agent_skills: String,
     pub temperature: f32,
+    #[serde(skip)]
+    pub restrict_tools: bool,
     #[serde(default)]
     pub mcp_servers: Vec<AiWorkerMcpServer>,
 }
@@ -241,6 +243,8 @@ pub struct AiWorkerConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AiWorkerMcpServer {
     pub name: String,
+    #[serde(default)]
+    pub secret_id: String,
     pub command: Vec<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
@@ -450,7 +454,7 @@ pub fn execute_ai_worker_task(
 }
 
 pub fn chat_ai_worker(
-    config: AiWorkerConfig,
+    mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     cancellation: Arc<AtomicBool>,
 ) -> Result<AiWorkerChatResult, String> {
@@ -462,6 +466,8 @@ pub fn chat_ai_worker(
     check_cancelled(&cancellation)?;
 
     if config.runtime == "opencode" {
+        config.restrict_tools = true;
+        config.mcp_servers.clear();
         validate_opencode_config(&config)?;
         let (server, server_startup_error) = match opencode_server(&config) {
             Ok(server) => (Some(server), None),
@@ -765,6 +771,13 @@ fn validate_opencode_config(config: &AiWorkerConfig) -> Result<(), String> {
 
     if config.opencode_model.trim().is_empty() {
         return Err("OpenCode model is required.".to_string());
+    }
+
+    if config.opencode_auto_approve {
+        return Err(
+            "Unrestricted OpenCode auto-approval is disabled. Approve individual capabilities instead."
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -1464,11 +1477,25 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if mcp.is_empty() {
+    if mcp.is_empty() && !config.restrict_tools {
         return None;
     }
 
-    let serialized = serde_json::json!({ "mcp": mcp }).to_string();
+    let serialized = if config.restrict_tools {
+        serde_json::json!({
+            "mcp": {},
+            "permission": {
+                "edit": "deny",
+                "bash": "deny",
+                "webfetch": "deny",
+                "task": "deny",
+                "external_directory": "deny"
+            }
+        })
+        .to_string()
+    } else {
+        serde_json::json!({ "mcp": mcp }).to_string()
+    };
     let cache = OPENCODE_MCP_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().ok()?;
     if let Some(cached) = cache.get(&serialized) {
@@ -2027,6 +2054,7 @@ mod tests {
             agent_rules: rules.to_string(),
             agent_skills: skills.to_string(),
             temperature: 0.2,
+            restrict_tools: false,
             mcp_servers: Vec::new(),
         }
     }
@@ -2237,6 +2265,7 @@ mod tests {
         config.runtime = "opencode".to_string();
         config.mcp_servers.push(AiWorkerMcpServer {
             name: "spacesly-jira".to_string(),
+            secret_id: "jira".to_string(),
             command: vec!["npx".to_string(), "-y".to_string(), "jira-mcp".to_string()],
             environment: HashMap::from([("JIRA_URL".to_string(), "https://jira.test".to_string())]),
         });
@@ -2278,6 +2307,7 @@ mod tests {
         let mut first = config_with_governance("", "");
         first.mcp_servers.push(AiWorkerMcpServer {
             name: "spacesly-kube".to_string(),
+            secret_id: "kube".to_string(),
             command: vec![
                 "npx".to_string(),
                 "kubernetes-mcp-server@latest".to_string(),
@@ -2290,6 +2320,7 @@ mod tests {
         let mut second = config_with_governance("", "");
         second.mcp_servers.push(AiWorkerMcpServer {
             name: "spacesly-kube".to_string(),
+            secret_id: "kube".to_string(),
             command: vec![
                 "npx".to_string(),
                 "kubernetes-mcp-server@latest".to_string(),

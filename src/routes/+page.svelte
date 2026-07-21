@@ -136,10 +136,12 @@
     resizePtyTerminal,
     saveAiProviderSecret,
     saveJiraSecret,
+    saveJiraConnectionProfile,
     saveMcpEnvironmentSecret,
     saveExecutionRun,
     searchWorkspace,
     listActiveExecutionRuns,
+    grantAiRunCapabilities,
     releaseAiWorkerRun,
     reserveAiWorkerRun,
     setWorkspaceRoot,
@@ -1056,10 +1058,25 @@
       for (const [providerId, apiKey] of Object.entries(legacyAiKeys)) {
         if (apiKey.trim()) await saveAiProviderSecret(providerId, apiKey);
       }
-      for (const [serverId, environment] of Object.entries(localSecrets.mcp_env)) {
-        if (Object.keys(environment).length > 0) {
-          await saveMcpEnvironmentSecret(serverId, environment);
+      for (const server of settings.mcpServers) {
+        if (server.kind !== "jira" && server.command.trim()) {
+          await saveMcpEnvironmentSecret(
+            server.id,
+            server.command,
+            server.args,
+            localSecrets.mcp_env[server.id] ?? {},
+          );
         }
+      }
+      const jiraServer = settings.mcpServers.find((server) => server.id === settings.jira.serverId);
+      if (settings.jira.baseUrl.trim()) {
+        await saveJiraConnectionProfile({
+          base_url: settings.jira.baseUrl,
+          auth_mode: settings.jira.authMode,
+          username: settings.jira.username,
+          command: jiraServer?.command ?? "",
+          args: jiraServer?.args ?? [],
+        });
       }
       if (localSecrets.jira_api_token.trim()) {
         await saveJiraSecret("api_token", localSecrets.jira_api_token);
@@ -1199,9 +1216,19 @@
       await saveAiProviderSecret(providerId, apiKey);
     }
     for (const server of value.mcpServers) {
-      if (Object.keys(server.env).length > 0) {
-        await saveMcpEnvironmentSecret(server.id, server.env);
+      if (server.kind !== "jira" && server.command.trim()) {
+        await saveMcpEnvironmentSecret(server.id, server.command, server.args, server.env);
       }
+    }
+    const jiraServer = value.mcpServers.find((server) => server.id === value.jira.serverId);
+    if (value.jira.baseUrl.trim()) {
+      await saveJiraConnectionProfile({
+        base_url: value.jira.baseUrl,
+        auth_mode: value.jira.authMode,
+        username: value.jira.username,
+        command: jiraServer?.command ?? "",
+        args: jiraServer?.args ?? [],
+      });
     }
     if (appSecrets.jira_api_token.trim()) {
       await saveJiraSecret("api_token", appSecrets.jira_api_token);
@@ -3291,7 +3318,7 @@
       opencode_command: effectiveSettings.aiWorker.opencodeCommand,
       opencode_model: effectiveSettings.aiWorker.opencodeModel,
       opencode_workdir: effectiveSettings.aiWorker.opencodeWorkdir.trim() || null,
-      opencode_auto_approve: effectiveSettings.aiWorker.opencodeAutoApprove,
+      opencode_auto_approve: false,
       agent_rules: effectiveSettings.aiWorker.agentRules,
       agent_skills: effectiveSettings.aiWorker.agentSkills,
       temperature: effectiveSettings.aiWorker.temperature,
@@ -3301,6 +3328,7 @@
         return [
           {
             name: `spacesly-${server.id}`,
+            secret_id: server.id,
             command,
           },
         ];
@@ -4048,7 +4076,12 @@
     if (!selectedServer) return;
     const serverId = selectedServer.id;
     if (selectedServer.kind !== "jira" && Object.keys(selectedServer.env).length > 0) {
-      await saveMcpEnvironmentSecret(serverId, selectedServer.env);
+      await saveMcpEnvironmentSecret(
+        serverId,
+        selectedServer.command,
+        selectedServer.args,
+        selectedServer.env,
+      );
       mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
     }
 
@@ -4097,7 +4130,12 @@
     if (!selectedServer) return false;
     const serverId = selectedServer.id;
     if (selectedServer.kind !== "jira" && Object.keys(selectedServer.env).length > 0) {
-      await saveMcpEnvironmentSecret(serverId, selectedServer.env);
+      await saveMcpEnvironmentSecret(
+        serverId,
+        selectedServer.command,
+        selectedServer.args,
+        selectedServer.env,
+      );
       mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
     }
     const serverConfig =
@@ -5737,7 +5775,14 @@
 
     try {
       await reserveAiWorkerRun(runId, config);
+      await grantAiRunCapabilities(runId, [
+        "workspace_read",
+        "workspace_write",
+        "shell",
+        "git",
+      ]);
     } catch (reason) {
+      await releaseAiWorkerRun(runId).catch(() => false);
       finishWorkerRun(cardId, runId);
       const message = reason instanceof Error ? reason.message : String(reason);
       appNotice = { tone: "error", message };
@@ -6593,23 +6638,8 @@
                         />
                       </label>
                       <label class="check-row">
-                        <input
-                          type="checkbox"
-                          checked={settings.aiWorker.opencodeAutoApprove}
-                          oninput={(event) => {
-                            settings = {
-                              ...settings,
-                              aiWorker: {
-                                ...settings.aiWorker,
-                                opencodeAutoApprove: event.currentTarget.checked,
-                              },
-                            };
-                          }}
-                        />
-                        <span
-                          >Allow OpenCode to auto-approve execution requests for file and shell
-                          changes.</span
-                        >
+                        <input type="checkbox" checked={false} disabled />
+                        <span>Unrestricted auto-approval is disabled by the AI Runtime.</span>
                       </label>
                       <p class="field-help">
                         Run <code>opencode auth login</code> in your terminal first. Spacesly uses the

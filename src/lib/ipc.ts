@@ -28,6 +28,7 @@ export {
   reserveAiWorkerRun,
   testAiWorker,
   getAiRun,
+  grantAiRunCapabilities,
   beginAiRun,
   cancelAiRun,
   aiWorkspaceTrustStatus,
@@ -89,6 +90,7 @@ export {
   saveAppSecrets,
   saveMcpEnvironmentSecret,
   saveJiraSecret,
+  saveJiraConnectionProfile,
 } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";
