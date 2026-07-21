@@ -11,7 +11,8 @@ use domain::execution::ExecutionRun;
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
-    chat_ai_worker as chat_ai_worker_impl, close_all_opencode_servers,
+    chat_ai_worker as chat_ai_worker_impl,
+    chat_ai_worker_streaming as chat_ai_worker_streaming_impl, close_all_opencode_servers,
     execute_ai_worker_task as execute_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
     test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiEditRequest, AiEditResult,
     AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerTask,
@@ -549,23 +550,27 @@ async fn chat_ai_worker(
             },
         );
     });
-    let result = match tauri::async_runtime::spawn_blocking(move || {
-        chat_ai_worker_impl(config, request, cancellation, Some(on_text))
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = runtime.finish(&run_id, AiRunStatus::Failed);
-            emit_ai_event(
-                Some(&on_event),
-                AiRuntimeEvent::RunFailed {
-                    run_id: run_id.clone(),
-                    sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
-                    error_code: "worker_join_failed".to_string(),
-                },
-            );
-            return Err(format!("Agent chat task failed: {error}"));
+    let result = if config.runtime == "api" {
+        chat_ai_worker_streaming_impl(config, request, cancellation, on_text).await
+    } else {
+        match tauri::async_runtime::spawn_blocking(move || {
+            chat_ai_worker_impl(config, request, cancellation, Some(on_text))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = runtime.finish(&run_id, AiRunStatus::Failed);
+                emit_ai_event(
+                    Some(&on_event),
+                    AiRuntimeEvent::RunFailed {
+                        run_id: run_id.clone(),
+                        sequence: event_sequence.fetch_add(1, Ordering::Relaxed),
+                        error_code: "worker_join_failed".to_string(),
+                    },
+                );
+                return Err(format!("Agent chat task failed: {error}"));
+            }
         }
     };
     match result {

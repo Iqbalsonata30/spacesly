@@ -1,5 +1,6 @@
 use super::shell_env::inject_shell_env;
 use reqwest::blocking::Client;
+use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,6 +36,7 @@ const MAX_AI_EDIT_DIAGNOSTICS: usize = 50;
 const MAX_AI_EDIT_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 static ACTIVE_CHAT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static AGENT_HTTP_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static ASYNC_AI_HTTP_CLIENT: OnceLock<Result<AsyncClient, String>> = OnceLock::new();
 static OPENCODE_MCP_CONFIGS: OnceLock<Mutex<HashMap<String, Arc<String>>>> = OnceLock::new();
 static OPENCODE_SERVERS: OnceLock<Mutex<HashMap<u64, Arc<OpenCodeServer>>>> = OnceLock::new();
 static OPENCODE_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -591,6 +593,43 @@ pub fn chat_ai_worker(
     })
 }
 
+pub async fn chat_ai_worker_streaming(
+    config: AiWorkerConfig,
+    request: AiWorkerChatRequest,
+    cancellation: Arc<AtomicBool>,
+    mut on_text: Box<dyn FnMut(&str) + Send>,
+) -> Result<AiWorkerChatResult, String> {
+    let message = request.message.trim();
+    if message.is_empty() {
+        return Err("Chat message is required.".to_string());
+    }
+    validate_config(&config)?;
+    let _chat_run = acquire_chat_run()?;
+    let system_prompt = format!(
+        "You are the Spacesly workspace chat assistant. Act like a helpful chatbot, not a strict agent executor. Use only the rules below for behavioral guardrails. Prefer the latest user message and recent session context over older board state. If the user asks for a board mutation, you may request it with a final SPACESLY_ACTIONS line, but do not invent task targets. Use session context to keep pronouns and follow-ups grounded in the most recent relevant card. Keep answers concise and practical.\n\nRules:\n{}",
+        governance_context(&config, false),
+    );
+    let user_prompt = format!(
+        "Session context:\n{}\n\nWorkspace context:\n{}\n\nUser message:\n{}",
+        request.session_context.as_deref().unwrap_or("none"),
+        request.terminal_context.as_deref().unwrap_or("none"),
+        message,
+    );
+    let message = stream_model_response(
+        &config,
+        &system_prompt,
+        &user_prompt,
+        550,
+        cancellation,
+        &mut on_text,
+    )
+    .await?;
+    Ok(AiWorkerChatResult {
+        run_id: String::new(),
+        message,
+    })
+}
+
 pub fn propose_ai_edit(
     config: AiWorkerConfig,
     request: AiEditRequest,
@@ -1103,11 +1142,11 @@ where
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let _ = stdout_thread.join();
                 while let Ok(line) = line_rx.try_recv() {
                     process_line(line?)?;
                 }
                 let stderr = stderr_thread.join().unwrap_or_else(|_| Ok(Vec::new()))?;
-                let _ = stdout_thread.join();
                 return Ok(Output {
                     status,
                     stdout: stdout_bytes,
@@ -1593,6 +1632,19 @@ fn agent_http_client() -> Result<&'static Client, String> {
     }
 }
 
+fn async_ai_http_client() -> Result<&'static AsyncClient, String> {
+    match ASYNC_AI_HTTP_CLIENT.get_or_init(|| {
+        AsyncClient::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(CHAT_TIMEOUT)
+            .build()
+            .map_err(|error| format!("Failed to create async AI HTTP client: {error}"))
+    }) {
+        Ok(client) => Ok(client),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
     let mcp = config
         .mcp_servers
@@ -1886,6 +1938,208 @@ fn opencode_command(config: &AiWorkerConfig) -> Command {
     }
 
     command
+}
+
+async fn stream_model_response(
+    config: &AiWorkerConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    cancellation: Arc<AtomicBool>,
+    on_text: &mut (dyn FnMut(&str) + Send),
+) -> Result<String, String> {
+    let client = async_ai_http_client()?;
+    let (endpoint, body) = match config.api_style.as_str() {
+        "openai_responses" => (
+            responses_endpoint(&config.base_url),
+            serde_json::json!({
+                "model": config.model,
+                "max_output_tokens": max_tokens,
+                "stream": true,
+                "input": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": user_prompt }
+                ]
+            }),
+        ),
+        "anthropic_messages" => (
+            anthropic_endpoint(&config.base_url),
+            serde_json::json!({
+                "model": config.model,
+                "system": system_prompt,
+                "temperature": config.temperature.clamp(0.0, 1.0),
+                "max_tokens": max_tokens,
+                "stream": true,
+                "messages": [{ "role": "user", "content": user_prompt }]
+            }),
+        ),
+        _ => (
+            chat_endpoint(&config.base_url),
+            serde_json::json!({
+                "model": config.model,
+                "temperature": config.temperature.clamp(0.0, 2.0),
+                "max_tokens": max_tokens,
+                "stream": true,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": user_prompt }
+                ]
+            }),
+        ),
+    };
+    let mut request = client
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(&body);
+    request = if config.api_style == "anthropic_messages" {
+        request
+            .header("x-api-key", config.api_key.trim())
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(config.api_key.trim())
+    };
+    let mut response = tokio::select! {
+        response = request.send() => response.map_err(|error| format!("Failed to call Agent. {}", describe_reqwest_error(&error)))?,
+        _ = wait_for_cancellation(cancellation.clone()) => return Err("AI chat run was cancelled.".to_string()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("Failed to read Agent response: {error}"))?;
+        return Err(format!(
+            "Agent returned HTTP {status}: {}",
+            first_line(&text)
+        ));
+    }
+
+    let mut decoder = SseDecoder::default();
+    let mut output = String::new();
+    loop {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|error| format!("Failed to read Agent stream: {error}"))?,
+            _ = wait_for_cancellation(cancellation.clone()) => return Err("AI chat run was cancelled.".to_string()),
+        };
+        let Some(chunk) = chunk else { break };
+        for data in decoder.push(&chunk) {
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Some(delta) = provider_stream_delta(&config.api_style, &data) {
+                if output.len().saturating_add(delta.len()) > CHAT_OUTPUT_LIMIT {
+                    return Err(format!(
+                        "AI chat output exceeded the {CHAT_OUTPUT_LIMIT} byte limit."
+                    ));
+                }
+                output.push_str(&delta);
+                on_text(&delta);
+            }
+        }
+    }
+    for data in decoder.finish() {
+        if let Some(delta) = provider_stream_delta(&config.api_style, &data) {
+            if output.len().saturating_add(delta.len()) > CHAT_OUTPUT_LIMIT {
+                return Err(format!(
+                    "AI chat output exceeded the {CHAT_OUTPUT_LIMIT} byte limit."
+                ));
+            }
+            output.push_str(&delta);
+            on_text(&delta);
+        }
+    }
+    if output.trim().is_empty() {
+        Err("Agent returned no message content.".to_string())
+    } else {
+        Ok(output)
+    }
+}
+
+async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some((index, delimiter_len)) = sse_delimiter(&self.buffer) {
+            let event = self
+                .buffer
+                .drain(..index + delimiter_len)
+                .collect::<Vec<_>>();
+            if let Some(data) = sse_event_data(&event) {
+                events.push(data);
+            }
+        }
+        events
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let event = std::mem::take(&mut self.buffer);
+        sse_event_data(&event).into_iter().collect()
+    }
+}
+
+fn sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+        return Some((index, 4));
+    }
+    buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2))
+}
+
+fn sse_event_data(event: &[u8]) -> Option<String> {
+    let event = String::from_utf8_lossy(event).replace("\r\n", "\n");
+    let data = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!data.is_empty()).then_some(data)
+}
+
+fn provider_stream_delta(api_style: &str, data: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    match api_style {
+        "openai_responses" => (value.get("type").and_then(Value::as_str)
+            == Some("response.output_text.delta"))
+        .then(|| {
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten(),
+        "anthropic_messages" => value
+            .get("delta")
+            .filter(|delta| delta.get("type").and_then(Value::as_str) == Some("text_delta"))
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
 }
 
 fn call_model(
@@ -2454,6 +2708,40 @@ mod tests {
 
         assert_eq!(text.as_deref(), Some("hello"));
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn sse_decoder_handles_split_events_and_provider_deltas() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder
+            .push(b"data: {\"choices\":[{\"delta\":{\"con")
+            .is_empty());
+        let events = decoder.push(b"tent\":\"hi\"}}]}\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            provider_stream_delta("openai_chat", &events[0]).as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn provider_sse_delta_parsers_cover_responses_and_anthropic() {
+        assert_eq!(
+            provider_stream_delta(
+                "openai_responses",
+                r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+            )
+            .as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            provider_stream_delta(
+                "anthropic_messages",
+                r#"{"delta":{"type":"text_delta","text":"hello"}}"#,
+            )
+            .as_deref(),
+            Some("hello")
+        );
     }
 
     #[cfg(unix)]
