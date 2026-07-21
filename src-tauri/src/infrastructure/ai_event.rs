@@ -16,6 +16,10 @@ pub enum AiRuntimeEvent {
         run_id: String,
         sequence: u64,
     },
+    RunBlocked {
+        run_id: String,
+        sequence: u64,
+    },
     RunFailed {
         run_id: String,
         sequence: u64,

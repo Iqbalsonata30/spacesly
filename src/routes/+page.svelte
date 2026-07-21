@@ -5945,11 +5945,36 @@
       );
       await setExecutionRunForCard(cardId, executionRun);
       let result: AiWorkerTaskResult;
+      let lastAgentEventSequence = 0;
       try {
         backendExecutionStarted = true;
         result = await executeAiWorkerTask(runId, config, {
           execution_contract: executionRun.contract,
           session_key: `task:${cardId}`,
+        }, (event) => {
+          if (event.run_id !== runId || event.sequence <= lastAgentEventSequence) return;
+          lastAgentEventSequence = event.sequence;
+          if (event.type === "run_started") {
+            appendStructuredAgentLogForCard(
+              cardId,
+              "info",
+              "runtime",
+              "Agent runtime started.",
+              ["Execution events are now being tracked by the backend runtime."],
+              [],
+              [],
+            );
+          } else if (event.type === "run_blocked") {
+            appendStructuredAgentLogForCard(
+              cardId,
+              "error",
+              "runtime",
+              "Agent runtime blocked the execution.",
+              [],
+              [],
+              ["Review the blocked reason and resolve the missing requirement."],
+            );
+          }
         });
       } catch (reason) {
         if (reason instanceof IpcPolicyError && reason.category === "timeout") {

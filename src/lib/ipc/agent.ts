@@ -120,6 +120,7 @@ export type AiRuntimeEvent =
   | { type: "run_started"; run_id: string; sequence: number }
   | { type: "text_delta"; run_id: string; sequence: number; delta: string }
   | { type: "run_completed"; run_id: string; sequence: number }
+  | { type: "run_blocked"; run_id: string; sequence: number }
   | { type: "run_failed"; run_id: string; sequence: number; error_code: string }
   | { type: "run_cancelled"; run_id: string; sequence: number };
 
@@ -223,10 +224,13 @@ export async function executeAiWorkerTask(
   runId: string,
   config: AiWorkerConfig,
   task: AiWorkerTask,
+  onEvent: (event: AiRuntimeEvent) => void,
 ): Promise<AiWorkerTaskResult> {
+  const channel = new Channel<AiRuntimeEvent>();
+  channel.onmessage = onEvent;
   const result = await invokeWithPolicy<unknown>(
     "execute_ai_worker_task",
-    { runId, config, task },
+    { runId, config, task, onEvent: channel },
     IPC_POLICIES.aiExecution,
   );
   return validateAiWorkerTaskResult(result);

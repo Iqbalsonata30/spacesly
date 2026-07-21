@@ -399,6 +399,7 @@ async fn execute_ai_worker_task(
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
     secrets: State<'_, AppSecretsStore>,
+    on_event: Channel<AiRuntimeEvent>,
 ) -> Result<AiWorkerTaskResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     resolve_ai_secrets(&mut config, secrets.inner())?;
@@ -427,6 +428,13 @@ async fn execute_ai_worker_task(
         let _ = registry.finish(&run_id);
         return Err(error);
     }
+    emit_ai_event(
+        Some(&on_event),
+        AiRuntimeEvent::RunStarted {
+            run_id: run_id.clone(),
+            sequence: 1,
+        },
+    );
     let cancellation = runtime.cancellation(&run_id)?;
     let store = execution_store.inner().clone();
     let worker_run_id = run_id.clone();
@@ -465,6 +473,26 @@ async fn execute_ai_worker_task(
             _ => AiRunStatus::Failed,
         };
         let _ = runtime.finish(&worker_run_id, runtime_status);
+        let event = match status {
+            "completed" => AiRuntimeEvent::RunCompleted {
+                run_id: worker_run_id.clone(),
+                sequence: 2,
+            },
+            "blocked" => AiRuntimeEvent::RunBlocked {
+                run_id: worker_run_id.clone(),
+                sequence: 2,
+            },
+            "cancelled" => AiRuntimeEvent::RunCancelled {
+                run_id: worker_run_id.clone(),
+                sequence: 2,
+            },
+            _ => AiRuntimeEvent::RunFailed {
+                run_id: worker_run_id.clone(),
+                sequence: 2,
+                error_code: "agent_execution_failed".to_string(),
+            },
+        };
+        emit_ai_event(Some(&on_event), event);
         result
     })
     .await
