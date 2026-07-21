@@ -44,6 +44,7 @@ static OPENCODE_MCP_CONFIGS: OnceLock<Mutex<HashMap<String, Arc<String>>>> = Onc
 static OPENCODE_SERVERS: OnceLock<Mutex<HashMap<u64, Arc<OpenCodeServer>>>> = OnceLock::new();
 static OPENCODE_SERVER_STARTUP: OnceLock<Mutex<()>> = OnceLock::new();
 static OPENCODE_SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static OPENCODE_CONTEXT_REVISIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const MAX_OPENCODE_SERVERS: usize = 4;
 
 struct OpenCodeServer {
@@ -270,6 +271,8 @@ pub struct AiWorkerChatRequest {
     pub run_id: Option<String>,
     pub message: String,
     pub terminal_context: Option<String>,
+    #[serde(default)]
+    pub context_revision: Option<String>,
     pub session_context: Option<String>,
     #[serde(default)]
     pub session_key: Option<String>,
@@ -502,6 +505,14 @@ pub fn chat_ai_worker(
         let session = server
             .as_ref()
             .and_then(|server| cached_opencode_session(server, request.session_key.as_deref()));
+        let context_unchanged = server.as_ref().is_some_and(|server| {
+            session.is_some()
+                && opencode_context_revision_matches(
+                    server,
+                    request.session_key.as_deref(),
+                    request.context_revision.as_deref(),
+                )
+        });
         let session_context = if session.is_some() {
             request
                 .session_context
@@ -514,9 +525,21 @@ pub fn chat_ai_worker(
             request.session_context.as_deref().unwrap_or("none")
         };
         let context = ContextBuilder::new(&config);
+        let workspace_context = if context_unchanged {
+            format!(
+                "Workspace context unchanged (revision {}). Reuse the workspace context from this existing session.",
+                request.context_revision.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            request
+                .terminal_context
+                .as_deref()
+                .unwrap_or("none")
+                .to_string()
+        };
         let prompt = context.opencode_chat_prompt(
             &session_context,
-            request.terminal_context.as_deref().unwrap_or("none"),
+            &workspace_context,
             message,
             session.is_some(),
         );
@@ -574,6 +597,11 @@ pub fn chat_ai_worker(
         let response = parse_opencode_run_output(&stdout)?;
         if let Some(server) = server.as_ref() {
             remember_opencode_session(server, request.session_key.as_deref(), &response.session_id);
+            remember_opencode_context_revision(
+                server,
+                request.session_key.as_deref(),
+                request.context_revision.as_deref(),
+            );
         }
         return Ok(AiWorkerChatResult {
             run_id: String::new(),
@@ -1978,6 +2006,51 @@ fn remember_opencode_session(server: &OpenCodeServer, session_key: Option<&str>,
     }
 }
 
+fn opencode_context_revision_matches(
+    server: &OpenCodeServer,
+    session_key: Option<&str>,
+    revision: Option<&str>,
+) -> bool {
+    let (Some(session_key), Some(revision)) = (
+        session_key.map(str::trim).filter(|value| !value.is_empty()),
+        revision.map(str::trim).filter(|value| !value.is_empty()),
+    ) else {
+        return false;
+    };
+    OPENCODE_CONTEXT_REVISIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|revisions| {
+            revisions
+                .get(&opencode_session_cache_key(server, session_key))
+                .map(|cached| cached == revision)
+        })
+        .unwrap_or(false)
+}
+
+fn remember_opencode_context_revision(
+    server: &OpenCodeServer,
+    session_key: Option<&str>,
+    revision: Option<&str>,
+) {
+    let (Some(session_key), Some(revision)) = (
+        session_key.map(str::trim).filter(|value| !value.is_empty()),
+        revision.map(str::trim).filter(|value| !value.is_empty()),
+    ) else {
+        return;
+    };
+    if let Ok(mut revisions) = OPENCODE_CONTEXT_REVISIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        revisions.insert(
+            opencode_session_cache_key(server, session_key),
+            revision.to_string(),
+        );
+    }
+}
+
 pub fn close_all_opencode_servers() {
     if let Some(servers) = OPENCODE_SERVERS.get() {
         if let Ok(mut servers) = servers.lock() {
@@ -1987,6 +2060,11 @@ pub fn close_all_opencode_servers() {
     if let Some(sessions) = OPENCODE_SESSIONS.get() {
         if let Ok(mut sessions) = sessions.lock() {
             sessions.clear();
+        }
+    }
+    if let Some(revisions) = OPENCODE_CONTEXT_REVISIONS.get() {
+        if let Ok(mut revisions) = revisions.lock() {
+            revisions.clear();
         }
     }
 }

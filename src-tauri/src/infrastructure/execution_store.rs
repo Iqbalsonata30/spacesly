@@ -530,6 +530,38 @@ impl ExecutionStore {
         Ok(imported)
     }
 
+    pub fn prune_conversations(
+        &self,
+        workspace_id: &str,
+        retained_ids: &[String],
+    ) -> Result<usize, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare("SELECT conversation_id FROM conversations WHERE workspace_id = ?1")
+            .map_err(|error| format!("Failed to prepare conversation retention query: {error}"))?;
+        let ids = statement
+            .query_map(params![workspace_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Failed to query conversations for retention: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to decode conversation retention IDs: {error}"))?;
+        let mut deleted = 0;
+        for conversation_id in ids {
+            if retained_ids
+                .iter()
+                .any(|retained| retained == &conversation_id)
+            {
+                continue;
+            }
+            deleted += connection
+                .execute(
+                    "DELETE FROM conversations WHERE conversation_id = ?1 AND workspace_id = ?2",
+                    params![conversation_id, workspace_id],
+                )
+                .map_err(|error| format!("Failed to prune conversation: {error}"))?;
+        }
+        Ok(deleted)
+    }
+
     pub fn list_active(&self) -> Result<Vec<ExecutionRun>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
@@ -833,5 +865,45 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn conversation_retention_is_scoped_to_the_workspace() {
+        let store = test_store();
+        for (conversation_id, message_id) in [("keep", "keep-message"), ("drop", "drop-message")] {
+            store
+                .append_conversation_message(
+                    "workspace-a",
+                    conversation_id,
+                    "Chat",
+                    &ConversationMessageInput {
+                        id: message_id.to_string(),
+                        role: "user".to_string(),
+                        text: conversation_id.to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_conversation_message(
+                "workspace-b",
+                "other",
+                "Chat",
+                &ConversationMessageInput {
+                    id: "other-message".to_string(),
+                    role: "user".to_string(),
+                    text: "Other workspace".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prune_conversations("workspace-a", &["keep".to_string()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.list_conversations("workspace-a").unwrap().len(), 1);
+        assert_eq!(store.list_conversations("workspace-b").unwrap().len(), 1);
     }
 }

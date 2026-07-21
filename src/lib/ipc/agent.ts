@@ -91,6 +91,7 @@ export interface AiWorkerChatRequest {
   run_id?: string;
   message: string;
   terminal_context: string | null;
+  context_revision: string | null;
   session_context: string | null;
   session_key: string;
 }
@@ -275,6 +276,17 @@ export async function importConversations(
   return invokeWithPolicy<number>(
     "import_conversations",
     { workspaceId, conversations },
+    IPC_POLICIES.fileWrite,
+  );
+}
+
+export async function pruneConversations(
+  workspaceId: string,
+  retainedIds: string[],
+): Promise<number> {
+  return invokeWithPolicy<number>(
+    "prune_conversations",
+    { workspaceId, retainedIds },
     IPC_POLICIES.fileWrite,
   );
 }

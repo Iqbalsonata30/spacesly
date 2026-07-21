@@ -38,6 +38,7 @@ export {
   trustAiWorkspace,
   appendConversationMessage,
   importConversations,
+  pruneConversations,
   listConversations,
   loadConversationMessages,
 } from "$lib/ipc/agent";

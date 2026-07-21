@@ -16,6 +16,7 @@ import { lspConfigForPath } from "../src/lib/lspConfig";
 import {
   workspaceChatActionDescription,
   workspaceChatActionRequiresConfirmation,
+  workspaceContextRevision,
 } from "../src/lib/workspaceChat";
 import { aiEditProposalIsStale, applyAiEditHunks, createAiEditProposal } from "../src/lib/aiEdit";
 import {
@@ -43,6 +44,15 @@ function assertEqual(actual: unknown, expected: unknown, message: string) {
       `${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
     );
   }
+}
+
+assertEqual(
+  workspaceContextRevision("same context"),
+  workspaceContextRevision("same context"),
+  "workspace context revisions should be stable",
+);
+if (workspaceContextRevision("context a") === workspaceContextRevision("context b")) {
+  throw new Error("workspace context revisions should change with context content");
 }
 
 assertEqual(

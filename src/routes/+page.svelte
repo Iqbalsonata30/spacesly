@@ -87,6 +87,7 @@
     fastWorkspaceChatActions,
     ticketLabel,
     workspaceChatActionRequiresConfirmation,
+    workspaceContextRevision,
     workspaceAgentContext,
     stripWorkspaceActions,
     type WorkspaceChatAction,
@@ -106,6 +107,7 @@
     cancelAiWorkerTask,
     chatAiWorker,
     proposeAiEdit,
+    pruneConversations,
     executeAiWorkerTask,
     getJiraBoards,
     getPathGitInfo,
@@ -834,6 +836,10 @@
   });
 
   let activeBoard = $derived<BoardProjection | null>(workspace?.projects[0]?.boards[0] ?? null);
+  let workspaceChatRequestContextValue = $derived.by(() => {
+    const context = workspaceAgentContext(activeBoard);
+    return { context, revision: workspaceContextRevision(context) };
+  });
   let displayColumns = $derived<BoardDisplayColumn[]>(
     activeBoard?.columns.map((column) => {
       const cards = visibleCardsForColumn(column);
@@ -3395,6 +3401,12 @@
       }
 
       const retainedRecords = records.slice(0, MAX_CHAT_SESSIONS);
+      if (records.length > retainedRecords.length) {
+        void pruneConversations(
+          workspaceId,
+          retainedRecords.map((record) => record.id),
+        ).catch(() => {});
+      }
       const hydrated = await Promise.all(
         retainedRecords.map(async (record) => {
           const messages = await loadConversationMessages(workspaceId, record.id);
@@ -3611,6 +3623,10 @@
     ].join("\n\n");
   }
 
+  function workspaceChatRequestContext(): { context: string; revision: string } {
+    return workspaceChatRequestContextValue;
+  }
+
   function scrollWorkspaceChatToLatest() {
     void tick().then(() => {
       workspaceChatEnd?.scrollIntoView({ block: "end" });
@@ -3816,7 +3832,7 @@
     if (!message || workspaceChatRunning) return;
     const requestSessionId = workspaceChatActiveSessionId;
     const requestSessionContext = workspaceChatSessionPromptContext();
-    const requestTerminalContext = workspaceAgentContext(activeBoard);
+    const requestWorkspaceContext = workspaceChatRequestContext();
 
     if (workspaceChatTextarea) workspaceChatTextarea.value = "";
     appendWorkspaceChat({ role: "user", text: message }, requestSessionId);
@@ -3858,7 +3874,8 @@
       const result = await chatAiWorker(config, {
         run_id: run.run_id,
         message,
-        terminal_context: requestTerminalContext,
+        terminal_context: requestWorkspaceContext.context,
+        context_revision: requestWorkspaceContext.revision,
         session_context: requestSessionContext,
         session_key: `chat:${requestSessionId}`,
       }, (event) => {

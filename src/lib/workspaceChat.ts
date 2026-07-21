@@ -61,6 +61,15 @@ export function workspaceAgentContext(
   return [terminalContext(), boardContext(activeBoard)].filter(Boolean).join("\n\n");
 }
 
+export function workspaceContextRevision(context: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < context.length; index += 1) {
+    hash ^= context.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `ctx-${(hash >>> 0).toString(16).padStart(8, "0")}-${context.length}`;
+}
+
 export function boardContext(
   activeBoard: WorkspaceProjection["projects"][number]["boards"][number] | null,
 ): string {

@@ -678,6 +678,20 @@ async fn import_conversations(
 }
 
 #[tauri::command]
+async fn prune_conversations(
+    workspace_id: String,
+    retained_ids: Vec<String>,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<usize, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.prune_conversations(&workspace_id, &retained_ids)
+    })
+    .await
+    .map_err(|error| format!("Conversation retention task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn chat_ai_worker(
     mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
@@ -2025,6 +2039,7 @@ pub fn run() {
             load_conversation_messages,
             append_conversation_message,
             import_conversations,
+            prune_conversations,
             chat_ai_worker,
             propose_ai_edit,
             sync_recovery_snapshots,
