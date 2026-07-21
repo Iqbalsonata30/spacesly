@@ -403,10 +403,11 @@ async fn execute_ai_worker_task(
     if submitted_contract != &persisted_run.contract {
         return Err("Execution contract does not match the persisted run.".to_string());
     }
-    ai_runs.require_capabilities(
-        &run_id,
-        &["workspace_read", "workspace_write", "shell", "git"],
-    )?;
+    let mut required_capabilities = vec!["workspace_read", "workspace_write", "shell", "git"];
+    if !config.mcp_servers.is_empty() {
+        required_capabilities.push("external_tools");
+    }
+    ai_runs.require_capabilities(&run_id, &required_capabilities)?;
     let registry = agent_runs.inner().clone();
     registry.start(&run_id)?;
     let runtime = ai_runs.inner().clone();

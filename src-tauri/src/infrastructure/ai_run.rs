@@ -118,7 +118,13 @@ impl AiRunRegistry {
         run_id: &str,
         capabilities: Vec<String>,
     ) -> Result<(), String> {
-        const ALLOWED: [&str; 4] = ["workspace_read", "workspace_write", "shell", "git"];
+        const ALLOWED: [&str; 5] = [
+            "workspace_read",
+            "workspace_write",
+            "shell",
+            "git",
+            "external_tools",
+        ];
         let state = self.state.lock().map_err(|error| error.to_string())?;
         let run = state
             .get(run_id)

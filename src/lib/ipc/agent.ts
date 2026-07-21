@@ -171,7 +171,13 @@ export async function getAiRun(runId: string): Promise<AiRun | null> {
 
 export async function grantAiRunCapabilities(
   runId: string,
-  capabilities: ("workspace_read" | "workspace_write" | "shell" | "git")[],
+  capabilities: (
+    | "workspace_read"
+    | "workspace_write"
+    | "shell"
+    | "git"
+    | "external_tools"
+  )[],
 ): Promise<void> {
   return invokeWithPolicy<void>(
     "grant_ai_run_capabilities",

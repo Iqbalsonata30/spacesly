@@ -5775,12 +5775,14 @@
 
     try {
       await reserveAiWorkerRun(runId, config);
-      await grantAiRunCapabilities(runId, [
+      const grantedCapabilities = [
         "workspace_read",
         "workspace_write",
         "shell",
         "git",
-      ]);
+        ...(config.mcp_servers.length > 0 ? ["external_tools"] : []),
+      ] as ("workspace_read" | "workspace_write" | "shell" | "git" | "external_tools")[];
+      await grantAiRunCapabilities(runId, grantedCapabilities);
     } catch (reason) {
       await releaseAiWorkerRun(runId).catch(() => false);
       finishWorkerRun(cardId, runId);
