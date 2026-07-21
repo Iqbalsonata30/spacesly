@@ -27,6 +27,119 @@ impl ToolRisk {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolDisplayContext {
+    pub label: String,
+    pub category: String,
+    pub target: Option<String>,
+}
+
+pub fn tool_display_context(tool_name: &str, arguments: &serde_json::Value) -> ToolDisplayContext {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    let category = if matches!(
+        normalized.as_str(),
+        "read" | "glob" | "grep" | "list" | "ls" | "edit" | "write" | "apply_patch" | "patch"
+    ) {
+        "files"
+    } else if matches!(normalized.as_str(), "bash" | "shell") {
+        "commands"
+    } else if normalized == "git" || normalized.contains("git_") {
+        "git"
+    } else if normalized.contains("jira") || normalized.contains("atlassian") {
+        "jira"
+    } else if normalized.contains("kubernetes") || normalized.contains("kube") {
+        "kubernetes"
+    } else if normalized.contains("bamboo") {
+        "bamboo"
+    } else if matches!(normalized.as_str(), "todowrite" | "question" | "skill") {
+        "runtime"
+    } else {
+        "external"
+    };
+    let target = match category {
+        "files" => safe_relative_path(arguments),
+        "jira" => safe_identifier(arguments, &["issue_key", "issueKey", "key"]),
+        "kubernetes" => safe_identifier(arguments, &["name", "namespace"]),
+        "bamboo" => safe_identifier(arguments, &["plan_key", "planKey", "build_key"]),
+        _ => None,
+    };
+    let action = if normalized == "read" {
+        "Reading"
+    } else if matches!(
+        normalized.as_str(),
+        "edit" | "write" | "apply_patch" | "patch"
+    ) {
+        "Updating"
+    } else if normalized == "glob" {
+        "Finding files in"
+    } else if normalized == "grep" {
+        "Searching"
+    } else if matches!(normalized.as_str(), "bash" | "shell") {
+        "Running shell command in"
+    } else if category == "git" {
+        "Running Git operation in"
+    } else if ToolBroker::risk_for_tool(&normalized) == ToolRisk::Destructive {
+        "Deleting from"
+    } else if ToolBroker::risk_for_tool(&normalized) == ToolRisk::Mutation {
+        "Updating"
+    } else if ToolBroker::risk_for_tool(&normalized) == ToolRisk::Read {
+        "Reading from"
+    } else {
+        "Using"
+    };
+    let category_label = match category {
+        "files" => "workspace",
+        "commands" => "workspace",
+        "git" => "repository",
+        "jira" => "Jira",
+        "kubernetes" => "Kubernetes",
+        "bamboo" => "Bamboo",
+        "runtime" => "Agent runtime",
+        _ => "external tool",
+    };
+    ToolDisplayContext {
+        label: target
+            .as_deref()
+            .map(|target| format!("{action} {target}"))
+            .unwrap_or_else(|| format!("{action} {category_label}")),
+        category: category.to_string(),
+        target,
+    }
+}
+
+fn safe_relative_path(arguments: &serde_json::Value) -> Option<String> {
+    let value = string_argument(arguments, &["file_path", "filePath", "path"])?;
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 180
+        || value.starts_with('/')
+        || value.as_bytes().get(1) == Some(&b':')
+        || value.split(['/', '\\']).any(|part| part == "..")
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn safe_identifier(arguments: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let value = string_argument(arguments, keys)?.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || value
+            .chars()
+            .any(|character| !(character.is_ascii_alphanumeric() || "-_.:/".contains(character)))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn string_argument<'a>(arguments: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+}
+
 pub fn argument_digest(arguments: &serde_json::Value) -> Result<String, String> {
     let canonical = canonical_json(arguments);
     let bytes = serde_json::to_vec(&canonical)
@@ -364,6 +477,42 @@ mod tests {
             argument_digest(&first).unwrap(),
             argument_digest(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn display_context_exposes_only_allowlisted_safe_targets() {
+        assert_eq!(
+            tool_display_context("read", &serde_json::json!({"filePath": "src/main.rs"})),
+            ToolDisplayContext {
+                label: "Reading src/main.rs".to_string(),
+                category: "files".to_string(),
+                target: Some("src/main.rs".to_string()),
+            }
+        );
+        let shell = tool_display_context(
+            "bash",
+            &serde_json::json!({"command": "deploy --token super-secret"}),
+        );
+        assert_eq!(shell.category, "commands");
+        assert_eq!(shell.target, None);
+        assert!(!shell.label.contains("token"));
+        assert!(!shell.label.contains("secret"));
+        let absolute = tool_display_context(
+            "read",
+            &serde_json::json!({"path": "/home/user/private.txt"}),
+        );
+        assert_eq!(absolute.target, None);
+    }
+
+    #[test]
+    fn display_context_identifies_safe_connector_resources() {
+        let jira = tool_display_context(
+            "atlassian_jira_transition_issue",
+            &serde_json::json!({"issue_key": "APP-123", "comment": "private"}),
+        );
+        assert_eq!(jira.category, "jira");
+        assert_eq!(jira.target.as_deref(), Some("APP-123"));
+        assert!(!jira.label.contains("private"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use super::tool_broker::ToolDisplayContext;
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AiRuntimeEvent {
@@ -20,6 +22,7 @@ pub enum AiRuntimeEvent {
         risk: String,
         operation_id: String,
         arguments_digest: String,
+        display_context: ToolDisplayContext,
     },
     ToolCompleted {
         run_id: String,
@@ -30,6 +33,7 @@ pub enum AiRuntimeEvent {
         risk: String,
         operation_id: String,
         arguments_digest: String,
+        display_context: ToolDisplayContext,
     },
     ApprovalRequired {
         run_id: String,

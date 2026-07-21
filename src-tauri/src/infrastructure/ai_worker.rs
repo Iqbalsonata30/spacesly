@@ -1,6 +1,6 @@
 use super::provider_registry::ApiStyle;
 use super::shell_env::inject_shell_env;
-use super::tool_broker::{argument_digest, ToolBroker};
+use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
@@ -333,6 +333,7 @@ pub enum AiWorkerStreamEvent {
         tool_name: String,
         risk: String,
         arguments_digest: String,
+        display_context: ToolDisplayContext,
     },
     ToolCompleted {
         tool_call_id: String,
@@ -340,6 +341,7 @@ pub enum AiWorkerStreamEvent {
         success: bool,
         risk: String,
         arguments_digest: String,
+        display_context: ToolDisplayContext,
     },
     UsageUpdated {
         input_tokens: u64,
@@ -2704,6 +2706,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let arguments_digest = argument_digest(&arguments).ok()?;
+    let display_context = tool_display_context(&tool_name, &arguments);
     match status {
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -2711,6 +2714,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             success: true,
             risk,
             arguments_digest,
+            display_context,
         }),
         "error" | "failed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -2718,12 +2722,14 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             success: false,
             risk,
             arguments_digest,
+            display_context,
         }),
         _ => Some(AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
             tool_name,
             risk,
             arguments_digest,
+            display_context,
         }),
     }
 }
@@ -3437,6 +3443,10 @@ mod tests {
                 risk: "mutation".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({"command": "secret"}))
                     .unwrap(),
+                display_context: tool_display_context(
+                    "shell",
+                    &serde_json::json!({"command": "secret"}),
+                ),
             })
         );
 
@@ -3451,6 +3461,7 @@ mod tests {
                 success: true,
                 risk: "mutation".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
+                display_context: tool_display_context("shell", &serde_json::json!({})),
             })
         );
     }

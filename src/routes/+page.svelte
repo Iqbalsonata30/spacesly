@@ -6094,20 +6094,26 @@
             appendStructuredAgentLogForCard(
               cardId,
               "info",
-              "tool",
-              `Tool started: ${event.tool_name}.`,
-              [`Tool call: ${event.tool_call_id}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
-              [],
+              event.display_context.category,
+              `${event.display_context.label}.`,
+              [
+                `Category: ${event.display_context.category}`,
+                ...(event.display_context.target ? [`Target: ${event.display_context.target}`] : []),
+              ],
+              [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
               ["Wait for the runtime to report tool completion."],
             );
           } else if (event.type === "tool_completed") {
             appendStructuredAgentLogForCard(
               cardId,
               event.success ? "info" : "error",
-              "tool",
-              `Tool ${event.success ? "completed" : "failed"}: ${event.tool_name}.`,
-              [`Tool call: ${event.tool_call_id}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
-              [],
+              event.display_context.category,
+              `${event.success ? "Completed" : "Failed"}: ${event.display_context.label}.`,
+              [
+                `Category: ${event.display_context.category}`,
+                ...(event.display_context.target ? [`Target: ${event.display_context.target}`] : []),
+              ],
+              [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
               event.success ? [] : ["Review the tool failure evidence before continuing."],
             );
           } else if (event.type === "approval_required") {

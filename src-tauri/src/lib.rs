@@ -841,6 +841,7 @@ fn emit_worker_stream_event(
             tool_name,
             risk,
             arguments_digest,
+            display_context,
         } => {
             let tool_risk = ToolBroker::risk_for_tool(&tool_name);
             let operation_id = operation_id(
@@ -857,6 +858,7 @@ fn emit_worker_stream_event(
                     "risk": risk,
                     "operation_id": operation_id,
                     "arguments_digest": arguments_digest,
+                    "display_context": display_context,
                 });
                 let _ = store.record_ai_audit(Some(run_id), "tool_started", &payload);
             }
@@ -868,6 +870,7 @@ fn emit_worker_stream_event(
                 risk,
                 operation_id,
                 arguments_digest,
+                display_context,
             }
         }
         AiWorkerStreamEvent::ToolCompleted {
@@ -876,6 +879,7 @@ fn emit_worker_stream_event(
             success,
             risk,
             arguments_digest,
+            display_context,
         } => {
             let operation_id = operation_id(
                 run_id,
@@ -892,6 +896,7 @@ fn emit_worker_stream_event(
                     "risk": risk,
                     "operation_id": operation_id,
                     "arguments_digest": arguments_digest,
+                    "display_context": display_context,
                 });
                 let _ = store.record_ai_audit(Some(run_id), "tool_completed", &payload);
             }
@@ -904,6 +909,7 @@ fn emit_worker_stream_event(
                 risk,
                 operation_id,
                 arguments_digest,
+                display_context,
             }
         }
         AiWorkerStreamEvent::UsageUpdated {

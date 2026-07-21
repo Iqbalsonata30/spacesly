@@ -124,6 +124,12 @@ export type ToolOperationRisk =
   | "credential_sensitive"
   | "unknown";
 
+export interface ToolDisplayContext {
+  label: string;
+  category: "files" | "commands" | "git" | "jira" | "kubernetes" | "bamboo" | "runtime" | "external";
+  target: string | null;
+}
+
 export type AiRuntimeEvent =
   | { type: "run_started"; run_id: string; sequence: number }
   | { type: "text_delta"; run_id: string; sequence: number; delta: string }
@@ -136,6 +142,7 @@ export type AiRuntimeEvent =
       risk: ToolOperationRisk;
       operation_id: string;
       arguments_digest: string;
+      display_context: ToolDisplayContext;
     }
   | {
       type: "tool_completed";
@@ -147,6 +154,7 @@ export type AiRuntimeEvent =
       risk: ToolOperationRisk;
       operation_id: string;
       arguments_digest: string;
+      display_context: ToolDisplayContext;
     }
   | {
       type: "approval_required";
