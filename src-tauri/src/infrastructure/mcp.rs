@@ -712,39 +712,42 @@ where
             .entry(key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let _initialization_guard = initialization.lock().map_err(|error| error.to_string())?;
-        if let Some(existing) = manager
-            .sessions
-            .lock()
-            .map_err(|error| error.to_string())?
-            .get(&key)
-            .map(|entry| Arc::clone(&entry.client))
         {
-            existing
-        } else {
-            let client = StdioMcpClient::start(server)?;
-            client.initialize()?;
-            client.tools()?;
-            let candidate = Arc::new(client);
-            let evicted = {
-                let mut sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
-                let evicted = evict_oldest_idle_session(&mut sessions, now);
-                if sessions.len() >= MCP_MAX_SESSIONS {
-                    return Err(format!(
-                        "MCP session limit reached ({MCP_MAX_SESSIONS}). Close an unused MCP connection before starting another."
-                    ));
-                }
-                sessions.insert(
-                    key.clone(),
-                    McpSessionEntry {
-                        client: Arc::clone(&candidate),
-                        last_used: now,
-                    },
-                );
-                evicted
-            };
-            drop(evicted);
-            candidate
+            let _initialization_guard = initialization.lock().map_err(|error| error.to_string())?;
+            if let Some(existing) = manager
+                .sessions
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(&key)
+                .map(|entry| Arc::clone(&entry.client))
+            {
+                existing
+            } else {
+                let client = StdioMcpClient::start(server)?;
+                client.initialize()?;
+                client.tools()?;
+                let candidate = Arc::new(client);
+                let evicted = {
+                    let mut sessions =
+                        manager.sessions.lock().map_err(|error| error.to_string())?;
+                    let evicted = evict_oldest_idle_session(&mut sessions, now);
+                    if sessions.len() >= MCP_MAX_SESSIONS {
+                        return Err(format!(
+                            "MCP session limit reached ({MCP_MAX_SESSIONS}). Close an unused MCP connection before starting another."
+                        ));
+                    }
+                    sessions.insert(
+                        key.clone(),
+                        McpSessionEntry {
+                            client: Arc::clone(&candidate),
+                            last_used: now,
+                        },
+                    );
+                    evicted
+                };
+                drop(evicted);
+                candidate
+            }
         }
     };
 

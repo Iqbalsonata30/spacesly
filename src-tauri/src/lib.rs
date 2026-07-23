@@ -40,8 +40,8 @@ use infrastructure::lsp::{
     LspServerConfig, LspServerStatus,
 };
 use infrastructure::mcp::{
-    close_all_mcp_sessions, JiraBoard, JiraConnectionStatus, JiraIssue, JiraMcpConfig,
-    McpConnectionStatus, McpServerConfig,
+    close_all_mcp_sessions, close_mcp_session, JiraBoard, JiraConnectionStatus, JiraIssue,
+    JiraMcpConfig, McpConnectionStatus, McpServerConfig,
 };
 use infrastructure::provider_registry::profile as provider_profile;
 use infrastructure::pty::{
@@ -72,8 +72,11 @@ use infrastructure::workspace_search::{
 use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
+
+const MCP_TEST_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn workspace_id_or_default(workspace_id: Option<String>) -> String {
     workspace_id.unwrap_or_else(|| "workspace-personal".to_string())
@@ -260,11 +263,21 @@ async fn test_mcp_server_connection(
     secrets: State<'_, AppSecretsStore>,
 ) -> Result<McpConnectionStatus, String> {
     resolve_mcp_secret_environment(&mut config, secrets.inner())?;
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let cleanup_config = config.clone();
+    let _ = close_mcp_session(config.clone());
+    let task = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().test_mcp_connection(config)
-    })
-    .await
-    .map_err(|error| mcp_ipc_error("MCP test task failed", error))?;
+    });
+    let result = tokio::time::timeout(MCP_TEST_CONNECTION_TIMEOUT, task)
+        .await
+        .map_err(|_| {
+            let _ = close_mcp_session(cleanup_config);
+            mcp_ipc_error(
+                "MCP test failed",
+                "request timed out after 60 seconds while testing the connector",
+            )
+        })?
+        .map_err(|error| mcp_ipc_error("MCP test task failed", error))?;
     result.map_err(|error| mcp_ipc_error("MCP test failed", error))
 }
 

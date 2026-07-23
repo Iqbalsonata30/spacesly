@@ -37,6 +37,8 @@ import {
   type WorkspaceChatMessage,
 } from "../src/lib/uiState";
 import { formatJiraExecutionComment } from "../src/lib/jiraComment";
+import { timelineActivity, timelineActivities } from "../src/lib/agentTimeline";
+import { relativeTimeLabel } from "../src/lib/relativeTime";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -50,6 +52,51 @@ assertEqual(
   workspaceContextRevision("same context"),
   workspaceContextRevision("same context"),
   "workspace context revisions should be stable",
+);
+
+const timestampNow = new Date(2026, 0, 1, 4, 30, 18).getTime();
+assertEqual(relativeTimeLabel("04:30:18 AM", timestampNow), "Just now", "fresh activity should be relative");
+assertEqual(relativeTimeLabel("04:29:58 AM", timestampNow), "20 sec ago", "recent activity should show seconds");
+assertEqual(relativeTimeLabel("04:25:18 AM", timestampNow), "5 min ago", "older activity should show minutes");
+
+const contextActivity = timelineActivity({
+  id: "log-1",
+  at: "04:30:18 AM",
+  tone: "info",
+  label: "context",
+  message: [
+    "STATUS: Running",
+    "SUMMARY: Exported structured context for APP-1.",
+    "EVIDENCE:",
+    "- Runtime: OpenCode gpt-5.5",
+    "DETAILS:",
+    "- Sections: SUMMARY, EVIDENCE, DETAILS",
+  ].join("\n"),
+});
+assertEqual(contextActivity.title, "Preparing execution context", "timeline should explain progress");
+assertEqual(
+  contextActivity.summary,
+  "Workspace, task, evidence, and operator context were prepared for execution.",
+  "timeline summary should avoid raw runtime labels",
+);
+assertEqual(contextActivity.sections[0].title, "Evidence", "technical evidence should move into details");
+
+const collapsedActivities = timelineActivities([
+  { id: "log-2", at: "04:30:19 AM", tone: "info", label: "runtime", message: "SUMMARY: Agent runtime started." },
+  { id: "log-3", at: "04:30:20 AM", tone: "info", label: "runtime", message: "SUMMARY: Agent runtime started." },
+]);
+assertEqual(collapsedActivities.length, 1, "repeated runtime updates should collapse");
+assertEqual(collapsedActivities[0].repeatCount, 2, "collapsed updates should retain count");
+assertEqual(
+  timelineActivity({
+    id: "log-4",
+    at: "04:30:21 AM",
+    tone: "info",
+    label: "files",
+    message: "SUMMARY: Completed: Reading src/main.rs.",
+  }).status,
+  "completed",
+  "completed tool activity should not appear as still running",
 );
 if (workspaceContextRevision("context a") === workspaceContextRevision("context b")) {
   throw new Error("workspace context revisions should change with context content");

@@ -12,6 +12,7 @@
     X,
   } from "lucide-svelte";
   import type { AiWorkerTaskResult } from "$lib/ipc";
+  import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
     AgentRunLog,
     AgentRunStatus,
@@ -19,6 +20,7 @@
     AgentTerminalLine,
     ExecutionRun,
   } from "$lib/agentRun";
+  import { relativeTimeLabel } from "$lib/relativeTime";
 
   type Props = {
     style?: string;
@@ -65,6 +67,7 @@
   let technicalOpen = $state(false);
   let attentionOpen = $state(true);
   let expandedActivities = $state<Record<string, boolean>>({});
+  let timelineNow = $state(Date.now());
 
   let isWorking = $derived(runStatus === "running");
   let isBlocked = $derived(runStatus === "blocked" || runStatus === "timeout");
@@ -99,51 +102,16 @@
       .slice(0, 4),
   );
 
+  $effect(() => {
+    if (!isWorking) return;
+    const timer = window.setInterval(() => {
+      timelineNow = Date.now();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
+
   function latestActivities() {
-    const recent = logs.slice(-10);
-    return recent.filter((log, index) => {
-      if (index === 0) return true;
-      const previous = recent[index - 1];
-      return log.tone !== previous.tone || log.label !== previous.label || log.message !== previous.message;
-    });
-  }
-
-  function humanActivity(log: AgentRunLog): string {
-    const labels: Record<string, string> = {
-      start: "Agent started",
-      continue: "Agent continued the task",
-      board: "Task moved into active work",
-      model: "Agent is ready to work",
-      local: "Task prepared",
-      context: "Task context prepared",
-      agent: "Agent returned a result",
-      blocked: "Task paused",
-      timeout: "Agent response timed out",
-      approval: "Approval recorded",
-      operator: "Note added",
-      "manual-done": "Task marked complete",
-      files: "Workspace activity",
-      commands: "Command activity",
-      git: "Repository activity",
-      jira: "Jira activity",
-      kubernetes: "Kubernetes activity",
-      bamboo: "Deployment activity",
-      external: "External tool activity",
-      runtime: "Runtime activity",
-    };
-    return (
-      labels[log.label] ??
-      (log.tone === "error" ? "Task needs attention" : "Task activity recorded")
-    );
-  }
-
-  function activityPresentation(log: AgentRunLog): { title: string; summary: string } {
-    const summary = log.message.match(/^SUMMARY:\s*(.+)$/im)?.[1]?.trim();
-    const title = humanActivity(log);
-    return {
-      title,
-      summary: summary || cleanLine(log.message.split("\n")[0]) || "Execution activity recorded.",
-    };
+    return timelineActivities(logs, 10);
   }
 
   function userFacingActivity(
@@ -206,6 +174,14 @@
 
   function toggleActivity(id: string) {
     expandedActivities = { ...expandedActivities, [id]: !expandedActivities[id] };
+  }
+
+  function statusText(activity: TimelineActivity): string {
+    if (activity.status === "completed") return "Completed";
+    if (activity.status === "failed") return "Failed";
+    if (activity.status === "waiting") return "Waiting";
+    if (activity.status === "running") return "Running";
+    return "Recorded";
   }
 
   function resultLabel(value: string): string {
@@ -413,32 +389,48 @@
       {#if latestActivities().length === 0}
         <div class="empty-activity">The Agent will show meaningful progress here as it works.</div>
       {:else}
-        {#each latestActivities() as log (log.id)}
-          {@const activity = activityPresentation(log)}
+        {#each latestActivities() as activity (activity.log.id)}
           <article
             class="activity-item"
-            class:error={log.tone === "error"}
-            class:success={log.tone === "success"}
+            class:error={activity.status === "failed"}
+            class:success={activity.status === "completed"}
+            class:waiting={activity.status === "waiting"}
+            class:minor={activity.importance === "minor"}
           >
-            <span class="activity-marker"><span></span></span>
+            <span class="activity-marker" aria-label={statusText(activity)}><span></span></span>
             <div class="activity-copy">
-              <div class="activity-heading"><strong>{activity.title}</strong><time>{log.at}</time></div>
+              <div class="activity-heading">
+                <strong>{activity.title}</strong>
+                <button
+                  class="activity-expand"
+                  type="button"
+                  aria-label={expandedActivities[activity.log.id] ? "Hide activity details" : "Show activity details"}
+                  aria-expanded={expandedActivities[activity.log.id] ?? false}
+                  onclick={() => toggleActivity(activity.log.id)}
+                  ><ChevronDown size={14} class={expandedActivities[activity.log.id] ? "rotated" : ""} /></button
+                >
+              </div>
               <p class="activity-summary">{activity.summary}</p>
-              {#if expandedActivities[log.id]}
+              <div class="activity-meta">
+                <time title={activity.log.at}>{relativeTimeLabel(activity.log.at, timelineNow)}</time>
+                <span>{statusText(activity)}</span>
+                {#if activity.repeatCount > 1}<span>{activity.repeatCount} similar updates</span>{/if}
+              </div>
+              {#if expandedActivities[activity.log.id]}
                 <div class="activity-details">
-                  <span>Technical details</span>
-                  <pre>{log.message}</pre>
+                  {#each activity.sections as section (section.title)}
+                    <section>
+                      <h4>{section.title}</h4>
+                      <ul>
+                        {#each section.lines as line (line)}
+                          <li>{line}</li>
+                        {/each}
+                      </ul>
+                    </section>
+                  {/each}
                 </div>
               {/if}
             </div>
-            <button
-              class="activity-expand"
-              type="button"
-              aria-label={expandedActivities[log.id] ? "Hide activity details" : "Show activity details"}
-              aria-expanded={expandedActivities[log.id] ?? false}
-              onclick={() => toggleActivity(log.id)}
-              ><ChevronDown size={14} class={expandedActivities[log.id] ? "rotated" : ""} /></button
-            >
           </article>
         {/each}
       {/if}
@@ -516,8 +508,6 @@
   .timeline-title,
   .result-summary,
   .result-item,
-  .activity-item,
-  .activity-item > div:first-of-type,
   .technical-toggle,
   .operator-form {
     display: flex;
@@ -885,16 +875,31 @@
     color: #e49a80;
   }
   .activity-feed {
-    padding: 5px 12px 10px;
+    display: grid;
+    gap: 9px;
+    padding: 8px 12px 14px;
   }
   .activity-item {
-    gap: 8px;
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr);
+    gap: 11px;
     min-width: 0;
-    padding: 9px 0;
-    border-bottom: 1px solid #28242f;
+    padding: 12px 13px;
+    border: 1px solid #302b3a;
+    border-radius: 13px;
+    background: linear-gradient(180deg, #17141f 0%, #13111a 100%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
   }
-  .activity-item:last-child {
-    border-bottom: 0;
+  .activity-item.minor {
+    border-color: #262331;
+    background: #13111a;
+  }
+  .activity-item.error {
+    border-color: rgba(209, 119, 98, 0.42);
+    background: linear-gradient(180deg, rgba(50, 27, 25, 0.62), #151119);
+  }
+  .activity-item.success {
+    border-color: rgba(102, 183, 125, 0.35);
   }
   .activity-marker {
     display: inline-flex;
@@ -905,6 +910,7 @@
     justify-content: center;
     border: 1px solid #5a5267;
     border-radius: 50%;
+    margin-top: 2px;
   }
   .activity-marker span {
     width: 5px;
@@ -924,56 +930,125 @@
   .activity-item.error .activity-marker span {
     background: #e48e76;
   }
+  .activity-item.waiting .activity-marker {
+    border-color: #c7a75e;
+  }
+  .activity-item.waiting .activity-marker span {
+    background: #e7c56d;
+  }
+  .activity-item.minor .activity-marker {
+    border-color: #474151;
+  }
+  .activity-item.minor .activity-marker span {
+    background: #6f657c;
+  }
   .activity-copy {
     flex: 1;
     min-width: 0;
   }
-  .activity-copy > div {
+  .activity-heading {
+    display: flex;
     justify-content: space-between;
+    align-items: center;
     gap: 8px;
   }
-  .activity-heading {
-    min-height: 16px;
+  .activity-heading strong {
+    min-width: 0;
   }
   .activity-copy strong {
     display: block;
     overflow: hidden;
-    color: #d9d2df;
-    font-size: 11px;
+    color: #eee8f4;
+    font-size: 12px;
+    font-weight: 850;
+    line-height: 1.35;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .activity-item.minor .activity-copy strong {
+    color: #d8d0df;
+    font-size: 11px;
+    font-weight: 780;
+  }
   .activity-copy time {
     flex: 0 0 auto;
-    color: #70687a;
+    color: #746d7e;
     font-size: 10px;
   }
   .activity-summary {
     margin: 3px 0 0;
-    color: #a9a1b7;
+    color: #b9b0c5;
     font-size: 11px;
-    line-height: 1.4;
+    line-height: 1.45;
+  }
+  .activity-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 6px;
+    color: #706879;
+    font-size: 10px;
+  }
+  .activity-meta span:not(:first-child)::before {
+    content: "";
+    display: inline-block;
+    width: 3px;
+    height: 3px;
+    margin: 0 7px 2px 0;
+    border-radius: 50%;
+    background: #484151;
   }
   .activity-expand {
     display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    margin: -4px -4px -4px 0;
     border: 0;
+    border-radius: 6px;
     background: transparent;
     color: #777080;
   }
-  .activity-details {
-    margin-top: 6px;
-    padding: 7px 8px;
-    border-left: 2px solid #393246;
-    background: rgba(23, 20, 31, 0.7);
+  .activity-expand:hover {
+    background: #24202e;
+    color: #c1b8d0;
   }
-  .activity-details > span {
-    color: #756d80;
+  .activity-details {
+    display: grid;
+    gap: 9px;
+    margin-top: 9px;
+    padding: 9px 10px;
+    border: 1px solid #2b2635;
+    border-radius: 10px;
+    background: rgba(13, 12, 18, 0.58);
+  }
+  .activity-details section {
+    display: grid;
+    gap: 5px;
+  }
+  .activity-details h4 {
+    margin: 0;
+    color: #8b8197;
     font-size: 9px;
-    font-weight: 800;
-    letter-spacing: 0.08em;
+    font-weight: 850;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
-  .activity-copy pre,
+  .activity-details ul {
+    display: grid;
+    gap: 3px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .activity-details li {
+    color: #aaa1b5;
+    font-size: 10px;
+    line-height: 1.45;
+    word-break: break-word;
+  }
   .technical-body pre {
     margin: 6px 0 0;
     overflow: auto;
