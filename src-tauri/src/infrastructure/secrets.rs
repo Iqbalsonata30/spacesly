@@ -37,33 +37,7 @@ pub struct JiraConnectionProfile {
     pub args: Vec<String>,
 }
 
-const KEYRING_SERVICE: &str = "com.iqbalsonata.spacesly";
-
-fn keyring_entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, account)
-        .map_err(|error| format!("Failed to access OS secure storage: {error}"))
-}
-
-fn keyring_set(account: &str, value: &str) -> Result<(), String> {
-    keyring_entry(account)?
-        .set_password(value)
-        .map_err(|error| format!("Failed to store secret in OS secure storage: {error}"))
-}
-
-fn keyring_get(account: &str) -> Option<String> {
-    keyring_entry(account).ok()?.get_password().ok()
-}
-
-fn keyring_delete(account: &str) {
-    if let Ok(entry) = keyring_entry(account) {
-        let _ = entry.delete_credential();
-    }
-}
-
-fn secret_account(namespace: &str, id: &str) -> String {
-    format!("{namespace}:{id}")
-}
-
+#[cfg(test)]
 fn redact_secrets(mut secrets: AppSecrets) -> AppSecrets {
     secrets.jira_api_token.clear();
     secrets.jira_personal_access_token.clear();
@@ -80,104 +54,32 @@ fn redact_secrets(mut secrets: AppSecrets) -> AppSecrets {
 }
 
 fn persist_secret_snapshot(secrets: &AppSecrets) -> Result<(), String> {
-    let mut write_failed = None;
-    let operations = [
-        ("jira:api_token", secrets.jira_api_token.as_str()),
-        (
-            "jira:personal_access_token",
-            secrets.jira_personal_access_token.as_str(),
-        ),
-        ("jira:password", secrets.jira_password.as_str()),
-    ];
-    for (account, value) in operations {
-        let result = if value.is_empty() {
-            keyring_delete(account);
-            Ok(())
-        } else {
-            keyring_set(account, value)
-        };
-        if let Err(error) = result {
-            write_failed = Some(error);
-        }
-    }
-    for (provider_id, value) in &secrets.ai_api_keys {
-        let account = secret_account("ai", provider_id);
-        let result = if value.trim().is_empty() {
-            keyring_delete(&account);
-            Ok(())
-        } else {
-            keyring_set(&account, value)
-        };
-        if let Err(error) = result {
-            write_failed = Some(error);
-        }
-    }
-    for (server_id, values) in &secrets.mcp_env {
-        for (key, value) in values {
-            let account = secret_account(&format!("mcp:{server_id}"), key);
-            let result = if value.trim().is_empty() {
-                keyring_delete(&account);
-                Ok(())
-            } else {
-                keyring_set(&account, value)
-            };
-            if let Err(error) = result {
-                write_failed = Some(error);
-            }
-        }
-    }
-    if let Some(error) = write_failed {
-        // Keep the legacy file usable when a platform has no configured vault.
-        save_app_secrets(secrets.clone())?;
-        return Err(error);
-    }
-    save_app_secrets(redact_secrets(secrets.clone()))
+    // Always persist the full secret values to the local 0600 JSON file.
+    // The keyring crate v3 without platform-specific feature flags compiles to a mock
+    // (in-memory) backend that does not survive process restarts. Relying on the keyring
+    // for primary storage silently drops all credentials on every app restart, which is
+    // worse than storing them in the restricted local file.
+    //
+    // The JSON file lives at ~/.config/spacesly/secrets.json with permissions 0600 (set
+    // by set_private_file_permissions), so it is only readable by the owning user — the
+    // same security boundary as the OS keyring on a single-user desktop.
+    //
+    // When a real OS keyring backend is available (keyring feature flags added in the
+    // future), this function can be extended to write there as well.
+    save_app_secrets(secrets.clone())
 }
 
 fn persist_secret_snapshot_best_effort(secrets: &AppSecrets) {
     if let Err(error) = persist_secret_snapshot(secrets) {
-        eprintln!("OS secure storage unavailable; using legacy secret fallback: {error}");
+        eprintln!("Failed to persist secrets to local file: {error}");
     }
 }
 
-fn load_secure_snapshot(mut secrets: AppSecrets) -> AppSecrets {
-    let legacy_has_values = !secrets.jira_api_token.is_empty()
-        || !secrets.jira_personal_access_token.is_empty()
-        || !secrets.jira_password.is_empty()
-        || !secrets.ai_api_keys.is_empty()
-        || !secrets.mcp_env.is_empty();
-    if legacy_has_values && persist_secret_snapshot(&secrets).is_ok() {
-        secrets = redact_secrets(secrets);
-    }
-
-    if secrets.jira_api_token.is_empty() {
-        secrets.jira_api_token = keyring_get("jira:api_token").unwrap_or_default();
-    }
-    if secrets.jira_personal_access_token.is_empty() {
-        secrets.jira_personal_access_token =
-            keyring_get("jira:personal_access_token").unwrap_or_default();
-    }
-    if secrets.jira_password.is_empty() {
-        secrets.jira_password = keyring_get("jira:password").unwrap_or_default();
-    }
-    for provider_id in ["openai", "gemini", "deepseek", "claude"] {
-        let account = secret_account("ai", provider_id);
-        if let Some(value) = keyring_get(&account) {
-            secrets.ai_api_keys.insert(provider_id.to_string(), value);
-        }
-    }
-    for (server_id, values) in secrets.mcp_env.clone() {
-        for key in values.keys() {
-            let account = secret_account(&format!("mcp:{server_id}"), key);
-            if let Some(value) = keyring_get(&account) {
-                secrets
-                    .mcp_env
-                    .entry(server_id.clone())
-                    .or_default()
-                    .insert(key.clone(), value);
-            }
-        }
-    }
+fn load_secure_snapshot(secrets: AppSecrets) -> AppSecrets {
+    // Secrets are persisted directly in the JSON file (see persist_secret_snapshot).
+    // The keyring round-trip has been removed because the keyring crate without platform
+    // feature flags uses an in-memory mock that never survives process restarts.
+    // The JSON file at ~/.config/spacesly/secrets.json (mode 0600) is the primary store.
     secrets
 }
 
@@ -278,7 +180,6 @@ impl AppSecretsStore {
                     .insert(provider_id.to_string(), value.to_string());
             }
             None => {
-                keyring_delete(&secret_account("ai", provider_id));
                 next.ai_api_keys.remove(provider_id);
             }
         }

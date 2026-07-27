@@ -216,16 +216,17 @@ pub struct McpServerConfig {
 
 /// Validates any stdio MCP server by initializing it and listing tools.
 pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatus, String> {
-    let tools = with_mcp_client(&server, |client| client.tools())?;
-    if tools.is_empty() {
-        return Err("MCP server initialized but exposed no tools.".to_string());
-    }
-
-    let tool_metadata = with_mcp_client(&server, |client| client.tool_metadata())?;
-    Ok(McpConnectionStatus {
-        tool_count: tools.len(),
-        tools,
-        tool_metadata,
+    with_mcp_client(&server, |client| {
+        let tool_metadata = client.tool_metadata()?;
+        if tool_metadata.is_empty() {
+            return Err("MCP server initialized but exposed no tools.".to_string());
+        }
+        let tools: Vec<String> = tool_metadata.iter().map(|m| m.name.clone()).collect();
+        Ok(McpConnectionStatus {
+            tool_count: tools.len(),
+            tools,
+            tool_metadata,
+        })
     })
 }
 
@@ -669,6 +670,12 @@ pub fn close_all_mcp_sessions() {
     if let Ok(sessions) = sessions {
         drop(sessions);
     }
+    // Clear initialization locks alongside sessions so any in-progress init threads
+    // do not block future callers after the app resets its connection state.
+    let _ = manager
+        .initializations
+        .lock()
+        .map(|mut inits| inits.clear());
 }
 
 pub fn close_mcp_session(server: McpServerConfig) -> Result<bool, String> {
@@ -680,6 +687,14 @@ pub fn close_mcp_session(server: McpServerConfig) -> Result<bool, String> {
         .map_err(|error| error.to_string())?
         .remove(&key)
         .map(|entry| entry.client);
+    // Also remove the initialization lock for this key.  If a previous spawn_blocking
+    // task timed out while holding the initialization guard, the Mutex remains poisoned
+    // (or just locked) and future callers block forever waiting for it.  Removing the
+    // entry here lets the next call create a fresh initialization lock.
+    let _ = manager
+        .initializations
+        .lock()
+        .map(|mut inits| inits.remove(&key));
     let existed = session.is_some();
     drop(session);
     Ok(existed)
@@ -714,13 +729,21 @@ where
             .clone();
         {
             let _initialization_guard = initialization.lock().map_err(|error| error.to_string())?;
-            if let Some(existing) = manager
-                .sessions
+            // Remove the map entry while holding the guard so that:
+            //   1. Any concurrent waiter queued behind us will see None after we release
+            //      the lock and will proceed normally (find the session or start a new init).
+            //   2. Stale entries from timed-out init attempts do not accumulate, and
+            //      close_mcp_session can install a fresh entry on the next attempt without
+            //      racing against an in-progress but abandoned init thread.
+            let _ = manager
+                .initializations
                 .lock()
-                .map_err(|error| error.to_string())?
-                .get(&key)
-                .map(|entry| Arc::clone(&entry.client))
-            {
+                .map(|mut inits| inits.remove(&key));
+            let existing = {
+                let sessions = manager.sessions.lock().map_err(|error| error.to_string())?;
+                sessions.get(&key).map(|entry| Arc::clone(&entry.client))
+            };
+            if let Some(existing) = existing {
                 existing
             } else {
                 let client = StdioMcpClient::start(server)?;
@@ -1317,6 +1340,43 @@ fn text_value(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn initializes_and_caches_a_new_mcp_session_without_deadlocking() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mock_tool"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let server = McpServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            scope_id: Some(format!("deadlock-regression-{}", request_seed())),
+            secret_id: None,
+        };
+        let cleanup = server.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(test_mcp_connection(server));
+        });
+
+        let status = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("new MCP session initialization deadlocked")
+            .unwrap();
+        assert_eq!(status.tools, vec!["mock_tool"]);
+        close_mcp_session(cleanup).unwrap();
+    }
 
     #[test]
     fn parses_issues_from_mcp_text_payload() {

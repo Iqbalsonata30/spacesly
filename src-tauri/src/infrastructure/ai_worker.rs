@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -1736,8 +1736,28 @@ fn opencode_workdir(config: &AiWorkerConfig) -> Option<PathBuf> {
         .as_deref()
         .map(str::trim)
         .filter(|workdir| !workdir.is_empty())
-        .map(PathBuf::from)
+        .map(|workdir| expand_home_path(workdir, user_home_dir().as_deref()))
         .or_else(|| std::env::current_dir().ok())
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn expand_home_path(path: &str, home: Option<&Path>) -> PathBuf {
+    if path == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(relative) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home {
+            return home.join(relative);
+        }
+    }
+    PathBuf::from(path)
 }
 
 fn agent_http_client() -> Result<&'static Client, String> {
@@ -2133,12 +2153,7 @@ fn opencode_command(config: &AiWorkerConfig) -> Command {
         command.env("OPENCODE_CONFIG_CONTENT", mcp_config.as_str());
     }
 
-    if let Some(workdir) = config
-        .opencode_workdir
-        .as_deref()
-        .map(str::trim)
-        .filter(|workdir| !workdir.is_empty())
-    {
+    if let Some(workdir) = opencode_workdir(config) {
         command.current_dir(workdir);
     }
 
@@ -2769,6 +2784,21 @@ mod tests {
             restrict_tools: false,
             mcp_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn expands_tilde_in_opencode_workdir() {
+        let home = Path::new("/home/spacesly-test");
+
+        assert_eq!(expand_home_path("~", Some(home)), home);
+        assert_eq!(
+            expand_home_path("~/projects/demo", Some(home)),
+            home.join("projects/demo")
+        );
+        assert_eq!(
+            expand_home_path("/workspace/demo", Some(home)),
+            PathBuf::from("/workspace/demo")
+        );
     }
 
     fn ai_edit_request() -> AiEditRequest {

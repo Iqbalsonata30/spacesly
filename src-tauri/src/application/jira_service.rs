@@ -42,7 +42,14 @@ impl JiraService {
         close_mcp_session(config)
     }
 
-    pub fn sync_workspace(&self, config: JiraMcpConfig) -> Result<Workspace, String> {
+    /// Syncs Jira issues onto a pre-built base workspace.
+    /// Prefer this path when a managed `AppState` is already available (Tauri command context),
+    /// so the seeded workspace is not reconstructed on every IPC call.
+    pub fn sync_workspace_from(
+        &self,
+        base_workspace: Workspace,
+        config: JiraMcpConfig,
+    ) -> Result<Workspace, String> {
         let issues = fetch_jira_issues(config)?;
         let fetched_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -64,7 +71,8 @@ impl JiraService {
             })
             .collect();
 
-        Ok(AppState::new().workspace_with_imported_issues(&imported_issues))
+        Ok(AppState::from_workspace(base_workspace)
+            .workspace_with_imported_issues(&imported_issues))
     }
 
     pub fn transition_issue(
@@ -87,5 +95,73 @@ impl JiraService {
         comment: String,
     ) -> Result<(), String> {
         add_comment(&config.auth, &issue_key, &comment)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::domain::entity::CardSource;
+    use crate::infrastructure::mcp::{JiraAuthConfig, McpServerConfig};
+    use std::collections::HashMap;
+
+    #[test]
+    fn syncs_board_issues_through_a_new_mcp_session() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"jira_get_board_issues"}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"issues":[{"key":"SPC-99","fields":{"summary":"Synced issue","status":{"name":"To Do"},"issuetype":{"name":"Task"}}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let server = McpServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            scope_id: Some("jira-sync-regression".to_string()),
+            secret_id: None,
+        };
+        let config = JiraMcpConfig {
+            server: server.clone(),
+            auth: JiraAuthConfig {
+                base_url: "https://jira.example.com".to_string(),
+                auth_mode: "api_token".to_string(),
+                username: "user@example.com".to_string(),
+                api_token: "token".to_string(),
+                personal_access_token: String::new(),
+                password: String::new(),
+            },
+            secret_id: "jira-default".to_string(),
+            tool_name: "jira_search".to_string(),
+            board_tool_name: "jira_get_agile_boards".to_string(),
+            board_issues_tool_name: "jira_get_board_issues".to_string(),
+            jql: String::new(),
+            board_id: Some("7".to_string()),
+            project_key: None,
+            board_name: None,
+            page_size: 25,
+            max_pages: 1,
+        };
+
+        let workspace = JiraService::new()
+            .sync_workspace_from(AppState::new().workspace(), config)
+            .unwrap();
+        let synced = workspace.projects[0].boards[0]
+            .columns
+            .iter()
+            .flat_map(|column| &column.cards)
+            .any(|card| matches!(&card.source, CardSource::Jira { key } if key == "SPC-99"));
+
+        assert!(synced);
+        close_mcp_session(server).unwrap();
     }
 }

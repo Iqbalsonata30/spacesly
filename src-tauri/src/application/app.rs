@@ -29,6 +29,11 @@ impl AppState {
         }
     }
 
+    /// Creates AppState from an existing workspace (used to avoid re-seeding when merging Jira issues).
+    pub fn from_workspace(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+
     /// Returns the current workspace board projection.
     pub fn workspace(&self) -> Workspace {
         self.workspace.clone()

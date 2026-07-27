@@ -76,7 +76,18 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-const MCP_TEST_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Each MCP request blocks for up to 45 s (recv_timeout inside StdioMcpClient::request).
+/// Session initialisation makes two sequential requests: initialize + tools/list = up to 90 s.
+/// The test also calls tool_metadata (cached after tools/list, 0 s extra) plus one optional
+/// tool call.  120 s covers the full cold-start path with margin and still leaves the frontend
+/// mcpTest policy (180 s) a comfortable 60 s gap to receive the structured error response.
+const MCP_TEST_CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Server-side guard for Jira sync operations.  The frontend jiraRead policy is 120 s, but
+/// MCP requests can individually block for up to 45 s.  This server-side timeout ensures the
+/// backend cancels cleanly and returns a structured error to the frontend before the IPC
+/// channel goes silent, avoiding the timeout mismatch that caused the frontend to see
+/// "request timed out" with no context.
+const JIRA_SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn workspace_id_or_default(workspace_id: Option<String>) -> String {
     workspace_id.unwrap_or_else(|| "workspace-personal".to_string())
@@ -169,8 +180,8 @@ fn file_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
 }
 
 #[tauri::command]
-fn get_workspace() -> Workspace {
-    AppState::new().workspace()
+fn get_workspace(app_state: State<'_, AppState>) -> Workspace {
+    app_state.workspace()
 }
 
 #[tauri::command]
@@ -203,11 +214,24 @@ async fn test_jira_mcp_connection(
     secrets: State<'_, AppSecretsStore>,
 ) -> Result<JiraConnectionStatus, String> {
     resolve_jira_secrets(&mut config, secrets.inner())?;
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    // Drop any stale session or in-progress init lock from a previous timed-out attempt.
+    // Without this, a hung spawn_blocking thread from a prior test holds the init-lock Arc;
+    // the next call acquires the same Arc and deadlocks waiting for the previous thread.
+    let cleanup_server = config.server.clone();
+    let _ = close_mcp_session(config.server.clone());
+    let task = tauri::async_runtime::spawn_blocking(move || {
         JiraService::new().test_jira_connection(config)
-    })
-    .await
-    .map_err(|error| mcp_ipc_error("Jira MCP test task failed", error))?;
+    });
+    let result = tokio::time::timeout(MCP_TEST_CONNECTION_TIMEOUT, task)
+        .await
+        .map_err(|_| {
+            let _ = close_mcp_session(cleanup_server);
+            mcp_ipc_error(
+                "Jira MCP test failed",
+                "request timed out after 120 seconds while testing the Jira connector",
+            )
+        })?
+        .map_err(|error| mcp_ipc_error("Jira MCP test task failed", error))?;
     result.map_err(|error| mcp_ipc_error("Jira MCP test failed", error))
 }
 
@@ -298,13 +322,24 @@ async fn disconnect_mcp_server(
 #[tauri::command]
 async fn sync_jira_workspace(
     mut config: JiraMcpConfig,
+    app_state: State<'_, AppState>,
     secrets: State<'_, AppSecretsStore>,
 ) -> Result<Workspace, String> {
     resolve_jira_secrets(&mut config, secrets.inner())?;
-    let result =
-        tauri::async_runtime::spawn_blocking(move || JiraService::new().sync_workspace(config))
-            .await
-            .map_err(|error| mcp_ipc_error("Jira sync task failed", error))?;
+    // Clone the seeded workspace once from the managed singleton — avoids reconstructing it per call.
+    let base_workspace = app_state.workspace();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        JiraService::new().sync_workspace_from(base_workspace, config)
+    });
+    let result = tokio::time::timeout(JIRA_SYNC_TIMEOUT, task)
+        .await
+        .map_err(|_| {
+            mcp_ipc_error(
+                "Jira sync failed",
+                "request timed out after 90 seconds while syncing Jira board",
+            )
+        })?
+        .map_err(|error| mcp_ipc_error("Jira sync task failed", error))?;
     result.map_err(|error| mcp_ipc_error("Jira sync failed", error))
 }
 
@@ -1112,9 +1147,18 @@ fn bind_backend_provider_profile(config: &mut AiWorkerConfig) -> Result<(), Stri
             config.model, config.provider_id
         ));
     }
-    config.provider_name = profile.name.to_string();
-    config.base_url = profile.base_url.to_string();
-    config.api_style = profile.api_style.as_str().to_string();
+    // Only allocate when the value differs — avoids 3 String allocs on every AI call
+    // when the frontend already sent the correct provider name/url/style.
+    if config.provider_name != profile.name {
+        config.provider_name = profile.name.to_string();
+    }
+    if config.base_url != profile.base_url {
+        config.base_url = profile.base_url.to_string();
+    }
+    let profile_api_style = profile.api_style.as_str();
+    if config.api_style != profile_api_style {
+        config.api_style = profile_api_style.to_string();
+    }
     Ok(())
 }
 
@@ -1125,9 +1169,22 @@ fn resolve_mcp_secret_environment(
     let Some(secret_id) = config.secret_id.as_deref() else {
         return Ok(());
     };
-    let profile = secrets.mcp_connector(secret_id)?;
-    config.command = profile.command;
-    config.args = profile.args;
+    // The saved connector profile stores the canonical command + args for servers whose
+    // credentials were persisted via saveMcpEnvironmentSecret.  However, the frontend also
+    // sends the command and args directly in the config payload.  When no profile has been
+    // saved yet (e.g. the server has no environment variables so the frontend never called
+    // saveMcpEnvironmentSecret), we fall back to the command/args the frontend already
+    // provided rather than returning a hard error.
+    match secrets.mcp_connector(secret_id) {
+        Ok(profile) => {
+            config.command = profile.command;
+            config.args = profile.args;
+        }
+        Err(_) if !config.command.trim().is_empty() => {
+            // No saved profile, but the frontend supplied a command directly — proceed with it.
+        }
+        Err(error) => return Err(error),
+    }
     config.env = secrets.mcp_environment(secret_id)?;
     Ok(())
 }
@@ -2013,12 +2070,32 @@ pub fn run() {
     let pty_state: PtyState = Arc::new(Mutex::new(PtyRegistry::new()));
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
-    let execution_store = ExecutionStore::open().expect("failed to initialize execution store");
-    let recovery_store = RecoveryStore::open().expect("failed to initialize recovery store");
+
+    // Initialize the three most expensive startup resources in parallel:
+    //   - ExecutionStore: opens SQLite + runs schema DDL + recover_interrupted_runs()
+    //   - RecoveryStore:  opens SQLite + runs schema DDL + prune_expired()
+    //   - AppSecretsStore: reads secrets.json + keyring round-trips
+    //
+    // Each opens a different file so there is no contention. Running all three
+    // concurrently reduces the serial startup chain from ~3×T to ~max(T).
+    let execution_handle = std::thread::spawn(|| {
+        ExecutionStore::open().expect("failed to initialize execution store")
+    });
+    let recovery_handle =
+        std::thread::spawn(|| RecoveryStore::open().expect("failed to initialize recovery store"));
+    let secrets_handle =
+        std::thread::spawn(|| AppSecretsStore::load().expect("failed to initialize app secrets"));
+
+    let execution_store = execution_handle
+        .join()
+        .expect("execution store init panicked");
+    let recovery_store = recovery_handle
+        .join()
+        .expect("recovery store init panicked");
+    let app_secrets = secrets_handle.join().expect("app secrets init panicked");
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
     let lsp_registry = LspRegistry::default();
-    let app_secrets = AppSecretsStore::load().expect("failed to initialize app secrets");
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
         .manage(pty_state)
@@ -2030,6 +2107,7 @@ pub fn run() {
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
         .manage(app_secrets)
+        .manage(AppState::new())
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -2122,7 +2200,7 @@ pub fn run() {
             lsp_code_actions
         ])
         .on_window_event(move |_window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
                 close_all_terminals(&shutdown_state);
                 close_all_mcp_sessions();
                 close_all_opencode_servers();

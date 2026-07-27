@@ -37,7 +37,7 @@ export const IPC_POLICIES = {
   gitMutation: { timeoutMs: 30_000, retries: 0 },
   gitRead: { timeoutMs: 15_000, retries: 1, retryDelayMs: 250 },
   jiraMutation: { timeoutMs: 30_000, retries: 0 },
-  jiraRead: { timeoutMs: 30_000, retries: 2, retryDelayMs: 500 },
+  jiraRead: { timeoutMs: 120_000, retries: 2, retryDelayMs: 500 },
   jiraTest: { timeoutMs: 20_000, retries: 1, retryDelayMs: 500 },
   lspInteractive: { timeoutMs: 15_000, retries: 0 },
   lspRead: { timeoutMs: 25_000, retries: 0 },

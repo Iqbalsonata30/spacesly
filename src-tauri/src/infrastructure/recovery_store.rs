@@ -76,6 +76,9 @@ impl RecoveryStore {
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
+                 PRAGMA cache_size = -8000;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA wal_autocheckpoint = 100;
                  CREATE TABLE IF NOT EXISTS recovery_snapshots (
                    workspace_id TEXT NOT NULL,
                    root_path TEXT NOT NULL,

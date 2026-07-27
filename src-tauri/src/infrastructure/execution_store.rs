@@ -82,6 +82,9 @@ impl ExecutionStore {
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA foreign_keys = ON;
+                 PRAGMA cache_size = -8000;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA wal_autocheckpoint = 100;
                  CREATE TABLE IF NOT EXISTS execution_contracts (
                    contract_id TEXT PRIMARY KEY,
                    task_id TEXT NOT NULL,

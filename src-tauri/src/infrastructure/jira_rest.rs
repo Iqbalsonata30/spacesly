@@ -1,8 +1,27 @@
 use serde::Deserialize;
 use std::error::Error;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::mcp::{JiraAuthConfig, JiraBoard, JiraIssue};
+
+// Single shared HTTP client for all Jira REST calls. Building a reqwest::blocking::Client
+// involves TLS context setup and connection pool allocation — doing it per-request costs
+// 50–200 ms in TLS handshake overhead. The OnceLock ensures it is built once and reused.
+static JIRA_HTTP_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+
+fn jira_client() -> Result<&'static reqwest::blocking::Client, String> {
+    JIRA_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
+}
 
 /// Fetches Jira agile boards directly from Jira REST.
 pub fn fetch_boards(
@@ -10,11 +29,7 @@ pub fn fetch_boards(
     project_key: Option<&str>,
     board_name: Option<&str>,
 ) -> Result<Vec<JiraBoard>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))?;
+    let client = jira_client()?;
     let base_url = normalized_base_url(&auth.base_url)?;
     let mut start_at = 0;
     let mut boards = Vec::new();
@@ -67,11 +82,7 @@ pub fn transition_issue(
     issue_key: &str,
     target_status: &str,
 ) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))?;
+    let client = jira_client()?;
     let base_url = normalized_base_url(&auth.base_url)?;
     let transitions_url = format!("{base_url}/rest/api/2/issue/{issue_key}/transitions");
     let transitions: TransitionPage = send(auth, client.get(&transitions_url))?;
@@ -86,7 +97,7 @@ pub fn transition_issue(
                 .find(|transition| status_matches(&transition.name, target_status))
         })
     else {
-        if issue_is_already_in_status(auth, &client, &base_url, issue_key, target_status)? {
+        if issue_is_already_in_status(auth, client, &base_url, issue_key, target_status)? {
             return Ok(());
         }
 
@@ -130,11 +141,7 @@ pub fn assign_issue(auth: &JiraAuthConfig, issue_key: &str) -> Result<(), String
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))?;
+    let client = jira_client()?;
     let base_url = normalized_base_url(&auth.base_url)?;
     let assignee_url = format!("{base_url}/rest/api/2/issue/{issue_key}/assignee");
     let body = serde_json::json!({
@@ -150,11 +157,7 @@ pub fn add_comment(auth: &JiraAuthConfig, issue_key: &str, comment: &str) -> Res
         return Err("Cannot add an empty Jira comment.".to_string());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))?;
+    let client = jira_client()?;
     let base_url = normalized_base_url(&auth.base_url)?;
     let comment_url = format!("{base_url}/rest/api/2/issue/{issue_key}/comment");
     let body = serde_json::json!({
@@ -172,11 +175,7 @@ pub fn fetch_board_issues_paginated(
     page_size: u32,
     max_pages: u32,
 ) -> Result<Vec<JiraIssue>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Failed to create Jira HTTP client: {error}"))?;
+    let client = jira_client()?;
     let base_url = normalized_base_url(&auth.base_url)?;
     let browse_base_url = base_url.clone();
     let page_size = page_size.clamp(1, 100) as i64;
@@ -228,11 +227,7 @@ fn send<T: for<'de> Deserialize<'de>>(
     auth: &JiraAuthConfig,
     request: reqwest::blocking::RequestBuilder,
 ) -> Result<T, String> {
-    let request = match auth.auth_mode.as_str() {
-        "pat" => request.bearer_auth(&auth.personal_access_token),
-        "password" => request.basic_auth(&auth.username, Some(&auth.password)),
-        _ => request.basic_auth(&auth.username, Some(&auth.api_token)),
-    };
+    let request = apply_auth(auth, request);
 
     let response = request.send().map_err(|error| {
         format!(
