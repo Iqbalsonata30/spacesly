@@ -3185,3 +3185,129 @@ dd a:hover {
     flex-direction: column;
   }
 }
+
+.global-env-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.env-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid #2a2832;
+  border-radius: 8px;
+  background: #1a1b1e;
+}
+
+.env-row.env-draft {
+  border-color: #6d8aaa;
+  background: #1d232b;
+}
+
+.env-row.env-secret {
+  border-left: 3px solid #9b6a3c;
+}
+
+.env-row-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.env-key-input {
+  width: 140px;
+  min-width: 100px;
+  font-family: monospace;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+.env-value-input {
+  flex: 1;
+  min-width: 140px;
+  font-family: monospace;
+}
+
+.env-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.env-toggle input {
+  width: auto;
+}
+
+.env-row-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.env-row-actions button {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid #3a3842;
+  border-radius: 5px;
+  background: #222328;
+  color: #b8c8da;
+  cursor: pointer;
+}
+
+.env-save-btn {
+  border-color: #5a7a5a !important;
+  background: #1e2a1e !important;
+  color: #aad6aa !important;
+}
+
+.env-delete-btn {
+  border-color: #5a3a3a !important;
+  background: #2a1e1e !important;
+  color: #da8a8a !important;
+}
+
+.env-reveal-btn {
+  border-color: #7a6a3a !important;
+  background: #2a2518 !important;
+  color: #dab86a !important;
+}
+
+.env-hide-btn {
+  border-color: #4a4a5a !important;
+  background: #22222a !important;
+}
+
+.add-env-btn {
+  height: 34px;
+  padding: 0 12px;
+  font-weight: 700;
+  border: 1px solid #4a6a5a;
+  border-radius: 6px;
+  background: #1e2a22;
+  color: #aad6aa;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.add-env-btn:disabled,
+.env-row-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.empty-state {
+  color: #6a6872;
+  font-style: italic;
+  margin-top: 16px;
+}

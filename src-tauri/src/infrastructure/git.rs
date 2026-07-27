@@ -6,6 +6,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::files::WorkspaceRoot;
+use super::global_environment::{inject_global_environment, redact_global_environment_values};
 
 const GIT_STATUS_CACHE_TTL: Duration = Duration::from_millis(500);
 
@@ -150,13 +151,17 @@ pub fn checkout_workspace_git_branch(
         return Err("Branch name is required.".to_string());
     }
 
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let status = command
         .args(["checkout", branch])
         .current_dir(&repo_root)
         .output()
         .map_err(|error| format!("Failed to run git checkout: {error}"))?;
     if !status.status.success() {
-        return Err(String::from_utf8_lossy(&status.stderr).trim().to_string());
+        return Err(redact_global_environment_values(
+            String::from_utf8_lossy(&status.stderr).trim(),
+        ));
     }
 
     invalidate_git_status_for_repo(&repo_root);
@@ -205,13 +210,17 @@ fn git_status_for_repo(repo_root: &Path) -> Result<GitStatus, String> {
 }
 
 fn load_git_status(repo_root: &Path) -> Result<GitStatus, String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let output = command
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
         .current_dir(repo_root)
         .output()
         .map_err(|error| format!("Failed to run git status: {error}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err(redact_global_environment_values(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
     }
 
     let mut staged = Vec::new();
@@ -405,7 +414,9 @@ fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(cwd)
         .output()
@@ -418,7 +429,9 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
 }
 
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(cwd)
         .output()
@@ -426,12 +439,16 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(redact_global_environment_values(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))
     }
 }
 
 fn run_git_dynamic(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(cwd)
         .output()
@@ -439,7 +456,9 @@ fn run_git_dynamic(cwd: &Path, args: &[&str]) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(redact_global_environment_values(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))
     }
 }
 

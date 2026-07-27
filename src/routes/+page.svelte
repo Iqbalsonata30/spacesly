@@ -114,6 +114,8 @@
     getWorkspaceGitInfo,
     getWorkspace,
     importConversations,
+    listGlobalEnvironmentVariables,
+    deleteGlobalEnvironmentVariable,
     deleteRecoverySnapshot,
     listDirectory,
     listConversations,
@@ -139,17 +141,20 @@
     closePtyTerminal,
     disconnectMcpServer,
     readFile,
+    removeMcpConnector,
     resizePtyTerminal,
     saveAiProviderSecret,
     saveJiraSecret,
     saveJiraConnectionProfile,
     saveMcpEnvironmentSecret,
     saveExecutionRun,
+    saveGlobalEnvironmentVariable,
     searchWorkspace,
     listActiveExecutionRuns,
     grantAiRunCapabilities,
     releaseAiWorkerRun,
     reserveAiWorkerRun,
+    revealGlobalEnvironmentVariable,
     setWorkspaceRoot,
     syncJiraWorkspace,
     syncRecoverySnapshots,
@@ -189,6 +194,7 @@
     type WorkspaceReplacePreviewResponse,
     type RecoverySnapshot,
     type RecoverySnapshotInput,
+    type GlobalEnvironmentVariable,
     testJiraMcpConnection,
   } from "$lib/ipc";
   import { lspConfigForPath } from "$lib/lspConfig";
@@ -358,7 +364,9 @@
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
   let mcpToolsByServer = $state<Record<string, string[]>>({});
   let settingsOpen = $state(false);
-  let settingsTab = $state<"agent" | "rules" | "skills" | "mcp" | "jira" | "theme">("agent");
+  let settingsTab = $state<
+    "agent" | "rules" | "skills" | "mcp" | "environment" | "jira" | "theme"
+  >("agent");
   let settingsError = $state<string | null>(null);
   let settings = $state<AppSettings>(initialSettings);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
@@ -366,6 +374,16 @@
   let mcpEnvironmentSecrets = $state<Record<string, string[]>>({});
   let jiraSecrets = $state<Record<string, boolean>>({});
   let secretsHydrated = $state(false);
+  const mcpEnvEditedServerIds = new SvelteSet<string>();
+  type GlobalEnvironmentDraft = GlobalEnvironmentVariable & {
+    draft?: boolean;
+    revealed?: boolean;
+    editing?: boolean;
+  };
+  let globalEnvironmentVariables = $state<GlobalEnvironmentDraft[]>([]);
+  let globalEnvironmentSearch = $state("");
+  let globalEnvironmentHydrated = $state(false);
+  let globalEnvironmentLoading = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
   let durableConversationWorkspaceId = $state<string | null>(null);
@@ -717,6 +735,12 @@
   });
 
   $effect(() => {
+    if (settingsOpen && settingsTab === "environment") {
+      void loadGlobalEnvironmentRuntime();
+    }
+  });
+
+  $effect(() => {
     if (agentConsoleOpen && hasAgentConsoleSession) {
       void loadAgentConsoleRuntime();
     }
@@ -1046,6 +1070,7 @@
       mcp: "MCP Connections",
       jira: "Jira Sync",
       theme: "Theme",
+      environment: "Global Environment",
     }[settingsTab],
   );
 
@@ -1095,11 +1120,12 @@
       }
       for (const server of settings.mcpServers) {
         if (server.kind !== "jira" && server.command.trim()) {
+          const localEnvironment = localSecrets.mcp_env[server.id];
           await saveMcpEnvironmentSecret(
             server.id,
             server.command,
             server.args,
-            localSecrets.mcp_env[server.id] ?? {},
+            localEnvironment ? localEnvironment : null,
           );
         }
       }
@@ -1252,7 +1278,11 @@
     }
     for (const server of value.mcpServers) {
       if (server.kind !== "jira" && server.command.trim()) {
-        await saveMcpEnvironmentSecret(server.id, server.command, server.args, server.env);
+        const environment =
+          mcpEnvEditedServerIds.has(server.id) || Object.keys(server.env).length > 0
+            ? server.env
+            : null;
+        await saveMcpEnvironmentSecret(server.id, server.command, server.args, environment);
       }
     }
     const jiraServer = value.mcpServers.find((server) => server.id === value.jira.serverId);
@@ -1284,6 +1314,7 @@
       ai_api_keys: {},
       mcp_env: {},
     };
+    mcpEnvEditedServerIds.clear();
     saveSettings(settingsWithoutSecrets(value));
   }
 
@@ -1364,8 +1395,6 @@
       const entries = await listDirectory(workspace.id, relativePath);
       if (revision !== fileTreeRevision) return;
       fileEntries = entries;
-      expandedFileEntries = {};
-      expandingFilePaths = {};
     } catch (reason: unknown) {
       if (revision !== fileTreeRevision) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
@@ -2104,28 +2133,32 @@
     }
   }
 
+  let expandingFileFolder = $state<Record<string, boolean>>({});
+
   async function toggleFileFolder(entry: FileEntry) {
-    if (!workspace || !entry.is_dir || expandingFilePaths[entry.path]) return;
+    if (!workspace || !entry.is_dir || expandingFileFolder[entry.path]) return;
 
     if (expandedFileEntries[entry.path]) {
       expandedFileEntries = pruneExpandedFolderTree(expandedFileEntries, entry.path);
       return;
     }
 
-    const revision = fileTreeRevision;
+    expandingFileFolder = { ...expandingFileFolder, [entry.path]: true };
     expandingFilePaths = { ...expandingFilePaths, [entry.path]: true };
     fileError = null;
     try {
       const children = await listDirectory(workspace.id, entry.path);
-      if (revision !== fileTreeRevision) return;
+      if (!expandingFileFolder[entry.path]) return;
       expandedFileEntries = { ...expandedFileEntries, [entry.path]: children };
     } catch (reason: unknown) {
-      if (revision !== fileTreeRevision) return;
+      if (!expandingFileFolder[entry.path]) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      if (revision === fileTreeRevision) {
-        const { [entry.path]: _finished, ...remaining } = expandingFilePaths;
-        expandingFilePaths = remaining;
+      if (expandingFileFolder[entry.path]) {
+        const { [entry.path]: _removed, ...remaining } = expandingFileFolder;
+        expandingFileFolder = remaining;
+        const { [entry.path]: _finished, ...loadingRemaining } = expandingFilePaths;
+        expandingFilePaths = loadingRemaining;
       }
     }
   }
@@ -2137,13 +2170,14 @@
   function collapseAllFileFolders() {
     expandedFileEntries = {};
     expandingFilePaths = {};
+    expandingFileFolder = {};
   }
 
   async function expandFileAncestors(path: string) {
     if (!workspace) return;
 
     for (const current of collectAncestorPaths(path)) {
-      if (expandedFileEntries[current] || expandingFilePaths[current]) continue;
+      if (expandedFileEntries[current] || expandingFileFolder[current]) continue;
       const folderEntry: FileEntry = {
         name: current.split("/").at(-1) ?? current,
         path: current,
@@ -3058,6 +3092,109 @@
   function switchSettingsTab(tab: typeof settingsTab) {
     if (settingsTab === tab) return;
     settingsTab = tab;
+  }
+
+  async function loadGlobalEnvironmentRuntime() {
+    if (globalEnvironmentHydrated) return;
+    globalEnvironmentHydrated = true;
+    globalEnvironmentLoading = true;
+    try {
+      globalEnvironmentVariables = (await listGlobalEnvironmentVariables()).map((env) => ({
+        ...env,
+        draft: false,
+        revealed: false,
+        editing: false,
+      }));
+    } catch (reason) {
+      settingsError = `Failed to load global environment: ${reason instanceof Error ? reason.message : String(reason)}`;
+    } finally {
+      globalEnvironmentLoading = false;
+    }
+  }
+
+  async function addGlobalEnvironmentVariable() {
+    const variable: GlobalEnvironmentDraft = {
+      id: `draft-${Date.now().toString(36)}`,
+      key: "",
+      value: "",
+      secret: false,
+      enabled: true,
+      value_set: false,
+      draft: true,
+      revealed: false,
+      editing: true,
+    };
+    globalEnvironmentVariables = [variable, ...globalEnvironmentVariables];
+  }
+
+  function updateGlobalEnvironmentDraft(id: string, values: Partial<GlobalEnvironmentDraft>) {
+    globalEnvironmentVariables = globalEnvironmentVariables.map((env) =>
+      env.id === id ? { ...env, ...values } : env,
+    );
+  }
+
+  async function saveGlobalEnvironmentEntry(variable: GlobalEnvironmentDraft) {
+    if (globalEnvironmentLoading) return;
+    if (!variable.key.trim()) {
+      settingsError = "Environment key is required.";
+      return;
+    }
+    globalEnvironmentLoading = true;
+    settingsError = null;
+    try {
+      const saved = await saveGlobalEnvironmentVariable({
+        id: variable.draft ? null : variable.id,
+        key: variable.key.trim(),
+        value: variable.draft || variable.revealed ? variable.value : undefined,
+        secret: variable.secret,
+        enabled: variable.enabled,
+      });
+      globalEnvironmentVariables = globalEnvironmentVariables
+        .filter((env) => env.id !== variable.id || !variable.draft)
+        .concat({
+          ...saved,
+          draft: false,
+          revealed: false,
+          editing: false,
+        });
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      globalEnvironmentLoading = false;
+    }
+  }
+
+  async function revealGlobalEnvironment(id: string) {
+    try {
+      const value = await revealGlobalEnvironmentVariable(id);
+      updateGlobalEnvironmentDraft(id, { value, revealed: true });
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+    }
+  }
+
+  function hideGlobalEnvironment(id: string) {
+    updateGlobalEnvironmentDraft(id, { value: "", revealed: false });
+  }
+
+  async function removeGlobalEnvironment(id: string) {
+    if (globalEnvironmentLoading) return;
+    const variable = globalEnvironmentVariables.find((env) => env.id === id);
+    if (!variable) return;
+    if (variable.draft) {
+      globalEnvironmentVariables = globalEnvironmentVariables.filter((env) => env.id !== id);
+      return;
+    }
+    globalEnvironmentLoading = true;
+    settingsError = null;
+    try {
+      await deleteGlobalEnvironmentVariable(id);
+      globalEnvironmentVariables = globalEnvironmentVariables.filter((env) => env.id !== id);
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      globalEnvironmentLoading = false;
+    }
   }
 
   function normalizeLayoutPrefs(value: Partial<LayoutPrefs>): LayoutPrefs {
@@ -4470,19 +4607,28 @@
   }
 
   async function removeSelectedServer() {
-    if (settings.mcpServers.length <= 1 || !selectedServer) return;
+    if (!selectedServer) return;
     const serverId = selectedServer.id;
 
     settingsError = null;
-    if (!(await disconnectSelectedMcpServer())) return;
+    await disconnectSelectedMcpServer();
+    try {
+      await removeMcpConnector(serverId);
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+      return;
+    }
+    settingsError = null;
+    invalidateMcpConnection(serverId);
 
     const remaining = settings.mcpServers.filter((server) => server.id !== serverId);
+    const nextServer = remaining[0];
     settings = {
       ...settings,
       mcpServers: remaining,
-      jira: { ...settings.jira, serverId: remaining[0].id },
+      jira: { ...settings.jira, serverId: nextServer?.id ?? "" },
     };
-    selectedServerId = remaining[0].id;
+    selectedServerId = nextServer?.id ?? "";
   }
 
   function updateSelectedServer(
@@ -4497,6 +4643,7 @@
     if (!selectedServer) return;
 
     const serverId = selectedServer.id;
+    if ("env" in values) mcpEnvEditedServerIds.add(serverId);
     invalidateMcpConnection(serverId);
     settings = {
       ...settings,
@@ -6542,6 +6689,14 @@
                 <span>Board sync and credentials</span>
               </button>
               <button
+                class:active={settingsTab === "environment"}
+                type="button"
+                onclick={() => switchSettingsTab("environment")}
+              >
+                <strong>Global Environment</strong>
+                <span>Process environment variables</span>
+              </button>
+              <button
                 class:active={settingsTab === "theme"}
                 type="button"
                 onclick={() => switchSettingsTab("theme")}
@@ -6933,11 +7088,169 @@
                   </div>
                 {/if}
 
+                {#if settingsTab === "environment"}
+                  <div class="settings-section">
+                    <div>
+                      <p class="section-kicker">Global Environment</p>
+                      <h3>Process environment variables</h3>
+                    </div>
+                    <p class="field-help">
+                      Variables defined here are automatically injected into every process that
+                      Spacesly launches — terminals, shell commands, MCP servers, formatters, git
+                      operations, and Agent workers.
+                    </p>
+
+                    <div class="field-row">
+                      <label>
+                        <span>Search</span>
+                        <input
+                          type="search"
+                          placeholder="Filter by key…"
+                          value={globalEnvironmentSearch}
+                          oninput={(event) =>
+                            (globalEnvironmentSearch = event.currentTarget.value)}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        class="add-env-btn"
+                        onclick={addGlobalEnvironmentVariable}
+                        disabled={globalEnvironmentLoading}
+                      >
+                        ＋ Add Variable
+                      </button>
+                    </div>
+
+                    {#if globalEnvironmentLoading && globalEnvironmentVariables.length === 0}
+                      <p class="field-help">Loading environment variables…</p>
+                    {:else if globalEnvironmentVariables.length === 0}
+                      <p class="empty-state">No environment variables defined.</p>
+                    {:else}
+                      <div class="global-env-list">
+                        {#each globalEnvironmentVariables.filter(
+                            (env) =>
+                              !globalEnvironmentSearch.trim() ||
+                              env.key
+                                .toLowerCase()
+                                .includes(globalEnvironmentSearch.trim().toLowerCase()),
+                          ) as variable (variable.id)}
+                          <div
+                            class="env-row"
+                            class:env-draft={variable.draft}
+                            class:env-secret={variable.secret}
+                          >
+                            <div class="env-row-fields">
+                              <input
+                                class="env-key-input"
+                                type="text"
+                                placeholder="KEY_NAME"
+                                value={variable.key}
+                                disabled={!variable.editing && !variable.draft}
+                                oninput={(event) =>
+                                  updateGlobalEnvironmentDraft(variable.id, {
+                                    key: event.currentTarget.value,
+                                  })}
+                              />
+                              {#if variable.revealed || !variable.secret || !variable.value_set}
+                                <input
+                                  class="env-value-input"
+                                  type={variable.secret ? "password" : "text"}
+                                  placeholder="value"
+                                  value={variable.revealed || !variable.secret ? variable.value : ""}
+                                  disabled={!variable.editing && !variable.draft}
+                                  oninput={(event) =>
+                                    updateGlobalEnvironmentDraft(variable.id, {
+                                      value: event.currentTarget.value,
+                                    })}
+                                />
+                              {:else}
+                                <input
+                                  class="env-value-input"
+                                  type="password"
+                                  placeholder="••••••••"
+                                  disabled
+                                />
+                              {/if}
+                              <label class="env-toggle" title="Secret">
+                                <input
+                                  type="checkbox"
+                                  checked={variable.secret}
+                                  disabled={!variable.editing && !variable.draft}
+                                  onchange={(event) =>
+                                    updateGlobalEnvironmentDraft(variable.id, {
+                                      secret: event.currentTarget.checked,
+                                    })}
+                                />
+                                <span>Secret</span>
+                              </label>
+                              <label class="env-toggle" title="Enabled">
+                                <input
+                                  type="checkbox"
+                                  checked={variable.enabled}
+                                  onchange={(event) =>
+                                    updateGlobalEnvironmentDraft(variable.id, {
+                                      enabled: event.currentTarget.checked,
+                                    })}
+                                />
+                                <span>On</span>
+                              </label>
+                            </div>
+                            <div class="env-row-actions">
+                              {#if variable.draft || variable.editing}
+                                <button
+                                  type="button"
+                                  class="env-save-btn"
+                                  onclick={() => saveGlobalEnvironmentEntry(variable)}
+                                  disabled={globalEnvironmentLoading}
+                                >
+                                  Save
+                                </button>
+                              {:else if variable.secret && variable.value_set && !variable.revealed}
+                                <button
+                                  type="button"
+                                  class="env-reveal-btn"
+                                  onclick={() => revealGlobalEnvironment(variable.id)}
+                                >
+                                  Reveal
+                                </button>
+                              {:else if variable.secret && variable.revealed}
+                                <button
+                                  type="button"
+                                  class="env-hide-btn"
+                                  onclick={() => hideGlobalEnvironment(variable.id)}
+                                >
+                                  Hide
+                                </button>
+                              {/if}
+                              <button
+                                type="button"
+                                class="env-edit-btn"
+                                onclick={() =>
+                                  updateGlobalEnvironmentDraft(variable.id, { editing: true })}
+                                disabled={variable.draft || variable.editing}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                class="env-delete-btn"
+                                onclick={() => removeGlobalEnvironment(variable.id)}
+                                disabled={globalEnvironmentLoading}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
                 {#if settingsTab === "jira"}
                   <div class="jira-section settings-section">
                     <div>
-                      <p class="section-kicker">Jira Integration</p>
-                      <h3>Jira account</h3>
+                      <p class="section-kicker">Jira</p>
+                      <h3>Jira Board Sync</h3>
                     </div>
                     <p class="field-help">
                       Configure Jira once. These credentials power board sync, card transitions,
@@ -7300,7 +7613,6 @@
                     <button
                       type="button"
                       onclick={removeSelectedServer}
-                      disabled={settings.mcpServers.length <= 1}
                     >
                       Remove
                     </button>

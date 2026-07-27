@@ -3,6 +3,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use super::global_environment::inject_global_environment;
+
 /// Injects the user's login shell environment into a spawned command.
 pub fn inject_shell_env(command: &mut Command) {
     let env = shell_env();
@@ -12,6 +14,7 @@ pub fn inject_shell_env(command: &mut Command) {
             .iter()
             .filter(|(key, _)| is_safe_runtime_env_key(key)),
     );
+    inject_global_environment(command);
 }
 
 fn is_safe_runtime_env_key(key: &str) -> bool {

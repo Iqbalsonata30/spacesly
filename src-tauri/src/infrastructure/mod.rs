@@ -6,6 +6,7 @@ pub mod file_watcher;
 pub mod files;
 pub mod formatting;
 pub mod git;
+pub mod global_environment;
 pub mod jira_rest;
 pub mod lsp;
 pub mod mcp;

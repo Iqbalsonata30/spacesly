@@ -136,7 +136,7 @@ impl AppSecretsStore {
         server_id: &str,
         command: String,
         args: Vec<String>,
-        environment: HashMap<String, String>,
+        environment: Option<HashMap<String, String>>,
     ) -> Result<(), String> {
         let server_id = server_id.trim();
         if server_id.is_empty() {
@@ -147,21 +147,20 @@ impl AppSecretsStore {
         if command.trim().is_empty() {
             return Err("MCP connector command is required.".to_string());
         }
-        next.mcp_connectors.insert(
-            server_id.to_string(),
-            McpConnectorProfile {
-                command: command.trim().to_string(),
-                args,
-            },
-        );
-        if !environment.is_empty() {
-            let values = next.mcp_env.entry(server_id.to_string()).or_default();
-            values.extend(
-                environment
-                    .into_iter()
-                    .filter(|(_, value)| !value.trim().is_empty()),
-            );
+        replace_mcp_connector_profile(&mut next, server_id, command.trim(), args, environment);
+        persist_secret_snapshot_best_effort(&next);
+        *current = next;
+        Ok(())
+    }
+
+    pub fn remove_mcp_connector(&self, server_id: &str) -> Result<(), String> {
+        let server_id = server_id.trim();
+        if server_id.is_empty() {
+            return Err("MCP server ID is required.".to_string());
         }
+        let mut current = self.secrets.lock().map_err(|error| error.to_string())?;
+        let mut next = current.clone();
+        remove_mcp_connector_data(&mut next, server_id);
         persist_secret_snapshot_best_effort(&next);
         *current = next;
         Ok(())
@@ -318,6 +317,56 @@ impl AppSecretsStore {
     }
 }
 
+fn replace_mcp_connector(
+    secrets: &mut AppSecrets,
+    server_id: &str,
+    command: &str,
+    args: Vec<String>,
+    environment: HashMap<String, String>,
+) {
+    replace_mcp_connector_profile(secrets, server_id, command, args, Some(environment));
+}
+
+fn replace_mcp_connector_profile(
+    secrets: &mut AppSecrets,
+    server_id: &str,
+    command: &str,
+    args: Vec<String>,
+    environment: Option<HashMap<String, String>>,
+) {
+    secrets.mcp_connectors.insert(
+        server_id.to_string(),
+        McpConnectorProfile {
+            command: command.to_string(),
+            args,
+        },
+    );
+    if let Some(environment) = environment {
+        replace_mcp_environment(secrets, server_id, environment);
+    }
+}
+
+fn replace_mcp_environment(
+    secrets: &mut AppSecrets,
+    server_id: &str,
+    environment: HashMap<String, String>,
+) {
+    let environment = environment
+        .into_iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .collect::<HashMap<_, _>>();
+    if environment.is_empty() {
+        secrets.mcp_env.remove(server_id);
+    } else {
+        secrets.mcp_env.insert(server_id.to_string(), environment);
+    }
+}
+
+fn remove_mcp_connector_data(secrets: &mut AppSecrets, server_id: &str) {
+    secrets.mcp_connectors.remove(server_id);
+    secrets.mcp_env.remove(server_id);
+}
+
 pub fn load_app_secrets() -> Result<AppSecrets, String> {
     let path = secrets_path()?;
     if !path.exists() {
@@ -413,5 +462,76 @@ mod tests {
         assert_eq!(redacted.ai_api_keys["openai"], "");
         assert_eq!(redacted.mcp_env["jira"]["JIRA_TOKEN"], "");
         assert!(redacted.jira_api_token.is_empty());
+    }
+
+    #[test]
+    fn replacing_and_removing_mcp_connector_drops_stale_environment_values() {
+        let mut secrets = AppSecrets {
+            mcp_connectors: HashMap::from([(
+                "generic".to_string(),
+                McpConnectorProfile {
+                    command: "old-command".to_string(),
+                    args: Vec::new(),
+                },
+            )]),
+            mcp_env: HashMap::from([(
+                "generic".to_string(),
+                HashMap::from([("OLD_TOKEN".to_string(), "old".to_string())]),
+            )]),
+            ..AppSecrets::default()
+        };
+
+        replace_mcp_connector(
+            &mut secrets,
+            "generic",
+            "new-command",
+            vec!["--stdio".to_string()],
+            HashMap::from([("NEW_TOKEN".to_string(), "new".to_string())]),
+        );
+        assert_eq!(
+            secrets.mcp_env["generic"],
+            HashMap::from([("NEW_TOKEN".to_string(), "new".to_string())])
+        );
+
+        replace_mcp_connector(
+            &mut secrets,
+            "generic",
+            "new-command",
+            Vec::new(),
+            HashMap::new(),
+        );
+        assert!(!secrets.mcp_env.contains_key("generic"));
+
+        remove_mcp_connector_data(&mut secrets, "generic");
+        assert!(!secrets.mcp_connectors.contains_key("generic"));
+    }
+
+    #[test]
+    fn saving_mcp_connector_without_environment_preserves_existing_values() {
+        let mut secrets = AppSecrets {
+            mcp_connectors: HashMap::from([(
+                "generic".to_string(),
+                McpConnectorProfile {
+                    command: "old-command".to_string(),
+                    args: Vec::new(),
+                },
+            )]),
+            mcp_env: HashMap::from([(
+                "generic".to_string(),
+                HashMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            )]),
+            ..AppSecrets::default()
+        };
+
+        replace_mcp_connector_profile(
+            &mut secrets,
+            "generic",
+            "new-command",
+            vec!["--stdio".to_string()],
+            None,
+        );
+
+        assert_eq!(secrets.mcp_connectors["generic"].command, "new-command");
+        assert_eq!(secrets.mcp_env["generic"]["TOKEN"], "secret");
     }
 }

@@ -26,6 +26,7 @@ use infrastructure::execution_store::{
     ConversationImportInput, ConversationMessageInput, ExecutionStore,
 };
 use infrastructure::file_watcher::FileWatchRegistry;
+use infrastructure::global_environment::GlobalEnvironmentStore;
 use infrastructure::files::{
     FileEntry, FileSnapshot, FileWriteResult, LineEnding, TextEncoding, WorkspaceRoot,
 };
@@ -1458,7 +1459,7 @@ async fn save_mcp_environment_secret(
     server_id: String,
     command: String,
     args: Vec<String>,
-    environment: std::collections::HashMap<String, String>,
+    environment: Option<std::collections::HashMap<String, String>>,
     store: State<'_, AppSecretsStore>,
 ) -> Result<(), String> {
     let store = store.inner().clone();
@@ -1467,6 +1468,17 @@ async fn save_mcp_environment_secret(
     })
     .await
     .map_err(|error| format!("Save MCP environment task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn remove_mcp_connector(
+    server_id: String,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.remove_mcp_connector(&server_id))
+        .await
+        .map_err(|error| format!("Remove MCP connector task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1503,6 +1515,49 @@ async fn save_app_secrets(
     tauri::async_runtime::spawn_blocking(move || store.save_from_renderer(secrets))
         .await
         .map_err(|error| format!("Save secrets task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_global_environment_variables(
+    store: State<'_, GlobalEnvironmentStore>,
+) -> Result<Vec<infrastructure::global_environment::GlobalEnvironmentVariableView>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list())
+        .await
+        .map_err(|error| format!("List global env vars task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_global_environment_variable(
+    input: infrastructure::global_environment::GlobalEnvironmentVariableInput,
+    store: State<'_, GlobalEnvironmentStore>,
+) -> Result<infrastructure::global_environment::GlobalEnvironmentVariableView, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save(input))
+        .await
+        .map_err(|error| format!("Save global env var task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_global_environment_variable(
+    id: String,
+    store: State<'_, GlobalEnvironmentStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.delete(&id))
+        .await
+        .map_err(|error| format!("Delete global env var task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn reveal_global_environment_variable(
+    id: String,
+    store: State<'_, GlobalEnvironmentStore>,
+) -> Result<String, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.reveal(&id))
+        .await
+        .map_err(|error| format!("Reveal global env var task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2075,6 +2130,7 @@ pub fn run() {
     //   - ExecutionStore: opens SQLite + runs schema DDL + recover_interrupted_runs()
     //   - RecoveryStore:  opens SQLite + runs schema DDL + prune_expired()
     //   - AppSecretsStore: reads secrets.json + keyring round-trips
+    //   - GlobalEnvironmentStore: reads managed process environment variables
     //
     // Each opens a different file so there is no contention. Running all three
     // concurrently reduces the serial startup chain from ~3×T to ~max(T).
@@ -2085,6 +2141,9 @@ pub fn run() {
         std::thread::spawn(|| RecoveryStore::open().expect("failed to initialize recovery store"));
     let secrets_handle =
         std::thread::spawn(|| AppSecretsStore::load().expect("failed to initialize app secrets"));
+    let global_environment_handle = std::thread::spawn(|| {
+        GlobalEnvironmentStore::global().expect("failed to initialize global environment")
+    });
 
     let execution_store = execution_handle
         .join()
@@ -2093,6 +2152,9 @@ pub fn run() {
         .join()
         .expect("recovery store init panicked");
     let app_secrets = secrets_handle.join().expect("app secrets init panicked");
+    let global_environment = global_environment_handle
+        .join()
+        .expect("global environment init panicked");
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
     let lsp_registry = LspRegistry::default();
@@ -2107,6 +2169,7 @@ pub fn run() {
         .manage(FileWatchRegistry::default())
         .manage(lsp_registry)
         .manage(app_secrets)
+        .manage(global_environment)
         .manage(AppState::new())
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
@@ -2158,9 +2221,14 @@ pub fn run() {
             save_ai_provider_secret,
             mcp_environment_secret_statuses,
             save_mcp_environment_secret,
+            remove_mcp_connector,
             save_jira_connection_profile,
             jira_secret_statuses,
             save_jira_secret,
+            list_global_environment_variables,
+            save_global_environment_variable,
+            delete_global_environment_variable,
+            reveal_global_environment_variable,
             load_cached_workspace,
             save_cached_workspace,
             save_execution_run,

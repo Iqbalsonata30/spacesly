@@ -3,6 +3,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::global_environment::inject_global_environment;
+use super::global_environment::redact_global_environment_values;
+
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn format_code(formatter: String, source: String) -> Result<String, String> {
@@ -33,7 +36,9 @@ fn format_with_command(
 }
 
 fn run_formatter(command: &str, args: &[&str], source: String) -> Result<String, String> {
-    let mut child = Command::new(command)
+    let mut command_process = Command::new(command);
+    inject_global_environment(&mut command_process);
+    let mut child = command_process
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -56,7 +61,7 @@ fn run_formatter(command: &str, args: &[&str], source: String) -> Result<String,
         return Err(if stderr.is_empty() {
             format!("{command} exited with status {}.", output.status)
         } else {
-            stderr
+            redact_global_environment_values(&stderr)
         });
     }
 

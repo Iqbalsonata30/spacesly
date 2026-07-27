@@ -94,11 +94,20 @@ export {
   loadAppSecrets,
   jiraSecretStatuses,
   mcpEnvironmentSecretStatuses,
+  listGlobalEnvironmentVariables,
+  removeMcpConnector,
+  deleteGlobalEnvironmentVariable,
+  revealGlobalEnvironmentVariable,
   saveAiProviderSecret,
   saveAppSecrets,
+  saveGlobalEnvironmentVariable,
   saveMcpEnvironmentSecret,
   saveJiraSecret,
   saveJiraConnectionProfile,
+} from "$lib/ipc/settings";
+export type {
+  GlobalEnvironmentVariable,
+  GlobalEnvironmentVariableInput,
 } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";

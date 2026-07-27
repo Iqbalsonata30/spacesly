@@ -1,4 +1,5 @@
 use super::provider_registry::ApiStyle;
+use super::global_environment::inject_global_environment;
 use super::shell_env::inject_shell_env;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use reqwest::blocking::Client;
@@ -1713,6 +1714,7 @@ fn git_head(config: &AiWorkerConfig) -> Option<String> {
 
 fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<String> {
     let mut command = Command::new("git");
+    inject_global_environment(&mut command);
     command.args(args);
     command.current_dir(opencode_workdir(config)?);
     let output = command.output().ok()?;
@@ -1725,6 +1727,7 @@ fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Optio
 
 fn git_status<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<bool> {
     let mut command = Command::new("git");
+    inject_global_environment(&mut command);
     command.args(args);
     command.current_dir(opencode_workdir(config)?);
     command.output().ok().map(|output| output.status.success())

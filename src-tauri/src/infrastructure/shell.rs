@@ -9,6 +9,8 @@ use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
+use super::global_environment::redact_global_environment_values;
+
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const MIN_TIMEOUT_SECONDS: u64 = 1;
 const MAX_TIMEOUT_SECONDS: u64 = 300;
@@ -124,8 +126,8 @@ pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandRes
 
     Ok(ShellCommandResult {
         exit_code: exit_code.or_else(|| status.code()),
-        stdout,
-        stderr: render_stream(stderr_capture, "stderr"),
+        stdout: redact_global_environment_values(&stdout),
+        stderr: redact_global_environment_values(&render_stream(stderr_capture, "stderr")),
         timed_out,
         cwd,
     })

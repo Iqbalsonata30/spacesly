@@ -307,7 +307,7 @@ function normalizeSettings(value: unknown): AppSettings {
   const aiApiKeys = normalizeAiApiKeys(candidate.aiWorker, aiProviderId);
 
   return {
-    mcpServers: mcpServers.length > 0 ? mcpServers : fallback.mcpServers,
+    mcpServers,
     aiWorker: {
       runtime: candidate.aiWorker?.runtime === "opencode" ? "opencode" : fallback.aiWorker.runtime,
       providerId: aiProviderId,

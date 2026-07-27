@@ -39,6 +39,7 @@ import {
 import { formatJiraExecutionComment } from "../src/lib/jiraComment";
 import { timelineActivity, timelineActivities } from "../src/lib/agentTimeline";
 import { relativeTimeLabel } from "../src/lib/relativeTime";
+import { defaultSettings, loadSettings, parseEnvText, saveSettings } from "../src/lib/settings";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -47,6 +48,48 @@ function assertEqual(actual: unknown, expected: unknown, message: string) {
     );
   }
 }
+
+assertEqual(
+  parseEnvText("API_URL=https://service.example\nAPI_TOKEN=secret"),
+  { API_URL: "https://service.example", API_TOKEN: "secret" },
+  "generic MCP environment should be parsed as the complete textarea value",
+);
+assertEqual(parseEnvText(""), {}, "clearing generic MCP environment should remove every key");
+
+const originalLocalStorage = globalThis.localStorage;
+const settingsStorage = new Map<string, string>();
+const memoryLocalStorage = {
+  get length() {
+    return settingsStorage.size;
+  },
+  clear() {
+    settingsStorage.clear();
+  },
+  getItem(key: string) {
+    return settingsStorage.get(key) ?? null;
+  },
+  key(index: number) {
+    return [...settingsStorage.keys()][index] ?? null;
+  },
+  removeItem(key: string) {
+    settingsStorage.delete(key);
+  },
+  setItem(key: string, value: string) {
+    settingsStorage.set(key, value);
+  },
+} satisfies Storage;
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: memoryLocalStorage,
+});
+const settingsWithoutMcp = structuredClone(defaultSettings);
+settingsWithoutMcp.mcpServers = [];
+saveSettings(settingsWithoutMcp);
+assertEqual(loadSettings().mcpServers, [], "removing the final MCP connector should persist");
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: originalLocalStorage,
+});
 
 assertEqual(
   workspaceContextRevision("same context"),

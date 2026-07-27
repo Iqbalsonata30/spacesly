@@ -35,7 +35,7 @@
   function updateEnv(value: string) {
     try {
       onError(null);
-      onUpdate({ env: { ...server.env, ...parseEnvText(value) } });
+      onUpdate({ env: parseEnvText(value) });
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : String(reason));
     }

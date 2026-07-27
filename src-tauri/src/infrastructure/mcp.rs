@@ -9,6 +9,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::jira_rest;
+use super::global_environment::redact_global_environment_values;
 use super::shell_env::inject_shell_env;
 use super::tool_broker::ToolBroker;
 
@@ -859,11 +860,13 @@ fn mcp_server_key(server: &McpServerConfig) -> String {
 }
 
 fn redact_mcp_diagnostic(error: &str, env: &HashMap<String, String>) -> String {
-    env.values()
+    let redacted = env
+        .values()
         .filter(|value| value.len() >= 4)
         .fold(error.to_string(), |message, value| {
             message.replace(value, "[REDACTED]")
-        })
+        });
+    redact_global_environment_values(&redacted)
 }
 
 fn spawn_stdout_reader(
