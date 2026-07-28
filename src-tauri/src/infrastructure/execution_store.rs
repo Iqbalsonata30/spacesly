@@ -376,15 +376,7 @@ impl ExecutionStore {
         conversation_id: &str,
     ) -> Result<Vec<ConversationMessageRecord>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM conversations WHERE conversation_id = ?1 AND workspace_id = ?2",
-                params![conversation_id, workspace_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| format!("Failed to verify conversation scope: {error}"))?;
-        if exists.is_none() {
+        if !conversation_exists_in(&connection, workspace_id, conversation_id)? {
             return Err("Conversation does not belong to this workspace.".to_string());
         }
         let mut statement = connection
@@ -408,6 +400,16 @@ impl ExecutionStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Failed to decode conversation message: {error}"))?;
         Ok(messages)
+    }
+
+    /// Returns whether a durable conversation belongs to the requested workspace.
+    pub fn conversation_exists(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        conversation_exists_in(&connection, workspace_id, conversation_id)
     }
 
     pub fn append_conversation_message(
@@ -776,6 +778,22 @@ fn contract_string<'a>(contract: &'a Value, field: &str) -> Result<&'a str, Stri
         .ok_or_else(|| format!("Execution Contract field {field} is required."))
 }
 
+fn conversation_exists_in(
+    connection: &Connection,
+    workspace_id: &str,
+    conversation_id: &str,
+) -> Result<bool, String> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM conversations WHERE conversation_id = ?1 AND workspace_id = ?2",
+            params![conversation_id, workspace_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to verify conversation scope: {error}"))?;
+    Ok(exists.is_some())
+}
+
 fn database_path() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -868,6 +886,12 @@ mod tests {
                 },
             )
             .is_err());
+        assert!(store
+            .conversation_exists("workspace-a", "conversation-a")
+            .unwrap());
+        assert!(!store
+            .conversation_exists("workspace-b", "conversation-a")
+            .unwrap());
     }
 
     #[test]

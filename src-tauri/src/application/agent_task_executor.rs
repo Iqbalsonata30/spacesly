@@ -75,6 +75,11 @@ pub struct AgentTaskExecutor {
 }
 
 impl AgentTaskExecutor {
+    /// Creates an Agent executor with a trusted resolver and runtime invocation boundary.
+    ///
+    /// The executor is shared by scheduler Workers, while each call to `execute` receives a distinct
+    /// `TaskExecutionContext` with its own cancellation token, fencing token, MCP authority, and
+    /// activity timeline.
     pub fn new(
         resolver: Arc<dyn AgentRuntimeResolver>,
         runner: Arc<dyn AgentRuntimeRunner>,
@@ -332,7 +337,7 @@ mod tests {
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -364,6 +369,11 @@ mod tests {
 
     struct FakeRunner {
         executions: Arc<AtomicUsize>,
+    }
+
+    struct IsolationRunner {
+        barrier: Arc<Barrier>,
+        seen: Arc<Mutex<Vec<(String, u64, u64, u64)>>>,
     }
 
     struct BlockedRunner;
@@ -448,6 +458,40 @@ mod tests {
         }
     }
 
+    impl AgentRuntimeRunner for IsolationRunner {
+        fn execute(
+            &self,
+            config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let authority = config.mcp_servers[0]
+                .proxy_authority
+                .as_ref()
+                .expect("fenced proxy authority");
+            self.seen.lock().expect("seen lock").push((
+                task.session_key.expect("session key"),
+                authority.session_id.0,
+                authority.attempt_id,
+                authority.fencing_token,
+            ));
+            self.barrier.wait();
+            on_event(AiWorkerStreamEvent::TextDelta(format!(
+                "session:{}",
+                authority.session_id.0
+            )))?;
+            Ok(AiWorkerTaskResult {
+                summary: "complete".to_string(),
+                evidence: Vec::new(),
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AiWorkerCompletionStatus::Completed,
+                blocked_reason: None,
+            })
+        }
+    }
+
     #[test]
     fn scheduler_agent_executor_fences_connectors_and_journals_runtime_events() {
         let directory = tempdir().expect("temp directory");
@@ -489,6 +533,67 @@ mod tests {
             .any(|event| {
                 event.kind == TaskSessionEventKind::Runtime && event.payload["type"] == "text_delta"
             }));
+    }
+
+    #[test]
+    fn concurrent_agent_sessions_get_isolated_runtime_and_tool_authority() {
+        let directory = tempdir().expect("temp directory");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            Arc::new(IsolationRunner {
+                barrier: Arc::new(Barrier::new(2)),
+                seen: seen.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let first = engine
+            .submit_envelope_with_grants(
+                "isolated-agent-1",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("first task submitted");
+        let second = engine
+            .submit_envelope_with_grants(
+                "isolated-agent-2",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("second task submitted");
+
+        engine
+            .wait_for_terminal(first.id, Duration::from_secs(5))
+            .expect("first completes");
+        engine
+            .wait_for_terminal(second.id, Duration::from_secs(5))
+            .expect("second completes");
+        let seen = seen.lock().expect("seen lock").clone();
+        assert_eq!(seen.len(), 2);
+        assert_ne!(seen[0].0, seen[1].0);
+        assert_ne!(seen[0].1, seen[1].1);
+        assert_ne!(seen[0].2, seen[1].2);
+        assert_eq!(seen[0].3, 1);
+        assert_eq!(seen[1].3, 1);
+        assert!(engine
+            .events_after(first.id, 0)
+            .expect("first events")
+            .iter()
+            .all(|event| event.session_id == first.id));
+        assert!(engine
+            .events_after(second.id, 0)
+            .expect("second events")
+            .iter()
+            .all(|event| event.session_id == second.id));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
-    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionKind, TaskSessionSnapshot,
+    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -1647,9 +1647,7 @@ async fn submit_task_session(
     execution_engine: State<'_, Arc<ExecutionEngine>>,
 ) -> Result<TaskSessionSnapshot, String> {
     let TaskSessionEnvelope::V1(session) = &envelope;
-    if session.kind != TaskSessionKind::Agent {
-        return Err("The live Task Session runtime currently accepts Agent sessions only.".to_string());
-    }
+    session.validate_agent_runtime_ownership()?;
     let engine = execution_engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine

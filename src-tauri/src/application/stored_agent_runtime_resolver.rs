@@ -20,6 +20,11 @@ pub struct StoredAgentRuntimeResolver {
 }
 
 impl StoredAgentRuntimeResolver {
+    /// Creates a resolver that borrows singleton stores but resolves per-session runtime state.
+    ///
+    /// The resolver itself is a shared service; each `resolve` call returns owned runtime config,
+    /// MCP connector command/environment snapshots, and task contract data for exactly one
+    /// assignment attempt.
     pub fn new(
         profiles: RuntimeProfileStore,
         executions: ExecutionStore,
@@ -46,6 +51,7 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
         if runtime_attempt_id.trim().is_empty() {
             return Err("Agent runtime attempt ID is required.".to_string());
         }
+        envelope.validate_agent_runtime_ownership()?;
         let profile = self
             .profiles
             .get(&envelope.runtime_profile_id)?
@@ -69,6 +75,16 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             .execution_run_id
             .as_deref()
             .ok_or_else(|| "Agent execution run ID is required.".to_string())?;
+        let conversation_id = envelope
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| "Agent conversation ID is required.".to_string())?;
+        if !self
+            .executions
+            .conversation_exists(&envelope.workspace_id, conversation_id)?
+        {
+            return Err("Agent conversation does not belong to this workspace.".to_string());
+        }
         let run = self
             .executions
             .get(execution_run_id)?

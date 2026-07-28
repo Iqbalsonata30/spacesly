@@ -106,14 +106,17 @@ export type TaskSessionUpdateWatch = {
   acknowledge: (sequence: number) => void;
 };
 
+/** Lists durable Task Sessions currently retained by the scheduler projection. */
 export function listTaskSessions(): Promise<TaskSessionSnapshot[]> {
   return invokeWithPolicy("list_task_sessions", {}, IPC_POLICIES.taskSessionRead);
 }
 
+/** Lists non-secret Agent runtime profiles available for future Task Session submissions. */
 export function listAgentRuntimeProfiles(): Promise<AgentRuntimeProfile[]> {
   return invokeWithPolicy("list_agent_runtime_profiles", {}, IPC_POLICIES.taskSessionRead);
 }
 
+/** Saves one non-secret Agent runtime profile; provider/MCP secrets remain in the secrets store. */
 export function saveAgentRuntimeProfile(
   profile: AgentRuntimeProfile,
 ): Promise<AgentRuntimeProfile> {
@@ -124,6 +127,7 @@ export function saveAgentRuntimeProfile(
   );
 }
 
+/** Submits one Agent Task Session with explicit capability grants; this mutation is never retried. */
 export function submitTaskSession(
   label: string,
   envelope: TaskSessionEnvelope,
@@ -136,6 +140,7 @@ export function submitTaskSession(
   );
 }
 
+/** Requests cooperative cancellation for one queued or running Task Session. */
 export function cancelTaskSession(sessionId: number): Promise<boolean> {
   return invokeWithPolicy(
     "cancel_task_session",
@@ -144,6 +149,7 @@ export function cancelTaskSession(sessionId: number): Promise<boolean> {
   );
 }
 
+/** Removes a retained Task Session projection after terminal completion. */
 export function removeTaskSession(sessionId: number): Promise<boolean> {
   return invokeWithPolicy(
     "remove_task_session",
@@ -152,10 +158,12 @@ export function removeTaskSession(sessionId: number): Promise<boolean> {
   );
 }
 
+/** Returns the latest durable projection for one Task Session, if it is still retained. */
 export function getTaskSession(sessionId: number): Promise<TaskSessionSnapshot | null> {
   return invokeWithPolicy("get_task_session", { sessionId }, IPC_POLICIES.taskSessionRead);
 }
 
+/** Replays a bounded page of durable Task Session events after a monotonic sequence cursor. */
 export function listTaskSessionEvents(
   sessionId: number,
   afterSequence: number,
@@ -168,6 +176,7 @@ export function listTaskSessionEvents(
   );
 }
 
+/** Polls one Task Session projection and emits update hints until explicitly unlistened. */
 export function onTaskSessionUpdated(
   sessionId: number,
   handler: (update: TaskSessionUpdate) => void,
@@ -203,6 +212,7 @@ export function onTaskSessionUpdated(
   });
 }
 
+/** Combines initial durable replay with update polling for one Task Session timeline. */
 export async function subscribeTaskSessionReplay(
   sessionId: number,
   afterSequence: number,

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Non-secret durable configuration used to reconstruct one scheduler-owned Agent runtime.
 pub struct AgentRuntimeProfile {
     pub id: String,
     pub runtime: String,
@@ -22,6 +23,7 @@ pub struct AgentRuntimeProfile {
 }
 
 impl AgentRuntimeProfile {
+    /// Validates the profile before it can be stored or used by the Agent runtime resolver.
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("id", self.id.as_str()),
@@ -73,15 +75,21 @@ impl AgentRuntimeProfile {
 }
 
 #[derive(Clone)]
+/// SQLite-backed owner of durable Agent runtime profiles.
+///
+/// The store owns only non-secret runtime metadata. Secret provider keys and MCP environments remain
+/// owned by `AppSecretsStore` and are resolved at assignment time.
 pub struct RuntimeProfileStore {
     connection: Arc<Mutex<Connection>>,
 }
 
 impl RuntimeProfileStore {
+    /// Opens the default runtime profile database under the application data directory.
     pub fn open() -> Result<Self, String> {
         Self::open_at(runtime_profile_database_path()?)
     }
 
+    /// Opens a runtime profile database at an explicit path, primarily for tests.
     pub fn open_at(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -105,6 +113,7 @@ impl RuntimeProfileStore {
         })
     }
 
+    /// Inserts or replaces one validated Agent runtime profile.
     pub fn save(&self, profile: &AgentRuntimeProfile) -> Result<AgentRuntimeProfile, String> {
         profile.validate()?;
         let encoded = serde_json::to_string(profile)
@@ -123,6 +132,7 @@ impl RuntimeProfileStore {
         Ok(profile.clone())
     }
 
+    /// Loads one Agent runtime profile by identifier.
     pub fn get(&self, profile_id: &str) -> Result<Option<AgentRuntimeProfile>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let encoded = connection
@@ -141,6 +151,7 @@ impl RuntimeProfileStore {
             .transpose()
     }
 
+    /// Lists all stored Agent runtime profiles in stable identifier order.
     pub fn list(&self) -> Result<Vec<AgentRuntimeProfile>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection

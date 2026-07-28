@@ -120,6 +120,35 @@ impl TaskSessionEnvelopeV1 {
         }
         Ok(())
     }
+
+    /// Validates ownership required by the live Agent runtime.
+    ///
+    /// This is stricter than persistence validation so old durable envelopes remain readable while
+    /// new scheduler-owned Agent submissions explicitly bind conversation, prompt/context revision,
+    /// Agent runtime profile revisions, MCP connector context, progress, timeline, and cancellation
+    /// to one Task Session assignment.
+    pub fn validate_agent_runtime_ownership(&self) -> Result<(), String> {
+        self.validate()?;
+        if self.kind != TaskSessionKind::Agent {
+            return Err(
+                "Live Task Session runtime currently accepts Agent sessions only.".to_string(),
+            );
+        }
+        for (name, value) in [
+            ("conversation_id", self.conversation_id.as_deref()),
+            ("execution_run_id", self.execution_run_id.as_deref()),
+            ("context_revision", self.context_revision.as_deref()),
+            ("rules_revision", self.rules_revision.as_deref()),
+            ("skills_revision", self.skills_revision.as_deref()),
+        ] {
+            if value.is_none_or(|value| value.trim().is_empty() || value != value.trim()) {
+                return Err(format!(
+                    "Agent Task Session ownership field '{name}' is required."
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Versioned durable Task Session execution envelope.
@@ -512,5 +541,29 @@ mod tests {
             skills_revision: None,
         };
         assert!(envelope.validate().is_err());
+    }
+
+    #[test]
+    fn agent_runtime_ownership_requires_conversation_and_revisions() {
+        let mut envelope = TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "digest".to_string(),
+            runtime_profile_id: "profile".to_string(),
+            model: "model".to_string(),
+            connector_ids: Vec::new(),
+            requested_capabilities: Vec::new(),
+            prompt_template_version: "v1".to_string(),
+            context_revision: Some("context-1".to_string()),
+            rules_revision: Some("rules-1".to_string()),
+            skills_revision: Some("skills-1".to_string()),
+        };
+        assert!(envelope.validate_agent_runtime_ownership().is_ok());
+
+        envelope.conversation_id = None;
+        assert!(envelope.validate_agent_runtime_ownership().is_err());
     }
 }
