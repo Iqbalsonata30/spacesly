@@ -1,9 +1,11 @@
 use super::global_environment::inject_global_environment;
 use super::mcp::{
-    mcp_connector_binding_digest, MCP_PROXY_AUTHORITY_MODE_ENV, MCP_PROXY_AUTHORITY_MODE_LEGACY,
+    mcp_connector_binding_digest, MCP_PROXY_AUTHORITY_ENV, MCP_PROXY_AUTHORITY_MODE_ENV,
+    MCP_PROXY_AUTHORITY_MODE_LEGACY, MCP_PROXY_AUTHORITY_MODE_REQUIRED,
     MCP_PROXY_CONNECTOR_BINDING_ENV, MCP_PROXY_CONNECTOR_ID_ENV,
 };
 use super::provider_registry::ApiStyle;
+use super::scheduler_store::ExternalAssignmentAuthority;
 use super::shell_env::inject_shell_env;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use reqwest::blocking::Client;
@@ -261,6 +263,8 @@ pub struct AiWorkerMcpServer {
     pub command: Vec<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    #[serde(skip)]
+    pub proxy_authority: Option<ExternalAssignmentAuthority>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1812,10 +1816,24 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
                 "SPACESLY_MCP_PROXY_COMMAND".to_string(),
                 serde_json::to_string(&server.command).ok()?,
             );
-            environment.insert(
-                MCP_PROXY_AUTHORITY_MODE_ENV.to_string(),
-                MCP_PROXY_AUTHORITY_MODE_LEGACY.to_string(),
-            );
+            match &server.proxy_authority {
+                Some(authority) => {
+                    environment.insert(
+                        MCP_PROXY_AUTHORITY_MODE_ENV.to_string(),
+                        MCP_PROXY_AUTHORITY_MODE_REQUIRED.to_string(),
+                    );
+                    environment.insert(
+                        MCP_PROXY_AUTHORITY_ENV.to_string(),
+                        serde_json::to_string(authority).ok()?,
+                    );
+                }
+                None => {
+                    environment.insert(
+                        MCP_PROXY_AUTHORITY_MODE_ENV.to_string(),
+                        MCP_PROXY_AUTHORITY_MODE_LEGACY.to_string(),
+                    );
+                }
+            }
             environment.insert(
                 MCP_PROXY_CONNECTOR_ID_ENV.to_string(),
                 connector_id.to_string(),
@@ -3033,6 +3051,7 @@ mod tests {
             secret_id: "jira".to_string(),
             command: vec!["npx".to_string(), "-y".to_string(), "jira-mcp".to_string()],
             environment: HashMap::from([("JIRA_URL".to_string(), "https://jira.test".to_string())]),
+            proxy_authority: None,
         });
 
         let command = opencode_command(&config);
@@ -3078,6 +3097,55 @@ mod tests {
             parsed["mcp"]["spacesly-jira"]["environment"]["JIRA_URL"],
             "https://jira.test"
         );
+    }
+
+    #[test]
+    fn backend_authority_switches_mcp_proxy_to_required_mode() {
+        let mut config = config_with_governance("", "");
+        config.mcp_servers.push(AiWorkerMcpServer {
+            name: "spacesly-jira".to_string(),
+            secret_id: "jira".to_string(),
+            command: vec!["jira-mcp".to_string()],
+            environment: HashMap::new(),
+            proxy_authority: Some(ExternalAssignmentAuthority {
+                scheduler_database: PathBuf::from("/tmp/scheduler.db"),
+                scheduler_instance_id: "instance".to_string(),
+                session_id: crate::domain::task_session::TaskSessionId(1),
+                attempt_id: 2,
+                attempt: 1,
+                owner_id: 3,
+                fencing_token: 4,
+                capability: "external_tools:jira".to_string(),
+                connector_id: "jira".to_string(),
+                connector_binding_digest: mcp_connector_binding_digest(
+                    "jira",
+                    &["jira-mcp".to_string()],
+                    &HashMap::new(),
+                )
+                .expect("connector binding"),
+            }),
+        });
+
+        let serialized = opencode_mcp_config(&config).expect("MCP config");
+        let parsed: Value = serde_json::from_str(&serialized).expect("valid OpenCode config");
+        let environment = &parsed["mcp"]["spacesly-jira"]["environment"];
+        assert_eq!(
+            environment[MCP_PROXY_AUTHORITY_MODE_ENV],
+            MCP_PROXY_AUTHORITY_MODE_REQUIRED
+        );
+        assert!(environment[MCP_PROXY_AUTHORITY_ENV]
+            .as_str()
+            .is_some_and(|value| value.contains("external_tools:jira")));
+
+        let renderer_server: AiWorkerMcpServer = serde_json::from_value(serde_json::json!({
+            "name": "spacesly-jira",
+            "secret_id": "jira",
+            "command": ["jira-mcp"],
+            "environment": {},
+            "proxy_authority": environment[MCP_PROXY_AUTHORITY_ENV]
+        }))
+        .expect("renderer server decoded");
+        assert!(renderer_server.proxy_authority.is_none());
     }
 
     #[test]
@@ -3177,6 +3245,7 @@ mod tests {
                 ("B".to_string(), "2".to_string()),
                 ("A".to_string(), "1".to_string()),
             ]),
+            proxy_authority: None,
         });
         let mut second = config_with_governance("", "");
         second.mcp_servers.push(AiWorkerMcpServer {
@@ -3190,6 +3259,7 @@ mod tests {
                 ("A".to_string(), "1".to_string()),
                 ("B".to_string(), "2".to_string()),
             ]),
+            proxy_authority: None,
         });
 
         assert_eq!(opencode_mcp_config(&first), opencode_mcp_config(&second));
