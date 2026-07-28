@@ -6,17 +6,19 @@
 //! context, and return to idle until the engine is dropped.
 
 use crate::domain::task_session::{
-    TaskRequest, TaskSessionId, TaskSessionSnapshot, TaskSessionState,
+    TaskCapabilityGrant, TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent,
+    TaskSessionEventInput, TaskSessionEventKind, TaskSessionId, TaskSessionSnapshot,
+    TaskSessionState, TaskSessionUpdate,
 };
 use crate::infrastructure::scheduler_store::{
-    AssignmentFence, DurableAssignment, DurableOutcome, SchedulerStore,
+    AssignmentFence, DurableAssignment, DurableOutcome, FinishResult, SchedulerStore,
 };
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -73,7 +75,9 @@ pub struct TaskExecutionContext {
     attempt_id: u64,
     fencing_token: u64,
     request: TaskRequest,
+    grants: Vec<TaskCapabilityGrant>,
     cancellation: TaskCancellation,
+    event_sink: TaskEventSink,
 }
 
 impl TaskExecutionContext {
@@ -105,6 +109,148 @@ impl TaskExecutionContext {
     /// Returns the cooperative cancellation handle for this assignment.
     pub fn cancellation(&self) -> &TaskCancellation {
         &self.cancellation
+    }
+
+    /// Returns durable grants snapshotted for this assignment.
+    pub fn capability_grants(&self) -> &[TaskCapabilityGrant] {
+        &self.grants
+    }
+
+    /// Returns true when this assignment has an explicit durable capability grant.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.grants
+            .iter()
+            .any(|grant| grant.capability == capability)
+    }
+
+    /// Fails unless this exact attempt still owns an unexpired running assignment.
+    pub fn ensure_current(&self) -> Result<(), TaskExecutionError> {
+        self.event_sink.ensure_current()
+    }
+
+    /// Authorizes one capability for this exact current assignment attempt.
+    pub fn authorize_capability(&self, capability: &str) -> Result<(), TaskExecutionError> {
+        self.ensure_current()?;
+        if self.has_capability(capability) {
+            Ok(())
+        } else {
+            Err(TaskExecutionError::new(format!(
+                "Task assignment lacks capability '{capability}'."
+            )))
+        }
+    }
+
+    /// Returns an attempt-unique identity suitable for runtime and conversation isolation.
+    pub fn runtime_attempt_id(&self) -> String {
+        format!(
+            "task-{}-{}-attempt-{}-fence-{}",
+            self.event_sink.store.instance_id(),
+            self.session_id.0,
+            self.attempt_id,
+            self.fencing_token
+        )
+    }
+
+    /// Appends a structured event using this assignment's durable fencing token.
+    pub fn emit_event(
+        &self,
+        kind: TaskSessionEventKind,
+        payload: serde_json::Value,
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        if matches!(
+            kind,
+            TaskSessionEventKind::Lifecycle | TaskSessionEventKind::Progress
+        ) {
+            return Err(TaskExecutionError::new(
+                "Use report_progress for progress; lifecycle events are Scheduler-owned.",
+            ));
+        }
+        self.event_sink.emit(TaskSessionEventInput {
+            kind,
+            payload,
+            progress: None,
+        })
+    }
+
+    /// Appends a progress event and atomically updates the session progress projection.
+    pub fn report_progress(
+        &self,
+        progress: TaskProgress,
+        payload: serde_json::Value,
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        self.event_sink.emit(TaskSessionEventInput {
+            kind: TaskSessionEventKind::Progress,
+            payload,
+            progress: Some(progress),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TaskEventSink {
+    store: SchedulerStore,
+    fence: AssignmentFence,
+    notifier: Arc<TaskSessionNotifier>,
+}
+
+impl TaskEventSink {
+    fn emit(&self, input: TaskSessionEventInput) -> Result<TaskSessionEvent, TaskExecutionError> {
+        let event = self
+            .store
+            .append_assignment_event(self.fence, input)
+            .map_err(TaskExecutionError::new)?;
+        self.notifier.publish(TaskSessionUpdate {
+            session_id: event.session_id,
+            latest_sequence: event.sequence,
+        });
+        Ok(event)
+    }
+
+    fn ensure_current(&self) -> Result<(), TaskExecutionError> {
+        match self.store.assignment_is_current(self.fence) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(TaskExecutionError::new(
+                "Task assignment authority is stale, cancelled, or expired.",
+            )),
+            Err(error) => Err(TaskExecutionError::new(error)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskSessionNotifier {
+    state: Mutex<TaskSessionNotifierState>,
+}
+
+#[derive(Default)]
+struct TaskSessionNotifierState {
+    subscribers: Vec<mpsc::Sender<TaskSessionUpdate>>,
+    latest_by_session: HashMap<TaskSessionId, u64>,
+}
+
+impl TaskSessionNotifier {
+    fn subscribe(&self) -> mpsc::Receiver<TaskSessionUpdate> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut state) = self.state.lock() {
+            state.subscribers.push(sender);
+        }
+        receiver
+    }
+
+    fn publish(&self, update: TaskSessionUpdate) {
+        if let Ok(mut state) = self.state.lock() {
+            let latest = state
+                .latest_by_session
+                .entry(update.session_id)
+                .or_default();
+            if update.latest_sequence <= *latest {
+                return;
+            }
+            *latest = update.latest_sequence;
+            state
+                .subscribers
+                .retain(|subscriber| subscriber.send(update).is_ok());
+        }
     }
 }
 
@@ -231,18 +377,33 @@ impl std::error::Error for ExecutionEngineError {}
 /// bounded shutdown.
 pub struct ExecutionEngine {
     sender: mpsc::Sender<SchedulerMessage>,
+    notifier: Arc<TaskSessionNotifier>,
     scheduler: Option<JoinHandle<()>>,
 }
 
 impl ExecutionEngine {
     /// Starts an isolated in-memory Scheduler and exactly five reusable Workers.
     pub fn new(executor: MockTaskExecutor) -> Result<Self, ExecutionEngineError> {
+        Self::new_with_executor(Arc::new(executor))
+    }
+
+    /// Starts an isolated Scheduler with a production-capable executor boundary.
+    pub fn new_with_executor(
+        executor: Arc<dyn TaskExecutor>,
+    ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open_in_memory().map_err(ExecutionEngineError::Persistence)?;
         Self::with_store(executor, store)
     }
 
     /// Opens the persistent Scheduler database and starts exactly five reusable Workers.
     pub fn open_persistent(executor: MockTaskExecutor) -> Result<Self, ExecutionEngineError> {
+        Self::open_persistent_with_executor(Arc::new(executor))
+    }
+
+    /// Opens the persistent Scheduler with a production-capable executor boundary.
+    pub fn open_persistent_with_executor(
+        executor: Arc<dyn TaskExecutor>,
+    ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open().map_err(ExecutionEngineError::Persistence)?;
         Self::with_store(executor, store)
     }
@@ -252,25 +413,36 @@ impl ExecutionEngine {
         executor: MockTaskExecutor,
         path: PathBuf,
     ) -> Result<Self, ExecutionEngineError> {
+        Self::open_persistent_at_with_executor(Arc::new(executor), path)
+    }
+
+    /// Opens a persistent Scheduler at an explicit path with a generic executor.
+    pub fn open_persistent_at_with_executor(
+        executor: Arc<dyn TaskExecutor>,
+        path: PathBuf,
+    ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open_at(path).map_err(ExecutionEngineError::Persistence)?;
         Self::with_store(executor, store)
     }
 
     fn with_store(
-        executor: MockTaskExecutor,
+        executor: Arc<dyn TaskExecutor>,
         store: SchedulerStore,
     ) -> Result<Self, ExecutionEngineError> {
         let (sender, receiver) = mpsc::channel();
         let (startup, startup_result) = mpsc::channel();
         let scheduler_sender = sender.clone();
+        let notifier = Arc::new(TaskSessionNotifier::default());
+        let scheduler_notifier = notifier.clone();
         let scheduler = thread::Builder::new()
             .name("spacesly-execution-scheduler".to_string())
             .spawn(move || {
                 run_scheduler(
                     receiver,
                     scheduler_sender,
-                    Arc::new(executor),
+                    executor,
                     store,
+                    scheduler_notifier,
                     startup,
                 )
             })
@@ -278,6 +450,7 @@ impl ExecutionEngine {
         match startup_result.recv() {
             Ok(Ok(())) => Ok(Self {
                 sender,
+                notifier,
                 scheduler: Some(scheduler),
             }),
             Ok(Err(error)) => {
@@ -304,6 +477,59 @@ impl ExecutionEngine {
         let (reply, response) = mpsc::channel();
         self.send(SchedulerCommand::Submit { request, reply })?;
         receive(response)?
+    }
+
+    /// Submits a validated versioned envelope while preserving the legacy mock request API.
+    pub fn submit_envelope(
+        &self,
+        label: impl Into<String>,
+        envelope: &TaskSessionEnvelope,
+    ) -> Result<TaskSessionSnapshot, ExecutionEngineError> {
+        let request = TaskRequest::from_envelope(label, envelope)
+            .map_err(ExecutionEngineError::InvalidRequest)?;
+        self.submit(request)
+    }
+
+    /// Atomically submits a validated envelope and explicit durable capability grants.
+    pub fn submit_envelope_with_grants(
+        &self,
+        label: impl Into<String>,
+        envelope: &TaskSessionEnvelope,
+        capabilities: Vec<String>,
+        grant_source: impl Into<String>,
+    ) -> Result<TaskSessionSnapshot, ExecutionEngineError> {
+        let label = label.into();
+        if label.trim().is_empty() {
+            return Err(ExecutionEngineError::InvalidRequest(
+                "Task label is required.".to_string(),
+            ));
+        }
+        let requested = match envelope {
+            TaskSessionEnvelope::V1(session) => &session.requested_capabilities,
+        };
+        if let Some(capability) = capabilities
+            .iter()
+            .find(|capability| !requested.contains(capability))
+        {
+            return Err(ExecutionEngineError::InvalidRequest(format!(
+                "Task capability '{capability}' was not requested by the envelope."
+            )));
+        }
+        let request = TaskRequest::from_envelope(label, envelope)
+            .map_err(ExecutionEngineError::InvalidRequest)?;
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::SubmitWithGrants {
+            request,
+            capabilities,
+            grant_source: grant_source.into(),
+            reply,
+        })?;
+        receive(response)?
+    }
+
+    /// Subscribes to best-effort post-commit wake-ups; durable replay remains authoritative.
+    pub fn subscribe_updates(&self) -> mpsc::Receiver<TaskSessionUpdate> {
+        self.notifier.subscribe()
     }
 
     /// Requests cancellation of a queued or running task session.
@@ -338,6 +564,21 @@ impl ExecutionEngine {
         let (reply, response) = mpsc::channel();
         self.send(SchedulerCommand::ListWorkers { reply })?;
         receive(response)
+    }
+
+    /// Returns durable Task Session events with sequence greater than the supplied cursor.
+    pub fn events_after(
+        &self,
+        id: TaskSessionId,
+        sequence: u64,
+    ) -> Result<Vec<TaskSessionEvent>, ExecutionEngineError> {
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::ListEvents {
+            id,
+            sequence,
+            reply,
+        })?;
+        receive(response)?
     }
 
     /// Removes a terminal session and its task-local scheduler state.
@@ -415,6 +656,12 @@ enum SchedulerCommand {
         request: TaskRequest,
         reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
     },
+    SubmitWithGrants {
+        request: TaskRequest,
+        capabilities: Vec<String>,
+        grant_source: String,
+        reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
+    },
     Cancel {
         id: TaskSessionId,
         reply: mpsc::Sender<Result<bool, ExecutionEngineError>>,
@@ -428,6 +675,11 @@ enum SchedulerCommand {
     },
     ListWorkers {
         reply: mpsc::Sender<Vec<WorkerSnapshot>>,
+    },
+    ListEvents {
+        id: TaskSessionId,
+        sequence: u64,
+        reply: mpsc::Sender<Result<Vec<TaskSessionEvent>, ExecutionEngineError>>,
     },
     RemoveSession {
         id: TaskSessionId,
@@ -454,6 +706,7 @@ struct WorkerSlot {
 struct TaskAssignment {
     assignment: DurableAssignment,
     cancellation: TaskCancellation,
+    event_sink: TaskEventSink,
 }
 
 enum WorkerCommand {
@@ -470,6 +723,7 @@ enum WorkerOutcome {
 // Single coordinator of durable store transitions and process-local Worker lifecycle mutations.
 struct Scheduler {
     store: SchedulerStore,
+    notifier: Arc<TaskSessionNotifier>,
     owner_id: u64,
     active: HashMap<TaskSessionId, ActiveAssignment>,
     workers: Vec<WorkerSlot>,
@@ -481,6 +735,7 @@ fn run_scheduler(
     sender: mpsc::Sender<SchedulerMessage>,
     executor: Arc<dyn TaskExecutor>,
     store: SchedulerStore,
+    notifier: Arc<TaskSessionNotifier>,
     startup: mpsc::Sender<Result<(), ExecutionEngineError>>,
 ) {
     let owner_id = match store.register_owner() {
@@ -503,6 +758,7 @@ fn run_scheduler(
     };
     let mut scheduler = Scheduler {
         store,
+        notifier,
         owner_id,
         active: HashMap::new(),
         workers,
@@ -522,6 +778,24 @@ fn run_scheduler(
                         .store
                         .enqueue(&request)
                         .map_err(ExecutionEngineError::Persistence);
+                    if let Ok(snapshot) = &result {
+                        scheduler.publish(snapshot);
+                    }
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::SubmitWithGrants {
+                    request,
+                    capabilities,
+                    grant_source,
+                    reply,
+                }) => {
+                    let result = scheduler
+                        .store
+                        .enqueue_with_grants(&request, &capabilities, &grant_source)
+                        .map_err(ExecutionEngineError::Persistence);
+                    if let Ok(snapshot) = &result {
+                        scheduler.publish(snapshot);
+                    }
                     let _ = reply.send(result);
                 }
                 SchedulerMessage::Command(SchedulerCommand::Cancel { id, reply }) => {
@@ -551,6 +825,18 @@ fn run_scheduler(
                             .iter()
                             .map(|worker| worker.snapshot.clone())
                             .collect(),
+                    );
+                }
+                SchedulerMessage::Command(SchedulerCommand::ListEvents {
+                    id,
+                    sequence,
+                    reply,
+                }) => {
+                    let _ = reply.send(
+                        scheduler
+                            .store
+                            .events_after(id, sequence)
+                            .map_err(ExecutionEngineError::Persistence),
                     );
                 }
                 SchedulerMessage::Command(SchedulerCommand::RemoveSession { id, reply }) => {
@@ -584,6 +870,27 @@ fn run_scheduler(
 }
 
 impl Scheduler {
+    fn publish(&self, snapshot: &TaskSessionSnapshot) {
+        self.notifier.publish(TaskSessionUpdate {
+            session_id: snapshot.id,
+            latest_sequence: snapshot.last_event_sequence,
+        });
+    }
+
+    fn publish_current(&self, session_id: TaskSessionId) {
+        if let Ok(Some(snapshot)) = self.store.get_session(session_id) {
+            self.publish(&snapshot);
+        }
+    }
+
+    fn publish_all_current(&self) {
+        if let Ok(sessions) = self.store.list_sessions() {
+            for session in sessions {
+                self.publish(&session);
+            }
+        }
+    }
+
     fn dispatch(&mut self) {
         loop {
             let Some(worker_index) = self
@@ -594,20 +901,28 @@ impl Scheduler {
                 return;
             };
             let worker_id = self.workers[worker_index].snapshot.id;
-            let assignment = match self.store.claim_next(
+            let claim = self.store.claim_next(
                 self.owner_id,
                 worker_id,
                 ASSIGNMENT_LEASE_DURATION,
                 MAX_EXECUTION_WORKERS,
-            ) {
+            );
+            self.publish_all_current();
+            let assignment = match claim {
                 Ok(Some(assignment)) => assignment,
                 Ok(None) | Err(_) => return,
             };
             let session_id = assignment.fence.session_id;
             let cancellation = TaskCancellation::default();
+            let event_sink = TaskEventSink {
+                store: self.store.clone(),
+                fence: assignment.fence,
+                notifier: self.notifier.clone(),
+            };
             let assignment = TaskAssignment {
                 assignment,
                 cancellation: cancellation.clone(),
+                event_sink,
             };
             self.active.insert(
                 session_id,
@@ -625,12 +940,17 @@ impl Scheduler {
                 .is_err()
             {
                 if let Some(active) = self.active.remove(&session_id) {
-                    let _ = self.store.finish(
-                        active.fence,
-                        DurableOutcome::Failed(
-                            "Worker channel closed before dispatch.".to_string(),
+                    if matches!(
+                        self.store.finish(
+                            active.fence,
+                            DurableOutcome::Failed(
+                                "Worker channel closed before dispatch.".to_string(),
+                            ),
                         ),
-                    );
+                        Ok(FinishResult::Applied)
+                    ) {
+                        self.publish_current(session_id);
+                    }
                 }
                 self.workers[worker_index].snapshot.state = WorkerState::Stopped;
                 self.workers[worker_index].snapshot.session_id = None;
@@ -650,6 +970,9 @@ impl Scheduler {
             if let Some(active) = self.active.get(&id) {
                 active.cancellation.cancel();
             }
+        }
+        if result.changed {
+            self.publish(&result.snapshot);
         }
         Ok(result.changed)
     }
@@ -676,7 +999,9 @@ impl Scheduler {
             WorkerOutcome::Failed(error) => DurableOutcome::Failed(error),
             WorkerOutcome::Cancelled => DurableOutcome::Cancelled,
         };
-        let _ = self.store.finish(fence, outcome);
+        if matches!(self.store.finish(fence, outcome), Ok(FinishResult::Applied)) {
+            self.publish_current(session_id);
+        }
     }
 
     fn remove_session(&mut self, id: TaskSessionId) -> Result<bool, ExecutionEngineError> {
@@ -712,7 +1037,17 @@ impl Scheduler {
                 Ok(false) | Err(_) => active.cancellation.cancel(),
             }
         }
-        let _ = self.store.recover_expired();
+        if self
+            .store
+            .recover_expired()
+            .is_ok_and(|recovered| recovered > 0)
+        {
+            if let Ok(sessions) = self.store.list_sessions() {
+                for session in sessions {
+                    self.publish(&session);
+                }
+            }
+        }
         self.next_lease_renewal = Instant::now() + LEASE_RENEW_INTERVAL;
     }
 
@@ -757,7 +1092,9 @@ fn start_workers(
                                 attempt_id: fence.attempt_id,
                                 fencing_token: fence.fencing_token,
                                 request: assignment.assignment.request,
+                                grants: assignment.assignment.grants,
                                 cancellation: assignment.cancellation.clone(),
+                                event_sink: assignment.event_sink,
                             };
                             let result = catch_unwind(AssertUnwindSafe(|| {
                                 worker_executor.execute(&context)
@@ -826,6 +1163,7 @@ fn stop_worker_slots(workers: &mut [WorkerSlot]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task_session::{TaskSessionEnvelopeV1, TaskSessionKind};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1222,6 +1560,302 @@ mod tests {
         );
     }
 
+    #[test]
+    fn versioned_envelope_reaches_the_assignment_unchanged() {
+        let envelope = TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: Some("card-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "digest-1".to_string(),
+            runtime_profile_id: "profile-1".to_string(),
+            model: "model-1".to_string(),
+            connector_ids: vec!["jira".to_string()],
+            requested_capabilities: vec!["workspace_read".to_string()],
+            prompt_template_version: "prompt-v1".to_string(),
+            context_revision: Some("context-v1".to_string()),
+            rules_revision: Some("rules-v1".to_string()),
+            skills_revision: Some("skills-v1".to_string()),
+        });
+        let expected = envelope.clone();
+        let engine = ExecutionEngine::new(MockTaskExecutor::new(move |context| {
+            assert_eq!(
+                context.request().envelope().expect("envelope decoded"),
+                Some(expected.clone())
+            );
+            Ok(())
+        }))
+        .expect("engine starts");
+        let submitted = engine
+            .submit_envelope("versioned", &envelope)
+            .expect("envelope submitted");
+        let completed = engine
+            .wait_for_terminal(submitted.id, TEST_TIMEOUT)
+            .expect("task completes");
+        assert_eq!(
+            completed.request.envelope().expect("envelope decoded"),
+            Some(envelope)
+        );
+    }
+
+    #[test]
+    fn concurrent_sessions_keep_event_streams_isolated() {
+        let engine = ExecutionEngine::new(MockTaskExecutor::new(|context| {
+            let label = context.request().label.clone();
+            context.emit_event(
+                TaskSessionEventKind::Activity,
+                serde_json::json!({ "label": label, "worker_id": context.worker_id() }),
+            )?;
+            thread::sleep(Duration::from_millis(2));
+            context.report_progress(
+                TaskProgress {
+                    phase: "mock_execution".to_string(),
+                    completed: 1,
+                    total: Some(1),
+                },
+                serde_json::json!({ "label": context.request().label }),
+            )?;
+            Ok(())
+        }))
+        .expect("engine starts");
+        let sessions = submit_tasks(&engine, 20, "isolated");
+        wait_for_all(&engine, &sessions);
+
+        for session_id in sessions {
+            let snapshot = engine
+                .session(session_id)
+                .expect("session read")
+                .expect("session exists");
+            let events = engine.events_after(session_id, 0).expect("events read");
+            assert_eq!(events.len(), 5);
+            assert!(events.iter().all(|event| event.session_id == session_id));
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5]
+            );
+            let activity = events
+                .iter()
+                .find(|event| event.kind == TaskSessionEventKind::Activity)
+                .expect("activity exists");
+            assert_eq!(activity.payload["label"], snapshot.request.label);
+            assert_eq!(
+                snapshot.progress,
+                Some(TaskProgress {
+                    phase: "succeeded".to_string(),
+                    completed: 1,
+                    total: Some(1),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn durable_grants_reach_only_the_granted_assignment() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let engine = ExecutionEngine::new(MockTaskExecutor::new({
+            let observed = observed.clone();
+            move |context| {
+                context.authorize_capability("workspace_read")?;
+                assert!(context.authorize_capability("external_tools:jira").is_err());
+                observed.lock().expect("observed lock").push((
+                    context.runtime_attempt_id(),
+                    context
+                        .capability_grants()
+                        .iter()
+                        .map(|grant| grant.capability.clone())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok(())
+            }
+        }))
+        .expect("engine starts");
+        let envelope = test_envelope(vec![
+            "workspace_read".to_string(),
+            "external_tools:jira".to_string(),
+        ]);
+        let submitted = engine
+            .submit_envelope_with_grants(
+                "granted",
+                &envelope,
+                vec!["workspace_read".to_string()],
+                "test-approval",
+            )
+            .expect("granted task submitted");
+        assert_eq!(
+            engine
+                .wait_for_terminal(submitted.id, TEST_TIMEOUT)
+                .expect("task completes")
+                .state,
+            TaskSessionState::Succeeded
+        );
+        let observed = observed.lock().expect("observed lock");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].1, vec!["workspace_read"]);
+        assert!(observed[0]
+            .0
+            .contains(&format!("-{}-attempt-", submitted.id.0)));
+
+        assert!(matches!(
+            engine.submit_envelope_with_grants(
+                "over-granted",
+                &envelope,
+                vec!["shell".to_string()],
+                "test-approval",
+            ),
+            Err(ExecutionEngineError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            engine.submit_envelope_with_grants(
+                "   ",
+                &envelope,
+                vec!["workspace_read".to_string()],
+                "test-approval",
+            ),
+            Err(ExecutionEngineError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn cancellation_revokes_assignment_authority_before_executor_returns() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let authority_revoked = Arc::new(AtomicBool::new(false));
+        let engine = ExecutionEngine::new(MockTaskExecutor::new({
+            let entered = entered.clone();
+            let authority_revoked = authority_revoked.clone();
+            move |context| {
+                context.ensure_current()?;
+                entered.store(true, Ordering::SeqCst);
+                while !context.cancellation().is_cancelled() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                authority_revoked.store(context.ensure_current().is_err(), Ordering::SeqCst);
+                Ok(())
+            }
+        }))
+        .expect("engine starts");
+        let session = engine
+            .submit(TaskRequest::new("authority-cancellation"))
+            .expect("task submitted");
+        wait_until(|| entered.load(Ordering::SeqCst));
+        assert!(engine.cancel(session.id).expect("task cancelled"));
+        assert_eq!(
+            engine
+                .wait_for_terminal(session.id, TEST_TIMEOUT)
+                .expect("task terminates")
+                .state,
+            TaskSessionState::Cancelled
+        );
+        assert!(authority_revoked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn update_subscription_wakes_after_each_committed_event() {
+        let engine = ExecutionEngine::new(MockTaskExecutor::new(|context| {
+            context.emit_event(
+                TaskSessionEventKind::Activity,
+                serde_json::json!({ "message": "working" }),
+            )?;
+            context.report_progress(
+                TaskProgress {
+                    phase: "verifying".to_string(),
+                    completed: 1,
+                    total: Some(1),
+                },
+                serde_json::json!({ "message": "verified" }),
+            )?;
+            Ok(())
+        }))
+        .expect("engine starts");
+        let updates = engine.subscribe_updates();
+        let session = engine
+            .submit(TaskRequest::new("live-progress"))
+            .expect("task submitted");
+        engine
+            .wait_for_terminal(session.id, TEST_TIMEOUT)
+            .expect("task completes");
+
+        let received = (0..5)
+            .map(|_| {
+                updates
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("post-commit update received")
+            })
+            .collect::<Vec<_>>();
+        assert!(received
+            .iter()
+            .all(|update| update.session_id == session.id));
+        assert_eq!(
+            received
+                .iter()
+                .map(|update| update.latest_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        for update in received {
+            assert_eq!(
+                engine
+                    .events_after(session.id, update.latest_sequence - 1)
+                    .expect("journal replayed")[0]
+                    .sequence,
+                update.latest_sequence
+            );
+        }
+    }
+
+    #[test]
+    fn update_notifications_never_move_a_session_cursor_backward() {
+        let notifier = TaskSessionNotifier::default();
+        let updates = notifier.subscribe();
+        let session_id = TaskSessionId(1);
+        notifier.publish(TaskSessionUpdate {
+            session_id,
+            latest_sequence: 2,
+        });
+        notifier.publish(TaskSessionUpdate {
+            session_id,
+            latest_sequence: 1,
+        });
+        assert_eq!(
+            updates.recv_timeout(TEST_TIMEOUT).expect("update received"),
+            TaskSessionUpdate {
+                session_id,
+                latest_sequence: 2,
+            }
+        );
+        assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn runtime_attempt_ids_are_namespaced_per_scheduler_database() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        for label in ["first-database", "second-database"] {
+            let engine = ExecutionEngine::new(MockTaskExecutor::new({
+                let observed = observed.clone();
+                move |context| {
+                    observed
+                        .lock()
+                        .expect("observed lock")
+                        .push(context.runtime_attempt_id());
+                    Ok(())
+                }
+            }))
+            .expect("engine starts");
+            let session = engine
+                .submit(TaskRequest::new(label))
+                .expect("task submitted");
+            engine
+                .wait_for_terminal(session.id, TEST_TIMEOUT)
+                .expect("task completes");
+        }
+        let observed = observed.lock().expect("observed lock");
+        assert_eq!(observed.len(), 2);
+        assert_ne!(observed[0], observed[1]);
+    }
+
     fn submit_tasks(engine: &ExecutionEngine, count: usize, prefix: &str) -> Vec<TaskSessionId> {
         (0..count)
             .map(|index| {
@@ -1270,5 +1904,24 @@ mod tests {
             assert!(Instant::now() < deadline, "condition timed out");
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn test_envelope(requested_capabilities: Vec<String>) -> TaskSessionEnvelope {
+        TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: None,
+            conversation_id: None,
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "digest-1".to_string(),
+            runtime_profile_id: "profile-1".to_string(),
+            model: "model-1".to_string(),
+            connector_ids: Vec::new(),
+            requested_capabilities,
+            prompt_template_version: "prompt-v1".to_string(),
+            context_revision: None,
+            rules_revision: None,
+            skills_revision: None,
+        })
     }
 }
