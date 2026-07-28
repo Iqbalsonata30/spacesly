@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -8,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::jira_rest;
 use super::global_environment::redact_global_environment_values;
+use super::jira_rest;
+use super::scheduler_store::{ExternalAssignmentAuthority, SchedulerStore};
 use super::shell_env::inject_shell_env;
 use super::tool_broker::ToolBroker;
 
@@ -19,6 +21,17 @@ const MCP_HEADER_LINE_LIMIT: usize = 8 * 1024;
 const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MCP_MAX_SESSIONS: usize = 8;
 const MCP_PROXY_COMMAND_ENV: &str = "SPACESLY_MCP_PROXY_COMMAND";
+pub(crate) const MCP_PROXY_AUTHORITY_ENV: &str = "SPACESLY_MCP_PROXY_AUTHORITY";
+pub(crate) const MCP_PROXY_AUTHORITY_MODE_ENV: &str = "SPACESLY_MCP_PROXY_AUTHORITY_MODE";
+pub(crate) const MCP_PROXY_AUTHORITY_MODE_LEGACY: &str = "legacy";
+const MCP_PROXY_AUTHORITY_MODE_REQUIRED: &str = "required";
+pub(crate) const MCP_PROXY_CONNECTOR_ID_ENV: &str = "SPACESLY_MCP_PROXY_CONNECTOR_ID";
+pub(crate) const MCP_PROXY_CONNECTOR_BINDING_ENV: &str = "SPACESLY_MCP_PROXY_CONNECTOR_BINDING";
+
+enum ProxyAssignmentAuthority {
+    Legacy,
+    Fenced(ExternalAssignmentAuthority),
+}
 
 pub fn run_mcp_proxy_from_env() -> Result<(), String> {
     let command_json = std::env::var(MCP_PROXY_COMMAND_ENV)
@@ -31,11 +44,22 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
     if executable.trim().is_empty() {
         return Err("MCP proxy connector executable is empty.".to_string());
     }
+    let authority_mode = optional_unicode_environment(MCP_PROXY_AUTHORITY_MODE_ENV)?;
+    let authority_json = optional_unicode_environment(MCP_PROXY_AUTHORITY_ENV)?;
+    let authority =
+        parse_proxy_assignment_authority(authority_mode.as_deref(), authority_json.as_deref())?;
+    let connector_id = required_unicode_environment(MCP_PROXY_CONNECTOR_ID_ENV)?;
+    let connector_binding = required_unicode_environment(MCP_PROXY_CONNECTOR_BINDING_ENV)?;
+    validate_connector_binding_value(&connector_binding)?;
 
     let mut command = Command::new(executable);
     command
         .args(args)
         .env_remove(MCP_PROXY_COMMAND_ENV)
+        .env_remove(MCP_PROXY_AUTHORITY_ENV)
+        .env_remove(MCP_PROXY_AUTHORITY_MODE_ENV)
+        .env_remove(MCP_PROXY_CONNECTOR_ID_ENV)
+        .env_remove(MCP_PROXY_CONNECTOR_BINDING_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -71,7 +95,13 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
                 }
             }
             if method == Some("tools/call") {
-                if let Err(error) = validate_proxy_tool_call(&message, &request_tools) {
+                if let Err(error) = validate_proxy_request(
+                    &message,
+                    &request_tools,
+                    &authority,
+                    &connector_id,
+                    &connector_binding,
+                ) {
                     write_proxy_error(&request_stdout, message.get("id"), &error)?;
                     continue;
                 }
@@ -130,6 +160,101 @@ fn validate_proxy_tool_call(
         .ok_or_else(|| "MCP tool call did not include arguments.".to_string())?;
     let tools = exposed_tools.lock().map_err(|error| error.to_string())?;
     ToolBroker::validate_mcp_call(name, &tools, arguments)
+}
+
+fn validate_proxy_request(
+    message: &Value,
+    exposed_tools: &Mutex<Vec<String>>,
+    authority: &ProxyAssignmentAuthority,
+    connector_id: &str,
+    connector_binding: &str,
+) -> Result<super::tool_broker::ToolRisk, String> {
+    let risk = validate_proxy_tool_call(message, exposed_tools)?;
+    validate_proxy_assignment_authority(authority, connector_id, connector_binding)?;
+    Ok(risk)
+}
+
+fn validate_proxy_assignment_authority(
+    authority: &ProxyAssignmentAuthority,
+    connector_id: &str,
+    connector_binding: &str,
+) -> Result<(), String> {
+    let authority = match authority {
+        ProxyAssignmentAuthority::Legacy => return Ok(()),
+        ProxyAssignmentAuthority::Fenced(authority) => authority,
+    };
+    if authority.capability != format!("external_tools:{connector_id}")
+        || authority.connector_id != connector_id
+        || authority.connector_binding_digest != connector_binding
+    {
+        return Err("MCP proxy authority did not match this connector.".to_string());
+    }
+    match SchedulerStore::external_authority_is_current(authority)? {
+        true => Ok(()),
+        false => Err("MCP proxy assignment authority is stale, expired, or ungranted.".to_string()),
+    }
+}
+
+fn optional_unicode_environment(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "MCP proxy environment '{name}' was not valid Unicode."
+        )),
+    }
+}
+
+fn required_unicode_environment(name: &str) -> Result<String, String> {
+    optional_unicode_environment(name)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("MCP proxy environment '{name}' was required."))
+}
+
+fn parse_proxy_assignment_authority(
+    mode: Option<&str>,
+    authority_json: Option<&str>,
+) -> Result<ProxyAssignmentAuthority, String> {
+    let mode = mode.unwrap_or(MCP_PROXY_AUTHORITY_MODE_REQUIRED);
+    if !matches!(
+        mode,
+        MCP_PROXY_AUTHORITY_MODE_REQUIRED | MCP_PROXY_AUTHORITY_MODE_LEGACY
+    ) {
+        return Err(format!("Unknown MCP proxy authority mode '{mode}'."));
+    }
+    match authority_json {
+        Some(value) => serde_json::from_str(value)
+            .map(ProxyAssignmentAuthority::Fenced)
+            .map_err(|error| format!("Invalid MCP proxy assignment authority: {error}")),
+        None if mode == MCP_PROXY_AUTHORITY_MODE_LEGACY => Ok(ProxyAssignmentAuthority::Legacy),
+        None => Err("MCP proxy assignment authority was required but not provided.".to_string()),
+    }
+}
+
+pub(crate) fn mcp_connector_binding_digest(
+    connector_id: &str,
+    command: &[String],
+    environment: &HashMap<String, String>,
+) -> Result<String, String> {
+    let connector_id = connector_id.trim();
+    if connector_id.is_empty() {
+        return Err("MCP connector ID is required for proxy binding.".to_string());
+    }
+    let canonical_environment = environment.iter().collect::<BTreeMap<_, _>>();
+    let encoded = serde_json::to_vec(&(connector_id, command, canonical_environment))
+        .map_err(|error| format!("Failed to encode MCP connector binding: {error}"))?;
+    Ok(Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn validate_connector_binding_value(value: &str) -> Result<(), String> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err("MCP proxy connector binding was invalid.".to_string())
+    }
 }
 
 fn write_proxy_error(
@@ -1533,6 +1658,114 @@ done
             "params": { "name": "jira_delete", "arguments": {} }
         });
         assert!(validate_proxy_tool_call(&denied, &tools).is_err());
+    }
+
+    #[test]
+    fn proxy_rechecks_durable_assignment_authority_before_each_tool_call() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = SchedulerStore::open_at(directory.path().join("scheduler.db"))
+            .expect("scheduler store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &crate::domain::task_session::TaskRequest::new("fenced-mcp"),
+                &[
+                    "external_tools:jira-a".to_string(),
+                    "external_tools:jira-b".to_string(),
+                ],
+                "test-approval",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 5)
+            .expect("task claimed")
+            .expect("assignment");
+        let connector_command = vec!["jira-mcp".to_string(), "--stdio".to_string()];
+        let connector_environment = HashMap::from([("JIRA_URL".to_string(), "jira-a".to_string())]);
+        let connector_binding =
+            mcp_connector_binding_digest("jira-a", &connector_command, &connector_environment)
+                .expect("connector bound");
+        let authority = store
+            .external_authority(
+                assignment.fence,
+                "external_tools:jira-a",
+                "jira-a",
+                &connector_binding,
+            )
+            .expect("authority created");
+        let tools = Mutex::new(vec!["jira_search".to_string()]);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "jira_search", "arguments": { "jql": "project = APP" } }
+        });
+
+        assert!(validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(authority.clone()),
+            "jira-a",
+            &connector_binding,
+        )
+        .is_ok());
+
+        let mut ungranted = authority.clone();
+        ungranted.capability = "external_tools:other".to_string();
+        assert!(validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(ungranted),
+            "jira-a",
+            &connector_binding,
+        )
+        .is_err());
+
+        let other_environment = HashMap::from([("JIRA_URL".to_string(), "jira-b".to_string())]);
+        let other_binding =
+            mcp_connector_binding_digest("jira-b", &connector_command, &other_environment)
+                .expect("other connector bound");
+        assert!(validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(authority.clone()),
+            "jira-b",
+            &other_binding,
+        )
+        .is_err());
+
+        let mut stale = authority.clone();
+        stale.fencing_token = stale.fencing_token.saturating_add(1);
+        assert!(validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(stale),
+            "jira-a",
+            &connector_binding,
+        )
+        .is_err());
+
+        store
+            .cancel(session.id)
+            .expect("task cancellation requested");
+        assert!(validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(authority),
+            "jira-a",
+            &connector_binding,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_authority_defaults_to_required_and_legacy_is_explicit() {
+        assert!(parse_proxy_assignment_authority(None, None).is_err());
+        assert!(matches!(
+            parse_proxy_assignment_authority(Some(MCP_PROXY_AUTHORITY_MODE_LEGACY), None),
+            Ok(ProxyAssignmentAuthority::Legacy)
+        ));
+        assert!(parse_proxy_assignment_authority(Some("unknown"), None).is_err());
     }
 
     #[test]

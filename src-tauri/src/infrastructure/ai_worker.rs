@@ -1,5 +1,9 @@
-use super::provider_registry::ApiStyle;
 use super::global_environment::inject_global_environment;
+use super::mcp::{
+    mcp_connector_binding_digest, MCP_PROXY_AUTHORITY_MODE_ENV, MCP_PROXY_AUTHORITY_MODE_LEGACY,
+    MCP_PROXY_CONNECTOR_BINDING_ENV, MCP_PROXY_CONNECTOR_ID_ENV,
+};
+use super::provider_registry::ApiStyle;
 use super::shell_env::inject_shell_env;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use reqwest::blocking::Client;
@@ -1799,10 +1803,26 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
         .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
         .filter_map(|server| {
             let proxy_executable = proxy_executable.as_ref()?;
+            let connector_id = server.secret_id.trim();
+            let connector_binding =
+                mcp_connector_binding_digest(connector_id, &server.command, &server.environment)
+                    .ok()?;
             let mut environment = server.environment.clone();
             environment.insert(
                 "SPACESLY_MCP_PROXY_COMMAND".to_string(),
                 serde_json::to_string(&server.command).ok()?,
+            );
+            environment.insert(
+                MCP_PROXY_AUTHORITY_MODE_ENV.to_string(),
+                MCP_PROXY_AUTHORITY_MODE_LEGACY.to_string(),
+            );
+            environment.insert(
+                MCP_PROXY_CONNECTOR_ID_ENV.to_string(),
+                connector_id.to_string(),
+            );
+            environment.insert(
+                MCP_PROXY_CONNECTOR_BINDING_ENV.to_string(),
+                connector_binding,
             );
             Some((
                 server.name.clone(),
@@ -3035,6 +3055,25 @@ mod tests {
         )
         .expect("proxied command should be valid JSON");
         assert_eq!(proxied_command, ["npx", "-y", "jira-mcp"]);
+        assert_eq!(
+            parsed["mcp"]["spacesly-jira"]["environment"][MCP_PROXY_AUTHORITY_MODE_ENV],
+            MCP_PROXY_AUTHORITY_MODE_LEGACY
+        );
+        assert_eq!(
+            parsed["mcp"]["spacesly-jira"]["environment"][MCP_PROXY_CONNECTOR_ID_ENV],
+            "jira"
+        );
+        assert_eq!(
+            parsed["mcp"]["spacesly-jira"]["environment"][MCP_PROXY_CONNECTOR_BINDING_ENV]
+                .as_str()
+                .expect("connector binding"),
+            mcp_connector_binding_digest(
+                "jira",
+                &["npx".to_string(), "-y".to_string(), "jira-mcp".to_string()],
+                &HashMap::from([("JIRA_URL".to_string(), "https://jira.test".to_string())]),
+            )
+            .expect("expected connector binding")
+        );
         assert_eq!(
             parsed["mcp"]["spacesly-jira"]["environment"]["JIRA_URL"],
             "https://jira.test"

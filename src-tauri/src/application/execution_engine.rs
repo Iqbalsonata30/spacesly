@@ -10,8 +10,10 @@ use crate::domain::task_session::{
     TaskSessionEventInput, TaskSessionEventKind, TaskSessionId, TaskSessionSnapshot,
     TaskSessionState, TaskSessionUpdate,
 };
+use crate::infrastructure::mcp::mcp_connector_binding_digest;
 use crate::infrastructure::scheduler_store::{
-    AssignmentFence, DurableAssignment, DurableOutcome, FinishResult, SchedulerStore,
+    AssignmentFence, DurableAssignment, DurableOutcome, ExternalAssignmentAuthority, FinishResult,
+    SchedulerStore,
 };
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -138,6 +140,29 @@ impl TaskExecutionContext {
                 "Task assignment lacks capability '{capability}'."
             )))
         }
+    }
+
+    /// Creates a non-secret descriptor for a subprocess pre-side-effect authority check.
+    pub fn external_authority(
+        &self,
+        connector_id: &str,
+        connector_command: &[String],
+        connector_environment: &HashMap<String, String>,
+    ) -> Result<ExternalAssignmentAuthority, TaskExecutionError> {
+        let capability = format!("external_tools:{}", connector_id.trim());
+        self.authorize_capability(&capability)?;
+        let connector_binding =
+            mcp_connector_binding_digest(connector_id, connector_command, connector_environment)
+                .map_err(TaskExecutionError::new)?;
+        self.event_sink
+            .store
+            .external_authority(
+                self.event_sink.fence,
+                &capability,
+                connector_id,
+                &connector_binding,
+            )
+            .map_err(TaskExecutionError::new)
     }
 
     /// Returns an attempt-unique identity suitable for runtime and conversation isolation.

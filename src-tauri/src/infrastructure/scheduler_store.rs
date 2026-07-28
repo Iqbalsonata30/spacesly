@@ -12,6 +12,7 @@ use crate::domain::task_session::{
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -25,6 +26,22 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SchedulerStore {
     connection: Arc<Mutex<Connection>>,
     instance_id: Arc<str>,
+    database_path: Option<Arc<PathBuf>>,
+}
+
+/// Non-secret identity checked by a subprocess immediately before forwarding an external call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalAssignmentAuthority {
+    pub scheduler_database: PathBuf,
+    pub scheduler_instance_id: String,
+    pub session_id: TaskSessionId,
+    pub attempt_id: u64,
+    pub attempt: u32,
+    pub owner_id: u64,
+    pub fencing_token: u64,
+    pub capability: String,
+    pub connector_id: String,
+    pub connector_binding_digest: String,
 }
 
 /// Identity required for a Worker to renew or finish one assignment attempt.
@@ -96,14 +113,19 @@ impl SchedulerStore {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("Failed to create scheduler data directory: {error}"))?;
         }
-        let connection = Connection::open(path)
+        let connection = Connection::open(&path)
             .map_err(|error| format!("Failed to open scheduler database: {error}"))?;
-        Self::initialize(connection)
+        let canonical_path = fs::canonicalize(&path)
+            .map_err(|error| format!("Failed to resolve scheduler database path: {error}"))?;
+        Self::initialize(connection, Some(canonical_path))
     }
 
     fn open_read_only_at(path: PathBuf) -> Result<Self, String> {
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|error| format!("Failed to open Task Session query database: {error}"))?;
+        let canonical_path = fs::canonicalize(&path)
+            .map_err(|error| format!("Failed to resolve Task Session query database: {error}"))?;
+        let connection =
+            Connection::open_with_flags(&canonical_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| format!("Failed to open Task Session query database: {error}"))?;
         connection
             .busy_timeout(STORE_BUSY_TIMEOUT)
             .map_err(|error| format!("Failed to configure Task Session query timeout: {error}"))?;
@@ -127,6 +149,7 @@ impl SchedulerStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             instance_id: Arc::from(instance_id),
+            database_path: Some(Arc::new(canonical_path)),
         })
     }
 
@@ -134,10 +157,13 @@ impl SchedulerStore {
     pub fn open_in_memory() -> Result<Self, String> {
         let connection = Connection::open_in_memory()
             .map_err(|error| format!("Failed to open in-memory scheduler database: {error}"))?;
-        Self::initialize(connection)
+        Self::initialize(connection, None)
     }
 
-    fn initialize(mut connection: Connection) -> Result<Self, String> {
+    fn initialize(
+        mut connection: Connection,
+        database_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
         connection
             .busy_timeout(STORE_BUSY_TIMEOUT)
             .map_err(|error| format!("Failed to configure scheduler database timeout: {error}"))?;
@@ -296,11 +322,93 @@ impl SchedulerStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             instance_id: Arc::from(instance_id),
+            database_path: database_path.map(Arc::new),
         })
     }
 
     pub(crate) fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub(crate) fn external_authority(
+        &self,
+        fence: AssignmentFence,
+        capability: &str,
+        connector_id: &str,
+        connector_binding_digest: &str,
+    ) -> Result<ExternalAssignmentAuthority, String> {
+        if capability.trim().is_empty() || capability != capability.trim() {
+            return Err("External assignment capability must be canonical.".to_string());
+        }
+        let connector_id = connector_id.trim();
+        if connector_id.is_empty()
+            || capability != format!("external_tools:{connector_id}")
+            || connector_binding_digest.len() != 64
+            || !connector_binding_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("External assignment connector binding is invalid.".to_string());
+        }
+        let database_path = self.database_path.as_ref().ok_or_else(|| {
+            "External assignment authority requires a persistent store.".to_string()
+        })?;
+        Ok(ExternalAssignmentAuthority {
+            scheduler_database: database_path.as_ref().clone(),
+            scheduler_instance_id: self.instance_id.to_string(),
+            session_id: fence.session_id,
+            attempt_id: fence.attempt_id,
+            attempt: fence.attempt,
+            owner_id: fence.owner_id,
+            fencing_token: fence.fencing_token,
+            capability: capability.to_string(),
+            connector_id: connector_id.to_string(),
+            connector_binding_digest: connector_binding_digest.to_ascii_lowercase(),
+        })
+    }
+
+    pub(crate) fn external_authority_is_current(
+        authority: &ExternalAssignmentAuthority,
+    ) -> Result<bool, String> {
+        let store = Self::open_read_only_at(authority.scheduler_database.clone())?;
+        if store.instance_id() != authority.scheduler_instance_id {
+            return Ok(false);
+        }
+        let connection = store.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT 1
+                   FROM scheduler_task_sessions sessions
+                   JOIN scheduler_task_attempts attempts
+                     ON attempts.attempt_id = sessions.active_attempt_id
+                   JOIN scheduler_task_grants grants
+                     ON grants.session_id = sessions.session_id
+                  WHERE sessions.session_id = ?1
+                    AND sessions.state = 'running'
+                    AND sessions.active_attempt_id = ?2
+                    AND sessions.fencing_token = ?3
+                    AND sessions.lease_expires_at > ?4
+                    AND attempts.session_id = sessions.session_id
+                    AND attempts.attempt_number = ?5
+                    AND attempts.owner_id = ?6
+                    AND attempts.fencing_token = ?3
+                    AND attempts.state = 'running'
+                    AND attempts.lease_expires_at > ?4
+                    AND grants.capability = ?7",
+                params![
+                    to_i64(authority.session_id.0)?,
+                    to_i64(authority.attempt_id)?,
+                    to_i64(authority.fencing_token)?,
+                    to_i64(now_millis())?,
+                    i64::from(authority.attempt),
+                    to_i64(authority.owner_id)?,
+                    authority.capability
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|current| current.is_some())
+            .map_err(|error| format!("Failed to validate external assignment authority: {error}"))
     }
 
     pub(crate) fn register_owner(&self) -> Result<u64, String> {
