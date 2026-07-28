@@ -42,6 +42,25 @@ export {
   listConversations,
   loadConversationMessages,
 } from "$lib/ipc/agent";
+export type {
+  TaskProgress,
+  TaskRequest,
+  TaskSessionEvent,
+  TaskSessionEventKind,
+  TaskSessionEventPage,
+  TaskSessionSnapshot,
+  TaskSessionState,
+  TaskSessionSubscription,
+  TaskSessionUpdate,
+  TaskSessionUpdateWatch,
+} from "$lib/ipc/taskSessions";
+export {
+  getTaskSession,
+  listTaskSessionEvents,
+  listTaskSessions,
+  onTaskSessionUpdated,
+  subscribeTaskSessionReplay,
+} from "$lib/ipc/taskSessions";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {
   listDirectory,

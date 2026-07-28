@@ -12,6 +12,7 @@ use application::git_service::GitService;
 use application::jira_service::JiraService;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
+use domain::task_session::{TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot};
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
@@ -26,7 +27,6 @@ use infrastructure::execution_store::{
     ConversationImportInput, ConversationMessageInput, ExecutionStore,
 };
 use infrastructure::file_watcher::FileWatchRegistry;
-use infrastructure::global_environment::GlobalEnvironmentStore;
 use infrastructure::files::{
     FileEntry, FileSnapshot, FileWriteResult, LineEnding, TextEncoding, WorkspaceRoot,
 };
@@ -35,6 +35,7 @@ use infrastructure::git::git_info_for_path;
 use infrastructure::git::{
     invalidate_workspace_git_status, CommitResult, GitStatus, GitWorkspaceInfo,
 };
+use infrastructure::global_environment::GlobalEnvironmentStore;
 use infrastructure::lsp::{
     LspCodeAction, LspCodeActionRequest, LspCompletionRequest, LspCompletionResult,
     LspDiagnosticReport, LspDocumentSymbol, LspHoverResult, LspLocation, LspPosition, LspRegistry,
@@ -53,6 +54,7 @@ use infrastructure::pty::{
     PtyRegistry, PtyState,
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
+use infrastructure::scheduler_store::SchedulerStore;
 use infrastructure::secrets::{AppSecrets, AppSecretsStore, JiraConnectionProfile};
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
@@ -1601,6 +1603,43 @@ async fn list_active_execution_runs(
 }
 
 #[tauri::command]
+async fn list_task_sessions(
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Vec<TaskSessionSnapshot>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list_sessions())
+        .await
+        .map_err(|error| format!("List Task Sessions task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_task_session(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Option<TaskSessionSnapshot>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.get_session(TaskSessionId(session_id)))
+        .await
+        .map_err(|error| format!("Get Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn list_task_session_events(
+    session_id: u64,
+    after_sequence: u64,
+    limit: Option<usize>,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<TaskSessionEventPage, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session_id = TaskSessionId(session_id);
+        store.event_page(session_id, after_sequence, limit.unwrap_or(100))
+    })
+    .await
+    .map_err(|error| format!("List Task Session events task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -2126,7 +2165,7 @@ pub fn run() {
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
 
-    // Initialize the three most expensive startup resources in parallel:
+    // Initialize the most expensive startup resources in parallel:
     //   - ExecutionStore: opens SQLite + runs schema DDL + recover_interrupted_runs()
     //   - RecoveryStore:  opens SQLite + runs schema DDL + prune_expired()
     //   - AppSecretsStore: reads secrets.json + keyring round-trips
@@ -2144,6 +2183,9 @@ pub fn run() {
     let global_environment_handle = std::thread::spawn(|| {
         GlobalEnvironmentStore::global().expect("failed to initialize global environment")
     });
+    let scheduler_store_handle = std::thread::spawn(|| {
+        SchedulerStore::open_query().expect("failed to initialize Task Session query store")
+    });
 
     let execution_store = execution_handle
         .join()
@@ -2155,6 +2197,9 @@ pub fn run() {
     let global_environment = global_environment_handle
         .join()
         .expect("global environment init panicked");
+    let scheduler_store = scheduler_store_handle
+        .join()
+        .expect("Task Session store init panicked");
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
     let lsp_registry = LspRegistry::default();
@@ -2170,6 +2215,7 @@ pub fn run() {
         .manage(lsp_registry)
         .manage(app_secrets)
         .manage(global_environment)
+        .manage(scheduler_store)
         .manage(AppState::new())
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
@@ -2233,6 +2279,9 @@ pub fn run() {
             save_cached_workspace,
             save_execution_run,
             list_active_execution_runs,
+            list_task_sessions,
+            get_task_session,
+            list_task_session_events,
             format_code,
             get_workspace_git_info,
             get_path_git_info,

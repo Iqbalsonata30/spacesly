@@ -6,10 +6,11 @@
 
 use crate::domain::task_session::{
     TaskCapabilityGrant, TaskProgress, TaskRequest, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionId, TaskSessionSnapshot, TaskSessionState,
+    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
+    TaskSessionState,
 };
 use rusqlite::{
-    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+    params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde_json::json;
 use std::fs;
@@ -69,6 +70,26 @@ impl SchedulerStore {
         Self::open_at(database_path()?)
     }
 
+    /// Opens a query-only connection, bootstrapping or migrating the schema only when required.
+    pub fn open_query() -> Result<Self, String> {
+        Self::open_query_at(database_path()?)
+    }
+
+    fn open_query_at(path: PathBuf) -> Result<Self, String> {
+        match Self::open_read_only_at(path.clone()) {
+            Ok(store) => Ok(store),
+            Err(error)
+                if !path.exists()
+                    || error.contains("no such table")
+                    || error.contains("no such column") =>
+            {
+                drop(Self::open_at(path.clone())?);
+                Self::open_read_only_at(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Opens or creates a persistent Scheduler database at an explicit path.
     pub fn open_at(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
@@ -78,6 +99,35 @@ impl SchedulerStore {
         let connection = Connection::open(path)
             .map_err(|error| format!("Failed to open scheduler database: {error}"))?;
         Self::initialize(connection)
+    }
+
+    fn open_read_only_at(path: PathBuf) -> Result<Self, String> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("Failed to open Task Session query database: {error}"))?;
+        connection
+            .busy_timeout(STORE_BUSY_TIMEOUT)
+            .map_err(|error| format!("Failed to configure Task Session query timeout: {error}"))?;
+        connection
+            .prepare(SESSION_SELECT_ALL)
+            .map_err(|error| format!("Task Session query schema is not ready: {error}"))?;
+        connection
+            .prepare(
+                "SELECT event_id, session_id, attempt_id, fencing_token, sequence,
+                        event_kind, payload_json, progress_json, created_at
+                   FROM scheduler_task_events LIMIT 1",
+            )
+            .map_err(|error| format!("Task Session event schema is not ready: {error}"))?;
+        let instance_id = connection
+            .query_row(
+                "SELECT instance_id FROM scheduler_metadata WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Failed to read scheduler instance ID: {error}"))?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            instance_id: Arc::from(instance_id),
+        })
     }
 
     /// Opens an isolated in-memory Scheduler database.
@@ -449,6 +499,71 @@ impl SchedulerStore {
                 .into_event()
         })
         .collect()
+    }
+
+    pub(crate) fn event_page(
+        &self,
+        session_id: TaskSessionId,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<TaskSessionEventPage, String> {
+        if !(1..=500).contains(&limit) {
+            return Err("Task Session event page limit must be between 1 and 500.".to_string());
+        }
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Failed to start task event page transaction: {error}"))?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM scheduler_task_sessions WHERE session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate Task Session event page: {error}"))?
+            .is_some();
+        if !exists {
+            return Err(format!("Task Session {} was not found.", session_id.0));
+        }
+        let mut statement = transaction
+            .prepare(
+                "SELECT event_id, session_id, attempt_id, fencing_token, sequence,
+                        event_kind, payload_json, progress_json, created_at
+                   FROM scheduler_task_events
+                  WHERE session_id = ?1 AND sequence > ?2
+                  ORDER BY sequence
+                  LIMIT ?3",
+            )
+            .map_err(|error| format!("Failed to prepare task event page: {error}"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_i64(session_id.0)?,
+                    to_i64(sequence)?,
+                    i64::try_from(limit + 1).map_err(|_| "Task event page limit exceeds i64.")?
+                ],
+                stored_event_from_row,
+            )
+            .map_err(|error| format!("Failed to query task event page: {error}"))?;
+        let mut events = rows
+            .map(|row| {
+                row.map_err(|error| format!("Failed to decode task event: {error}"))?
+                    .into_event()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let next_cursor = events.last().map_or(sequence, |event| event.sequence);
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit task event page transaction: {error}"))?;
+        Ok(TaskSessionEventPage {
+            events,
+            next_cursor,
+            has_more,
+        })
     }
 
     #[cfg(test)]
@@ -1619,6 +1734,36 @@ mod tests {
     }
 
     #[test]
+    fn query_store_replays_without_lifecycle_write_authority() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let session = {
+            let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+            store
+                .enqueue_at(&TaskRequest::new("query-only"), 1)
+                .expect("task enqueued")
+        };
+        let query = SchedulerStore::open_query_at(path).expect("query store opens");
+        assert_eq!(
+            query
+                .get_session(session.id)
+                .expect("session read")
+                .expect("session exists")
+                .last_event_sequence,
+            1
+        );
+        assert_eq!(
+            query
+                .event_page(session.id, 0, 100)
+                .expect("event page read")
+                .events
+                .len(),
+            1
+        );
+        assert!(query.enqueue(&TaskRequest::new("forbidden")).is_err());
+    }
+
+    #[test]
     fn sessions_and_fifo_order_survive_reopen() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("scheduler.db");
@@ -2044,6 +2189,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![4, 5]
         );
+        let first_page = reopened
+            .event_page(session.id, 0, 2)
+            .expect("first page replayed");
+        assert_eq!(first_page.next_cursor, 2);
+        assert!(first_page.has_more);
+        assert_eq!(
+            first_page
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let final_page = reopened
+            .event_page(session.id, 4, 2)
+            .expect("final page replayed");
+        assert_eq!(final_page.next_cursor, 5);
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.events.len(), 1);
     }
 
     #[test]

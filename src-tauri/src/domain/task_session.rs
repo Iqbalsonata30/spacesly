@@ -247,6 +247,17 @@ pub struct TaskSessionUpdate {
     pub latest_sequence: u64,
 }
 
+/// Bounded durable journal page returned to replay consumers.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TaskSessionEventPage {
+    /// Ordered events with sequence greater than the requested cursor.
+    pub events: Vec<TaskSessionEvent>,
+    /// Last sequence included in this page, or the requested cursor for an empty page.
+    pub next_cursor: u64,
+    /// True when another bounded page remains available.
+    pub has_more: bool,
+}
+
 /// Stable identifier assigned to one scheduler-managed task session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TaskSessionId(
