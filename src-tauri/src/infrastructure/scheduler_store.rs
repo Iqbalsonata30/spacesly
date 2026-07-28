@@ -66,6 +66,7 @@ pub(crate) struct DurableAssignment {
 pub(crate) enum DurableOutcome {
     Succeeded,
     Failed(String),
+    Blocked(String),
     Cancelled,
 }
 
@@ -1062,6 +1063,7 @@ impl SchedulerStore {
             match outcome {
                 DurableOutcome::Succeeded => ("succeeded", "succeeded", None),
                 DurableOutcome::Failed(error) => ("failed", "failed", Some(error)),
+                DurableOutcome::Blocked(error) => ("blocked", "blocked", Some(error)),
                 DurableOutcome::Cancelled => ("cancelled", "cancelled", None),
             }
         };
@@ -1158,7 +1160,7 @@ impl SchedulerStore {
         connection
             .execute(
                 "DELETE FROM scheduler_task_sessions
-                  WHERE session_id = ?1 AND state IN ('succeeded', 'failed', 'cancelled')",
+                  WHERE session_id = ?1 AND state IN ('succeeded', 'failed', 'blocked', 'cancelled')",
                 params![to_i64(id.0)?],
             )
             .map(|updated| updated == 1)
@@ -1666,6 +1668,7 @@ fn parse_state(value: &str) -> Result<TaskSessionState, String> {
         "cancelling" => Ok(TaskSessionState::Cancelling),
         "succeeded" => Ok(TaskSessionState::Succeeded),
         "failed" => Ok(TaskSessionState::Failed),
+        "blocked" => Ok(TaskSessionState::Blocked),
         "cancelled" => Ok(TaskSessionState::Cancelled),
         _ => Err(format!("Unknown task session state '{value}'.")),
     }

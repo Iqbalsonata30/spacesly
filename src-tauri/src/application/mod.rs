@@ -1,3 +1,4 @@
+pub mod agent_task_executor;
 pub mod app;
 // The pool is intentionally disconnected until the approved runtime integration phase.
 #[allow(dead_code)]

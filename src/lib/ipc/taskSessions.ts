@@ -3,7 +3,7 @@ import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 const TASK_SESSION_POLL_INTERVAL_MS = 500;
 
 export type TaskSessionState =
-  "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
+  "queued" | "running" | "cancelling" | "succeeded" | "failed" | "blocked" | "cancelled";
 
 export type TaskSessionEventKind = "lifecycle" | "activity" | "progress" | "runtime" | "tool";
 

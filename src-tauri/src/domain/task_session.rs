@@ -6,6 +6,7 @@
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// Current schema version for durable Task Session execution envelopes.
 pub const TASK_SESSION_ENVELOPE_VERSION: u32 = 1;
@@ -72,11 +73,13 @@ impl TaskSessionEnvelopeV1 {
                 return Err(format!("Task Session envelope field '{name}' is required."));
             }
         }
-        if self
-            .connector_ids
-            .iter()
-            .any(|value| value.trim().is_empty() || value != value.trim())
-        {
+        if self.connector_ids.iter().any(|value| {
+            value.trim().is_empty()
+                || value != value.trim()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }) {
             return Err(
                 "Task Session connector IDs must be non-empty canonical values.".to_string(),
             );
@@ -88,6 +91,31 @@ impl TaskSessionEnvelopeV1 {
         {
             return Err(
                 "Task Session capabilities must be non-empty canonical values.".to_string(),
+            );
+        }
+        let connectors = self
+            .connector_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if connectors.len() != self.connector_ids.len() {
+            return Err("Task Session connector IDs must be unique.".to_string());
+        }
+        let external_capabilities = self
+            .requested_capabilities
+            .iter()
+            .filter_map(|capability| capability.strip_prefix("external_tools:"))
+            .collect::<HashSet<_>>();
+        if self
+            .connector_ids
+            .iter()
+            .any(|connector| !external_capabilities.contains(connector.as_str()))
+            || external_capabilities
+                .iter()
+                .any(|connector| !connectors.contains(connector))
+        {
+            return Err(
+                "Task Session connectors and external tool capabilities must match.".to_string(),
             );
         }
         Ok(())
@@ -279,6 +307,8 @@ pub enum TaskSessionState {
     Succeeded,
     /// Mock execution returned an error or panicked.
     Failed,
+    /// Execution could not continue without operator action.
+    Blocked,
     /// Session was cancelled before dispatch or during execution.
     Cancelled,
 }
@@ -286,7 +316,10 @@ pub enum TaskSessionState {
 impl TaskSessionState {
     /// Returns true when the session cannot transition without an explicit retry.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Blocked | Self::Cancelled
+        )
     }
 }
 
@@ -393,7 +426,10 @@ mod tests {
             runtime_profile_id: "openai".to_string(),
             model: "gpt-5".to_string(),
             connector_ids: vec!["jira".to_string()],
-            requested_capabilities: vec!["workspace_read".to_string()],
+            requested_capabilities: vec![
+                "workspace_read".to_string(),
+                "external_tools:jira".to_string(),
+            ],
             prompt_template_version: "agent-v1".to_string(),
             context_revision: Some("context-7".to_string()),
             rules_revision: Some("rules-2".to_string()),
@@ -449,6 +485,27 @@ mod tests {
             model: "model".to_string(),
             connector_ids: Vec::new(),
             requested_capabilities: vec![" shell ".to_string()],
+            prompt_template_version: "v1".to_string(),
+            context_revision: None,
+            rules_revision: None,
+            skills_revision: None,
+        };
+        assert!(envelope.validate().is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_connector_glob_characters() {
+        let envelope = TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: None,
+            conversation_id: None,
+            execution_run_id: None,
+            context_digest: "digest".to_string(),
+            runtime_profile_id: "profile".to_string(),
+            model: "model".to_string(),
+            connector_ids: vec!["jira*".to_string()],
+            requested_capabilities: vec!["external_tools:jira*".to_string()],
             prompt_template_version: "v1".to_string(),
             context_revision: None,
             rules_revision: None,

@@ -2123,6 +2123,8 @@ mod tests {
             agent_skills: String::new(),
             temperature: 0.2,
             restrict_tools: false,
+            fenced_tools_only: false,
+            isolated_opencode_process: false,
             mcp_servers: Vec::new(),
         };
 
@@ -2152,6 +2154,8 @@ mod tests {
             agent_skills: String::new(),
             temperature: 0.0,
             restrict_tools: false,
+            fenced_tools_only: false,
+            isolated_opencode_process: false,
             mcp_servers: Vec::new(),
         };
 

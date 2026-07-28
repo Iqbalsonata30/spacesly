@@ -251,6 +251,10 @@ pub struct AiWorkerConfig {
     pub temperature: f32,
     #[serde(skip)]
     pub restrict_tools: bool,
+    #[serde(skip)]
+    pub fenced_tools_only: bool,
+    #[serde(skip)]
+    pub isolated_opencode_process: bool,
     #[serde(default)]
     pub mcp_servers: Vec<AiWorkerMcpServer>,
 }
@@ -357,6 +361,8 @@ pub enum AiWorkerStreamEvent {
         output_tokens: u64,
     },
 }
+
+pub type AiWorkerEventCallback = Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AiEditRequest {
@@ -472,7 +478,7 @@ pub fn execute_ai_worker_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     cancellation: Arc<AtomicBool>,
-    on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
+    on_event: Option<AiWorkerEventCallback>,
 ) -> Result<AiWorkerTaskResult, String> {
     check_cancelled(&cancellation)?;
     require_execution_contract(&task)?;
@@ -1089,9 +1095,13 @@ fn execute_opencode_task(
     let start_head = git_head(&config);
     let context = ContextBuilder::new(&config);
     let prompt = context.opencode_agent_prompt(&task);
-    let (server, server_startup_error) = match opencode_server(&config) {
-        Ok(server) => (Some(server), None),
-        Err(error) => (None, Some(error)),
+    let (server, server_startup_error) = if config.isolated_opencode_process {
+        (None, None)
+    } else {
+        match opencode_server(&config) {
+            Ok(server) => (Some(server), None),
+            Err(error) => (None, Some(error)),
+        }
     };
     let session = server
         .as_ref()
@@ -1853,20 +1863,20 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    if mcp.is_empty() && !config.restrict_tools {
+    if mcp.is_empty() && !config.restrict_tools && !config.fenced_tools_only {
         return None;
     }
 
-    let serialized = if config.restrict_tools {
-        serde_json::json!({
-            "mcp": {},
-            "permission": {
-                "edit": "deny",
-                "bash": "deny",
-                "webfetch": "deny",
-                "task": "deny",
-                "external_directory": "deny"
+    let serialized = if config.restrict_tools || config.fenced_tools_only {
+        let mut permission = BTreeMap::from([("*".to_string(), "deny")]);
+        if config.fenced_tools_only {
+            for server_name in mcp.keys() {
+                permission.insert(format!("{server_name}_*"), "allow");
             }
+        }
+        serde_json::json!({
+            "mcp": if config.restrict_tools { BTreeMap::new() } else { mcp },
+            "permission": permission,
         })
         .to_string()
     } else {
@@ -2823,6 +2833,8 @@ mod tests {
             agent_skills: skills.to_string(),
             temperature: 0.2,
             restrict_tools: false,
+            fenced_tools_only: false,
+            isolated_opencode_process: false,
             mcp_servers: Vec::new(),
         }
     }
@@ -3102,6 +3114,7 @@ mod tests {
     #[test]
     fn backend_authority_switches_mcp_proxy_to_required_mode() {
         let mut config = config_with_governance("", "");
+        config.fenced_tools_only = true;
         config.mcp_servers.push(AiWorkerMcpServer {
             name: "spacesly-jira".to_string(),
             secret_id: "jira".to_string(),
@@ -3136,6 +3149,9 @@ mod tests {
         assert!(environment[MCP_PROXY_AUTHORITY_ENV]
             .as_str()
             .is_some_and(|value| value.contains("external_tools:jira")));
+        assert_eq!(parsed["permission"]["*"], "deny");
+        assert_eq!(parsed["permission"]["spacesly-jira_*"], "allow");
+        assert!(parsed["mcp"]["spacesly-jira"].is_object());
 
         let renderer_server: AiWorkerMcpServer = serde_json::from_value(serde_json::json!({
             "name": "spacesly-jira",

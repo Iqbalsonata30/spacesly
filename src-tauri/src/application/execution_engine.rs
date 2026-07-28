@@ -65,6 +65,11 @@ impl TaskCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Returns the shared cancellation flag expected by provider runtime adapters.
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -182,6 +187,38 @@ impl TaskExecutionContext {
         kind: TaskSessionEventKind,
         payload: serde_json::Value,
     ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        self.event_reporter().emit_event(kind, payload)
+    }
+
+    /// Appends a progress event and atomically updates the session progress projection.
+    pub fn report_progress(
+        &self,
+        progress: TaskProgress,
+        payload: serde_json::Value,
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        self.event_reporter().report_progress(progress, payload)
+    }
+
+    /// Returns a cloneable assignment-fenced reporter for synchronous runtime callbacks.
+    pub fn event_reporter(&self) -> TaskEventReporter {
+        TaskEventReporter {
+            event_sink: self.event_sink.clone(),
+        }
+    }
+}
+
+/// Cloneable journal writer scoped to one current assignment attempt.
+#[derive(Clone)]
+pub struct TaskEventReporter {
+    event_sink: TaskEventSink,
+}
+
+impl TaskEventReporter {
+    pub fn emit_event(
+        &self,
+        kind: TaskSessionEventKind,
+        payload: serde_json::Value,
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
         if matches!(
             kind,
             TaskSessionEventKind::Lifecycle | TaskSessionEventKind::Progress
@@ -197,7 +234,6 @@ impl TaskExecutionContext {
         })
     }
 
-    /// Appends a progress event and atomically updates the session progress projection.
     pub fn report_progress(
         &self,
         progress: TaskProgress,
@@ -283,6 +319,13 @@ impl TaskSessionNotifier {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskExecutionError {
     message: String,
+    disposition: TaskExecutionDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskExecutionDisposition {
+    Failed,
+    Blocked,
 }
 
 impl TaskExecutionError {
@@ -290,12 +333,25 @@ impl TaskExecutionError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            disposition: TaskExecutionDisposition::Failed,
+        }
+    }
+
+    /// Creates an operator-actionable blocked outcome.
+    pub fn blocked(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            disposition: TaskExecutionDisposition::Blocked,
         }
     }
 
     /// Returns the failure description.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.disposition == TaskExecutionDisposition::Blocked
     }
 }
 
@@ -742,6 +798,7 @@ enum WorkerCommand {
 enum WorkerOutcome {
     Succeeded,
     Failed(String),
+    Blocked(String),
     Cancelled,
 }
 
@@ -1022,6 +1079,7 @@ impl Scheduler {
         let outcome = match outcome {
             WorkerOutcome::Succeeded => DurableOutcome::Succeeded,
             WorkerOutcome::Failed(error) => DurableOutcome::Failed(error),
+            WorkerOutcome::Blocked(error) => DurableOutcome::Blocked(error),
             WorkerOutcome::Cancelled => DurableOutcome::Cancelled,
         };
         if matches!(self.store.finish(fence, outcome), Ok(FinishResult::Applied)) {
@@ -1129,6 +1187,9 @@ fn start_workers(
                             } else {
                                 match result {
                                     Ok(Ok(())) => WorkerOutcome::Succeeded,
+                                    Ok(Err(error)) if error.is_blocked() => {
+                                        WorkerOutcome::Blocked(error.message().to_string())
+                                    }
                                     Ok(Err(error)) => {
                                         WorkerOutcome::Failed(error.message().to_string())
                                     }
@@ -1597,7 +1658,10 @@ mod tests {
             runtime_profile_id: "profile-1".to_string(),
             model: "model-1".to_string(),
             connector_ids: vec!["jira".to_string()],
-            requested_capabilities: vec!["workspace_read".to_string()],
+            requested_capabilities: vec![
+                "workspace_read".to_string(),
+                "external_tools:jira".to_string(),
+            ],
             prompt_template_version: "prompt-v1".to_string(),
             context_revision: Some("context-v1".to_string()),
             rules_revision: Some("rules-v1".to_string()),
@@ -1932,6 +1996,11 @@ mod tests {
     }
 
     fn test_envelope(requested_capabilities: Vec<String>) -> TaskSessionEnvelope {
+        let connector_ids = requested_capabilities
+            .iter()
+            .filter_map(|capability| capability.strip_prefix("external_tools:"))
+            .map(str::to_string)
+            .collect();
         TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
             workspace_id: "workspace-personal".to_string(),
             kind: TaskSessionKind::Agent,
@@ -1941,7 +2010,7 @@ mod tests {
             context_digest: "digest-1".to_string(),
             runtime_profile_id: "profile-1".to_string(),
             model: "model-1".to_string(),
-            connector_ids: Vec::new(),
+            connector_ids,
             requested_capabilities,
             prompt_template_version: "prompt-v1".to_string(),
             context_revision: None,

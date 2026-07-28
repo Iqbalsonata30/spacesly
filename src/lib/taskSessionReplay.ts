@@ -66,6 +66,7 @@ function isTaskSessionState(value: unknown): value is TaskSessionState {
     value === "cancelling" ||
     value === "succeeded" ||
     value === "failed" ||
+    value === "blocked" ||
     value === "cancelled"
   );
 }
