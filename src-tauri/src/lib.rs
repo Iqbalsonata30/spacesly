@@ -6,13 +6,18 @@ pub fn run_mcp_proxy() -> Result<(), String> {
     infrastructure::mcp::run_mcp_proxy_from_env()
 }
 
+use application::agent_task_executor::{AgentTaskExecutor, AiWorkerRuntimeRunner};
 use application::app::AppState;
+use application::execution_engine::ExecutionEngine;
 use application::files_service::FilesService;
 use application::git_service::GitService;
 use application::jira_service::JiraService;
+use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
-use domain::task_session::{TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot};
+use domain::task_session::{
+    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionKind, TaskSessionSnapshot,
+};
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
@@ -54,6 +59,7 @@ use infrastructure::pty::{
     PtyRegistry, PtyState,
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
+use infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
 use infrastructure::scheduler_store::SchedulerStore;
 use infrastructure::secrets::{AppSecrets, AppSecretsStore, JiraConnectionProfile};
 use infrastructure::shell::{
@@ -1613,6 +1619,83 @@ async fn list_task_sessions(
 }
 
 #[tauri::command]
+async fn list_agent_runtime_profiles(
+    profile_store: State<'_, RuntimeProfileStore>,
+) -> Result<Vec<AgentRuntimeProfile>, String> {
+    let store = profile_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list())
+        .await
+        .map_err(|error| format!("List Agent runtime profiles task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn save_agent_runtime_profile(
+    profile: AgentRuntimeProfile,
+    profile_store: State<'_, RuntimeProfileStore>,
+) -> Result<AgentRuntimeProfile, String> {
+    let store = profile_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save(&profile))
+        .await
+        .map_err(|error| format!("Save Agent runtime profile task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn submit_task_session(
+    label: String,
+    envelope: TaskSessionEnvelope,
+    granted_capabilities: Vec<String>,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<TaskSessionSnapshot, String> {
+    let TaskSessionEnvelope::V1(session) = &envelope;
+    if session.kind != TaskSessionKind::Agent {
+        return Err("The live Task Session runtime currently accepts Agent sessions only.".to_string());
+    }
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .submit_envelope_with_grants(
+                label,
+                &envelope,
+                granted_capabilities,
+                "renderer_user_approval",
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Submit Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cancel_task_session(
+    session_id: u64,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<bool, String> {
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .cancel(TaskSessionId(session_id))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Cancel Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn remove_task_session(
+    session_id: u64,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<bool, String> {
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .remove_session(TaskSessionId(session_id))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Remove Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn get_task_session(
     session_id: u64,
     scheduler_store: State<'_, SchedulerStore>,
@@ -2175,7 +2258,7 @@ pub fn run() {
     //   - AppSecretsStore: reads secrets.json + keyring round-trips
     //   - GlobalEnvironmentStore: reads managed process environment variables
     //
-    // Each opens a different file so there is no contention. Running all three
+    // Each opens a different file so there is no contention. Running them
     // concurrently reduces the serial startup chain from ~3×T to ~max(T).
     let execution_handle = std::thread::spawn(|| {
         ExecutionStore::open().expect("failed to initialize execution store")
@@ -2189,6 +2272,9 @@ pub fn run() {
     });
     let scheduler_store_handle = std::thread::spawn(|| {
         SchedulerStore::open_query().expect("failed to initialize Task Session query store")
+    });
+    let runtime_profile_handle = std::thread::spawn(|| {
+        RuntimeProfileStore::open().expect("failed to initialize Agent runtime profiles")
     });
 
     let execution_store = execution_handle
@@ -2204,8 +2290,24 @@ pub fn run() {
     let scheduler_store = scheduler_store_handle
         .join()
         .expect("Task Session store init panicked");
+    let runtime_profile_store = runtime_profile_handle
+        .join()
+        .expect("Agent runtime profile store init panicked");
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
+    let runtime_resolver = StoredAgentRuntimeResolver::new(
+        runtime_profile_store.clone(),
+        execution_store.clone(),
+        app_secrets.clone(),
+        workspace_root.clone(),
+        workspace_trust.clone(),
+    );
+    let task_executor =
+        AgentTaskExecutor::new(Arc::new(runtime_resolver), Arc::new(AiWorkerRuntimeRunner));
+    let execution_engine = Arc::new(
+        ExecutionEngine::open_persistent_with_executor(Arc::new(task_executor))
+            .expect("failed to initialize Task Session execution engine"),
+    );
     let lsp_registry = LspRegistry::default();
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
@@ -2220,6 +2322,8 @@ pub fn run() {
         .manage(app_secrets)
         .manage(global_environment)
         .manage(scheduler_store)
+        .manage(runtime_profile_store)
+        .manage(execution_engine)
         .manage(AppState::new())
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
@@ -2286,6 +2390,11 @@ pub fn run() {
             list_task_sessions,
             get_task_session,
             list_task_session_events,
+            list_agent_runtime_profiles,
+            save_agent_runtime_profile,
+            submit_task_session,
+            cancel_task_session,
+            remove_task_session,
             format_code,
             get_workspace_git_info,
             get_path_git_info,

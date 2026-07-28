@@ -46,6 +46,7 @@ export const IPC_POLICIES = {
   pty: { timeoutMs: 5_000, retries: 0 },
   secret: { timeoutMs: 10_000, retries: 0 },
   shellCompletion: { timeoutMs: 3_000, retries: 0 },
+  taskSessionMutation: { timeoutMs: 15_000, retries: 0 },
   taskSessionRead: { timeoutMs: 15_000, retries: 1, retryDelayMs: 250 },
   workspaceCache: { timeoutMs: 10_000, retries: 0 },
 } satisfies Record<string, IpcPolicy>;

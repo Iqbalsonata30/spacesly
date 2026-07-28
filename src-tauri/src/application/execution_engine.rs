@@ -1252,7 +1252,7 @@ mod tests {
     use crate::domain::task_session::{TaskSessionEnvelopeV1, TaskSessionKind};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
     use tempfile::tempdir;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1318,8 +1318,15 @@ mod tests {
 
     #[test]
     fn long_lived_workers_are_reused_across_batches() {
-        let engine = ExecutionEngine::new(MockTaskExecutor::succeeding(Duration::from_millis(20)))
-            .expect("engine starts");
+        let barrier = Arc::new(Barrier::new(MAX_EXECUTION_WORKERS));
+        let executor = MockTaskExecutor::new({
+            let barrier = barrier.clone();
+            move |_| {
+                barrier.wait();
+                Ok(())
+            }
+        });
+        let engine = ExecutionEngine::new(executor).expect("engine starts");
         let first = submit_tasks(&engine, 5, "first");
         wait_for_all(&engine, &first);
         let first_workers = worker_ids(&engine, &first);

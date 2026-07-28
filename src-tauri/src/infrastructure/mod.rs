@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod provider_registry;
 pub mod pty;
 pub mod recovery_store;
+pub mod runtime_profile_store;
 pub mod scheduler_store;
 pub mod secrets;
 pub mod shell;

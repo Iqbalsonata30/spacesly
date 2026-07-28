@@ -110,7 +110,7 @@ impl TaskExecutor for AgentTaskExecutor {
         let mut resolved = self
             .resolver
             .resolve(&envelope, &runtime_attempt_id)
-            .map_err(TaskExecutionError::new)?;
+            .map_err(TaskExecutionError::blocked)?;
         validate_resolved_task(&envelope, &resolved).map_err(TaskExecutionError::new)?;
         let requested = envelope
             .requested_capabilities

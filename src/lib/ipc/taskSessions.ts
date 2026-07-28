@@ -7,6 +7,42 @@ export type TaskSessionState =
 
 export type TaskSessionEventKind = "lifecycle" | "activity" | "progress" | "runtime" | "tool";
 
+export type TaskSessionKind = "agent" | "chat" | "edit";
+
+export type TaskSessionEnvelope = {
+  schema_version: 1;
+  session: {
+    workspace_id: string;
+    kind: TaskSessionKind;
+    subject_id: string | null;
+    conversation_id: string | null;
+    execution_run_id: string | null;
+    context_digest: string;
+    runtime_profile_id: string;
+    model: string;
+    connector_ids: string[];
+    requested_capabilities: string[];
+    prompt_template_version: string;
+    context_revision: string | null;
+    rules_revision: string | null;
+    skills_revision: string | null;
+  };
+};
+
+export type AgentRuntimeProfile = {
+  id: string;
+  runtime: "opencode";
+  model: string;
+  opencode_command: string;
+  agent_rules: string;
+  agent_skills: string;
+  temperature: number;
+  connector_ids: string[];
+  prompt_template_version: string;
+  rules_revision: string;
+  skills_revision: string;
+};
+
 export type TaskProgress = {
   phase: string;
   completed: number;
@@ -72,6 +108,48 @@ export type TaskSessionUpdateWatch = {
 
 export function listTaskSessions(): Promise<TaskSessionSnapshot[]> {
   return invokeWithPolicy("list_task_sessions", {}, IPC_POLICIES.taskSessionRead);
+}
+
+export function listAgentRuntimeProfiles(): Promise<AgentRuntimeProfile[]> {
+  return invokeWithPolicy("list_agent_runtime_profiles", {}, IPC_POLICIES.taskSessionRead);
+}
+
+export function saveAgentRuntimeProfile(
+  profile: AgentRuntimeProfile,
+): Promise<AgentRuntimeProfile> {
+  return invokeWithPolicy(
+    "save_agent_runtime_profile",
+    { profile },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+export function submitTaskSession(
+  label: string,
+  envelope: TaskSessionEnvelope,
+  grantedCapabilities: string[],
+): Promise<TaskSessionSnapshot> {
+  return invokeWithPolicy(
+    "submit_task_session",
+    { label, envelope, grantedCapabilities },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+export function cancelTaskSession(sessionId: number): Promise<boolean> {
+  return invokeWithPolicy(
+    "cancel_task_session",
+    { sessionId },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+export function removeTaskSession(sessionId: number): Promise<boolean> {
+  return invokeWithPolicy(
+    "remove_task_session",
+    { sessionId },
+    IPC_POLICIES.taskSessionMutation,
+  );
 }
 
 export function getTaskSession(sessionId: number): Promise<TaskSessionSnapshot | null> {
