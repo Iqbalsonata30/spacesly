@@ -1,16 +1,20 @@
 //! Backend-owned FIFO Scheduler and fixed-size reusable Worker Pool.
 //!
-//! `ExecutionEngine` owns one Scheduler thread. The Scheduler exclusively owns all queue,
-//! session, assignment, and Worker lifecycle state. Five Worker threads are created once, execute
-//! one mock Task Session at a time, reset their task-local context, and return to idle until the
-//! engine is dropped.
+//! `ExecutionEngine` owns one Scheduler thread. `SchedulerStore` owns durable queue, session, and
+//! assignment state; the Scheduler owns process-local Worker and cancellation handles. Five Worker
+//! threads are created once, execute one mock Task Session at a time, reset their task-local
+//! context, and return to idle until the engine is dropped.
 
 use crate::domain::task_session::{
-    TaskRequest, TaskSession, TaskSessionId, TaskSessionSnapshot, TaskSessionState,
+    TaskRequest, TaskSessionId, TaskSessionSnapshot, TaskSessionState,
 };
-use std::collections::{HashMap, VecDeque};
+use crate::infrastructure::scheduler_store::{
+    AssignmentFence, DurableAssignment, DurableOutcome, SchedulerStore,
+};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
@@ -18,6 +22,8 @@ use std::time::{Duration, Instant};
 
 /// Fixed number of long-lived workers owned by one execution engine.
 pub const MAX_EXECUTION_WORKERS: usize = 5;
+const ASSIGNMENT_LEASE_DURATION: Duration = Duration::from_secs(30);
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Observable lifecycle state of one reusable worker slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +70,8 @@ impl TaskCancellation {
 pub struct TaskExecutionContext {
     session_id: TaskSessionId,
     worker_id: usize,
+    attempt_id: u64,
+    fencing_token: u64,
     request: TaskRequest,
     cancellation: TaskCancellation,
 }
@@ -77,6 +85,16 @@ impl TaskExecutionContext {
     /// Returns the stable worker slot executing this assignment.
     pub fn worker_id(&self) -> usize {
         self.worker_id
+    }
+
+    /// Returns the durable assignment attempt identifier.
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt_id
+    }
+
+    /// Returns the token required to fence stale assignment completion.
+    pub fn fencing_token(&self) -> u64 {
+        self.fencing_token
     }
 
     /// Returns the immutable request submitted for this session.
@@ -179,6 +197,8 @@ pub enum ExecutionEngineError {
     WaitTimeout(TaskSessionId),
     /// The submitted request failed validation.
     InvalidRequest(String),
+    /// Durable Scheduler storage could not complete an operation.
+    Persistence(String),
 }
 
 impl Display for ExecutionEngineError {
@@ -195,6 +215,9 @@ impl Display for ExecutionEngineError {
                 write!(formatter, "Timed out waiting for task session {}.", id.0)
             }
             Self::InvalidRequest(message) => formatter.write_str(message),
+            Self::Persistence(message) => {
+                write!(formatter, "Scheduler persistence failed: {message}")
+            }
         }
     }
 }
@@ -212,14 +235,45 @@ pub struct ExecutionEngine {
 }
 
 impl ExecutionEngine {
-    /// Starts a Scheduler and exactly five reusable Workers using the supplied mock executor.
+    /// Starts an isolated in-memory Scheduler and exactly five reusable Workers.
     pub fn new(executor: MockTaskExecutor) -> Result<Self, ExecutionEngineError> {
+        let store = SchedulerStore::open_in_memory().map_err(ExecutionEngineError::Persistence)?;
+        Self::with_store(executor, store)
+    }
+
+    /// Opens the persistent Scheduler database and starts exactly five reusable Workers.
+    pub fn open_persistent(executor: MockTaskExecutor) -> Result<Self, ExecutionEngineError> {
+        let store = SchedulerStore::open().map_err(ExecutionEngineError::Persistence)?;
+        Self::with_store(executor, store)
+    }
+
+    /// Opens a persistent Scheduler database at an explicit path.
+    pub fn open_persistent_at(
+        executor: MockTaskExecutor,
+        path: PathBuf,
+    ) -> Result<Self, ExecutionEngineError> {
+        let store = SchedulerStore::open_at(path).map_err(ExecutionEngineError::Persistence)?;
+        Self::with_store(executor, store)
+    }
+
+    fn with_store(
+        executor: MockTaskExecutor,
+        store: SchedulerStore,
+    ) -> Result<Self, ExecutionEngineError> {
         let (sender, receiver) = mpsc::channel();
         let (startup, startup_result) = mpsc::channel();
         let scheduler_sender = sender.clone();
         let scheduler = thread::Builder::new()
             .name("spacesly-execution-scheduler".to_string())
-            .spawn(move || run_scheduler(receiver, scheduler_sender, Arc::new(executor), startup))
+            .spawn(move || {
+                run_scheduler(
+                    receiver,
+                    scheduler_sender,
+                    Arc::new(executor),
+                    store,
+                    startup,
+                )
+            })
             .map_err(|_| ExecutionEngineError::SchedulerUnavailable)?;
         match startup_result.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -249,7 +303,7 @@ impl ExecutionEngine {
         }
         let (reply, response) = mpsc::channel();
         self.send(SchedulerCommand::Submit { request, reply })?;
-        receive(response)
+        receive(response)?
     }
 
     /// Requests cancellation of a queued or running task session.
@@ -269,14 +323,14 @@ impl ExecutionEngine {
     ) -> Result<Option<TaskSessionSnapshot>, ExecutionEngineError> {
         let (reply, response) = mpsc::channel();
         self.send(SchedulerCommand::GetSession { id, reply })?;
-        receive(response)
+        receive(response)?
     }
 
     /// Returns every session currently owned by the Scheduler, ordered by session ID.
     pub fn sessions(&self) -> Result<Vec<TaskSessionSnapshot>, ExecutionEngineError> {
         let (reply, response) = mpsc::channel();
         self.send(SchedulerCommand::ListSessions { reply })?;
-        receive(response)
+        receive(response)?
     }
 
     /// Returns all five Worker projections ordered by worker ID.
@@ -351,7 +405,7 @@ enum SchedulerMessage {
     Command(SchedulerCommand),
     WorkerFinished {
         worker_id: usize,
-        session_id: TaskSessionId,
+        fence: AssignmentFence,
         outcome: WorkerOutcome,
     },
 }
@@ -359,7 +413,7 @@ enum SchedulerMessage {
 enum SchedulerCommand {
     Submit {
         request: TaskRequest,
-        reply: mpsc::Sender<TaskSessionSnapshot>,
+        reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
     },
     Cancel {
         id: TaskSessionId,
@@ -367,10 +421,10 @@ enum SchedulerCommand {
     },
     GetSession {
         id: TaskSessionId,
-        reply: mpsc::Sender<Option<TaskSessionSnapshot>>,
+        reply: mpsc::Sender<Result<Option<TaskSessionSnapshot>, ExecutionEngineError>>,
     },
     ListSessions {
-        reply: mpsc::Sender<Vec<TaskSessionSnapshot>>,
+        reply: mpsc::Sender<Result<Vec<TaskSessionSnapshot>, ExecutionEngineError>>,
     },
     ListWorkers {
         reply: mpsc::Sender<Vec<WorkerSnapshot>>,
@@ -384,9 +438,9 @@ enum SchedulerCommand {
     },
 }
 
-// Scheduler-owned state destroyed only after explicit removal of a terminal session.
-struct SessionEntry {
-    session: TaskSession,
+// Process-local state for one durable assignment owned by this Scheduler instance.
+struct ActiveAssignment {
+    fence: AssignmentFence,
     cancellation: TaskCancellation,
 }
 
@@ -398,8 +452,7 @@ struct WorkerSlot {
 }
 
 struct TaskAssignment {
-    session_id: TaskSessionId,
-    request: TaskRequest,
+    assignment: DurableAssignment,
     cancellation: TaskCancellation,
 }
 
@@ -414,21 +467,33 @@ enum WorkerOutcome {
     Cancelled,
 }
 
-// Single owner of queue, session, assignment, and Worker lifecycle mutations.
+// Single coordinator of durable store transitions and process-local Worker lifecycle mutations.
 struct Scheduler {
-    sessions: HashMap<TaskSessionId, SessionEntry>,
-    queue: VecDeque<TaskSessionId>,
+    store: SchedulerStore,
+    owner_id: u64,
+    active: HashMap<TaskSessionId, ActiveAssignment>,
     workers: Vec<WorkerSlot>,
-    next_session_id: u64,
-    next_dispatch_sequence: u64,
+    next_lease_renewal: Instant,
 }
 
 fn run_scheduler(
     receiver: mpsc::Receiver<SchedulerMessage>,
     sender: mpsc::Sender<SchedulerMessage>,
     executor: Arc<dyn TaskExecutor>,
+    store: SchedulerStore,
     startup: mpsc::Sender<Result<(), ExecutionEngineError>>,
 ) {
+    let owner_id = match store.register_owner() {
+        Ok(owner_id) => owner_id,
+        Err(error) => {
+            let _ = startup.send(Err(ExecutionEngineError::Persistence(error)));
+            return;
+        }
+    };
+    if let Err(error) = store.recover_expired() {
+        let _ = startup.send(Err(ExecutionEngineError::Persistence(error)));
+        return;
+    }
     let workers = match start_workers(sender, executor) {
         Ok(workers) => workers,
         Err(error) => {
@@ -437,78 +502,84 @@ fn run_scheduler(
         }
     };
     let mut scheduler = Scheduler {
-        sessions: HashMap::new(),
-        queue: VecDeque::new(),
+        store,
+        owner_id,
+        active: HashMap::new(),
         workers,
-        next_session_id: 1,
-        next_dispatch_sequence: 1,
+        next_lease_renewal: Instant::now() + LEASE_RENEW_INTERVAL,
     };
     let _ = startup.send(Ok(()));
+    scheduler.dispatch();
 
-    while let Ok(message) = receiver.recv() {
-        match message {
-            SchedulerMessage::Command(SchedulerCommand::Submit { request, reply }) => {
-                let id = TaskSessionId(scheduler.next_session_id);
-                scheduler.next_session_id = scheduler.next_session_id.saturating_add(1);
-                let entry = SessionEntry {
-                    session: TaskSession::new(id, request),
-                    cancellation: TaskCancellation::default(),
-                };
-                let snapshot = entry.session.snapshot();
-                scheduler.sessions.insert(id, entry);
-                scheduler.queue.push_back(id);
-                let _ = reply.send(snapshot);
-                scheduler.dispatch();
-            }
-            SchedulerMessage::Command(SchedulerCommand::Cancel { id, reply }) => {
-                let result = scheduler.cancel(id);
-                let _ = reply.send(result);
-                scheduler.dispatch();
-            }
-            SchedulerMessage::Command(SchedulerCommand::GetSession { id, reply }) => {
-                let _ = reply.send(
-                    scheduler
-                        .sessions
-                        .get(&id)
-                        .map(|entry| entry.session.snapshot()),
-                );
-            }
-            SchedulerMessage::Command(SchedulerCommand::ListSessions { reply }) => {
-                let mut sessions = scheduler
-                    .sessions
-                    .values()
-                    .map(|entry| entry.session.snapshot())
-                    .collect::<Vec<_>>();
-                sessions.sort_by_key(|session| session.id.0);
-                let _ = reply.send(sessions);
-            }
-            SchedulerMessage::Command(SchedulerCommand::ListWorkers { reply }) => {
-                let _ = reply.send(
-                    scheduler
-                        .workers
-                        .iter()
-                        .map(|worker| worker.snapshot.clone())
-                        .collect(),
-                );
-            }
-            SchedulerMessage::Command(SchedulerCommand::RemoveSession { id, reply }) => {
-                let result = scheduler.remove_session(id);
-                let _ = reply.send(result);
-            }
-            SchedulerMessage::Command(SchedulerCommand::Shutdown { reply }) => {
+    'scheduler: loop {
+        let wait = scheduler
+            .next_lease_renewal
+            .saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(wait) {
+            Ok(message) => match message {
+                SchedulerMessage::Command(SchedulerCommand::Submit { request, reply }) => {
+                    let result = scheduler
+                        .store
+                        .enqueue(&request)
+                        .map_err(ExecutionEngineError::Persistence);
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::Cancel { id, reply }) => {
+                    let result = scheduler.cancel(id);
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::GetSession { id, reply }) => {
+                    let _ = reply.send(
+                        scheduler
+                            .store
+                            .get_session(id)
+                            .map_err(ExecutionEngineError::Persistence),
+                    );
+                }
+                SchedulerMessage::Command(SchedulerCommand::ListSessions { reply }) => {
+                    let _ = reply.send(
+                        scheduler
+                            .store
+                            .list_sessions()
+                            .map_err(ExecutionEngineError::Persistence),
+                    );
+                }
+                SchedulerMessage::Command(SchedulerCommand::ListWorkers { reply }) => {
+                    let _ = reply.send(
+                        scheduler
+                            .workers
+                            .iter()
+                            .map(|worker| worker.snapshot.clone())
+                            .collect(),
+                    );
+                }
+                SchedulerMessage::Command(SchedulerCommand::RemoveSession { id, reply }) => {
+                    let result = scheduler.remove_session(id);
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::Shutdown { reply }) => {
+                    scheduler.shutdown_workers();
+                    let _ = reply.send(());
+                    break 'scheduler;
+                }
+                SchedulerMessage::WorkerFinished {
+                    worker_id,
+                    fence,
+                    outcome,
+                } => {
+                    scheduler.finish(worker_id, fence, outcome);
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 scheduler.shutdown_workers();
-                let _ = reply.send(());
                 break;
             }
-            SchedulerMessage::WorkerFinished {
-                worker_id,
-                session_id,
-                outcome,
-            } => {
-                scheduler.finish(worker_id, session_id, outcome);
-                scheduler.dispatch();
-            }
         }
+        if Instant::now() >= scheduler.next_lease_renewal {
+            scheduler.renew_leases();
+        }
+        scheduler.dispatch();
     }
 }
 
@@ -522,22 +593,29 @@ impl Scheduler {
             else {
                 return;
             };
-            let Some(session_id) = self.next_queued_session() else {
-                return;
-            };
-            let dispatch_sequence = self.next_dispatch_sequence;
-            self.next_dispatch_sequence = self.next_dispatch_sequence.saturating_add(1);
-
-            let Some(entry) = self.sessions.get_mut(&session_id) else {
-                continue;
-            };
             let worker_id = self.workers[worker_index].snapshot.id;
-            entry.session.assign(worker_id, dispatch_sequence);
-            let assignment = TaskAssignment {
-                session_id,
-                request: entry.session.request().clone(),
-                cancellation: entry.cancellation.clone(),
+            let assignment = match self.store.claim_next(
+                self.owner_id,
+                worker_id,
+                ASSIGNMENT_LEASE_DURATION,
+                MAX_EXECUTION_WORKERS,
+            ) {
+                Ok(Some(assignment)) => assignment,
+                Ok(None) | Err(_) => return,
             };
+            let session_id = assignment.fence.session_id;
+            let cancellation = TaskCancellation::default();
+            let assignment = TaskAssignment {
+                assignment,
+                cancellation: cancellation.clone(),
+            };
+            self.active.insert(
+                session_id,
+                ActiveAssignment {
+                    fence: assignment.assignment.fence,
+                    cancellation,
+                },
+            );
             self.workers[worker_index].snapshot.state = WorkerState::Running;
             self.workers[worker_index].snapshot.session_id = Some(session_id);
 
@@ -546,52 +624,38 @@ impl Scheduler {
                 .send(WorkerCommand::Execute(assignment))
                 .is_err()
             {
-                entry
-                    .session
-                    .fail("Worker channel closed before dispatch.".to_string());
+                if let Some(active) = self.active.remove(&session_id) {
+                    let _ = self.store.finish(
+                        active.fence,
+                        DurableOutcome::Failed(
+                            "Worker channel closed before dispatch.".to_string(),
+                        ),
+                    );
+                }
                 self.workers[worker_index].snapshot.state = WorkerState::Stopped;
                 self.workers[worker_index].snapshot.session_id = None;
             }
         }
     }
 
-    fn next_queued_session(&mut self) -> Option<TaskSessionId> {
-        while let Some(id) = self.queue.pop_front() {
-            if self
-                .sessions
-                .get(&id)
-                .is_some_and(|entry| entry.session.state() == TaskSessionState::Queued)
-            {
-                return Some(id);
-            }
-        }
-        None
-    }
-
     fn cancel(&mut self, id: TaskSessionId) -> Result<bool, ExecutionEngineError> {
-        let entry = self
-            .sessions
-            .get_mut(&id)
-            .ok_or(ExecutionEngineError::SessionNotFound(id))?;
-        match entry.session.state() {
-            TaskSessionState::Queued => {
-                entry.cancellation.cancel();
-                entry.session.cancel_queued();
-                Ok(true)
+        let result = self.store.cancel(id).map_err(|error| {
+            if error.contains("was not found") {
+                ExecutionEngineError::SessionNotFound(id)
+            } else {
+                ExecutionEngineError::Persistence(error)
             }
-            TaskSessionState::Running => {
-                entry.cancellation.cancel();
-                entry.session.request_cancellation();
-                Ok(true)
+        })?;
+        if result.snapshot.state == TaskSessionState::Cancelling {
+            if let Some(active) = self.active.get(&id) {
+                active.cancellation.cancel();
             }
-            TaskSessionState::Cancelling => Ok(false),
-            TaskSessionState::Succeeded
-            | TaskSessionState::Failed
-            | TaskSessionState::Cancelled => Ok(false),
         }
+        Ok(result.changed)
     }
 
-    fn finish(&mut self, worker_id: usize, session_id: TaskSessionId, outcome: WorkerOutcome) {
+    fn finish(&mut self, worker_id: usize, fence: AssignmentFence, outcome: WorkerOutcome) {
+        let session_id = fence.session_id;
         let Some(worker) = self.workers.iter_mut().find(|worker| {
             worker.snapshot.id == worker_id && worker.snapshot.session_id == Some(session_id)
         }) else {
@@ -601,38 +665,60 @@ impl Scheduler {
         worker.snapshot.session_id = None;
         worker.snapshot.completed_sessions = worker.snapshot.completed_sessions.saturating_add(1);
 
-        let Some(entry) = self.sessions.get_mut(&session_id) else {
+        let Some(active) = self.active.remove(&session_id) else {
             return;
         };
-        if entry.session.state() == TaskSessionState::Cancelling
-            || entry.cancellation.is_cancelled()
-        {
-            entry.session.cancel();
+        if active.fence != fence {
             return;
         }
-        match outcome {
-            WorkerOutcome::Succeeded => entry.session.succeed(),
-            WorkerOutcome::Failed(error) => entry.session.fail(error),
-            WorkerOutcome::Cancelled => entry.session.cancel(),
-        }
+        let outcome = match outcome {
+            WorkerOutcome::Succeeded => DurableOutcome::Succeeded,
+            WorkerOutcome::Failed(error) => DurableOutcome::Failed(error),
+            WorkerOutcome::Cancelled => DurableOutcome::Cancelled,
+        };
+        let _ = self.store.finish(fence, outcome);
     }
 
     fn remove_session(&mut self, id: TaskSessionId) -> Result<bool, ExecutionEngineError> {
-        let Some(entry) = self.sessions.get(&id) else {
+        let Some(session) = self
+            .store
+            .get_session(id)
+            .map_err(ExecutionEngineError::Persistence)?
+        else {
             return Ok(false);
         };
-        if !entry.session.state().is_terminal() {
+        if !session.state.is_terminal() {
             return Err(ExecutionEngineError::SessionNotTerminal(id));
         }
-        self.sessions.remove(&id);
-        Ok(true)
+        self.store
+            .remove_terminal(id)
+            .map_err(ExecutionEngineError::Persistence)
+    }
+
+    fn renew_leases(&mut self) {
+        for (session_id, active) in &self.active {
+            match self.store.renew(active.fence, ASSIGNMENT_LEASE_DURATION) {
+                Ok(true) => {
+                    if self
+                        .store
+                        .get_session(*session_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|session| session.state == TaskSessionState::Cancelling)
+                    {
+                        active.cancellation.cancel();
+                    }
+                }
+                Ok(false) | Err(_) => active.cancellation.cancel(),
+            }
+        }
+        let _ = self.store.recover_expired();
+        self.next_lease_renewal = Instant::now() + LEASE_RENEW_INTERVAL;
     }
 
     fn shutdown_workers(&mut self) {
-        for entry in self.sessions.values_mut() {
-            if !entry.session.state().is_terminal() {
-                entry.cancellation.cancel();
-            }
+        for active in self.active.values() {
+            active.cancellation.cancel();
         }
         for worker in &self.workers {
             let _ = worker.sender.send(WorkerCommand::Shutdown);
@@ -644,6 +730,8 @@ impl Scheduler {
             worker.snapshot.state = WorkerState::Stopped;
             worker.snapshot.session_id = None;
         }
+        let _ = self.store.abandon_owner(self.owner_id);
+        self.active.clear();
     }
 }
 
@@ -662,10 +750,13 @@ fn start_workers(
                 while let Ok(command) = receiver.recv() {
                     match command {
                         WorkerCommand::Execute(assignment) => {
+                            let fence = assignment.assignment.fence;
                             let context = TaskExecutionContext {
-                                session_id: assignment.session_id,
+                                session_id: fence.session_id,
                                 worker_id,
-                                request: assignment.request,
+                                attempt_id: fence.attempt_id,
+                                fencing_token: fence.fencing_token,
+                                request: assignment.assignment.request,
                                 cancellation: assignment.cancellation.clone(),
                             };
                             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -687,7 +778,7 @@ fn start_workers(
                             if worker_scheduler
                                 .send(SchedulerMessage::WorkerFinished {
                                     worker_id,
-                                    session_id: assignment.session_id,
+                                    fence,
                                     outcome,
                                 })
                                 .is_err()
@@ -738,6 +829,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1051,6 +1143,83 @@ mod tests {
         assert!(workers
             .iter()
             .all(|worker| worker.state == WorkerState::Idle));
+    }
+
+    #[test]
+    fn terminal_sessions_survive_persistent_engine_reopen() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let session_id = {
+            let engine = ExecutionEngine::open_persistent_at(
+                MockTaskExecutor::succeeding(Duration::from_millis(5)),
+                path.clone(),
+            )
+            .expect("persistent engine starts");
+            let session = engine
+                .submit(TaskRequest::new("persisted-terminal"))
+                .expect("task submitted");
+            engine
+                .wait_for_terminal(session.id, TEST_TIMEOUT)
+                .expect("task completes");
+            session.id
+        };
+
+        let reopened =
+            ExecutionEngine::open_persistent_at(MockTaskExecutor::succeeding(Duration::ZERO), path)
+                .expect("persistent engine reopens");
+        let restored = reopened
+            .session(session_id)
+            .expect("session read")
+            .expect("session restored");
+        assert_eq!(restored.state, TaskSessionState::Succeeded);
+        assert_eq!(restored.attempt, 1);
+        assert!(restored.fencing_token > 0);
+    }
+
+    #[test]
+    fn graceful_restart_requeues_running_sessions_with_new_attempts() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let session_ids = {
+            let engine = ExecutionEngine::open_persistent_at(
+                MockTaskExecutor::new(|context| {
+                    while !context.cancellation().is_cancelled() {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(())
+                }),
+                path.clone(),
+            )
+            .expect("persistent engine starts");
+            let sessions = submit_tasks(&engine, 7, "restart");
+            wait_until(|| running_count(&engine) == 5);
+            sessions
+        };
+
+        let reopened = ExecutionEngine::open_persistent_at(
+            MockTaskExecutor::succeeding(Duration::from_millis(5)),
+            path,
+        )
+        .expect("persistent engine reopens");
+        wait_for_all(&reopened, &session_ids);
+        let sessions = reopened.sessions().expect("sessions listed");
+        assert!(sessions
+            .iter()
+            .all(|session| session.state == TaskSessionState::Succeeded));
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.attempt == 2)
+                .count(),
+            5
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.attempt == 1)
+                .count(),
+            2
+        );
     }
 
     fn submit_tasks(engine: &ExecutionEngine, count: usize, prefix: &str) -> Vec<TaskSessionId> {
