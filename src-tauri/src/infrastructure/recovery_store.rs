@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RECOVERY_CONTENT_BYTES: usize = 1_000_000;
 const MAX_RECOVERY_SNAPSHOTS_PER_WORKSPACE: usize = 64;
@@ -72,6 +72,9 @@ impl RecoveryStore {
         }
         let connection = Connection::open(&path)
             .map_err(|error| format!("Failed to open recovery database: {error}"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Failed to configure recovery database timeout: {error}"))?;
         secure_database_file(&path)?;
         connection
             .execute_batch(

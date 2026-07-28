@@ -497,7 +497,9 @@
   let fileFilter = $state("");
   let expandedFileEntries = $state<Record<string, FileEntry[]>>({});
   let expandingFilePaths = $state<Record<string, true>>({});
+  let expandingFileFolder = $state<Record<string, number>>({});
   let fileTreeRevision = 0;
+  let fileFolderRequestId = 0;
   let fileSidebarCollapsed = $state(false);
   let workspaceSidebarTab = $state<"explorer" | "search" | "source-control">("explorer");
   let workspaceFilesRoot = $state(initialUiState.workspaceFilesRoot);
@@ -1381,8 +1383,9 @@
     });
   }
 
-  async function refreshFileDirectory(relativePath = fileDirectory) {
-    if (!workspace || fileLoading) return;
+  async function refreshFileDirectory(relativePath = fileDirectory): Promise<boolean> {
+    if (!workspace) return false;
+    const workspaceId = workspace.id;
     const revision = fileTreeRevision + 1;
     fileTreeRevision = revision;
     fileLoading = true;
@@ -1392,12 +1395,14 @@
     workspaceFilesDirectory = relativePath;
     saveUiState();
     try {
-      const entries = await listDirectory(workspace.id, relativePath);
-      if (revision !== fileTreeRevision) return;
+      const entries = await listDirectory(workspaceId, relativePath);
+      if (revision !== fileTreeRevision) return false;
       fileEntries = entries;
+      return true;
     } catch (reason: unknown) {
-      if (revision !== fileTreeRevision) return;
+      if (revision !== fileTreeRevision) return false;
       fileError = reason instanceof Error ? reason.message : String(reason);
+      return false;
     } finally {
       if (revision === fileTreeRevision) {
         fileLoading = false;
@@ -1809,26 +1814,40 @@
     if (typeof selected !== "string") return;
     if (!(await resolveDirtyEditors(openEditorFiles, "opening another folder"))) return;
 
-    await clearCurrentRecoverySnapshots();
-    await stopWorkspaceLspServers();
-    await setWorkspaceRoot(workspace.id, selected);
-    resetWorkspaceSearch();
-    fileDirectory = "";
-    workspaceFilesDirectory = "";
-    openEditorFiles = [];
-    aiEditPinnedDocumentIds = [];
-    editorNavigation = createEditorNavigation();
-    activeEditorHandle = null;
-    activeEditorPath = null;
-    expandedFileEntries = {};
-    expandingFilePaths = {};
-    fileTreeRevision += 1;
-    fileFilter = "";
-    await refreshWorkspaceRootLabel();
-    await refreshFileDirectory("");
-    await refreshWorkspaceGitState();
-    saveUiState();
-    appNotice = { tone: "success", message: `Opened folder ${fileRootLabel}` };
+    try {
+      await clearCurrentRecoverySnapshots().catch((reason: unknown) => {
+        console.warn("Failed to clear recovery snapshots before opening a folder", reason);
+      });
+      await stopWorkspaceLspServers();
+      const selectedRoot = normalizeAbsolutePath(
+        await setWorkspaceRoot(workspace.id, selected),
+      );
+      resetWorkspaceSearch();
+      workspaceRoot = selectedRoot;
+      workspaceFilesRoot = selectedRoot;
+      fileRootLabel = displayPath(selectedRoot);
+      fileDirectory = "";
+      workspaceFilesDirectory = "";
+      openEditorFiles = [];
+      aiEditPinnedDocumentIds = [];
+      editorNavigation = createEditorNavigation();
+      activeEditorHandle = null;
+      activeEditorPath = null;
+      expandedFileEntries = {};
+      expandingFilePaths = {};
+      expandingFileFolder = {};
+      fileTreeRevision += 1;
+      fileFilter = "";
+      if (!(await refreshFileDirectory(""))) {
+        throw new Error(fileError ?? "Failed to load the selected folder.");
+      }
+      await refreshWorkspaceGitState();
+      saveUiState();
+      appNotice = { tone: "success", message: `Opened folder ${fileRootLabel}` };
+    } catch (reason: unknown) {
+      fileError = reason instanceof Error ? reason.message : String(reason);
+      appNotice = { tone: "error", message: fileError };
+    }
   }
 
   async function openFileFromDialog() {
@@ -1846,7 +1865,9 @@
     const separator = normalized.lastIndexOf("/");
     const parent = separator > 0 ? normalized.slice(0, separator) : normalized;
     const name = separator > 0 ? normalized.slice(separator + 1) : normalized;
-    await clearCurrentRecoverySnapshots();
+    await clearCurrentRecoverySnapshots().catch((reason: unknown) => {
+      console.warn("Failed to clear recovery snapshots before opening a file", reason);
+    });
     await stopWorkspaceLspServers();
     await setWorkspaceRoot(workspace.id, parent);
     resetWorkspaceSearch();
@@ -1854,6 +1875,7 @@
     workspaceFilesDirectory = "";
     expandedFileEntries = {};
     expandingFilePaths = {};
+    expandingFileFolder = {};
     openEditorFiles = [];
     aiEditPinnedDocumentIds = [];
     editorNavigation = createEditorNavigation();
@@ -2133,8 +2155,6 @@
     }
   }
 
-  let expandingFileFolder = $state<Record<string, boolean>>({});
-
   async function toggleFileFolder(entry: FileEntry) {
     if (!workspace || !entry.is_dir || expandingFileFolder[entry.path]) return;
 
@@ -2143,18 +2163,19 @@
       return;
     }
 
-    expandingFileFolder = { ...expandingFileFolder, [entry.path]: true };
+    const requestId = ++fileFolderRequestId;
+    expandingFileFolder = { ...expandingFileFolder, [entry.path]: requestId };
     expandingFilePaths = { ...expandingFilePaths, [entry.path]: true };
     fileError = null;
     try {
       const children = await listDirectory(workspace.id, entry.path);
-      if (!expandingFileFolder[entry.path]) return;
+      if (expandingFileFolder[entry.path] !== requestId) return;
       expandedFileEntries = { ...expandedFileEntries, [entry.path]: children };
     } catch (reason: unknown) {
-      if (!expandingFileFolder[entry.path]) return;
+      if (expandingFileFolder[entry.path] !== requestId) return;
       fileError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      if (expandingFileFolder[entry.path]) {
+      if (expandingFileFolder[entry.path] === requestId) {
         const { [entry.path]: _removed, ...remaining } = expandingFileFolder;
         expandingFileFolder = remaining;
         const { [entry.path]: _finished, ...loadingRemaining } = expandingFilePaths;
