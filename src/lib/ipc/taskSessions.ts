@@ -111,6 +111,22 @@ export type TaskToolState = {
   calls: TaskToolCallState[];
 };
 
+export type TaskMcpConnectorContext = {
+  connector_id: string;
+  capability: string;
+  requested: boolean;
+  granted: boolean;
+};
+
+export type TaskMcpContext = {
+  session_id: number;
+  workspace_id: string | null;
+  runtime_profile_id: string | null;
+  active_attempt_id: number | null;
+  fencing_token: number;
+  connectors: TaskMcpConnectorContext[];
+};
+
 export type TaskSessionUpdate = {
   session_id: number;
   latest_sequence: number;
@@ -201,6 +217,15 @@ export function listTaskSessionEvents(
 export function getTaskSessionToolState(sessionId: number): Promise<TaskToolState> {
   return invokeWithPolicy(
     "get_task_session_tool_state",
+    { sessionId },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Returns non-secret per-session MCP connector context projected from envelope and grants. */
+export function getTaskSessionMcpContext(sessionId: number): Promise<TaskMcpContext> {
+  return invokeWithPolicy(
+    "get_task_session_mcp_context",
     { sessionId },
     IPC_POLICIES.taskSessionRead,
   );

@@ -16,7 +16,8 @@ use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
-    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot, TaskToolState,
+    TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
+    TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -1732,6 +1733,17 @@ async fn get_task_session_tool_state(
 }
 
 #[tauri::command]
+async fn get_task_session_mcp_context(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<TaskMcpContext, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.mcp_context(TaskSessionId(session_id)))
+        .await
+        .map_err(|error| format!("Get Task Session MCP context task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -2400,6 +2412,7 @@ pub fn run() {
             get_task_session,
             list_task_session_events,
             get_task_session_tool_state,
+            get_task_session_mcp_context,
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
             submit_task_session,

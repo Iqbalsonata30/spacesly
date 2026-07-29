@@ -5,9 +5,9 @@
 //! cancellation tokens in memory.
 
 use crate::domain::task_session::{
-    TaskCapabilityGrant, TaskProgress, TaskRequest, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
-    TaskSessionState, TaskToolState,
+    TaskCapabilityGrant, TaskMcpContext, TaskProgress, TaskRequest, TaskSessionEnvelope,
+    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionEventPage,
+    TaskSessionId, TaskSessionSnapshot, TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -685,7 +685,24 @@ impl SchedulerStore {
         ))
     }
 
-    #[cfg(test)]
+    pub(crate) fn mcp_context(&self, session_id: TaskSessionId) -> Result<TaskMcpContext, String> {
+        let session = self
+            .get_session(session_id)?
+            .ok_or_else(|| format!("Task Session {} was not found.", session_id.0))?;
+        let envelope = session.request.envelope()?;
+        let envelope = match envelope.as_ref() {
+            Some(TaskSessionEnvelope::V1(envelope)) => Some(envelope),
+            None => None,
+        };
+        Ok(TaskMcpContext::from_parts(
+            session_id,
+            envelope,
+            &self.capability_grants(session_id)?,
+            session.attempt_id,
+            session.fencing_token,
+        ))
+    }
+
     pub(crate) fn capability_grants(
         &self,
         session_id: TaskSessionId,
@@ -1770,6 +1787,7 @@ fn from_i64(value: i64, field: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task_session::{TaskSessionEnvelopeV1, TaskSessionKind};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
@@ -2394,6 +2412,50 @@ mod tests {
     }
 
     #[test]
+    fn mcp_context_projects_envelope_and_session_scoped_grants() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let first = store
+            .enqueue_with_grants_at(
+                &TaskRequest::from_envelope("first", &test_agent_envelope())
+                    .expect("first envelope"),
+                &["external_tools:jira".to_string()],
+                "test-approval",
+                10,
+            )
+            .expect("first enqueued");
+        let second = store
+            .enqueue_with_grants_at(
+                &TaskRequest::from_envelope("second", &test_agent_envelope())
+                    .expect("second envelope"),
+                &[],
+                "",
+                11,
+            )
+            .expect("second enqueued");
+        let owner = store.register_owner().expect("owner registered");
+        let assignment = store
+            .claim_next_at(owner, 1, 20, LEASE_MILLIS, 5)
+            .expect("task claimed")
+            .expect("assignment");
+
+        let first_context = store.mcp_context(first.id).expect("first context");
+        let second_context = store.mcp_context(second.id).expect("second context");
+        assert_eq!(first_context.session_id, first.id);
+        assert_eq!(second_context.session_id, second.id);
+        assert_eq!(
+            first_context.active_attempt_id,
+            Some(assignment.fence.attempt_id)
+        );
+        assert_eq!(first_context.fencing_token, assignment.fence.fencing_token);
+        assert_eq!(second_context.active_attempt_id, None);
+        assert_eq!(first_context.connectors.len(), 1);
+        assert_eq!(second_context.connectors.len(), 1);
+        assert_eq!(first_context.connectors[0].connector_id, "jira");
+        assert!(first_context.connectors[0].granted);
+        assert!(!second_context.connectors[0].granted);
+    }
+
+    #[test]
     fn stale_attempt_cannot_append_events_after_reclaim() {
         let store = SchedulerStore::open_in_memory().expect("store opens");
         let owner = store.register_owner().expect("owner registered");
@@ -2591,5 +2653,24 @@ mod tests {
         assert!(store
             .assignment_is_current_at(current.fence, 1_053)
             .expect("current authority checked"));
+    }
+
+    fn test_agent_envelope() -> TaskSessionEnvelope {
+        TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "sha256:contract".to_string(),
+            runtime_profile_id: "profile-1".to_string(),
+            model: "openai/gpt-5".to_string(),
+            connector_ids: vec!["jira".to_string()],
+            requested_capabilities: vec!["external_tools:jira".to_string()],
+            prompt_template_version: "prompt-v1".to_string(),
+            context_revision: Some("context-1".to_string()),
+            rules_revision: Some("rules-1".to_string()),
+            skills_revision: Some("skills-1".to_string()),
+        })
     }
 }

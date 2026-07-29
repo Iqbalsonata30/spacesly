@@ -363,6 +363,78 @@ pub struct TaskToolState {
     pub calls: Vec<TaskToolCallState>,
 }
 
+/// Read projection for one MCP connector requested by a Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskMcpConnectorContext {
+    /// Non-secret connector identifier from the Task Session envelope.
+    pub connector_id: String,
+    /// Capability required to use this connector through fenced MCP authority.
+    pub capability: String,
+    /// Whether the connector was requested by the immutable envelope.
+    pub requested: bool,
+    /// Whether the requested capability has a durable grant.
+    pub granted: bool,
+}
+
+/// Durable read projection of MCP context owned by one Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskMcpContext {
+    /// Owning Task Session.
+    pub session_id: TaskSessionId,
+    /// Workspace bound to the MCP context.
+    pub workspace_id: Option<String>,
+    /// Runtime profile whose resolver may materialize connector command/environment snapshots.
+    pub runtime_profile_id: Option<String>,
+    /// Current active assignment attempt, if the session is running.
+    pub active_attempt_id: Option<u64>,
+    /// Current session fencing token.
+    pub fencing_token: u64,
+    /// Connector contexts ordered by connector identifier.
+    pub connectors: Vec<TaskMcpConnectorContext>,
+}
+
+impl TaskMcpContext {
+    /// Projects MCP connector ownership from an optional envelope and explicit capability grants.
+    pub fn from_parts(
+        session_id: TaskSessionId,
+        envelope: Option<&TaskSessionEnvelopeV1>,
+        grants: &[TaskCapabilityGrant],
+        active_attempt_id: Option<u64>,
+        fencing_token: u64,
+    ) -> Self {
+        let granted = grants
+            .iter()
+            .map(|grant| grant.capability.as_str())
+            .collect::<HashSet<_>>();
+        let mut connectors = envelope
+            .map(|envelope| {
+                envelope
+                    .connector_ids
+                    .iter()
+                    .map(|connector_id| {
+                        let capability = format!("external_tools:{connector_id}");
+                        TaskMcpConnectorContext {
+                            connector_id: connector_id.clone(),
+                            requested: true,
+                            granted: granted.contains(capability.as_str()),
+                            capability,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        connectors.sort_by(|left, right| left.connector_id.cmp(&right.connector_id));
+        Self {
+            session_id,
+            workspace_id: envelope.map(|envelope| envelope.workspace_id.clone()),
+            runtime_profile_id: envelope.map(|envelope| envelope.runtime_profile_id.clone()),
+            active_attempt_id,
+            fencing_token,
+            connectors,
+        }
+    }
+}
+
 impl TaskToolState {
     /// Projects current tool state from the append-only event journal.
     pub fn from_events(session_id: TaskSessionId, events: &[TaskSessionEvent]) -> Self {
@@ -755,5 +827,49 @@ mod tests {
         assert_eq!(state.calls[0].started_sequence, 1);
         assert_eq!(state.calls[0].completed_sequence, Some(2));
         assert_eq!(state.calls[0].updated_at, 110);
+    }
+
+    #[test]
+    fn mcp_context_projects_connectors_and_grants() {
+        let envelope = TaskSessionEnvelopeV1 {
+            workspace_id: "workspace-personal".to_string(),
+            kind: TaskSessionKind::Agent,
+            subject_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "digest".to_string(),
+            runtime_profile_id: "profile-1".to_string(),
+            model: "openai/gpt-5".to_string(),
+            connector_ids: vec!["jira".to_string(), "github".to_string()],
+            requested_capabilities: vec![
+                "external_tools:jira".to_string(),
+                "external_tools:github".to_string(),
+            ],
+            prompt_template_version: "prompt-v1".to_string(),
+            context_revision: Some("context-1".to_string()),
+            rules_revision: Some("rules-1".to_string()),
+            skills_revision: Some("skills-1".to_string()),
+        };
+        let context = TaskMcpContext::from_parts(
+            TaskSessionId(9),
+            Some(&envelope),
+            &[TaskCapabilityGrant {
+                capability: "external_tools:jira".to_string(),
+                grant_source: "test".to_string(),
+                granted_at: 1,
+            }],
+            Some(77),
+            2,
+        );
+
+        assert_eq!(context.workspace_id.as_deref(), Some("workspace-personal"));
+        assert_eq!(context.runtime_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(context.active_attempt_id, Some(77));
+        assert_eq!(context.fencing_token, 2);
+        assert_eq!(context.connectors.len(), 2);
+        assert_eq!(context.connectors[0].connector_id, "github");
+        assert!(!context.connectors[0].granted);
+        assert_eq!(context.connectors[1].connector_id, "jira");
+        assert!(context.connectors[1].granted);
     }
 }
