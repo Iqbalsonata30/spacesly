@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CardProjection } from "$lib/ipc";
+  import type { AgentTaskCardProjection } from "$lib/agentRun";
 
   type DescriptionPart = { text: string; url?: string };
 
@@ -11,6 +12,7 @@
     executionLabel,
     ticketLabel,
     isBlocked,
+    agentTask,
     isQueued,
     showActions,
     showDelete,
@@ -30,6 +32,7 @@
     executionLabel: string;
     ticketLabel: string;
     isBlocked: boolean;
+    agentTask: AgentTaskCardProjection | null;
     isQueued: boolean;
     showActions: boolean;
     showDelete: boolean;
@@ -92,8 +95,14 @@
 >
   <div class="task-status">
     <span></span>
-    <strong>{executionLabel}</strong>
+    <strong>{agentTask?.status ?? executionLabel}</strong>
+    {#if agentTask}<em>{agentTask.progress}%</em>{/if}
   </div>
+  {#if agentTask}
+    <div class="task-progress" aria-label={`Agent progress ${agentTask.progress}%`}>
+      <span style={`width: ${agentTask.progress}%`}></span>
+    </div>
+  {/if}
   <h3>{card.title}</h3>
   <p>
     {#each description as part, index (`${index}:${part.url || part.text}`)}
@@ -242,6 +251,27 @@
     width: 9px;
     height: 9px;
     border-radius: 999px;
+    background: #8daa7a;
+  }
+
+  .task-status em {
+    margin-left: auto;
+    color: #aaa1c3;
+    font-style: normal;
+    letter-spacing: 0;
+  }
+
+  .task-progress {
+    height: 3px;
+    margin: -2px 0 10px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #302d38;
+  }
+
+  .task-progress span {
+    display: block;
+    height: 100%;
     background: #8daa7a;
   }
 

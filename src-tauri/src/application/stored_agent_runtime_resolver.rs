@@ -75,13 +75,7 @@ impl StoredAgentRuntimeResolver {
             .model
             .split_once('/')
             .ok_or_else(|| "Agent model must use the '<provider>/<model>' form.".to_string())?;
-        let provider = provider_registry::profile(provider_id)
-            .ok_or_else(|| format!("AI provider '{provider_id}' is not registered."))?;
-        if !provider.models.contains(&model) {
-            return Err(format!(
-                "Model '{model}' is not registered for provider '{provider_id}'."
-            ));
-        }
+        let provider = provider_registry::profile(provider_id);
 
         let mcp_servers = envelope
             .connector_ids
@@ -106,11 +100,16 @@ impl StoredAgentRuntimeResolver {
             config: AiWorkerConfig {
                 workspace_id: envelope.workspace_id.clone(),
                 runtime: profile.runtime,
-                provider_name: provider.name.to_string(),
-                provider_id: provider.id.to_string(),
-                base_url: provider.base_url.to_string(),
-                api_style: provider.api_style.as_str().to_string(),
-                api_key: self.secrets.ai_api_key(provider.id)?,
+                provider_name: provider
+                    .map_or(provider_id, |profile| profile.name)
+                    .to_string(),
+                provider_id: provider_id.to_string(),
+                base_url: provider.map_or("", |profile| profile.base_url).to_string(),
+                api_style: provider
+                    .map(|profile| profile.api_style.as_str())
+                    .unwrap_or("openai_chat")
+                    .to_string(),
+                api_key: self.secrets.ai_api_key(provider_id)?,
                 model: model.to_string(),
                 opencode_command: profile.opencode_command,
                 opencode_model: envelope.model.clone(),
@@ -122,6 +121,7 @@ impl StoredAgentRuntimeResolver {
                 restrict_tools: true,
                 fenced_tools_only: true,
                 isolated_opencode_process: true,
+                task_tool_authority: None,
                 mcp_servers,
             },
         })
@@ -211,6 +211,7 @@ fn validate_profile_binding(
     profile: &AgentRuntimeProfile,
 ) -> Result<(), String> {
     profile.validate()?;
+    profile.validate_content_revisions()?;
     if profile.id != envelope.runtime_profile_id
         || profile.model != envelope.model
         || profile.prompt_template_version != envelope.prompt_template_version
@@ -234,10 +235,12 @@ fn validate_profile_binding(
 mod tests {
     use super::*;
     use crate::domain::task_session::TaskSessionKind;
+    use crate::infrastructure::runtime_profile_store::content_revision;
 
     #[test]
     fn profile_binding_rejects_unapproved_connector() {
         let mut envelope = test_envelope();
+        assert!(validate_profile_binding(&envelope, &test_profile()).is_ok());
         envelope.connector_ids = vec!["jira".to_string(), "github".to_string()];
         assert!(validate_profile_binding(&envelope, &test_profile()).is_err());
     }
@@ -245,6 +248,7 @@ mod tests {
     #[test]
     fn profile_binding_requires_exact_revisions() {
         let mut envelope = test_envelope();
+        assert!(validate_profile_binding(&envelope, &test_profile()).is_ok());
         envelope.rules_revision = Some("stale".to_string());
         assert!(validate_profile_binding(&envelope, &test_profile()).is_err());
     }
@@ -263,8 +267,8 @@ mod tests {
             requested_capabilities: vec!["external_tools:jira".to_string()],
             prompt_template_version: "agent-v1".to_string(),
             context_revision: Some("1".to_string()),
-            rules_revision: Some("rules-v1".to_string()),
-            skills_revision: Some("skills-v1".to_string()),
+            rules_revision: Some(content_revision("Use evidence.")),
+            skills_revision: Some(content_revision("Verify changes.")),
         }
     }
 
@@ -279,8 +283,8 @@ mod tests {
             temperature: 0.2,
             connector_ids: vec!["jira".to_string()],
             prompt_template_version: "agent-v1".to_string(),
-            rules_revision: "rules-v1".to_string(),
-            skills_revision: "skills-v1".to_string(),
+            rules_revision: content_revision("Use evidence."),
+            skills_revision: content_revision("Verify changes."),
         }
     }
 }

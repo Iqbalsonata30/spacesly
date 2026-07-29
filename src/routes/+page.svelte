@@ -53,6 +53,9 @@
   } from "$lib/boardWorkflow";
   import {
     agentSessionReplay,
+    agentTaskCardProjection,
+    agentWorkflowCheckpoint,
+    agentWorkflowRecoveryDecision,
     appendAgentSessionEvent,
     clearActiveAgentRun,
     clearActiveAgentRuns,
@@ -60,12 +63,12 @@
     createAgentSessionEvent,
     loadActiveAgentRunCardIds,
     markActiveAgentRun,
+    runningAgentSessions,
     type AgentRunGitSnapshot,
     type AgentRunLog,
     type AgentRunSession,
     type AgentRunStatus,
     type AgentSessionEvent,
-    type AgentTerminalLine,
     type ExecutionRun,
   } from "$lib/agentRun";
   import { capList, capText } from "$lib/boundedBuffers";
@@ -94,7 +97,32 @@
     type WorkspaceChatActionContext,
     type WorkspaceChatActionProposal,
   } from "$lib/workspaceChat";
+  import {
+    cancelWorkspaceChatRun,
+    confirmLegacyWorkspaceChatCancellation,
+    createWorkspaceChatRun,
+    settleWorkspaceChatCancellation,
+    updateWorkspaceChatRun,
+    workspaceChatProgressPercent,
+    workspaceChatRunFor,
+    workspaceChatRunStatus,
+    type WorkspaceChatRuns,
+  } from "$lib/workspaceChatRuns";
   import { createSourceControlStore } from "$lib/sourceControlStore.svelte";
+  import {
+    createPromptTaskEnvelope,
+    ensureOpenCodePromptProfile,
+    executePromptTaskSession,
+    PROMPT_TASK_TEMPLATE_VERSION,
+    waitForPromptTaskSession,
+  } from "$lib/promptTaskSessions";
+  import {
+    AgentTaskSessionTimeoutError,
+    agentEnvelopeFromSnapshot,
+    executeAgentTaskSession,
+    prepareAgentTaskSession,
+    waitForAgentTaskSession,
+  } from "$lib/agentTaskSessions";
   import "./page.css";
   import {
     addJiraComment,
@@ -104,12 +132,15 @@
     assignJiraIssue,
     beginAiRun,
     cancelAiRun,
+    cancelTaskSession,
     cancelAiWorkerTask,
     chatAiWorker,
     proposeAiEdit,
     pruneConversations,
     executeAiWorkerTask,
     getJiraBoards,
+    getAiRun,
+    getTaskSession,
     getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
@@ -151,6 +182,7 @@
     saveGlobalEnvironmentVariable,
     searchWorkspace,
     listActiveExecutionRuns,
+    listTaskSessions,
     grantAiRunCapabilities,
     releaseAiWorkerRun,
     reserveAiWorkerRun,
@@ -167,6 +199,7 @@
     writeFile,
     writePtyTerminal,
     workspaceRootPath,
+    workspaceRootRevision,
     IpcPolicyError,
     type AiWorkerConfig,
     type AiWorkerStatus,
@@ -180,6 +213,8 @@
     type GitWorkspaceInfo,
     type AiWorkerTaskResult,
     type ExecutionContract,
+    type TaskSessionEvent,
+    type TaskSessionSnapshot,
     type JiraMcpConfig,
     type JiraBoard,
     type LspDiagnostic,
@@ -364,9 +399,9 @@
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
   let mcpToolsByServer = $state<Record<string, string[]>>({});
   let settingsOpen = $state(false);
-  let settingsTab = $state<
-    "agent" | "rules" | "skills" | "mcp" | "environment" | "jira" | "theme"
-  >("agent");
+  let settingsTab = $state<"agent" | "rules" | "skills" | "mcp" | "environment" | "jira" | "theme">(
+    "agent",
+  );
   let settingsError = $state<string | null>(null);
   let settings = $state<AppSettings>(initialSettings);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
@@ -400,17 +435,6 @@
   let newTaskDescription = $state("");
   let agentConsoleOpen = $state(false);
   let agentConsoleCardId = $state<string | null>(null);
-  let agentRunCardId = $state<string | null>(null);
-  let agentRunTitle = $state("No active run");
-  let agentRunStatus = $state<AgentRunStatus>("idle");
-  let agentRunProgress = $state(0);
-  let agentRunOutput = $state("");
-  let agentRunResult = $state<AiWorkerTaskResult | null>(null);
-  let agentRunLogs = $state<AgentRunLog[]>([]);
-  let agentTerminalLines = $state<AgentTerminalLine[]>([]);
-  let agentRunGitSnapshot = $state<AgentRunGitSnapshot | null>(null);
-  let agentRunTranscript = $state<AgentSessionEvent[]>([]);
-  let agentExecutionRun = $state<ExecutionRun | null>(null);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
   let latestAgentSessionId = $state<string | null>(null);
@@ -469,14 +493,8 @@
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
-  let workspaceChatRunning = $state(false);
-  let workspaceChatRunId = $state<string | null>(null);
-  let workspaceChatStreamingText = $state("");
-  let workspaceChatLastEventSequence = $state(0);
-  let workspaceChatStreamBuffer = "";
-  let workspaceChatStreamFrame: number | null = null;
-  let workspaceChatRequestId = 0;
-  let workspaceChatActionProposal = $state<WorkspaceChatActionProposal | null>(null);
+  let workspaceChatRuns = $state<WorkspaceChatRuns>({});
+  const recoveringPromptSessionIds = new SvelteSet<number>();
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
   let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
   let workspaceChatActiveSessionId = $state<string>(
@@ -534,6 +552,7 @@
   let aiEditSelectedHunkIds = $state<string[]>([]);
   let aiEditGenerating = $state(false);
   let aiEditRunId = $state<string | null>(null);
+  let aiEditTaskSessionId = $state<number | null>(null);
   let aiEditError = $state<string | null>(null);
   let aiEditRequestId = 0;
   let aiEditPinnedDocumentIds = $state<string[]>([]);
@@ -871,6 +890,9 @@
     if (appNoticeTimer) clearTimeout(appNoticeTimer);
     if (recoverySyncTimer) clearTimeout(recoverySyncTimer);
     if (terminalFrameId !== null) window.cancelAnimationFrame(terminalFrameId);
+    for (const run of Object.values(workspaceChatRuns)) {
+      if (run.streamFrame !== null) window.cancelAnimationFrame(run.streamFrame);
+    }
     if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
     resolveBacklogStartConfirmation(false);
     flushUiState();
@@ -885,6 +907,23 @@
     const context = workspaceAgentContext(activeBoard);
     return { context, revision: workspaceContextRevision(context) };
   });
+  let activeWorkspaceChatRun = $derived(
+    workspaceChatRunFor(workspaceChatRuns, workspaceChatActiveSessionId),
+  );
+  let workspaceChatSessionStatuses = $derived(
+    Object.fromEntries(
+      workspaceChatSessions.map((session) => {
+        const run = workspaceChatRunFor(workspaceChatRuns, session.id);
+        return [
+          session.id,
+          {
+            status: workspaceChatRunStatus(run),
+            progress: workspaceChatProgressPercent(run),
+          },
+        ];
+      }),
+    ),
+  );
   let displayColumns = $derived<BoardDisplayColumn[]>(
     activeBoard?.columns.map((column) => {
       const cards = visibleCardsForColumn(column);
@@ -934,6 +973,15 @@
   let selectedCardAgentSession = $derived<AgentRunSession | null>(
     selectedCardId ? (agentRunSessions[selectedCardId] ?? null) : null,
   );
+  let agentTaskCardProjections = $derived(
+    Object.fromEntries(
+      Object.entries(agentRunSessions).map(([cardId, session]) => [
+        cardId,
+        agentTaskCardProjection(session),
+      ]),
+    ),
+  );
+  let runningAgentTaskSessions = $derived(runningAgentSessions(agentRunSessions));
   let activeEditorFile = $derived.by((): OpenEditorFile | null => {
     return editorStateVersion >= 0 && activeEditorPath
       ? (openEditorFiles.find((file) => file.path === activeEditorPath) ?? null)
@@ -1209,13 +1257,32 @@
   async function hydrateDurableExecutionRuns() {
     try {
       const runs = await listActiveExecutionRuns();
+      const retainedTaskSessions =
+        typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
+          ? await listTaskSessions()
+          : [];
       for (const run of runs) {
         const cardId = run.contract.task_id;
         const card = activeCardById.get(cardId);
         if (!card || agentRunSessions[cardId]) continue;
         const ticketTitle = run.contract.ticket.title || card.title;
-        const recoveredStatus: AgentRunStatus =
-          run.status === "blocked" || run.status === "failed" ? "blocked" : "running";
+        const retainedTaskSession = retainedTaskSessions
+          .filter((session) => agentEnvelopeFromSnapshot(session)?.execution_run_id === run.run_id)
+          .sort((left, right) => right.id - left.id)[0];
+        const taskEnvelope = retainedTaskSession
+          ? agentEnvelopeFromSnapshot(retainedTaskSession)
+          : null;
+        const checkpoint = agentWorkflowCheckpoint(run);
+        const recoveryDecision = agentWorkflowRecoveryDecision(checkpoint);
+        const recoveredStatus: AgentRunStatus = !recoveryDecision.safe
+          ? "blocked"
+          : retainedTaskSession
+            ? taskSessionIsTerminal(retainedTaskSession)
+              ? "blocked_for_resume"
+              : "running"
+            : run.status === "blocked" || run.status === "failed"
+              ? "blocked"
+              : "running";
         agentRunSessions[cardId] = createAgentRunSession(
           cardId,
           ticketTitle,
@@ -1229,9 +1296,12 @@
               at: new Date().toLocaleTimeString(),
               tone: recoveredStatus === "blocked" ? "error" : "info",
               label: "recovery",
-              message:
-                recoveredStatus === "blocked"
-                  ? "This execution was recovered after the application restarted and needs review."
+              message: !recoveryDecision.safe
+                ? recoveryDecision.reason
+                : recoveredStatus === "blocked"
+                  ? retainedTaskSession
+                    ? `A terminal Task Session was recovered at ${checkpoint}. Automatic Jira writeback is blocked; Continue resumes from this persisted boundary.`
+                    : "This execution was recovered after the application restarted and needs review."
                   : "This execution is still active in the durable execution store.",
             },
           ],
@@ -1245,7 +1315,14 @@
             : null,
           [],
           run,
+          retainedTaskSession?.id ?? null,
+          taskEnvelope?.conversation_id ?? null,
+          retainedTaskSession?.state ?? null,
+          checkpoint,
         );
+        if (retainedTaskSession) {
+          void watchRecoveredAgentTask(cardId, retainedTaskSession.id);
+        }
         latestAgentSessionId = cardId;
       }
       agentRunSessions = retainAgentSessions(agentRunSessions);
@@ -1255,6 +1332,15 @@
         message: `Durable execution state could not be loaded: ${reason instanceof Error ? reason.message : String(reason)}`,
       };
     }
+  }
+
+  function taskSessionIsTerminal(session: TaskSessionSnapshot): boolean {
+    return (
+      session.state === "succeeded" ||
+      session.state === "failed" ||
+      session.state === "blocked" ||
+      session.state === "cancelled"
+    );
   }
 
   async function loadDefaultWorkspaceProjection() {
@@ -1813,15 +1899,15 @@
     });
     if (typeof selected !== "string") return;
     if (!(await resolveDirtyEditors(openEditorFiles, "opening another folder"))) return;
+    cancelAiEdit();
+    cancelWorkspaceChat();
 
     try {
       await clearCurrentRecoverySnapshots().catch((reason: unknown) => {
         console.warn("Failed to clear recovery snapshots before opening a folder", reason);
       });
       await stopWorkspaceLspServers();
-      const selectedRoot = normalizeAbsolutePath(
-        await setWorkspaceRoot(workspace.id, selected),
-      );
+      const selectedRoot = normalizeAbsolutePath(await setWorkspaceRoot(workspace.id, selected));
       resetWorkspaceSearch();
       workspaceRoot = selectedRoot;
       workspaceFilesRoot = selectedRoot;
@@ -1860,6 +1946,8 @@
     });
     if (typeof selected !== "string") return;
     if (!(await resolveDirtyEditors(openEditorFiles, "opening a file from another folder"))) return;
+    cancelAiEdit();
+    cancelWorkspaceChat();
 
     const normalized = normalizeAbsolutePath(selected);
     const separator = normalized.lastIndexOf("/");
@@ -2851,10 +2939,36 @@
   }
 
   async function requestAiEdit(instruction: string) {
+    if (aiEditGenerating) return;
     const file = activeEditorFile;
     const config = buildAiWorkerConfig();
     if (!file || !config) return;
+    const requestId = ++aiEditRequestId;
+    aiEditGenerating = true;
+    aiEditRunId = null;
+    aiEditTaskSessionId = null;
+    aiEditError = null;
+    aiEditProposal = null;
+    aiEditSelectedHunkIds = [];
+    if (config.runtime === "opencode" && !(await ensureAiWorkspaceTrusted(config))) {
+      if (requestId === aiEditRequestId) aiEditGenerating = false;
+      return;
+    }
+    if (activeEditorFile?.id !== file.id) {
+      if (requestId === aiEditRequestId) aiEditGenerating = false;
+      return;
+    }
     const snapshot = documentSnapshot(file);
+    const selection = activeEditorHandle?.getSelectionSnapshot() ?? null;
+    const diagnostics = activeLspDiagnostics.map((diagnostic) =>
+      [
+        diagnostic.source,
+        diagnostic.code === null ? null : String(diagnostic.code),
+        `${diagnostic.message} (line ${diagnostic.range.start.line + 1})`,
+      ]
+        .filter(Boolean)
+        .join(": "),
+    );
     const contextFiles = openEditorFiles.filter(
       (entry) => entry.id !== file.id && aiEditPinnedDocumentIds.includes(entry.id),
     );
@@ -2868,49 +2982,96 @@
         contextSnapshot.revision,
       ]),
     );
-    const requestId = ++aiEditRequestId;
-    aiEditGenerating = true;
-    aiEditRunId = null;
-    aiEditError = null;
-    aiEditProposal = null;
-    aiEditSelectedHunkIds = [];
     let lastEditEventSequence = 0;
     try {
-      const run = await beginAiRun("edit");
-      if (requestId !== aiEditRequestId) {
-        await cancelAiRun(run.run_id).catch(() => false);
-        return;
-      }
-      aiEditRunId = run.run_id;
-      const result = await proposeAiEdit(config, {
-        run_id: run.run_id,
-        file_path: file.path,
-        instruction,
-        content: snapshot.value,
-        selection: activeEditorHandle?.getSelectionSnapshot() ?? null,
-        context_files: contextSnapshots.map(({ file: entry, snapshot: contextSnapshot }) => ({
-          file_path: entry.path,
-          content: contextSnapshot.value,
-        })),
-        diagnostics: activeLspDiagnostics.map((diagnostic) =>
-          [
-            diagnostic.source,
-            diagnostic.code === null ? null : String(diagnostic.code),
-            `${diagnostic.message} (line ${diagnostic.range.start.line + 1})`,
-          ]
-            .filter(Boolean)
-            .join(": "),
-        ),
-      }, (event) => {
-        if (event.run_id !== run.run_id || requestId !== aiEditRequestId) return;
-        if (event.sequence <= lastEditEventSequence) return;
-        lastEditEventSequence = event.sequence;
-        if (event.type === "run_failed") {
-          aiEditError = "AI Edit generation failed in the backend runtime.";
-        } else if (event.type === "run_cancelled") {
-          aiEditError = "AI Edit generation was cancelled.";
+      const editInput = {
+        kind: "edit" as const,
+        input: {
+          file_path: file.path,
+          instruction,
+          content: snapshot.value,
+          selection,
+          context_files: contextSnapshots.map(({ file: entry, snapshot: contextSnapshot }) => ({
+            file_path: entry.path,
+            content: contextSnapshot.value,
+          })),
+          diagnostics,
+        },
+      };
+      let result: { run_id: string; summary: string; content: string };
+      if (config.runtime === "opencode" && "__TAURI_INTERNALS__" in window) {
+        const [profile, rootRevision] = await Promise.all([
+          ensureOpenCodePromptProfile(config),
+          workspaceRootRevision(config.workspace_id),
+        ]);
+        const envelope = await createPromptTaskEnvelope(
+          {
+            workspace_id: config.workspace_id,
+            kind: "edit",
+            subject_id: file.id,
+            conversation_id: null,
+            execution_run_id: null,
+            runtime_profile_id: profile.runtimeProfileId,
+            model: profile.model,
+            connector_ids: [],
+            requested_capabilities: [],
+            prompt_template_version: PROMPT_TASK_TEMPLATE_VERSION,
+            context_revision: String(rootRevision),
+            rules_revision: profile.rulesRevision,
+            skills_revision: profile.skillsRevision,
+          },
+          editInput,
+        );
+        const execution = await executePromptTaskSession(
+          `Edit ${file.path}`,
+          envelope,
+          undefined,
+          (session) => {
+            if (requestId !== aiEditRequestId) {
+              void cancelTaskSession(session.id).catch(() => false);
+              return;
+            }
+            aiEditTaskSessionId = session.id;
+          },
+        );
+        if (!("file_path" in execution.result)) {
+          throw new Error("Edit Task Session returned an unexpected result kind.");
         }
-      });
+        result = {
+          run_id: "",
+          summary: execution.result.summary,
+          content: execution.result.content,
+        };
+      } else {
+        const run = await beginAiRun("edit");
+        if (requestId !== aiEditRequestId) {
+          await cancelAiRun(run.run_id).catch(() => false);
+          return;
+        }
+        aiEditRunId = run.run_id;
+        result = await proposeAiEdit(
+          config,
+          {
+            run_id: run.run_id,
+            file_path: file.path,
+            instruction,
+            content: snapshot.value,
+            selection,
+            context_files: editInput.input.context_files,
+            diagnostics,
+          },
+          (event) => {
+            if (event.run_id !== run.run_id || requestId !== aiEditRequestId) return;
+            if (event.sequence <= lastEditEventSequence) return;
+            lastEditEventSequence = event.sequence;
+            if (event.type === "run_failed") {
+              aiEditError = "AI Edit generation failed in the backend runtime.";
+            } else if (event.type === "run_cancelled") {
+              aiEditError = "AI Edit generation was cancelled.";
+            }
+          },
+        );
+      }
       if (requestId !== aiEditRequestId) return;
       const proposal = createAiEditProposal({
         documentId: file.id,
@@ -2930,11 +3091,18 @@
     } catch (reason: unknown) {
       if (requestId !== aiEditRequestId) return;
       const runId = aiEditRunId;
+      const taskSessionId = aiEditTaskSessionId;
       aiEditRunId = null;
+      aiEditTaskSessionId = null;
       if (runId) void cancelAiRun(runId).catch(() => {});
+      if (taskSessionId !== null) void cancelTaskSession(taskSessionId).catch(() => false);
       aiEditError = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      if (requestId === aiEditRequestId) aiEditGenerating = false;
+      if (requestId === aiEditRequestId) {
+        aiEditRunId = null;
+        aiEditTaskSessionId = null;
+        aiEditGenerating = false;
+      }
     }
   }
 
@@ -2976,8 +3144,11 @@
     aiEditGenerating = false;
     aiEditError = null;
     const runId = aiEditRunId;
+    const taskSessionId = aiEditTaskSessionId;
     aiEditRunId = null;
+    aiEditTaskSessionId = null;
     if (runId) void cancelAiRun(runId).catch(() => {});
+    if (taskSessionId !== null) void cancelTaskSession(taskSessionId).catch(() => false);
   }
 
   function toggleAiEditHunk(id: string) {
@@ -3574,6 +3745,7 @@
             messages: session.messages,
           })),
         );
+        void recoverRetainedChatTaskSessions(workspaceId);
         return;
       }
 
@@ -3607,6 +3779,7 @@
       workspaceChatSession = active;
       workspaceChatMessages = active.messages;
       saveUiState();
+      void recoverRetainedChatTaskSessions(workspaceId);
     } catch (reason: unknown) {
       durableConversationWorkspaceId = null;
       appNotice = {
@@ -3616,12 +3789,57 @@
     }
   }
 
+  async function recoverRetainedChatTaskSessions(workspaceId: string) {
+    const sessions = await listTaskSessions().catch(() => []);
+    for (const snapshot of sessions) {
+      if (recoveringPromptSessionIds.has(snapshot.id)) continue;
+      let envelope: import("$lib/ipc/taskSessions").TaskSessionEnvelopeV2;
+      try {
+        envelope = JSON.parse(snapshot.request.payload);
+      } catch {
+        continue;
+      }
+      if (
+        envelope.schema_version !== 2 ||
+        envelope.session.session.kind !== "chat" ||
+        envelope.session.session.workspace_id !== workspaceId
+      ) {
+        continue;
+      }
+      const conversationId = envelope.session.session.conversation_id;
+      if (typeof conversationId !== "string") continue;
+      recoveringPromptSessionIds.add(snapshot.id);
+      void waitForPromptTaskSession(snapshot.id, envelope)
+        .then(async () => {
+          const messages = await loadConversationMessages(workspaceId, conversationId);
+          const session = workspaceChatSessions.find((entry) => entry.id === conversationId);
+          if (!session) return;
+          const updated = {
+            ...session,
+            updatedAt: Date.now(),
+            messages: messages.map(({ id, role, text }) => ({ id, role, text })),
+          };
+          workspaceChatSessions = [
+            updated,
+            ...workspaceChatSessions.filter((entry) => entry.id !== updated.id),
+          ];
+          if (updated.id === workspaceChatActiveSessionId) {
+            workspaceChatSession = updated;
+            workspaceChatMessages = updated.messages;
+          }
+          saveUiState();
+        })
+        .catch(() => {})
+        .finally(() => recoveringPromptSessionIds.delete(snapshot.id));
+    }
+  }
+
   function appendWorkspaceChat(
     message: Omit<WorkspaceChatMessage, "id">,
     targetSessionId = workspaceChatActiveSessionId,
   ) {
     const session = workspaceChatSessions.find((entry) => entry.id === targetSessionId);
-    if (!session) return;
+    if (!session) return null;
     const entry: WorkspaceChatMessage = {
       ...message,
       id: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
@@ -3643,23 +3861,65 @@
       workspaceChatSession = updatedSession;
       workspaceChatMessages = updatedSession.messages;
     }
-    appendWorkspaceChatActivity({
-      kind: "message",
-      label: message.role,
-      text: message.text,
-    }, targetSessionId);
+    const activityEntry = appendWorkspaceChatActivity(
+      {
+        kind: "message",
+        label: message.role,
+        text: message.text,
+      },
+      targetSessionId,
+    );
     saveUiState();
-    if (workspace?.id && ("__TAURI_INTERNALS__" in window)) {
-      void appendConversationMessage(workspace.id, targetSessionId, updatedSession.title, entry).catch(
-        (reason: unknown) => {
-          appNotice = {
-            tone: "error",
-            message: reason instanceof Error ? reason.message : String(reason),
-          };
-        },
-      );
-    }
+    const persisted =
+      workspace?.id && "__TAURI_INTERNALS__" in window
+        ? appendConversationMessage(
+            workspace.id,
+            targetSessionId,
+            updatedSession.title,
+            entry,
+          ).catch((reason: unknown) => {
+            appNotice = {
+              tone: "error",
+              message: reason instanceof Error ? reason.message : String(reason),
+            };
+            return null;
+          })
+        : null;
     scrollWorkspaceChatToLatest();
+    return {
+      entry,
+      persisted,
+      activityId: activityEntry?.id ?? null,
+      previousTitle: session.title,
+    };
+  }
+
+  function removeWorkspaceChatMessage(
+    messageId: string,
+    targetSessionId: string,
+    activityId: string | null,
+    previousTitle: string,
+  ) {
+    const session = workspaceChatSessions.find((entry) => entry.id === targetSessionId);
+    if (!session) return;
+    const updatedSession = {
+      ...session,
+      updatedAt: Date.now(),
+      title: previousTitle,
+      messages: session.messages.filter((message) => message.id !== messageId),
+      activities: activityId
+        ? session.activities.filter((activity) => activity.id !== activityId)
+        : session.activities,
+    };
+    workspaceChatSessions = [
+      updatedSession,
+      ...workspaceChatSessions.filter((entry) => entry.id !== targetSessionId),
+    ].slice(0, MAX_CHAT_SESSIONS);
+    if (targetSessionId === workspaceChatActiveSessionId) {
+      workspaceChatSession = updatedSession;
+      workspaceChatMessages = updatedSession.messages;
+    }
+    saveUiState();
   }
 
   function appendWorkspaceChatActivity(
@@ -3676,10 +3936,7 @@
     const updatedSession = {
       ...session,
       updatedAt: Date.now(),
-      activities: capList(
-        [...session.activities, entry],
-        MAX_WORKSPACE_CHAT_ACTIVITIES,
-      ),
+      activities: capList([...session.activities, entry], MAX_WORKSPACE_CHAT_ACTIVITIES),
     };
     workspaceChatSessions = [
       updatedSession,
@@ -3692,6 +3949,7 @@
       };
     }
     saveUiState();
+    return entry;
   }
 
   function syncWorkspaceChatSession() {
@@ -3708,20 +3966,10 @@
     ].slice(0, MAX_CHAT_SESSIONS);
   }
 
-  function cancelWorkspaceChatOnSessionChange() {
-    if (!workspaceChatRunning) return;
-    workspaceChatRequestId += 1;
-    const runId = workspaceChatRunId;
-    workspaceChatRunId = null;
-    workspaceChatRunning = false;
-    if (runId) void cancelAiRun(runId).catch(() => {});
-  }
-
   function activateWorkspaceChatSession(sessionId: string) {
     const session = workspaceChatSessions.find((entry) => entry.id === sessionId);
     if (!session || session.id === workspaceChatActiveSessionId) return;
 
-    cancelWorkspaceChatOnSessionChange();
     workspaceChatActiveSessionId = session.id;
     workspaceChatSession = {
       ...session,
@@ -3735,7 +3983,6 @@
   }
 
   function startWorkspaceChatSession() {
-    cancelWorkspaceChatOnSessionChange();
     const sessionNumber = workspaceChatSessions.length + 1;
     const session = createWorkspaceChatSession([], `Chat ${sessionNumber}`);
     workspaceChatSessions = [session, ...workspaceChatSessions].slice(0, MAX_CHAT_SESSIONS);
@@ -3746,51 +3993,63 @@
     scrollWorkspaceChatToLatest();
   }
 
-  function setWorkspaceChatSessionCard(cardId: string | null, options: { created?: boolean } = {}) {
+  function setWorkspaceChatSessionCard(
+    cardId: string | null,
+    options: { created?: boolean } = {},
+    targetSessionId = workspaceChatActiveSessionId,
+  ) {
+    const targetSession = workspaceChatSessions.find((session) => session.id === targetSessionId);
+    if (!targetSession) return;
     const card = cardId ? (activeCardById.get(cardId) ?? null) : null;
     const recentCardIds = cardId
       ? capList(
-          [cardId, ...workspaceChatSession.recentCardIds.filter((entry) => entry !== cardId)],
+          [cardId, ...targetSession.recentCardIds.filter((entry) => entry !== cardId)],
           MAX_WORKSPACE_CHAT_RECENT_CARDS,
         )
-      : workspaceChatSession.recentCardIds;
-    workspaceChatSession = {
-      ...workspaceChatSession,
+      : targetSession.recentCardIds;
+    const updatedSession = {
+      ...targetSession,
       updatedAt: Date.now(),
       title:
-        card && (options.created || isGenericChatTitle(workspaceChatSession.title))
+        card && (options.created || isGenericChatTitle(targetSession.title))
           ? chatTitleForCard(card)
-          : workspaceChatSession.title,
-      lastCardId: cardId ?? workspaceChatSession.lastCardId,
-      lastCreatedCardId:
-        options.created && cardId ? cardId : workspaceChatSession.lastCreatedCardId,
+          : targetSession.title,
+      lastCardId: cardId ?? targetSession.lastCardId,
+      lastCreatedCardId: options.created && cardId ? cardId : targetSession.lastCreatedCardId,
       recentCardIds,
     };
-    syncWorkspaceChatSession();
+    workspaceChatSessions = [
+      updatedSession,
+      ...workspaceChatSessions.filter((session) => session.id !== targetSessionId),
+    ].slice(0, MAX_CHAT_SESSIONS);
+    if (targetSessionId === workspaceChatActiveSessionId) {
+      workspaceChatSession = updatedSession;
+      workspaceChatMessages = updatedSession.messages;
+    }
     saveUiState();
   }
 
-  function workspaceChatActionContext(): WorkspaceChatActionContext {
+  function workspaceChatActionContext(session = workspaceChatSession): WorkspaceChatActionContext {
     return {
       activeCardIds,
       selectedCardId,
-      lastCardId: workspaceChatSession.lastCardId,
-      lastCreatedCardId: workspaceChatSession.lastCreatedCardId,
-      recentCardIds: workspaceChatSession.recentCardIds,
+      lastCardId: session.lastCardId,
+      lastCreatedCardId: session.lastCreatedCardId,
+      recentCardIds: session.recentCardIds,
     };
   }
 
-  function workspaceChatSessionPromptContext(): string {
-    const recentMessages = workspaceChatMessages
+  function workspaceChatSessionPromptContext(session: ChatSessionState): string {
+    const recentMessages = session.messages
       .filter((message) => message.id !== "chat-welcome")
       .slice(-10)
       .map((message) => `${message.role}: ${singleLine(message.text, 500)}`);
-    const recentActivities = workspaceChatSession.activities
+    const recentActivities = session.activities
       .slice(-8)
       .map((activity) => `${activity.kind}/${activity.label}: ${singleLine(activity.text, 300)}`);
 
     return [
-      chatSessionContext(workspaceChatActionContext()),
+      chatSessionContext(workspaceChatActionContext(session)),
       recentMessages.length > 0
         ? ["Recent chat turns:", ...recentMessages].join("\n")
         : "Recent chat turns: none.",
@@ -3984,49 +4243,76 @@
     return agentConsoleRuntime;
   }
 
-  function flushWorkspaceChatStream() {
-    workspaceChatStreamFrame = null;
-    if (!workspaceChatStreamBuffer) return;
-    workspaceChatStreamingText += workspaceChatStreamBuffer;
-    workspaceChatStreamBuffer = "";
+  function flushWorkspaceChatStream(sessionId: string, generation: number) {
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (run) =>
+      run.generation !== generation
+        ? run
+        : {
+            ...run,
+            streamFrame: null,
+            streamingText: run.streamingText + run.streamBuffer,
+            streamBuffer: "",
+          },
+    );
   }
 
-  function queueWorkspaceChatDelta(delta: string) {
-    workspaceChatStreamBuffer += delta;
-    if (workspaceChatStreamFrame !== null) return;
-    workspaceChatStreamFrame = requestAnimationFrame(flushWorkspaceChatStream);
+  function queueWorkspaceChatDelta(sessionId: string, generation: number, delta: string) {
+    const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
+    if (run.generation !== generation) return;
+    const streamFrame =
+      run.streamFrame ??
+      requestAnimationFrame(() => flushWorkspaceChatStream(sessionId, generation));
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (current) =>
+      current.generation === generation
+        ? { ...current, streamBuffer: current.streamBuffer + delta, streamFrame }
+        : current,
+    );
   }
 
-  function resetWorkspaceChatStream() {
-    if (workspaceChatStreamFrame !== null) cancelAnimationFrame(workspaceChatStreamFrame);
-    workspaceChatStreamFrame = null;
-    workspaceChatStreamBuffer = "";
-    workspaceChatStreamingText = "";
+  function resetWorkspaceChatStream(sessionId: string, generation?: number) {
+    const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
+    if (generation !== undefined && run.generation !== generation) return;
+    if (run.streamFrame !== null) cancelAnimationFrame(run.streamFrame);
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (current) => ({
+      ...current,
+      streamFrame: null,
+      streamBuffer: "",
+      streamingText: "",
+    }));
   }
 
   async function sendWorkspaceChat() {
     const message = workspaceChatTextarea?.value.trim() ?? "";
-    if (!message || workspaceChatRunning) return;
+    const currentRun = workspaceChatRunFor(workspaceChatRuns, workspaceChatActiveSessionId);
+    if (!message || currentRun.running) return;
     const requestSessionId = workspaceChatActiveSessionId;
-    const requestSessionContext = workspaceChatSessionPromptContext();
+    const requestSession = workspaceChatSessions.find((session) => session.id === requestSessionId);
+    if (!requestSession) return;
+    const requestSessionContext = workspaceChatSessionPromptContext(requestSession);
     const requestWorkspaceContext = workspaceChatRequestContext();
 
     if (workspaceChatTextarea) workspaceChatTextarea.value = "";
-    appendWorkspaceChat({ role: "user", text: message }, requestSessionId);
+    const appendedUser = appendWorkspaceChat({ role: "user", text: message }, requestSessionId);
     focusWorkspaceChatInput();
 
-    const localActions = fastWorkspaceChatActions(message, workspaceChatActionContext());
+    const localActions = fastWorkspaceChatActions(
+      message,
+      workspaceChatActionContext(requestSession),
+    );
     if (localActions.length > 0) {
       if (localActions.some(workspaceChatActionRequiresConfirmation)) {
-        proposeWorkspaceChatActions(localActions, "command", null);
-        appendWorkspaceChat({
-          role: "system",
-          text: "Review and approve the proposed workspace actions before they run.",
-        }, requestSessionId);
+        proposeWorkspaceChatActions(localActions, "command", null, requestSessionId);
+        appendWorkspaceChat(
+          {
+            role: "system",
+            text: "Review and approve the proposed workspace actions before they run.",
+          },
+          requestSessionId,
+        );
         focusWorkspaceChatInput();
         return;
       }
-      const actionSummary = await applyWorkspaceChatActions(localActions);
+      const actionSummary = await applyWorkspaceChatActions(localActions, requestSessionId);
       appendWorkspaceChat({ role: "system", text: actionSummary }, requestSessionId);
       focusWorkspaceChatInput();
       return;
@@ -4034,82 +4320,278 @@
 
     const config = buildAiWorkerConfig();
     if (!config) return;
-    if (!(await ensureAiWorkspaceTrusted(config))) return;
-
-    workspaceChatRunning = true;
-    resetWorkspaceChatStream();
-    workspaceChatLastEventSequence = 0;
-    const requestId = ++workspaceChatRequestId;
+    const requestId = currentRun.generation + 1;
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, requestSessionId, (run) => ({
+      ...createWorkspaceChatRun(requestId),
+      actionProposal: run.actionProposal,
+      running: true,
+      state: "queued",
+    }));
 
     try {
-      const run = await beginAiRun("chat");
-      if (requestId !== workspaceChatRequestId) {
-        await cancelAiRun(run.run_id).catch(() => false);
-        return;
-      }
-      workspaceChatRunId = run.run_id;
-      const result = await chatAiWorker(config, {
-        run_id: run.run_id,
-        message,
-        terminal_context: requestWorkspaceContext.context,
-        context_revision: requestWorkspaceContext.revision,
-        session_context: requestSessionContext,
-        session_key: `chat:${requestSessionId}`,
-      }, (event) => {
-        if (event.run_id !== run.run_id || requestId !== workspaceChatRequestId) return;
-        if (event.sequence <= workspaceChatLastEventSequence) return;
-        workspaceChatLastEventSequence = event.sequence;
-        if (event.type === "text_delta") {
-          queueWorkspaceChatDelta(event.delta);
+      if (!(await ensureAiWorkspaceTrusted(config))) return;
+      let result: { run_id: string; message: string };
+      if (config.runtime === "opencode" && "__TAURI_INTERNALS__" in window) {
+        const durableUser = appendedUser?.persisted ? await appendedUser.persisted : null;
+        if (!durableUser) {
+          if (appendedUser) {
+            removeWorkspaceChatMessage(
+              appendedUser.entry.id,
+              requestSessionId,
+              appendedUser.activityId,
+              appendedUser.previousTitle,
+            );
+          }
+          throw new Error("Chat message must be durably saved before Task Session submission.");
         }
-      });
-      if (requestId !== workspaceChatRequestId) return;
+        const [profile, rootRevision] = await Promise.all([
+          ensureOpenCodePromptProfile(config),
+          workspaceRootRevision(config.workspace_id),
+        ]);
+        const chatInput = {
+          kind: "chat" as const,
+          input: {
+            message_id: durableUser.id,
+            message_sequence: durableUser.sequence,
+            message,
+            terminal_context: requestWorkspaceContext.context,
+            session_context: requestSessionContext,
+          },
+        };
+        const envelope = await createPromptTaskEnvelope(
+          {
+            workspace_id: config.workspace_id,
+            kind: "chat",
+            subject_id: null,
+            conversation_id: requestSessionId,
+            execution_run_id: null,
+            runtime_profile_id: profile.runtimeProfileId,
+            model: profile.model,
+            connector_ids: [],
+            requested_capabilities: [],
+            prompt_template_version: PROMPT_TASK_TEMPLATE_VERSION,
+            context_revision: String(rootRevision),
+            rules_revision: profile.rulesRevision,
+            skills_revision: profile.skillsRevision,
+          },
+          chatInput,
+        );
+        let streamedAttemptId: number | null = null;
+        const execution = await executePromptTaskSession(
+          `Chat ${requestSessionId}`,
+          envelope,
+          (event) => {
+            const run = workspaceChatRunFor(workspaceChatRuns, requestSessionId);
+            if (requestId !== run.generation) return;
+            workspaceChatRuns = updateWorkspaceChatRun(
+              workspaceChatRuns,
+              requestSessionId,
+              (current) => ({
+                ...current,
+                state:
+                  event.kind === "lifecycle" &&
+                  typeof event.payload === "object" &&
+                  event.payload !== null &&
+                  !Array.isArray(event.payload) &&
+                  typeof (event.payload as Record<string, unknown>).state === "string"
+                    ? ((event.payload as Record<string, unknown>).state as typeof current.state)
+                    : current.state,
+                progress: event.progress ?? current.progress,
+              }),
+            );
+            if (event.kind !== "runtime") return;
+            if (event.attempt_id === null) return;
+            if (streamedAttemptId !== event.attempt_id) {
+              resetWorkspaceChatStream(requestSessionId, requestId);
+              streamedAttemptId = event.attempt_id;
+            }
+            const payload =
+              typeof event.payload === "object" &&
+              event.payload !== null &&
+              !Array.isArray(event.payload)
+                ? (event.payload as Record<string, unknown>)
+                : null;
+            if (
+              payload !== null &&
+              payload.type === "text_delta" &&
+              typeof payload.text === "string"
+            ) {
+              queueWorkspaceChatDelta(requestSessionId, requestId, payload.text);
+            }
+          },
+          (session) => {
+            if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) {
+              void cancelTaskSession(session.id).catch(() => false);
+              return;
+            }
+            workspaceChatRuns = updateWorkspaceChatRun(
+              workspaceChatRuns,
+              requestSessionId,
+              (run) => ({ ...run, taskSessionId: session.id, state: session.state }),
+            );
+          },
+        );
+        if (!("conversation_id" in execution.result)) {
+          throw new Error("Chat Task Session returned an unexpected result kind.");
+        }
+        result = { run_id: "", message: execution.result.message };
+      } else {
+        const run = await beginAiRun("chat");
+        if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) {
+          await cancelAiRun(run.run_id).catch(() => false);
+          return;
+        }
+        workspaceChatRuns = updateWorkspaceChatRun(
+          workspaceChatRuns,
+          requestSessionId,
+          (current) => ({ ...current, legacyRunId: run.run_id, state: "running" }),
+        );
+        result = await chatAiWorker(
+          config,
+          {
+            run_id: run.run_id,
+            message,
+            terminal_context: requestWorkspaceContext.context,
+            context_revision: requestWorkspaceContext.revision,
+            session_context: requestSessionContext,
+            session_key: `chat:${requestSessionId}`,
+          },
+          (event) => {
+            const current = workspaceChatRunFor(workspaceChatRuns, requestSessionId);
+            if (event.run_id !== run.run_id || requestId !== current.generation) return;
+            if (event.sequence <= current.lastEventSequence) return;
+            workspaceChatRuns = updateWorkspaceChatRun(
+              workspaceChatRuns,
+              requestSessionId,
+              (state) => ({ ...state, lastEventSequence: event.sequence }),
+            );
+            if (event.type === "text_delta") {
+              queueWorkspaceChatDelta(requestSessionId, requestId, event.delta);
+            }
+          },
+        );
+      }
+      if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) return;
       const response = result.message;
       const actions = extractWorkspaceActions(response);
-      appendWorkspaceChat(
-        { role: "agent", text: stripWorkspaceActions(response) },
-        requestSessionId,
-      );
+      if (result.run_id === "" && workspace?.id) {
+        const messages = await loadConversationMessages(workspace.id, requestSessionId);
+        const session = workspaceChatSessions.find((entry) => entry.id === requestSessionId);
+        if (session) {
+          const updated = {
+            ...session,
+            updatedAt: Date.now(),
+            messages: messages.map(({ id, role, text }) => ({ id, role, text })),
+          };
+          workspaceChatSessions = [
+            updated,
+            ...workspaceChatSessions.filter((entry) => entry.id !== requestSessionId),
+          ];
+          if (requestSessionId === workspaceChatActiveSessionId) {
+            workspaceChatSession = updated;
+            workspaceChatMessages = updated.messages;
+          }
+        }
+      } else {
+        appendWorkspaceChat(
+          { role: "agent", text: stripWorkspaceActions(response) },
+          requestSessionId,
+        );
+      }
+      if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) return;
       if (actions.length > 0) {
         if (actions.some(workspaceChatActionRequiresConfirmation)) {
-          proposeWorkspaceChatActions(actions, "model", result.run_id);
-            appendWorkspaceChat({
+          proposeWorkspaceChatActions(actions, "model", result.run_id || null, requestSessionId);
+          appendWorkspaceChat(
+            {
               role: "system",
               text: "The AI proposed workspace mutations. Review them before applying.",
-            }, requestSessionId);
+            },
+            requestSessionId,
+          );
         } else {
-          const actionSummary = await applyWorkspaceChatActions(actions);
+          const actionSummary = await applyWorkspaceChatActions(actions, requestSessionId);
           appendWorkspaceChat({ role: "system", text: actionSummary }, requestSessionId);
         }
       }
     } catch (reason) {
-      if (requestId !== workspaceChatRequestId) return;
-      const runId = workspaceChatRunId;
-      workspaceChatRunId = null;
+      const current = workspaceChatRunFor(workspaceChatRuns, requestSessionId);
+      if (requestId !== current.generation) return;
+      const runId = current.legacyRunId;
+      const taskSessionId = current.taskSessionId;
       if (runId) void cancelAiRun(runId).catch(() => {});
-      appendWorkspaceChat({
-        role: "system",
-        text: reason instanceof Error ? reason.message : String(reason),
-      }, requestSessionId);
+      if (taskSessionId !== null) void cancelTaskSession(taskSessionId).catch(() => false);
+      appendWorkspaceChat(
+        {
+          role: "system",
+          text: reason instanceof Error ? reason.message : String(reason),
+        },
+        requestSessionId,
+      );
+      workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, requestSessionId, (run) => ({
+        ...run,
+        error: reason instanceof Error ? reason.message : String(reason),
+        state: "failed",
+      }));
     } finally {
-      resetWorkspaceChatStream();
-      workspaceChatLastEventSequence = 0;
-      if (requestId === workspaceChatRequestId) {
-        workspaceChatRunId = null;
-        workspaceChatRunning = false;
+      if (requestId === workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) {
+        resetWorkspaceChatStream(requestSessionId, requestId);
+        workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, requestSessionId, (run) => ({
+          ...run,
+          running: false,
+          legacyRunId: null,
+          taskSessionId: null,
+          lastEventSequence: 0,
+          state: run.error ? "failed" : "succeeded",
+        }));
+        if (requestSessionId === workspaceChatActiveSessionId) focusWorkspaceChatInput();
       }
-      focusWorkspaceChatInput();
     }
   }
 
   function cancelWorkspaceChat() {
-    workspaceChatRequestId += 1;
-    workspaceChatRunning = false;
-    resetWorkspaceChatStream();
-    workspaceChatLastEventSequence = 0;
-    const runId = workspaceChatRunId;
-    workspaceChatRunId = null;
-    if (runId) void cancelAiRun(runId).catch(() => {});
+    const sessionId = workspaceChatActiveSessionId;
+    const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
+    if (run.streamFrame !== null) cancelAnimationFrame(run.streamFrame);
+    const runId = run.legacyRunId;
+    const taskSessionId = run.taskSessionId;
+    workspaceChatRuns = cancelWorkspaceChatRun(workspaceChatRuns, sessionId);
+    const cancellationGeneration = workspaceChatRunFor(workspaceChatRuns, sessionId).generation;
+    const settleCancellation = (terminalState: "cancelled" | "failed" | "succeeded" | null) => {
+      workspaceChatRuns = settleWorkspaceChatCancellation(
+        workspaceChatRuns,
+        sessionId,
+        cancellationGeneration,
+        terminalState,
+      );
+    };
+    if (runId)
+      void confirmLegacyWorkspaceChatCancellation(runId, {
+        cancel: cancelAiRun,
+        getRun: getAiRun,
+      })
+        .then(settleCancellation)
+        .catch(() => settleCancellation(null));
+    if (taskSessionId !== null) {
+      void cancelTaskSession(taskSessionId)
+        .then(async (accepted) => {
+          if (!accepted) return null;
+          const deadline = Date.now() + 5_000;
+          while (Date.now() < deadline) {
+            const snapshot = await getTaskSession(taskSessionId);
+            if (!snapshot) return null;
+            if (snapshot.state === "cancelled") return "cancelled" as const;
+            if (["failed", "blocked", "succeeded"].includes(snapshot.state)) {
+              return "failed" as const;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        })
+        .then(settleCancellation)
+        .catch(() => settleCancellation(null));
+    }
+    if (!runId && taskSessionId === null) settleCancellation("cancelled");
     focusWorkspaceChatInput();
   }
 
@@ -4117,32 +4599,42 @@
     actions: WorkspaceChatAction[],
     source: WorkspaceChatActionProposal["source"],
     runId: string | null,
+    sessionId = workspaceChatActiveSessionId,
   ) {
-    workspaceChatActionProposal = {
-      id: crypto.randomUUID(),
-      sessionId: workspaceChatSession.id,
-      runId,
-      source,
-      actions,
-    };
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (run) => ({
+      ...run,
+      actionProposal: { id: crypto.randomUUID(), sessionId, runId, source, actions },
+    }));
   }
 
   async function applyWorkspaceChatActionProposal() {
-    const proposal = workspaceChatActionProposal;
+    const proposal = activeWorkspaceChatRun.actionProposal;
     if (!proposal || proposal.sessionId !== workspaceChatSession.id) return;
-    workspaceChatActionProposal = null;
-    const actionSummary = await applyWorkspaceChatActions(proposal.actions);
-    appendWorkspaceChat({ role: "system", text: actionSummary });
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, proposal.sessionId, (run) => ({
+      ...run,
+      actionProposal: null,
+    }));
+    const actionSummary = await applyWorkspaceChatActions(proposal.actions, proposal.sessionId);
+    appendWorkspaceChat({ role: "system", text: actionSummary }, proposal.sessionId);
   }
 
   function rejectWorkspaceChatActionProposal() {
-    const proposal = workspaceChatActionProposal;
+    const proposal = activeWorkspaceChatRun.actionProposal;
     if (!proposal || proposal.sessionId !== workspaceChatSession.id) return;
-    workspaceChatActionProposal = null;
-    appendWorkspaceChat({ role: "system", text: "Proposed workspace actions were rejected." });
+    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, proposal.sessionId, (run) => ({
+      ...run,
+      actionProposal: null,
+    }));
+    appendWorkspaceChat(
+      { role: "system", text: "Proposed workspace actions were rejected." },
+      proposal.sessionId,
+    );
   }
 
-  async function applyWorkspaceChatActions(actions: WorkspaceChatAction[]): Promise<string> {
+  async function applyWorkspaceChatActions(
+    actions: WorkspaceChatAction[],
+    targetSessionId = workspaceChatActiveSessionId,
+  ): Promise<string> {
     const results: string[] = [];
 
     for (const action of actions.slice(0, 5)) {
@@ -4152,13 +4644,16 @@
           action.description ?? "Created by Spacesly Agent chat.",
         );
         if (card) {
-          setWorkspaceChatSessionCard(card.id, { created: true });
-          appendWorkspaceChatActivity({
-            kind: "tool",
-            label: "create_task",
-            text: `Created ${ticketLabel(card)}: ${card.title}`,
-            cardId: card.id,
-          });
+          setWorkspaceChatSessionCard(card.id, { created: true }, targetSessionId);
+          appendWorkspaceChatActivity(
+            {
+              kind: "tool",
+              label: "create_task",
+              text: `Created ${ticketLabel(card)}: ${card.title}`,
+              cardId: card.id,
+            },
+            targetSessionId,
+          );
           results.push(
             `Created local task "${card.title}" in Todo. Queue it or start the Agent when ready.`,
           );
@@ -4170,18 +4665,21 @@
 
       if (action.type === "sync_jira") {
         await syncJira();
-        appendWorkspaceChatActivity({
-          kind: "tool",
-          label: "sync_jira",
-          text: "Requested Jira sync from chat.",
-        });
+        appendWorkspaceChatActivity(
+          {
+            kind: "tool",
+            label: "sync_jira",
+            text: "Requested Jira sync from chat.",
+          },
+          targetSessionId,
+        );
         results.push(
           "Jira sync requested. Watch the board notice for fetched card count or errors.",
         );
         continue;
       }
 
-      const card = resolveActionCard(action);
+      const card = resolveActionCard(action, targetSessionId);
       if (!card) {
         results.push(`Could not find the requested card for ${action.type}.`);
         continue;
@@ -4189,14 +4687,17 @@
 
       if (action.type === "select_card") {
         selectCard(card);
-        setWorkspaceChatSessionCard(card.id);
+        setWorkspaceChatSessionCard(card.id, {}, targetSessionId);
         setWorkspaceMode("board");
-        appendWorkspaceChatActivity({
-          kind: "tool",
-          label: "select_card",
-          text: `Opened ${ticketLabel(card)}: ${card.title}`,
-          cardId: card.id,
-        });
+        appendWorkspaceChatActivity(
+          {
+            kind: "tool",
+            label: "select_card",
+            text: `Opened ${ticketLabel(card)}: ${card.title}`,
+            cardId: card.id,
+          },
+          targetSessionId,
+        );
         results.push(
           `Opened ${ticketLabel(card)}: "${card.title}". Current state: ${executionDetail(card.execution)}.`,
         );
@@ -4205,12 +4706,15 @@
 
       if (action.type === "delete_card") {
         const removed = removeCard(card.id);
-        appendWorkspaceChatActivity({
-          kind: "tool",
-          label: "delete_card",
-          text: `${removed ? "Removed" : "Failed to remove"} ${ticketLabel(card)}: ${card.title}`,
-          cardId: card.id,
-        });
+        appendWorkspaceChatActivity(
+          {
+            kind: "tool",
+            label: "delete_card",
+            text: `${removed ? "Removed" : "Failed to remove"} ${ticketLabel(card)}: ${card.title}`,
+            cardId: card.id,
+          },
+          targetSessionId,
+        );
         results.push(
           removed
             ? `Removed ${ticketLabel(card)} from Spacesly.`
@@ -4220,13 +4724,16 @@
       }
 
       if (action.type === "start_agent") {
-        setWorkspaceChatSessionCard(card.id);
-        appendWorkspaceChatActivity({
-          kind: "tool",
-          label: "start_agent",
-          text: `Requested Agent start for ${ticketLabel(card)}: ${card.title}`,
-          cardId: card.id,
-        });
+        setWorkspaceChatSessionCard(card.id, {}, targetSessionId);
+        appendWorkspaceChatActivity(
+          {
+            kind: "tool",
+            label: "start_agent",
+            text: `Requested Agent start for ${ticketLabel(card)}: ${card.title}`,
+            cardId: card.id,
+          },
+          targetSessionId,
+        );
         await startWorkerForCard(card.id);
         results.push(
           `Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`,
@@ -4241,13 +4748,16 @@
           continue;
         }
         await moveCardAndSync(card.id, columnId);
-        setWorkspaceChatSessionCard(card.id);
-        appendWorkspaceChatActivity({
-          kind: "tool",
-          label: "move_card",
-          text: `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}.`,
-          cardId: card.id,
-        });
+        setWorkspaceChatSessionCard(card.id, {}, targetSessionId);
+        appendWorkspaceChatActivity(
+          {
+            kind: "tool",
+            label: "move_card",
+            text: `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}.`,
+            cardId: card.id,
+          },
+          targetSessionId,
+        );
         results.push(
           `Moved ${ticketLabel(card)} to ${chatTargetLabel(action.target)}. Jira write-back is attempted only for In Progress and Done.`,
         );
@@ -4268,7 +4778,9 @@
 
   function hasJiraCredential(): boolean {
     if (settings.jira.authMode === "pat") {
-      return Boolean(appSecrets.jira_personal_access_token.trim()) || jiraSecrets.personal_access_token;
+      return (
+        Boolean(appSecrets.jira_personal_access_token.trim()) || jiraSecrets.personal_access_token
+      );
     }
     if (settings.jira.authMode === "password") {
       return Boolean(appSecrets.jira_password.trim()) || jiraSecrets.password;
@@ -4835,7 +5347,6 @@
       deletedJiraCardCount = locallyDeletedCachedCardIds().length;
     }
     if (selectedCardId === cardId) selectedCardId = null;
-    if (agentRunCardId === cardId) agentRunCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
     if (latestAgentSessionId === cardId) {
@@ -4914,31 +5425,17 @@
     gitSnapshot: AgentRunGitSnapshot | null = gitSnapshotFromInfo(workspaceGitInfo),
   ) {
     const previousSession = agentRunSessions[card.id];
-    agentRunCardId = card.id;
     agentConsoleCardId = card.id;
-    agentRunTitle = card.title;
-    agentRunStatus = "running";
-    agentRunProgress = continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5;
-    agentRunOutput =
+    const session = createAgentRunSession(
+      card.id,
+      card.title,
+      "running",
+      continuation ? Math.max(previousSession?.progress ?? 0, 20) : 5,
       continuation && previousSession?.output
         ? previousSession.output
-        : "Waiting for Agent output...";
-    agentRunResult = continuation && previousSession?.result ? previousSession.result : null;
-    agentRunLogs = continuation && previousSession ? previousSession.logs : [];
-    agentRunGitSnapshot =
-      continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot;
-    agentRunTranscript =
-      continuation && previousSession
-        ? (previousSession.transcript ?? [])
-        : [
-            createAgentSessionEvent(
-              "system",
-              "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
-            ),
-          ];
-    agentExecutionRun =
-      continuation && previousSession ? (previousSession.executionRun ?? null) : null;
-    agentTerminalLines =
+        : "Waiting for Agent output...",
+      continuation && previousSession?.result ? previousSession.result : null,
+      continuation && previousSession ? previousSession.logs : [],
       continuation && previousSession
         ? previousSession.terminalLines
         : [
@@ -4947,8 +5444,24 @@
               prompt: "system",
               text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
             },
-          ];
-    appendStructuredAgentLog(
+          ],
+      continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot,
+      continuation && previousSession
+        ? (previousSession.transcript ?? [])
+        : [
+            createAgentSessionEvent(
+              "system",
+              "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+            ),
+          ],
+      continuation && previousSession ? (previousSession.executionRun ?? null) : null,
+      null,
+      continuation ? (previousSession?.conversationId ?? null) : null,
+    );
+    agentRunSessions = retainAgentSessions({ ...agentRunSessions, [card.id]: session });
+    latestAgentSessionId = card.id;
+    appendStructuredAgentLogForCard(
+      card.id,
       "info",
       continuation ? "continue" : "start",
       continuation
@@ -4976,42 +5489,8 @@
     };
   }
 
-  function activeAgentSession(): AgentRunSession | null {
-    if (!agentRunCardId) return null;
-
-    return createAgentRunSession(
-      agentRunCardId,
-      agentRunTitle,
-      agentRunStatus,
-      agentRunProgress,
-      agentRunOutput,
-      agentRunResult,
-      agentRunLogs,
-      agentTerminalLines,
-      agentRunGitSnapshot,
-      agentRunTranscript,
-      agentExecutionRun,
-    );
-  }
-
-  function applyAgentSessionToConsole(session: AgentRunSession) {
-    agentRunCardId = session.cardId;
-    agentRunTitle = session.title;
-    agentRunStatus = session.status;
-    agentRunProgress = session.progress;
-    agentRunOutput = session.output;
-    agentRunResult = session.result;
-    agentRunLogs = session.logs;
-    agentTerminalLines = session.terminalLines;
-    agentRunGitSnapshot = session.gitSnapshot;
-    agentRunTranscript = session.transcript ?? [];
-    agentExecutionRun = session.executionRun ?? null;
-  }
-
   function agentSessionForCard(cardId: string): AgentRunSession | null {
-    return agentRunCardId === cardId
-      ? (activeAgentSession() ?? agentRunSessions[cardId] ?? null)
-      : (agentRunSessions[cardId] ?? null);
+    return agentRunSessions[cardId] ?? null;
   }
 
   function updateAgentSessionForCard(
@@ -5025,7 +5504,6 @@
     latestAgentSessionId = cardId;
     agentRunSessions[cardId] = nextSession;
     agentRunSessions = retainAgentSessions(agentRunSessions);
-    if (agentRunCardId === cardId) applyAgentSessionToConsole(nextSession);
   }
 
   function retainAgentSessions(
@@ -5035,12 +5513,7 @@
     if (entries.length <= MAX_RETAINED_AGENT_SESSIONS) return sessions;
 
     const candidates = entries
-      .filter(
-        ([cardId, session]) =>
-          session.status !== "running" &&
-          cardId !== agentConsoleCardId &&
-          cardId !== agentRunCardId,
-      )
+      .filter(([cardId, session]) => session.status !== "running" && cardId !== agentConsoleCardId)
       .sort(([, left], [, right]) => sessionActivityAt(left) - sessionActivityAt(right));
 
     const retained = { ...sessions };
@@ -5053,15 +5526,6 @@
 
   function sessionActivityAt(session: AgentRunSession): number {
     return session.transcript.at(-1)?.at ?? 0;
-  }
-
-  function appendAgentSessionTranscript(type: AgentSessionEvent["type"], text: string) {
-    agentRunTranscript = appendAgentSessionEvent(
-      agentRunTranscript,
-      createAgentSessionEvent(type, text),
-      MAX_AGENT_SESSION_EVENTS,
-    );
-    persistActiveAgentRun();
   }
 
   function appendAgentSessionTranscriptForCard(
@@ -5079,16 +5543,6 @@
     }));
   }
 
-  function persistActiveAgentRun() {
-    const session = activeAgentSession();
-    if (!session) return;
-
-    latestAgentSessionId = session.cardId;
-    agentRunSessions[session.cardId] = session;
-    agentRunSessions = retainAgentSessions(agentRunSessions);
-    agentConsoleCardId ??= session.cardId;
-  }
-
   function openAgentRunForCard(card: CardProjection) {
     const session = agentRunSessions[card.id];
     if (!session) {
@@ -5101,7 +5555,6 @@
 
     agentConsoleOpen = true;
     agentConsoleCardId = session.cardId;
-    applyAgentSessionToConsole(session);
     agentTerminalInput = "";
   }
 
@@ -5115,7 +5568,6 @@
     if (session) {
       agentConsoleOpen = true;
       agentConsoleCardId = session.cardId;
-      applyAgentSessionToConsole(session);
       return;
     }
 
@@ -5158,6 +5610,61 @@
     }
   }
 
+  async function persistExecutionRunUpdateForCard(
+    cardId: string,
+    transform: (run: ExecutionRun) => ExecutionRun,
+  ) {
+    const run = agentSessionForCard(cardId)?.executionRun;
+    if (!run) throw new Error("Execution run is unavailable for workflow checkpointing.");
+    const next = transform(run);
+    await setExecutionRunForCard(cardId, next);
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      workflowCheckpoint: agentWorkflowCheckpoint(next),
+    }));
+  }
+
+  async function watchRecoveredAgentTask(cardId: string, sessionId: number) {
+    try {
+      const execution = await waitForAgentTaskSession(sessionId, {
+        onEvent: (event) => projectTaskSessionEvent(cardId, event),
+      });
+      const run = agentSessionForCard(cardId)?.executionRun;
+      const checkpoint = run ? agentWorkflowCheckpoint(run) : "agent_result_committed";
+      updateAgentSessionForCard(cardId, (session) => ({
+        ...session,
+        status: "blocked_for_resume",
+        progress: Math.max(session.progress, 75),
+        output: agentResultText(execution.result),
+        result: execution.result,
+        taskSessionId: sessionId,
+        taskSessionState: execution.session.state,
+        workflowCheckpoint: checkpoint,
+      }));
+      appendStructuredAgentLogForCard(
+        cardId,
+        "info",
+        "recovery",
+        `Authoritative Agent result restored at ${checkpoint}.`,
+        [`Task Session: ${sessionId}`, `Terminal state: ${execution.session.state}`],
+        ["No verification or Jira side effect was repeated automatically."],
+        ["Use Continue to resume from the displayed durable checkpoint."],
+      );
+    } catch (reason) {
+      const snapshot = await getTaskSession(sessionId).catch(() => null);
+      if (snapshot && !taskSessionIsTerminal(snapshot)) return;
+      appendStructuredAgentLogForCard(
+        cardId,
+        "error",
+        "recovery",
+        reason instanceof Error ? reason.message : String(reason),
+        [`Task Session: ${sessionId}`],
+        [],
+        ["Review the retained Task Session before continuing."],
+      );
+    }
+  }
+
   function updateExecutionRunForCard(
     cardId: string,
     transform: (run: ExecutionRun) => ExecutionRun,
@@ -5189,27 +5696,6 @@
     }));
   }
 
-  function appendAgentLog(tone: AgentRunLog["tone"], label: string, message: string) {
-    agentRunLogs = capList(
-      [
-        ...agentRunLogs,
-        {
-          id: `run-${Date.now().toString(36)}-${agentRunLogs.length}`,
-          at: new Date().toLocaleTimeString(undefined, {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          }),
-          tone,
-          label,
-          message,
-        },
-      ],
-      MAX_AGENT_LOGS,
-    );
-    persistActiveAgentRun();
-  }
-
   function appendAgentLogForCard(
     cardId: string,
     tone: AgentRunLog["tone"],
@@ -5238,29 +5724,6 @@
     }));
   }
 
-  function appendStructuredAgentLog(
-    tone: AgentRunLog["tone"],
-    label: string,
-    summary: string,
-    evidence: string[],
-    details: string[],
-    next: string[],
-  ) {
-    appendAgentLog(
-      tone,
-      label,
-      [
-        `STATUS: ${tone === "success" ? "Complete" : tone === "error" ? "Blocked" : "Running"}`,
-        `SUMMARY: ${summary}`,
-        "EVIDENCE:",
-        ...evidence.map((line) => `- ${line}`),
-        "DETAILS:",
-        ...details.map((line) => `- ${line}`),
-        ...(next.length > 0 ? ["NEXT:", ...next.map((line) => `- ${line}`)] : []),
-      ].join("\n"),
-    );
-  }
-
   function appendStructuredAgentLogForCard(
     cardId: string,
     tone: AgentRunLog["tone"],
@@ -5283,6 +5746,54 @@
         ...details.map((line) => `- ${line}`),
         ...(next.length > 0 ? ["NEXT:", ...next.map((line) => `- ${line}`)] : []),
       ].join("\n"),
+    );
+  }
+
+  function projectTaskSessionEvent(cardId: string, event: TaskSessionEvent) {
+    const payload =
+      typeof event.payload === "object" && event.payload !== null && !Array.isArray(event.payload)
+        ? (event.payload as Record<string, unknown>)
+        : {};
+    const eventType = typeof payload.type === "string" ? payload.type : event.kind;
+    if (event.progress) {
+      const { completed, total } = event.progress;
+      const progress = total && total > 0 ? 35 + Math.round((completed / total) * 35) : 55;
+      setAgentProgressForCard(cardId, progress);
+    }
+    if (event.kind === "runtime" && eventType === "text_delta") return;
+
+    let tone: AgentRunLog["tone"] = "info";
+    let summary = `Task Session ${event.kind}: ${eventType}.`;
+    if (event.kind === "lifecycle" && typeof payload.state === "string") {
+      updateAgentSessionForCard(cardId, (session) => ({
+        ...session,
+        taskSessionState: payload.state as NonNullable<AgentRunSession["taskSessionState"]>,
+      }));
+      tone = payload.state === "failed" || payload.state === "blocked" ? "error" : "info";
+      summary = `Task Session entered ${payload.state}.`;
+    } else if (event.kind === "tool") {
+      const context =
+        typeof payload.display_context === "object" && payload.display_context !== null
+          ? (payload.display_context as Record<string, unknown>)
+          : {};
+      const label = typeof context.label === "string" ? context.label : payload.tool_name;
+      const failed = payload.type === "tool_completed" && payload.success === false;
+      tone = failed ? "error" : "info";
+      summary = `${payload.type === "tool_completed" ? (failed ? "Failed" : "Completed") : "Started"}: ${String(label ?? "Agent tool")}.`;
+    } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
+      summary = "Agent result staged for authoritative Task Session commit.";
+    }
+    appendStructuredAgentLogForCard(
+      cardId,
+      tone,
+      event.kind,
+      summary,
+      [
+        `Task Session event sequence: ${event.sequence}`,
+        `Assignment attempt: ${event.attempt_id ?? "unassigned"}`,
+      ],
+      event.progress ? [`Progress phase: ${event.progress.phase}`] : [],
+      [],
     );
   }
 
@@ -5626,6 +6137,49 @@
     agentTerminalInput = "";
   }
 
+  async function cancelAgentRunForCard(cardId: string) {
+    const session = agentSessionForCard(cardId);
+    if (!session || session.status !== "running") return;
+    const legacyRunId = runningWorkerRunIds[cardId];
+    const cancelled =
+      session.taskSessionId != null
+        ? await cancelTaskSession(session.taskSessionId).catch(() => false)
+        : legacyRunId
+          ? await cancelAiWorkerTask(legacyRunId).catch(() => false)
+          : false;
+    if (cancelled && session.taskSessionId != null) {
+      updateAgentSessionForCard(cardId, (current) => ({
+        ...current,
+        taskSessionState: "cancelling",
+      }));
+    }
+    appendStructuredAgentLogForCard(
+      cardId,
+      cancelled ? "info" : "error",
+      "cancel",
+      cancelled ? "Operator cancellation requested." : "Cancellation could not be confirmed.",
+      [
+        session.taskSessionId
+          ? `Task Session: ${session.taskSessionId}`
+          : `Legacy run: ${legacyRunId ?? "unknown"}`,
+      ],
+      [],
+      [
+        cancelled
+          ? "Wait for runtime cleanup before continuing."
+          : "Review runtime state before retrying.",
+      ],
+    );
+    if (cancelled) {
+      appNotice = { tone: "info", message: `Cancellation requested for ${session.title}.` };
+    } else {
+      appNotice = {
+        tone: "error",
+        message: `Could not confirm cancellation for ${session.title}.`,
+      };
+    }
+  }
+
   function isApprovalText(value: string): boolean {
     const text = value.toLowerCase();
     return (
@@ -5634,7 +6188,7 @@
   }
 
   function operatorNotesForCard(cardId: string): string | null {
-    const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
+    const session = agentRunSessions[cardId];
     const notes = session?.terminalLines
       .filter((line) => line.prompt === "operator")
       .map((line) => line.text.trim())
@@ -5646,7 +6200,7 @@
   }
 
   function previousOutputForCard(cardId: string): string | null {
-    const session = agentRunCardId === cardId ? activeAgentSession() : agentRunSessions[cardId];
+    const session = agentRunSessions[cardId];
     const transcript = agentSessionReplay(
       session?.transcript ?? [],
       MAX_AGENT_SESSION_REPLAY_CHARS,
@@ -5661,11 +6215,13 @@
       : null;
   }
 
-  function resolveSessionCardId(): string | null {
+  function resolveSessionCardId(sessionId = workspaceChatActiveSessionId): string | null {
+    const session =
+      workspaceChatSessions.find((entry) => entry.id === sessionId) ?? workspaceChatSession;
     const candidates = [
-      workspaceChatSession.lastCreatedCardId,
-      workspaceChatSession.lastCardId,
-      ...workspaceChatSession.recentCardIds,
+      session.lastCreatedCardId,
+      session.lastCardId,
+      ...session.recentCardIds,
       selectedCardId,
     ].filter((value): value is string => typeof value === "string" && value.length > 0);
 
@@ -5830,11 +6386,14 @@
     saveCachedWorkspace(workspace!);
   }
 
-  function resolveActionCard(action: {
-    card_id?: string;
-    ticket?: string;
-    title?: string;
-  }): CardProjection | null {
+  function resolveActionCard(
+    action: {
+      card_id?: string;
+      ticket?: string;
+      title?: string;
+    },
+    sessionId = workspaceChatActiveSessionId,
+  ): CardProjection | null {
     if (action.card_id && activeCardById.has(action.card_id))
       return activeCardById.get(action.card_id) ?? null;
 
@@ -5849,7 +6408,7 @@
       return activeCards.find((card) => card.title.toLowerCase().includes(title)) ?? null;
     }
 
-    const sessionCardId = resolveSessionCardId();
+    const sessionCardId = resolveSessionCardId(sessionId);
     return sessionCardId ? (activeCardById.get(sessionCardId) ?? null) : null;
   }
 
@@ -6030,7 +6589,13 @@
   }
 
   async function startWorkerForCard(cardId: string) {
-    if (runningWorkerCardIds[cardId]) {
+    const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
+    if (
+      runningWorkerCardIds[cardId] ||
+      agentSessionForCard(cardId)?.status === "running" ||
+      (retainedTaskState &&
+        ["queued", "running", "cancelling", "committing"].includes(retainedTaskState))
+    ) {
       appNotice = { tone: "info", message: "Agent is already running this card." };
       return;
     }
@@ -6063,36 +6628,48 @@
       finishWorkerRun(cardId, runId);
       return;
     }
+    const useTaskSession =
+      config.runtime === "opencode" &&
+      typeof window !== "undefined" &&
+      "__TAURI_INTERNALS__" in window;
 
-    try {
-      await reserveAiWorkerRun(runId, config);
-      const grantedCapabilities = [
-        "workspace_read",
-        "workspace_write",
-        "shell",
-        "git",
-        ...config.mcp_servers.map((server) => `external_tools:${server.secret_id}`),
-      ] as ("workspace_read" | "workspace_write" | "shell" | "git" | "external_tools")[];
-      await grantAiRunCapabilities(runId, grantedCapabilities);
-    } catch (reason) {
-      await releaseAiWorkerRun(runId).catch(() => false);
-      finishWorkerRun(cardId, runId);
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appNotice = { tone: "error", message };
-      return;
+    if (!useTaskSession) {
+      try {
+        await reserveAiWorkerRun(runId, config);
+        const grantedCapabilities = [
+          "workspace_read",
+          "workspace_write",
+          "shell",
+          "git",
+          ...config.mcp_servers.map((server) => `external_tools:${server.secret_id}`),
+        ] as ("workspace_read" | "workspace_write" | "shell" | "git" | "external_tools")[];
+        await grantAiRunCapabilities(runId, grantedCapabilities);
+      } catch (reason) {
+        await releaseAiWorkerRun(runId).catch(() => false);
+        finishWorkerRun(cardId, runId);
+        const message = reason instanceof Error ? reason.message : String(reason);
+        appNotice = { tone: "error", message };
+        return;
+      }
+      markActiveAgentRun(
+        typeof localStorage === "undefined" ? undefined : localStorage,
+        cardId,
+        runId,
+      );
     }
-    markActiveAgentRun(
-      typeof localStorage === "undefined" ? undefined : localStorage,
-      cardId,
-      runId,
-    );
 
     const issueKey = jiraKey(card);
     const existingSession = agentRunSessions[cardId];
     const isContinuation =
-      existingSession?.status === "blocked" || existingSession?.status === "timeout";
+      existingSession?.status === "blocked" ||
+      existingSession?.status === "blocked_for_resume" ||
+      existingSession?.status === "timeout";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
+    const resumeAuthoritativeResult =
+      existingSession?.status === "blocked_for_resume" && existingSession.result
+        ? existingSession.result
+        : null;
     let backendExecutionStarted = false;
     let jiraTransitionCompleted = !issueKey;
 
@@ -6214,19 +6791,21 @@
         ["Pass the exported context to the runtime and wait for evidence."],
       );
       let executionRun =
-        isContinuation && existingSession?.executionRun
-          ? resumeExecutionRun(runId, existingSession.executionRun, operatorNotes, previousOutput)
-          : createExecutionRun(
-              runId,
-              buildExecutionContract(
+        resumeAuthoritativeResult && existingSession?.executionRun
+          ? existingSession.executionRun
+          : isContinuation && existingSession?.executionRun
+            ? resumeExecutionRun(runId, existingSession.executionRun, operatorNotes, previousOutput)
+            : createExecutionRun(
                 runId,
-                card,
-                issueKey,
-                operatorNotes,
-                previousOutput,
-                jiraTransitionCompleted,
-              ),
-            );
+                buildExecutionContract(
+                  runId,
+                  card,
+                  issueKey,
+                  operatorNotes,
+                  previousOutput,
+                  jiraTransitionCompleted,
+                ),
+              );
       setAgentRunOutputForCard(cardId, buildAgentContextExport(config, executionRun.contract));
       setAgentProgressForCard(cardId, 55);
       if (issueKey && !jiraTransitionCompleted) {
@@ -6240,126 +6819,192 @@
         await setExecutionRunForCard(cardId, executionRun);
         throw new Error(message);
       }
-      executionRun = updateExecutionStep(
-        executionRun,
-        "worker.execute",
-        "running",
-        "Execution worker started.",
-      );
-      await setExecutionRunForCard(cardId, executionRun);
+      if (!resumeAuthoritativeResult) {
+        executionRun = updateExecutionStep(
+          executionRun,
+          "worker.execute",
+          "running",
+          "Execution worker started.",
+        );
+        await setExecutionRunForCard(cardId, executionRun);
+      }
       let result: AiWorkerTaskResult;
       let lastAgentEventSequence = 0;
-      try {
-        backendExecutionStarted = true;
-        result = await executeAiWorkerTask(runId, config, {
-          execution_contract: executionRun.contract,
-          session_key: `task:${cardId}`,
-        }, (event) => {
-          if (event.run_id !== runId || event.sequence <= lastAgentEventSequence) return;
-          lastAgentEventSequence = event.sequence;
-          if (event.type === "run_started") {
-            appendStructuredAgentLogForCard(
+      if (resumeAuthoritativeResult) {
+        result = resumeAuthoritativeResult;
+        appendStructuredAgentLogForCard(
+          cardId,
+          "info",
+          "resume",
+          `Continuing from ${existingSession?.workflowCheckpoint ?? "agent_result_committed"}.`,
+          [`Task Session: ${existingSession?.taskSessionId ?? "retained"}`],
+          ["The authoritative Agent result was reused; Agent execution was not repeated."],
+          ["Continue with verification and explicitly approved writeback stages."],
+        );
+      } else
+        try {
+          backendExecutionStarted = true;
+          if (useTaskSession) {
+            const prepared = await prepareAgentTaskSession(
+              config,
               cardId,
-              "info",
-              "runtime",
-              "Agent runtime started.",
-              ["Execution events are now being tracked by the backend runtime."],
-              [],
-              [],
+              card.title,
+              executionRun.run_id,
+              executionRun.contract,
+              await workspaceRootRevision(config.workspace_id),
             );
-          } else if (event.type === "run_blocked") {
-            appendStructuredAgentLogForCard(
-              cardId,
-              "error",
-              "runtime",
-              "Agent runtime blocked the execution.",
-              [],
-              [],
-              ["Review the blocked reason and resolve the missing requirement."],
-            );
-          } else if (event.type === "tool_started") {
-            appendStructuredAgentLogForCard(
-              cardId,
-              "info",
-              event.display_context.category,
-              `${event.display_context.label}.`,
-              [
-                `Category: ${event.display_context.category}`,
-                ...(event.display_context.target ? [`Target: ${event.display_context.target}`] : []),
-              ],
-              [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
-              ["Wait for the runtime to report tool completion."],
-            );
-          } else if (event.type === "tool_completed") {
-            appendStructuredAgentLogForCard(
-              cardId,
-              event.success ? "info" : "error",
-              event.display_context.category,
-              `${event.success ? "Completed" : "Failed"}: ${event.display_context.label}.`,
-              [
-                `Category: ${event.display_context.category}`,
-                ...(event.display_context.target ? [`Target: ${event.display_context.target}`] : []),
-              ],
-              [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
-              event.success ? [] : ["Review the tool failure evidence before continuing."],
-            );
-          } else if (event.type === "approval_required") {
-            appendStructuredAgentLogForCard(
-              cardId,
-              "error",
-              "approval",
-              `Tool approval required: ${event.operation}.`,
-              [`Capability: ${event.capability}`, `Operation: ${event.operation_id}`, `Risk: ${event.risk}`],
-              ["The backend stopped the unapproved operation."],
-              ["Grant the required capability and start a new execution run."],
-            );
-          }
-        });
-      } catch (reason) {
-        if (reason instanceof IpcPolicyError && reason.category === "timeout") {
-          const cancelled = await cancelAiWorkerTask(runId).catch(() => false);
-          updateExecutionRunForCard(cardId, (run) =>
-            updateExecutionStep(
-              { ...run, status: cancelled ? "cancelled" : "blocked" },
-              "worker.execute",
-              cancelled ? "failed" : "blocked",
-              reason.message,
-            ),
-          );
-          if (cancelled) {
-            updateCardExecution(cardId, {
-              blocked: { reason: "Agent timed out and was cancelled." },
+            updateAgentSessionForCard(cardId, (session) => ({
+              ...session,
+              conversationId: prepared.conversationId,
+            }));
+            const execution = await executeAgentTaskSession(ticketLabel(card), prepared, {
+              onSubmitted: (session) => {
+                updateAgentSessionForCard(cardId, (current) => ({
+                  ...current,
+                  taskSessionId: session.id,
+                  taskSessionState: session.state,
+                  conversationId: prepared.conversationId,
+                }));
+              },
+              onEvent: (event) => projectTaskSessionEvent(cardId, event),
             });
+            result = execution.result;
+          } else {
+            result = await executeAiWorkerTask(
+              runId,
+              config,
+              {
+                execution_contract: executionRun.contract,
+                session_key: `task:${cardId}`,
+              },
+              (event) => {
+                if (event.run_id !== runId || event.sequence <= lastAgentEventSequence) return;
+                lastAgentEventSequence = event.sequence;
+                if (event.type === "run_started") {
+                  appendStructuredAgentLogForCard(
+                    cardId,
+                    "info",
+                    "runtime",
+                    "Agent runtime started.",
+                    ["Execution events are now being tracked by the backend runtime."],
+                    [],
+                    [],
+                  );
+                } else if (event.type === "run_blocked") {
+                  appendStructuredAgentLogForCard(
+                    cardId,
+                    "error",
+                    "runtime",
+                    "Agent runtime blocked the execution.",
+                    [],
+                    [],
+                    ["Review the blocked reason and resolve the missing requirement."],
+                  );
+                } else if (event.type === "tool_started") {
+                  appendStructuredAgentLogForCard(
+                    cardId,
+                    "info",
+                    event.display_context.category,
+                    `${event.display_context.label}.`,
+                    [
+                      `Category: ${event.display_context.category}`,
+                      ...(event.display_context.target
+                        ? [`Target: ${event.display_context.target}`]
+                        : []),
+                    ],
+                    [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
+                    ["Wait for the runtime to report tool completion."],
+                  );
+                } else if (event.type === "tool_completed") {
+                  appendStructuredAgentLogForCard(
+                    cardId,
+                    event.success ? "info" : "error",
+                    event.display_context.category,
+                    `${event.success ? "Completed" : "Failed"}: ${event.display_context.label}.`,
+                    [
+                      `Category: ${event.display_context.category}`,
+                      ...(event.display_context.target
+                        ? [`Target: ${event.display_context.target}`]
+                        : []),
+                    ],
+                    [`Tool: ${event.tool_name}`, `Risk: ${event.risk}`],
+                    event.success ? [] : ["Review the tool failure evidence before continuing."],
+                  );
+                } else if (event.type === "approval_required") {
+                  appendStructuredAgentLogForCard(
+                    cardId,
+                    "error",
+                    "approval",
+                    `Tool approval required: ${event.operation}.`,
+                    [
+                      `Capability: ${event.capability}`,
+                      `Operation: ${event.operation_id}`,
+                      `Risk: ${event.risk}`,
+                    ],
+                    ["The backend stopped the unapproved operation."],
+                    ["Grant the required capability and start a new execution run."],
+                  );
+                }
+              },
+            );
           }
-          setAgentRunStatusForCard(cardId, "timeout");
-          appendStructuredAgentLogForCard(
-            cardId,
-            "error",
-            "timeout",
-            "Spacesly stopped waiting for the Agent response before a structured result arrived.",
-            [reason.message],
-            [
-              cancelled
-                ? "The Agent process was cancelled."
-                : "Spacesly could not confirm process cancellation.",
-            ],
-            [
-              cancelled
-                ? "Review the task, then retry when ready."
-                : "Do not retry until the Agent process is confirmed stopped.",
-            ],
-          );
-          appNotice = {
-            tone: cancelled ? "info" : "error",
-            message: cancelled
-              ? `${ticketLabel(card)} timed out and the Agent process was cancelled.`
-              : `${ticketLabel(card)} timed out, but process cancellation could not be confirmed.`,
-          };
-          return;
-        }
+        } catch (reason) {
+          if (
+            reason instanceof AgentTaskSessionTimeoutError ||
+            (reason instanceof IpcPolicyError && reason.category === "timeout")
+          ) {
+            const cancelled =
+              reason instanceof AgentTaskSessionTimeoutError
+                ? reason.cancelled
+                : await cancelAiWorkerTask(runId).catch(() => false);
+            if (reason instanceof AgentTaskSessionTimeoutError && reason.terminalState) {
+              updateAgentSessionForCard(cardId, (session) => ({
+                ...session,
+                taskSessionState: reason.terminalState,
+              }));
+            }
+            updateExecutionRunForCard(cardId, (run) =>
+              updateExecutionStep(
+                { ...run, status: cancelled ? "cancelled" : "blocked" },
+                "worker.execute",
+                cancelled ? "failed" : "blocked",
+                reason.message,
+              ),
+            );
+            if (cancelled) {
+              updateCardExecution(cardId, {
+                blocked: { reason: "Agent timed out and was cancelled." },
+              });
+            }
+            setAgentRunStatusForCard(cardId, "timeout");
+            appendStructuredAgentLogForCard(
+              cardId,
+              "error",
+              "timeout",
+              "Spacesly stopped waiting for the Agent response before a structured result arrived.",
+              [reason.message],
+              [
+                cancelled
+                  ? "The Agent process was cancelled."
+                  : "Spacesly could not confirm process cancellation.",
+              ],
+              [
+                cancelled
+                  ? "Review the task, then retry when ready."
+                  : "Do not retry until the Agent process is confirmed stopped.",
+              ],
+            );
+            appNotice = {
+              tone: cancelled ? "info" : "error",
+              message: cancelled
+                ? `${ticketLabel(card)} timed out and the Agent process was cancelled.`
+                : `${ticketLabel(card)} timed out, but process cancellation could not be confirmed.`,
+            };
+            return;
+          }
 
-        throw reason;
-      }
+          throw reason;
+        }
       appendStructuredAgentLogForCard(
         cardId,
         result.completion_status === "completed" ? "success" : "error",
@@ -6408,7 +7053,7 @@
         return;
       }
 
-      updateExecutionRunForCard(cardId, (run) => {
+      await persistExecutionRunUpdateForCard(cardId, (run) => {
         const executed = updateExecutionStep(run, "worker.execute", "completed", result.summary);
         const verifying = updateExecutionStep(
           executed,
@@ -6443,7 +7088,7 @@
         return;
       }
 
-      updateExecutionRunForCard(cardId, (run) =>
+      await persistExecutionRunUpdateForCard(cardId, (run) =>
         updateExecutionStep(run, "worker.verify", "completed", "Verification passed."),
       );
 
@@ -6466,16 +7111,38 @@
 
       if (issueKey) {
         const jiraConfig = buildJiraConfig();
-        if (jiraConfig) {
-          updateExecutionRunForCard(cardId, (run) => ({
-            ...updateExecutionStep(
-              run,
-              "jira.comment.result",
-              "running",
-              "Jira writeback started.",
-            ),
-            current_step_ids: ["jira.comment.result"],
-          }));
+        const resumeCheckpoint = existingSession?.workflowCheckpoint;
+        const recoveryDecision = resumeCheckpoint
+          ? agentWorkflowRecoveryDecision(resumeCheckpoint)
+          : { safe: true as const };
+        if (!recoveryDecision.safe) {
+          updateCardExecution(cardId, { blocked: { reason: recoveryDecision.reason } });
+          setAgentRunStatusForCard(cardId, "blocked");
+          appendAgentSessionTranscriptForCard(cardId, "blocker", recoveryDecision.reason);
+          appendStructuredAgentLogForCard(
+            cardId,
+            "error",
+            "recovery",
+            recoveryDecision.reason,
+            [`Checkpoint: ${resumeCheckpoint}`],
+            ["No Jira transition or comment was replayed."],
+            ["Reconcile Jira manually before starting a newly reviewed run."],
+          );
+          appNotice = { tone: "error", message: recoveryDecision.reason };
+          return;
+        }
+        if (jiraConfig && resumeCheckpoint !== "jira_writeback_completed") {
+          if (resumeCheckpoint !== "jira_transition_completed") {
+            await persistExecutionRunUpdateForCard(cardId, (run) => ({
+              ...updateExecutionStep(
+                run,
+                "jira.comment.result",
+                "running",
+                "Jira writeback started.",
+              ),
+              current_step_ids: ["jira.comment.result"],
+            }));
+          }
           appendStructuredAgentLogForCard(
             cardId,
             "info",
@@ -6486,7 +7153,17 @@
             ["Wait for the Jira transition result before finalizing the run."],
           );
           setAgentProgressForCard(cardId, 88);
-          await transitionJiraIssue(jiraConfig, issueKey, "Done");
+          if (resumeCheckpoint !== "jira_transition_completed") {
+            await transitionJiraIssue(jiraConfig, issueKey, "Done");
+            await persistExecutionRunUpdateForCard(cardId, (run) =>
+              updateExecutionStep(
+                run,
+                "jira.comment.result",
+                "running",
+                "Jira Done transition completed; completion comment pending.",
+              ),
+            );
+          }
           appendStructuredAgentLogForCard(
             cardId,
             "success",
@@ -6506,12 +7183,20 @@
             [`Wait for comment confirmation before final completion.`],
           );
           setAgentProgressForCard(cardId, 94);
+          await persistExecutionRunUpdateForCard(cardId, (run) =>
+            updateExecutionStep(
+              run,
+              "jira.comment.result",
+              "running",
+              "Jira completion comment started; confirmation pending.",
+            ),
+          );
           await addJiraComment(
             jiraConfig,
             issueKey,
             agentJiraComment(result, config, card.title, gitWritebackInfo),
           );
-          updateExecutionRunForCard(cardId, (run) =>
+          await persistExecutionRunUpdateForCard(cardId, (run) =>
             updateExecutionStep(
               run,
               "jira.comment.result",
@@ -6531,7 +7216,9 @@
         }
       }
 
-      updateExecutionRunForCard(cardId, (run) => completeExecutionRun(run, false, result.summary));
+      await persistExecutionRunUpdateForCard(cardId, (run) =>
+        completeExecutionRun(run, false, result.summary),
+      );
       setAgentRunStatusForCard(cardId, "completed");
       setAgentProgressForCard(cardId, 100);
       appNotice = {
@@ -6567,11 +7254,11 @@
       appNotice = { tone: "error", message };
     } finally {
       clearActiveAgentRun(
-        typeof localStorage === "undefined" ? undefined : localStorage,
+        useTaskSession || typeof localStorage === "undefined" ? undefined : localStorage,
         cardId,
         runId,
       );
-      if (!backendExecutionStarted) {
+      if (!useTaskSession && !backendExecutionStarted) {
         await releaseAiWorkerRun(runId).catch(() => undefined);
       }
       finishWorkerRun(cardId, runId);
@@ -6892,11 +7579,9 @@
                           <span>{selectedAiProvider.apiKeyLabel}</span>
                           <input
                             type="password"
-                            placeholder={
-                              aiProviderSecrets[selectedAiProvider.id]
-                                ? "Saved securely. Enter a new key to replace it."
-                                : selectedAiProvider.apiKeyPlaceholder
-                            }
+                            placeholder={aiProviderSecrets[selectedAiProvider.id]
+                              ? "Saved securely. Enter a new key to replace it."
+                              : selectedAiProvider.apiKeyPlaceholder}
                             value={selectedAiApiKey}
                             oninput={(event) =>
                               (appSecrets = {
@@ -7128,8 +7813,7 @@
                           type="search"
                           placeholder="Filter by key…"
                           value={globalEnvironmentSearch}
-                          oninput={(event) =>
-                            (globalEnvironmentSearch = event.currentTarget.value)}
+                          oninput={(event) => (globalEnvironmentSearch = event.currentTarget.value)}
                         />
                       </label>
                       <button
@@ -7148,13 +7832,11 @@
                       <p class="empty-state">No environment variables defined.</p>
                     {:else}
                       <div class="global-env-list">
-                        {#each globalEnvironmentVariables.filter(
-                            (env) =>
-                              !globalEnvironmentSearch.trim() ||
-                              env.key
-                                .toLowerCase()
-                                .includes(globalEnvironmentSearch.trim().toLowerCase()),
-                          ) as variable (variable.id)}
+                        {#each globalEnvironmentVariables.filter((env) => !globalEnvironmentSearch.trim() || env.key
+                              .toLowerCase()
+                              .includes(globalEnvironmentSearch
+                                  .trim()
+                                  .toLowerCase())) as variable (variable.id)}
                           <div
                             class="env-row"
                             class:env-draft={variable.draft}
@@ -7177,7 +7859,9 @@
                                   class="env-value-input"
                                   type={variable.secret ? "password" : "text"}
                                   placeholder="value"
-                                  value={variable.revealed || !variable.secret ? variable.value : ""}
+                                  value={variable.revealed || !variable.secret
+                                    ? variable.value
+                                    : ""}
                                   disabled={!variable.editing && !variable.draft}
                                   oninput={(event) =>
                                     updateGlobalEnvironmentDraft(variable.id, {
@@ -7631,12 +8315,7 @@
 
                 <footer>
                   {#if settingsTab === "mcp"}
-                    <button
-                      type="button"
-                      onclick={removeSelectedServer}
-                    >
-                      Remove
-                    </button>
+                    <button type="button" onclick={removeSelectedServer}> Remove </button>
                     <button type="button" onclick={disconnectSelectedMcpServer}>
                       Disconnect
                     </button>
@@ -7704,6 +8383,8 @@
             {selectedCardId}
             {draggedCardId}
             {runningWorkerCardIds}
+            agentTaskProjections={agentTaskCardProjections}
+            runningAgentSessions={runningAgentTaskSessions}
             cardMinHeight={layoutPrefs.cardMinHeight}
             {doneVisibleLimit}
             {hasAgentConsoleSession}
@@ -7713,6 +8394,10 @@
             onResizeLane={(event) => beginLayoutResize(event, "laneWidth", 260, 460, "x")}
             onResizeCard={(event) => beginLayoutResize(event, "cardMinHeight", 170, 360, "y")}
             onOpenAgentConsole={openAgentConsole}
+            onOpenAgentSession={(cardId) => {
+              const card = activeCardById.get(cardId);
+              if (card) openAgentRunForCard(card);
+            }}
             onDropCard={(cardId, columnId) => void moveCardAndSync(cardId, columnId)}
             onSelectCard={selectCard}
             onQueueCard={queueCard}
@@ -7767,6 +8452,7 @@
                 terminalInput={agentTerminalInput}
                 runCardId={agentConsoleCardId}
                 onClose={() => (agentConsoleOpen = false)}
+                onCancel={cancelAgentRunForCard}
                 onTerminalInputChange={(value) => (agentTerminalInput = value)}
                 onSubmitTerminalInput={submitAgentTerminalInput}
                 onOpenCard={(cardId) => (selectedCardId = cardId)}
@@ -7849,7 +8535,13 @@
               </div>
               <div>
                 <dt>Status</dt>
-                <dd>{executionDetail(selectedCard.execution)}</dd>
+                <dd>
+                  {selectedCardAgentSession?.taskSessionState ??
+                    executionDetail(selectedCard.execution)}
+                  {#if selectedCardAgentSession}
+                    · {selectedCardAgentSession.progress}%
+                  {/if}
+                </dd>
               </div>
               <div>
                 <dt>Labels</dt>
@@ -8163,14 +8855,16 @@
                 : selectedAiModel.label}
               onOpenRuntimeSettings={() => openSettings("agent")}
               sessions={workspaceChatSessions}
+              sessionStatuses={workspaceChatSessionStatuses}
               activeSessionId={workspaceChatActiveSessionId}
               onNewSession={startWorkspaceChatSession}
               onSwitchSession={activateWorkspaceChatSession}
               messages={workspaceChatMessages}
-              streamingText={workspaceChatStreamingText}
-              running={workspaceChatRunning}
-              actionProposal={workspaceChatActionProposal?.sessionId === workspaceChatSession.id
-                ? workspaceChatActionProposal
+              streamingText={activeWorkspaceChatRun.streamingText}
+              running={activeWorkspaceChatRun.running}
+              actionProposal={activeWorkspaceChatRun.actionProposal?.sessionId ===
+              workspaceChatSession.id
+                ? activeWorkspaceChatRun.actionProposal
                 : null}
               onApplyActionProposal={() => void applyWorkspaceChatActionProposal()}
               onRejectActionProposal={rejectWorkspaceChatActionProposal}

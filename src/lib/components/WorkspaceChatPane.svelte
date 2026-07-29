@@ -12,6 +12,7 @@
     title: string;
     onOpenRuntimeSettings: () => void;
     sessions: WorkspaceChatSession[];
+    sessionStatuses: Record<string, { status: string | null; progress: number | null }>;
     activeSessionId: string;
     onNewSession: () => void;
     onSwitchSession: (sessionId: string) => void;
@@ -32,6 +33,7 @@
     title,
     onOpenRuntimeSettings,
     sessions,
+    sessionStatuses,
     activeSessionId,
     onNewSession,
     onSwitchSession,
@@ -266,6 +268,7 @@
                 </div>
               {:else}
                 {#each filteredSessions as session (session.id)}
+                  {@const run = sessionStatuses[session.id]}
                   <button
                     type="button"
                     role="menuitemradio"
@@ -288,6 +291,11 @@
                     </div>
                     <div class="workspace-chat-session-meta">
                       <span>{new Date(session.updatedAt).toLocaleString()}</span>
+                      {#if run?.status}
+                        <em class={`run-status ${run.status}`}
+                          >{run.status}{run.progress === null ? "" : ` ${run.progress}%`}</em
+                        >
+                      {/if}
                       {#if session.id === activeSessionId}
                         <em>Active</em>
                       {/if}
@@ -589,6 +597,17 @@
   .workspace-chat-session-meta em {
     font-size: 0.72rem;
     line-height: 1.35;
+  }
+
+  .workspace-chat-session-meta em.run-status {
+    background: rgba(149, 176, 130, 0.16);
+    color: #cce2bd;
+  }
+
+  .workspace-chat-session-meta em.run-status.failed,
+  .workspace-chat-session-meta em.run-status.cancelling {
+    background: rgba(240, 176, 170, 0.14);
+    color: #f0b0aa;
   }
 
   .workspace-chat-session-main span,

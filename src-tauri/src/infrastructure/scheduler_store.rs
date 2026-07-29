@@ -5,9 +5,10 @@
 //! cancellation tokens in memory.
 
 use crate::domain::task_session::{
-    TaskCapabilityGrant, TaskMcpContext, TaskProgress, TaskRequest, TaskSessionEnvelope,
-    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionEventPage,
-    TaskSessionId, TaskSessionSnapshot, TaskSessionState, TaskToolState,
+    AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskMcpContext,
+    TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
+    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionResult,
+    TaskSessionSnapshot, TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -42,6 +43,21 @@ pub struct ExternalAssignmentAuthority {
     pub capability: String,
     pub connector_id: String,
     pub connector_binding_digest: String,
+}
+
+/// Non-secret authority used by the assignment-local workspace tool MCP server.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskToolAuthority {
+    pub scheduler_database: PathBuf,
+    pub scheduler_instance_id: String,
+    pub session_id: TaskSessionId,
+    pub attempt_id: u64,
+    pub attempt: u32,
+    pub owner_id: u64,
+    pub fencing_token: u64,
+    pub workspace_id: String,
+    pub workspace_root: PathBuf,
+    pub capabilities: Vec<String>,
 }
 
 /// Identity required for a Worker to renew or finish one assignment attempt.
@@ -80,6 +96,28 @@ pub(crate) struct CancelResult {
 pub(crate) enum FinishResult {
     Applied,
     Stale,
+}
+
+#[derive(Default)]
+struct TaskOwnership {
+    workspace_id: Option<String>,
+    conversation_id: Option<String>,
+    subject_id: Option<String>,
+    execution_run_id: Option<String>,
+}
+
+/// Durable scheduler outbox entry awaiting projection into executions.db.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedCompletion {
+    pub(crate) projection_id: String,
+    pub(crate) session_id: TaskSessionId,
+    pub(crate) attempt_id: u64,
+    pub(crate) fencing_token: u64,
+    pub(crate) workspace_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) execution_run_id: String,
+    pub(crate) output: TaskExecutionOutput,
+    pub(crate) terminal_state: TaskSessionState,
 }
 
 impl SchedulerStore {
@@ -188,12 +226,16 @@ impl SchedulerStore {
                    started_at INTEGER NOT NULL,
                    last_seen_at INTEGER NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS scheduler_task_sessions (
+                  CREATE TABLE IF NOT EXISTS scheduler_task_sessions (
                    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    enqueue_sequence INTEGER NOT NULL UNIQUE,
-                   label TEXT NOT NULL,
-                   payload TEXT NOT NULL,
-                   state TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    workspace_id TEXT,
+                    conversation_id TEXT,
+                    subject_id TEXT,
+                    execution_run_id TEXT,
+                    state TEXT NOT NULL,
                    worker_id INTEGER,
                    dispatch_sequence INTEGER,
                    attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -244,7 +286,7 @@ impl SchedulerStore {
                    ON scheduler_task_attempts(state, lease_expires_at);
                  CREATE INDEX IF NOT EXISTS idx_scheduler_attempt_owner
                    ON scheduler_task_attempts(owner_id, state);
-                 CREATE TABLE IF NOT EXISTS scheduler_task_events (
+                  CREATE TABLE IF NOT EXISTS scheduler_task_events (
                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    session_id INTEGER NOT NULL,
                    attempt_id INTEGER,
@@ -258,8 +300,27 @@ impl SchedulerStore {
                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
                      ON DELETE CASCADE
                  );
-                  CREATE INDEX IF NOT EXISTS idx_scheduler_events_cursor
-                    ON scheduler_task_events(session_id, sequence);",
+                   CREATE INDEX IF NOT EXISTS idx_scheduler_events_cursor
+                     ON scheduler_task_events(session_id, sequence);
+                  CREATE TABLE IF NOT EXISTS scheduler_task_completions (
+                    session_id INTEGER PRIMARY KEY,
+                    projection_id TEXT NOT NULL UNIQUE,
+                    attempt_id INTEGER NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    execution_run_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL,
+                    output_json TEXT NOT NULL,
+                    projection_error TEXT,
+                    staged_at INTEGER NOT NULL,
+                    projected_at INTEGER,
+                    finalized_at INTEGER,
+                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_completion_pending
+                    ON scheduler_task_completions(projected_at, finalized_at, staged_at);",
         )
         .map_err(|error| format!("Failed to initialize scheduler database: {error}"))?;
         // Serialize non-destructive migrations across concurrently starting Scheduler processes.
@@ -271,6 +332,30 @@ impl SchedulerStore {
             "scheduler_metadata",
             "instance_id",
             "instance_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_sessions",
+            "workspace_id",
+            "workspace_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_sessions",
+            "conversation_id",
+            "conversation_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_sessions",
+            "subject_id",
+            "subject_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_sessions",
+            "execution_run_id",
+            "execution_run_id TEXT",
         )?;
         ensure_column(
             &migration,
@@ -302,6 +387,21 @@ impl SchedulerStore {
             "progress_json",
             "progress_json TEXT",
         )?;
+        migration
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_scheduler_active_conversation;
+                 DROP INDEX IF EXISTS idx_scheduler_active_subject;
+                 CREATE UNIQUE INDEX idx_scheduler_active_conversation
+                   ON scheduler_task_sessions(workspace_id, conversation_id)
+                  WHERE conversation_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_active_subject
+                   ON scheduler_task_sessions(workspace_id, subject_id)
+                  WHERE subject_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_active_execution_run
+                   ON scheduler_task_sessions(workspace_id, execution_run_id)
+                  WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');",
+            )
+            .map_err(|error| format!("Failed to create scheduler ownership indexes: {error}"))?;
         migration
             .execute(
                 "UPDATE scheduler_metadata
@@ -366,6 +466,105 @@ impl SchedulerStore {
             connector_id: connector_id.to_string(),
             connector_binding_digest: connector_binding_digest.to_ascii_lowercase(),
         })
+    }
+
+    pub(crate) fn task_tool_authority(
+        &self,
+        fence: AssignmentFence,
+        workspace_id: &str,
+        workspace_root: PathBuf,
+        capabilities: &[String],
+    ) -> Result<TaskToolAuthority, String> {
+        let database_path = self.database_path.as_ref().ok_or_else(|| {
+            "Task tool authority requires a persistent scheduler store.".to_string()
+        })?;
+        if workspace_id.trim().is_empty() || workspace_id != workspace_id.trim() {
+            return Err("Task tool workspace ID must be canonical.".to_string());
+        }
+        let workspace_root = workspace_root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve task tool workspace root: {error}"))?;
+        if !workspace_root.is_dir() {
+            return Err("Task tool workspace root is not a directory.".to_string());
+        }
+        let mut capabilities = capabilities
+            .iter()
+            .filter(|capability| {
+                matches!(
+                    capability.as_str(),
+                    "workspace_read" | "workspace_write" | "shell" | "git"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        capabilities.sort();
+        capabilities.dedup();
+        Ok(TaskToolAuthority {
+            scheduler_database: database_path.as_ref().clone(),
+            scheduler_instance_id: self.instance_id.to_string(),
+            session_id: fence.session_id,
+            attempt_id: fence.attempt_id,
+            attempt: fence.attempt,
+            owner_id: fence.owner_id,
+            fencing_token: fence.fencing_token,
+            workspace_id: workspace_id.to_string(),
+            workspace_root,
+            capabilities,
+        })
+    }
+
+    pub(crate) fn task_tool_authority_is_current(
+        authority: &TaskToolAuthority,
+        capability: &str,
+    ) -> Result<bool, String> {
+        if !authority
+            .capabilities
+            .iter()
+            .any(|granted| granted == capability)
+        {
+            return Ok(false);
+        }
+        let store = Self::open_read_only_at(authority.scheduler_database.clone())?;
+        if store.instance_id() != authority.scheduler_instance_id {
+            return Ok(false);
+        }
+        let connection = store.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT 1
+                   FROM scheduler_task_sessions sessions
+                   JOIN scheduler_task_attempts attempts
+                     ON attempts.attempt_id = sessions.active_attempt_id
+                   JOIN scheduler_task_grants grants
+                     ON grants.session_id = sessions.session_id
+                  WHERE sessions.session_id = ?1
+                    AND sessions.workspace_id = ?2
+                    AND sessions.state = 'running'
+                    AND sessions.active_attempt_id = ?3
+                    AND sessions.fencing_token = ?4
+                    AND sessions.lease_expires_at > ?5
+                    AND attempts.session_id = sessions.session_id
+                    AND attempts.attempt_number = ?6
+                    AND attempts.owner_id = ?7
+                    AND attempts.fencing_token = ?4
+                    AND attempts.state = 'running'
+                    AND attempts.lease_expires_at > ?5
+                    AND grants.capability = ?8",
+                params![
+                    to_i64(authority.session_id.0)?,
+                    authority.workspace_id,
+                    to_i64(authority.attempt_id)?,
+                    to_i64(authority.fencing_token)?,
+                    to_i64(now_millis())?,
+                    i64::from(authority.attempt),
+                    to_i64(authority.owner_id)?,
+                    capability,
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|current| current.is_some())
+            .map_err(|error| format!("Failed to validate task tool authority: {error}"))
     }
 
     pub(crate) fn external_authority_is_current(
@@ -450,6 +649,7 @@ impl SchedulerStore {
         now: u64,
     ) -> Result<TaskSessionSnapshot, String> {
         let capabilities = validate_capability_grants(capabilities, grant_source)?;
+        let ownership = request_ownership(request);
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -458,12 +658,17 @@ impl SchedulerStore {
         transaction
             .execute(
                 "INSERT INTO scheduler_task_sessions
-                   (enqueue_sequence, label, payload, state, attempt_count, fencing_token, created_at)
-                 VALUES (?1, ?2, ?3, 'queued', 0, 0, ?4)",
+                   (enqueue_sequence, label, payload, workspace_id, conversation_id, subject_id,
+                    execution_run_id, state, attempt_count, fencing_token, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, 0, ?8)",
                 params![
                     to_i64(enqueue_sequence)?,
                     request.label,
                     request.payload,
+                    ownership.workspace_id,
+                    ownership.conversation_id,
+                    ownership.subject_id,
+                    ownership.execution_run_id,
                     to_i64(now)?
                 ],
             )
@@ -763,10 +968,27 @@ impl SchedulerStore {
 
         let candidate = transaction
             .query_row(
-                "SELECT session_id, label, payload, attempt_count, fencing_token
-                   FROM scheduler_task_sessions
-                  WHERE state = 'queued'
-                  ORDER BY enqueue_sequence
+                "SELECT candidate.session_id, candidate.label, candidate.payload,
+                        candidate.attempt_count, candidate.fencing_token
+                   FROM scheduler_task_sessions candidate
+                  WHERE candidate.state = 'queued'
+                    AND NOT EXISTS (
+                      SELECT 1
+                        FROM scheduler_task_sessions active
+                       WHERE active.state IN ('running', 'cancelling', 'committing')
+                         AND active.workspace_id = candidate.workspace_id
+                         AND (
+                           (candidate.conversation_id IS NOT NULL
+                            AND active.conversation_id = candidate.conversation_id)
+                           OR
+                           (candidate.subject_id IS NOT NULL
+                            AND active.subject_id = candidate.subject_id)
+                           OR
+                           (candidate.execution_run_id IS NOT NULL
+                            AND active.execution_run_id = candidate.execution_run_id)
+                         )
+                    )
+                  ORDER BY candidate.enqueue_sequence
                   LIMIT 1",
                 [],
                 |row| {
@@ -1024,6 +1246,389 @@ impl SchedulerStore {
         self.finish_at(fence, outcome, now_millis())
     }
 
+    /// Atomically stores an authoritative typed result and moves the session into `committing`.
+    pub(crate) fn stage_completion(
+        &self,
+        fence: AssignmentFence,
+        output: &TaskExecutionOutput,
+    ) -> Result<FinishResult, String> {
+        self.stage_completion_at(fence, output, now_millis())
+    }
+
+    fn stage_completion_at(
+        &self,
+        fence: AssignmentFence,
+        output: &TaskExecutionOutput,
+        now: u64,
+    ) -> Result<FinishResult, String> {
+        let terminal_state = match output {
+            TaskExecutionOutput::Agent(result) => match result.completion_status {
+                AgentTaskCompletionStatus::Completed => TaskSessionState::Succeeded,
+                AgentTaskCompletionStatus::Blocked => TaskSessionState::Blocked,
+            },
+            TaskExecutionOutput::Chat(_) | TaskExecutionOutput::Edit(_) => {
+                TaskSessionState::Succeeded
+            }
+            TaskExecutionOutput::None => {
+                return Err("Empty task output cannot be staged.".to_string())
+            }
+        };
+        let terminal_state_text = state_text(terminal_state);
+        let output_json = serde_json::to_string(output)
+            .map_err(|error| format!("Failed to encode staged task result: {error}"))?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start scheduler result staging: {error}"))?;
+        let ownership = transaction
+            .query_row(
+                "SELECT workspace_id, conversation_id, execution_run_id
+                   FROM scheduler_task_sessions
+                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
+                    AND state = 'running' AND lease_expires_at > ?4",
+                params![
+                    to_i64(fence.session_id.0)?,
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.fencing_token)?,
+                    to_i64(now)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate staged result fence: {error}"))?;
+        let Some((workspace_id, conversation_id, execution_run_id)) = ownership else {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit stale result staging: {error}"))?;
+            return Ok(FinishResult::Stale);
+        };
+        let attempt_matches = transaction
+            .query_row(
+                "SELECT 1 FROM scheduler_task_attempts
+                  WHERE attempt_id = ?1 AND session_id = ?2 AND attempt_number = ?3
+                    AND owner_id = ?4 AND fencing_token = ?5 AND state = 'running'
+                    AND lease_expires_at > ?6",
+                params![
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.session_id.0)?,
+                    i64::from(fence.attempt),
+                    to_i64(fence.owner_id)?,
+                    to_i64(fence.fencing_token)?,
+                    to_i64(now)?
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate staged result attempt: {error}"))?
+            .is_some();
+        if !attempt_matches {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit stale result attempt: {error}"))?;
+            return Ok(FinishResult::Stale);
+        }
+        let workspace_id = workspace_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Task completion requires workspace ownership.".to_string())?;
+        let conversation_id = conversation_id.filter(|value| !value.trim().is_empty());
+        let execution_run_id = execution_run_id.filter(|value| !value.trim().is_empty());
+        match output {
+            TaskExecutionOutput::Agent(_) => {
+                if conversation_id.is_none() || execution_run_id.is_none() {
+                    return Err(
+                        "Agent completion requires conversation and execution run ownership."
+                            .to_string(),
+                    );
+                }
+            }
+            TaskExecutionOutput::Chat(result) => {
+                if conversation_id.as_deref() != Some(result.conversation_id.as_str()) {
+                    return Err("Chat result does not match conversation ownership.".to_string());
+                }
+            }
+            TaskExecutionOutput::Edit(_) => {}
+            TaskExecutionOutput::None => unreachable!(),
+        }
+        let projection_id = format!(
+            "task-session:{}:{}:{}:{}",
+            self.instance_id, fence.session_id.0, fence.attempt_id, fence.fencing_token
+        );
+        transaction
+            .execute(
+                "INSERT INTO scheduler_task_completions
+                   (session_id, projection_id, attempt_id, fencing_token, workspace_id,
+                    conversation_id, execution_run_id, terminal_state, output_json, staged_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    to_i64(fence.session_id.0)?,
+                    projection_id,
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.fencing_token)?,
+                    workspace_id,
+                    conversation_id.unwrap_or_default(),
+                    execution_run_id.unwrap_or_default(),
+                    terminal_state_text,
+                    output_json,
+                    to_i64(now)?
+                ],
+            )
+            .map_err(|error| format!("Failed to stage scheduler completion: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE scheduler_task_attempts
+                    SET state = 'committing', lease_expires_at = NULL
+                  WHERE attempt_id = ?1 AND state = 'running'",
+                params![to_i64(fence.attempt_id)?],
+            )
+            .map_err(|error| format!("Failed to stage scheduler attempt: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE scheduler_task_sessions
+                    SET state = 'committing', lease_expires_at = NULL, error = NULL
+                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3",
+                params![
+                    to_i64(fence.session_id.0)?,
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.fencing_token)?
+                ],
+            )
+            .map_err(|error| format!("Failed to stage scheduler session: {error}"))?;
+        append_event_in_transaction(
+            &transaction,
+            fence.session_id,
+            Some(fence.attempt_id),
+            fence.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Lifecycle,
+                payload: json!({ "state": "committing" }),
+                progress: Some(TaskProgress {
+                    phase: "committing".to_string(),
+                    completed: 0,
+                    total: Some(1),
+                }),
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit scheduler result staging: {error}"))?;
+        Ok(FinishResult::Applied)
+    }
+
+    pub(crate) fn pending_completions(&self) -> Result<Vec<StagedCompletion>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT projection_id, session_id, attempt_id, fencing_token, workspace_id,
+                        conversation_id, execution_run_id, terminal_state, output_json
+                   FROM scheduler_task_completions
+                  WHERE finalized_at IS NULL
+                  ORDER BY staged_at, session_id",
+            )
+            .map_err(|error| format!("Failed to prepare pending completions: {error}"))?;
+        let completions = statement
+            .query_map([], staged_completion_from_row)
+            .map_err(|error| format!("Failed to query pending completions: {error}"))?
+            .map(|row| {
+                row.map_err(|error| format!("Failed to decode pending completion: {error}"))?
+                    .decode()
+            })
+            .collect();
+        completions
+    }
+
+    pub fn task_session_result(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Option<TaskSessionResult>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT output_json, terminal_state, projection_error, projected_at, finalized_at
+                   FROM scheduler_task_completions WHERE session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query task session result: {error}"))?
+            .map(
+                |(output, terminal_state, projection_error, projected_at, finalized_at)| {
+                    Ok(TaskSessionResult {
+                        session_id,
+                        output: serde_json::from_str(&output).map_err(|error| {
+                            format!("Failed to decode task session result: {error}")
+                        })?,
+                        terminal_state: parse_state(&terminal_state)?,
+                        projection_error,
+                        projected_at: projected_at
+                            .map(|value| from_i64(value, "completion projection timestamp"))
+                            .transpose()?,
+                        finalized_at: finalized_at
+                            .map(|value| from_i64(value, "completion finalization timestamp"))
+                            .transpose()?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub(crate) fn record_completion_error(
+        &self,
+        completion: &StagedCompletion,
+        error: &str,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "UPDATE scheduler_task_completions SET projection_error = ?4
+                  WHERE session_id = ?1 AND attempt_id = ?2 AND fencing_token = ?3
+                    AND finalized_at IS NULL",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?,
+                    error
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| format!("Failed to record completion projection error: {error}"))
+    }
+
+    pub(crate) fn mark_completion_projected(
+        &self,
+        completion: &StagedCompletion,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "UPDATE scheduler_task_completions
+                    SET projected_at = COALESCE(projected_at, ?4), projection_error = NULL
+                  WHERE session_id = ?1 AND attempt_id = ?2 AND fencing_token = ?3
+                    AND finalized_at IS NULL",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?,
+                    to_i64(now_millis())?
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| format!("Failed to mark completion projected: {error}"))
+    }
+
+    pub(crate) fn finalize_completion(
+        &self,
+        completion: &StagedCompletion,
+    ) -> Result<FinishResult, String> {
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start completion finalization: {error}"))?;
+        let projected = transaction
+            .query_row(
+                "SELECT 1 FROM scheduler_task_completions
+                  WHERE session_id = ?1 AND attempt_id = ?2 AND fencing_token = ?3
+                    AND projected_at IS NOT NULL AND finalized_at IS NULL",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate projected completion: {error}"))?
+            .is_some();
+        if !projected {
+            transaction.commit().map_err(|error| {
+                format!("Failed to commit stale completion finalization: {error}")
+            })?;
+            return Ok(FinishResult::Stale);
+        }
+        let state = state_text(completion.terminal_state);
+        let error = match &completion.output {
+            TaskExecutionOutput::Agent(result)
+                if result.completion_status == AgentTaskCompletionStatus::Blocked =>
+            {
+                result
+                    .blocked_reason
+                    .as_deref()
+                    .or(Some(result.summary.as_str()))
+            }
+            _ => None,
+        };
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_task_sessions
+                    SET state = ?4, active_attempt_id = NULL, completed_at = ?5, error = ?6
+                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
+                    AND state = 'committing'",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?,
+                    state,
+                    to_i64(now)?,
+                    error
+                ],
+            )
+            .map_err(|error| format!("Failed to finalize scheduler session: {error}"))?;
+        if updated != 1 {
+            transaction.commit().map_err(|error| {
+                format!("Failed to commit stale scheduler finalization: {error}")
+            })?;
+            return Ok(FinishResult::Stale);
+        }
+        transaction
+            .execute(
+                "UPDATE scheduler_task_attempts SET state = ?2, completed_at = ?3
+                  WHERE attempt_id = ?1 AND state = 'committing'",
+                params![to_i64(completion.attempt_id)?, state, to_i64(now)?],
+            )
+            .map_err(|error| format!("Failed to finalize scheduler attempt: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE scheduler_task_completions SET finalized_at = ?2 WHERE session_id = ?1",
+                params![to_i64(completion.session_id.0)?, to_i64(now)?],
+            )
+            .map_err(|error| format!("Failed to finalize scheduler completion record: {error}"))?;
+        append_event_in_transaction(
+            &transaction,
+            completion.session_id,
+            Some(completion.attempt_id),
+            completion.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Lifecycle,
+                payload: json!({ "state": state, "error": error }),
+                progress: Some(TaskProgress {
+                    phase: state.to_string(),
+                    completed: 1,
+                    total: Some(1),
+                }),
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit completion finalization: {error}"))?;
+        Ok(FinishResult::Applied)
+    }
+
     fn finish_at(
         &self,
         fence: AssignmentFence,
@@ -1221,6 +1826,49 @@ struct StoredSession {
     progress_completed: Option<i64>,
     progress_total: Option<i64>,
     next_event_sequence: i64,
+}
+
+struct StoredCompletion {
+    projection_id: String,
+    session_id: i64,
+    attempt_id: i64,
+    fencing_token: i64,
+    workspace_id: String,
+    conversation_id: String,
+    execution_run_id: String,
+    terminal_state: String,
+    output_json: String,
+}
+
+impl StoredCompletion {
+    fn decode(self) -> Result<StagedCompletion, String> {
+        Ok(StagedCompletion {
+            projection_id: self.projection_id,
+            session_id: TaskSessionId(from_i64(self.session_id, "task session ID")?),
+            attempt_id: from_i64(self.attempt_id, "task attempt ID")?,
+            fencing_token: from_i64(self.fencing_token, "fencing token")?,
+            workspace_id: self.workspace_id,
+            conversation_id: self.conversation_id,
+            execution_run_id: self.execution_run_id,
+            output: serde_json::from_str(&self.output_json)
+                .map_err(|error| format!("Failed to decode staged task result: {error}"))?,
+            terminal_state: parse_state(&self.terminal_state)?,
+        })
+    }
+}
+
+fn staged_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCompletion> {
+    Ok(StoredCompletion {
+        projection_id: row.get(0)?,
+        session_id: row.get(1)?,
+        attempt_id: row.get(2)?,
+        fencing_token: row.get(3)?,
+        workspace_id: row.get(4)?,
+        conversation_id: row.get(5)?,
+        execution_run_id: row.get(6)?,
+        terminal_state: row.get(7)?,
+        output_json: row.get(8)?,
+    })
 }
 
 impl StoredSession {
@@ -1690,11 +2338,25 @@ fn parse_state(value: &str) -> Result<TaskSessionState, String> {
         "queued" => Ok(TaskSessionState::Queued),
         "running" => Ok(TaskSessionState::Running),
         "cancelling" => Ok(TaskSessionState::Cancelling),
+        "committing" => Ok(TaskSessionState::Committing),
         "succeeded" => Ok(TaskSessionState::Succeeded),
         "failed" => Ok(TaskSessionState::Failed),
         "blocked" => Ok(TaskSessionState::Blocked),
         "cancelled" => Ok(TaskSessionState::Cancelled),
         _ => Err(format!("Unknown task session state '{value}'.")),
+    }
+}
+
+fn state_text(state: TaskSessionState) -> &'static str {
+    match state {
+        TaskSessionState::Queued => "queued",
+        TaskSessionState::Running => "running",
+        TaskSessionState::Cancelling => "cancelling",
+        TaskSessionState::Committing => "committing",
+        TaskSessionState::Succeeded => "succeeded",
+        TaskSessionState::Failed => "failed",
+        TaskSessionState::Blocked => "blocked",
+        TaskSessionState::Cancelled => "cancelled",
     }
 }
 
@@ -1779,6 +2441,19 @@ fn to_i64(value: u64) -> Result<i64, String> {
 
 fn from_i64(value: i64, field: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("{field} cannot be negative."))
+}
+
+fn request_ownership(request: &TaskRequest) -> TaskOwnership {
+    let Ok(Some(envelope)) = request.envelope() else {
+        return TaskOwnership::default();
+    };
+    let session = envelope.session();
+    TaskOwnership {
+        workspace_id: Some(session.workspace_id.clone()),
+        conversation_id: session.conversation_id.clone(),
+        subject_id: session.subject_id.clone(),
+        execution_run_id: session.execution_run_id.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -2453,6 +3128,157 @@ mod tests {
     }
 
     #[test]
+    fn claims_serialize_matching_ownership_without_blocking_unrelated_sessions() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let first = owned_agent_request("first", "conversation-a", "subject-a");
+        let conflicting = owned_agent_request("conflicting", "conversation-a", "subject-b");
+        let subject_conflict =
+            owned_agent_request("subject-conflict", "conversation-c", "subject-a");
+        let unrelated = owned_agent_request("unrelated", "conversation-b", "subject-c");
+        store.enqueue_at(&first, 1).expect("first enqueued");
+        store
+            .enqueue_at(&conflicting, 2)
+            .expect("conflicting enqueued");
+        store
+            .enqueue_at(&subject_conflict, 3)
+            .expect("subject conflict enqueued");
+        store.enqueue_at(&unrelated, 4).expect("unrelated enqueued");
+
+        let first_assignment = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("first claim")
+            .expect("first assignment");
+        let unrelated_assignment = store
+            .claim_next_at(owner, 2, 11, LEASE_MILLIS, 5)
+            .expect("second claim")
+            .expect("unrelated assignment");
+        assert_eq!(unrelated_assignment.request.label, "unrelated");
+        assert!(store
+            .claim_next_at(owner, 3, 12, LEASE_MILLIS, 5)
+            .expect("conflict checked")
+            .is_none());
+
+        store
+            .finish_at(first_assignment.fence, DurableOutcome::Succeeded, 20)
+            .expect("first finished");
+        let conflicting_assignment = store
+            .claim_next_at(owner, 3, 21, LEASE_MILLIS, 5)
+            .expect("conflicting claim")
+            .expect("conflicting assignment");
+        assert_eq!(conflicting_assignment.request.label, "conflicting");
+        let subject_assignment = store
+            .claim_next_at(owner, 4, 22, LEASE_MILLIS, 5)
+            .expect("subject claim")
+            .expect("subject assignment");
+        assert_eq!(subject_assignment.request.label, "subject-conflict");
+    }
+
+    #[test]
+    fn structured_results_survive_staging_and_are_queryable_before_terminal() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        for (label, status, terminal) in [
+            (
+                "completed",
+                AgentTaskCompletionStatus::Completed,
+                TaskSessionState::Succeeded,
+            ),
+            (
+                "blocked",
+                AgentTaskCompletionStatus::Blocked,
+                TaskSessionState::Blocked,
+            ),
+        ] {
+            let request = owned_agent_request(label, &format!("conversation-{label}"), label);
+            let session = store.enqueue_at(&request, 1).expect("session enqueued");
+            let assignment = store
+                .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+                .expect("session claimed")
+                .expect("assignment");
+            let output = agent_output(status);
+            assert!(matches!(
+                store
+                    .stage_completion_at(assignment.fence, &output, 20)
+                    .expect("result staged"),
+                FinishResult::Applied
+            ));
+            assert_eq!(
+                store
+                    .get_session(session.id)
+                    .expect("session read")
+                    .expect("session exists")
+                    .state,
+                TaskSessionState::Committing
+            );
+            let result = store
+                .task_session_result(session.id)
+                .expect("result queried")
+                .expect("result exists");
+            assert_eq!(result.output, output);
+            assert_eq!(result.terminal_state, terminal);
+        }
+        drop(store);
+        let reopened = SchedulerStore::open_at(path).expect("store reopens");
+        assert!(reopened
+            .task_session_result(TaskSessionId(1))
+            .expect("result survives")
+            .is_some());
+        assert!(reopened
+            .task_session_result(TaskSessionId(2))
+            .expect("result survives")
+            .is_some());
+    }
+
+    #[test]
+    fn stale_fence_cannot_stage_result_and_committing_keeps_ownership_locked() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let first = owned_agent_request("first", "conversation-a", "subject-a");
+        let mut conflicting_envelope = owned_agent_request("second", "conversation-b", "subject-b")
+            .envelope()
+            .expect("envelope decoded")
+            .expect("envelope exists");
+        let TaskSessionEnvelope::V1(conflicting_session) = &mut conflicting_envelope else {
+            unreachable!();
+        };
+        conflicting_session.execution_run_id = Some("run-first".to_string());
+        let conflicting =
+            TaskRequest::from_envelope("second", &conflicting_envelope).expect("request encoded");
+        store.enqueue_at(&first, 1).expect("first enqueued");
+        store.enqueue_at(&conflicting, 2).expect("second enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("first claimed")
+            .expect("assignment");
+        let mut stale = assignment.fence;
+        stale.fencing_token += 1;
+        assert!(matches!(
+            store
+                .stage_completion_at(
+                    stale,
+                    &agent_output(AgentTaskCompletionStatus::Completed),
+                    20
+                )
+                .expect("stale result rejected"),
+            FinishResult::Stale
+        ));
+        store
+            .stage_completion_at(
+                assignment.fence,
+                &agent_output(AgentTaskCompletionStatus::Completed),
+                20,
+            )
+            .expect("result staged");
+        assert!(store
+            .claim_next_at(owner, 2, 21, LEASE_MILLIS, 5)
+            .expect("ownership checked")
+            .is_none());
+    }
+
+    #[test]
     fn stale_attempt_cannot_append_events_after_reclaim() {
         let store = SchedulerStore::open_in_memory().expect("store opens");
         let owner = store.register_owner().expect("owner registered");
@@ -2567,6 +3393,73 @@ mod tests {
     }
 
     #[test]
+    fn task_tool_authority_rejects_stale_and_denied_without_cross_session_cancellation() {
+        let directory = tempdir().expect("temp directory");
+        let store =
+            SchedulerStore::open_at(directory.path().join("scheduler.db")).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let first = store
+            .enqueue_with_grants(
+                &owned_agent_request("tools-1", "conversation-tools-1", "card-tools-1"),
+                &["shell".to_string()],
+                "test-approval",
+            )
+            .expect("first task enqueued");
+        let second = store
+            .enqueue_with_grants(
+                &owned_agent_request("tools-2", "conversation-tools-2", "card-tools-2"),
+                &["shell".to_string()],
+                "test-approval",
+            )
+            .expect("second task enqueued");
+        let first_assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 5)
+            .expect("first claim")
+            .expect("first assignment");
+        let second_assignment = store
+            .claim_next(owner, 2, Duration::from_secs(30), 5)
+            .expect("second claim")
+            .expect("second assignment");
+        let root = directory.path().canonicalize().expect("workspace root");
+        let first_authority = store
+            .task_tool_authority(
+                first_assignment.fence,
+                "workspace-personal",
+                root.clone(),
+                &["shell".to_string()],
+            )
+            .expect("first authority");
+        let second_authority = store
+            .task_tool_authority(
+                second_assignment.fence,
+                "workspace-personal",
+                root,
+                &["shell".to_string()],
+            )
+            .expect("second authority");
+
+        assert!(
+            SchedulerStore::task_tool_authority_is_current(&first_authority, "shell")
+                .expect("first authority checked")
+        );
+        assert!(!SchedulerStore::task_tool_authority_is_current(
+            &first_authority,
+            "workspace_write"
+        )
+        .expect("denied capability checked"));
+        store.cancel(first.id).expect("first cancelled");
+        assert!(
+            !SchedulerStore::task_tool_authority_is_current(&first_authority, "shell")
+                .expect("stale authority checked")
+        );
+        assert!(
+            SchedulerStore::task_tool_authority_is_current(&second_authority, "shell")
+                .expect("second authority remains current")
+        );
+        assert_eq!(second_assignment.fence.session_id, second.id);
+    }
+
+    #[test]
     fn assignment_authority_rejects_wrong_stale_and_cancelling_attempts() {
         let store = SchedulerStore::open_in_memory().expect("store opens");
         let owner = store.register_owner().expect("owner registered");
@@ -2668,6 +3561,29 @@ mod tests {
             context_revision: Some("context-1".to_string()),
             rules_revision: Some("rules-1".to_string()),
             skills_revision: Some("skills-1".to_string()),
+        })
+    }
+
+    fn owned_agent_request(label: &str, conversation_id: &str, subject_id: &str) -> TaskRequest {
+        let mut envelope = test_agent_envelope();
+        let TaskSessionEnvelope::V1(session) = &mut envelope else {
+            unreachable!("test envelope is V1");
+        };
+        session.conversation_id = Some(conversation_id.to_string());
+        session.subject_id = Some(subject_id.to_string());
+        session.execution_run_id = Some(format!("run-{label}"));
+        TaskRequest::from_envelope(label, &envelope).expect("owned request")
+    }
+
+    fn agent_output(status: AgentTaskCompletionStatus) -> TaskExecutionOutput {
+        TaskExecutionOutput::Agent(crate::domain::task_session::AgentTaskResult {
+            summary: format!("{status:?} result"),
+            evidence: vec!["evidence".to_string()],
+            details: vec!["details".to_string()],
+            next: vec!["next".to_string()],
+            completion_status: status,
+            blocked_reason: (status == AgentTaskCompletionStatus::Blocked)
+                .then(|| "approval required".to_string()),
         })
     }
 }

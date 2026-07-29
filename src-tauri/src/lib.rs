@@ -6,7 +6,13 @@ pub fn run_mcp_proxy() -> Result<(), String> {
     infrastructure::mcp::run_mcp_proxy_from_env()
 }
 
-use application::agent_task_executor::{AgentTaskExecutor, AiWorkerRuntimeRunner};
+pub fn run_task_tools() -> Result<(), String> {
+    infrastructure::task_tools::run_task_tools_from_env()
+}
+
+use application::agent_task_executor::{
+    execution_contract_digest, AgentTaskExecutor, AiWorkerRuntimeRunner,
+};
 use application::app::AppState;
 use application::execution_engine::ExecutionEngine;
 use application::files_service::FilesService;
@@ -19,8 +25,8 @@ use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
-    TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
-    TaskSessionInputV2, TaskToolState,
+    TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2,
+    TaskSessionResult, TaskSessionSnapshot, TaskSessionUpdate, TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -87,7 +93,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
+
+const TASK_SESSION_UPDATE_EVENT: &str = "task-session-update";
 
 /// Each MCP request blocks for up to 45 s (recv_timeout inside StdioMcpClient::request).
 /// Session initialisation makes two sequential requests: initialize + tools/list = up to 90 s.
@@ -1390,6 +1398,17 @@ async fn workspace_root_path(
 }
 
 #[tauri::command]
+async fn workspace_root_revision(
+    workspace_id: String,
+    workspace_root: State<'_, WorkspaceRoot>,
+) -> Result<u64, String> {
+    let root = workspace_root.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || root.revision(&workspace_id))
+        .await
+        .map_err(|error| file_ipc_error("Workspace root revision task failed", error))?
+}
+
+#[tauri::command]
 async fn set_workspace_root(
     workspace_id: String,
     absolute_path: String,
@@ -1644,6 +1663,17 @@ async fn save_agent_runtime_profile(
 }
 
 #[tauri::command]
+async fn save_immutable_agent_runtime_profile(
+    profile: AgentRuntimeProfile,
+    profile_store: State<'_, RuntimeProfileStore>,
+) -> Result<AgentRuntimeProfile, String> {
+    let store = profile_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save_immutable(&profile))
+        .await
+        .map_err(|error| format!("Save immutable Agent runtime profile task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn submit_task_session(
     label: String,
     envelope: TaskSessionEnvelope,
@@ -1672,6 +1702,11 @@ async fn submit_task_session(
 #[tauri::command]
 fn digest_task_session_prompt_input(input: TaskSessionInputV2) -> Result<String, String> {
     prompt_input_digest(&input)
+}
+
+#[tauri::command]
+fn digest_agent_execution_contract(contract: serde_json::Value) -> Result<String, String> {
+    execution_contract_digest(&contract)
 }
 
 #[tauri::command]
@@ -1713,6 +1748,21 @@ async fn get_task_session(
     tauri::async_runtime::spawn_blocking(move || store.get_session(TaskSessionId(session_id)))
         .await
         .map_err(|error| format!("Get Task Session task failed: {error}"))?
+}
+
+/// Returns the durable authoritative Agent result once staging has completed, including while the
+/// session is still committing its executions.db projection.
+#[tauri::command]
+async fn get_task_session_result(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Option<TaskSessionResult>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.task_session_result(TaskSessionId(session_id))
+    })
+    .await
+    .map_err(|error| format!("Get Task Session result task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2239,6 +2289,7 @@ mod tests {
             restrict_tools: false,
             fenced_tools_only: false,
             isolated_opencode_process: false,
+            task_tool_authority: None,
             mcp_servers: Vec::new(),
         };
 
@@ -2270,6 +2321,7 @@ mod tests {
             restrict_tools: false,
             fenced_tools_only: false,
             isolated_opencode_process: false,
+            task_tool_authority: None,
             mcp_servers: Vec::new(),
         };
 
@@ -2343,9 +2395,13 @@ pub fn run() {
     ));
     let task_executor = TaskSessionExecutor::new(agent_executor, prompt_executor);
     let execution_engine = Arc::new(
-        ExecutionEngine::open_persistent_with_executor(Arc::new(task_executor))
-            .expect("failed to initialize Task Session execution engine"),
+        ExecutionEngine::open_persistent_with_executor_and_projector(
+            Arc::new(task_executor),
+            Arc::new(execution_store.clone()),
+        )
+        .expect("failed to initialize Task Session execution engine"),
     );
+    let task_session_updates = execution_engine.subscribe_updates();
     let lsp_registry = LspRegistry::default();
     let shutdown_lsp = lsp_registry.clone();
     tauri::Builder::default()
@@ -2365,6 +2421,18 @@ pub fn run() {
         .manage(AppState::new())
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("spacesly-task-session-events".to_string())
+                .spawn(move || {
+                    while let Ok(update) = task_session_updates.recv() {
+                        let _ =
+                            app_handle.emit::<TaskSessionUpdate>(TASK_SESSION_UPDATE_EVENT, update);
+                    }
+                })?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_workspace,
             get_jira_issues,
@@ -2404,6 +2472,7 @@ pub fn run() {
             apply_workspace_replace,
             write_file,
             workspace_root_path,
+            workspace_root_revision,
             set_workspace_root,
             watch_workspace_files,
             unwatch_workspace_files,
@@ -2427,13 +2496,16 @@ pub fn run() {
             list_active_execution_runs,
             list_task_sessions,
             get_task_session,
+            get_task_session_result,
             list_task_session_events,
             get_task_session_tool_state,
             get_task_session_mcp_context,
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
+            save_immutable_agent_runtime_profile,
             submit_task_session,
             digest_task_session_prompt_input,
+            digest_agent_execution_contract,
             cancel_task_session,
             remove_task_session,
             format_code,

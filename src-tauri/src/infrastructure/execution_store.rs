@@ -1,4 +1,7 @@
+use crate::application::execution_engine::CompletionProjector;
 use crate::domain::execution::{ExecutionRun, StepRun};
+use crate::domain::task_session::{AgentTaskCompletionStatus, TaskExecutionOutput};
+use crate::infrastructure::scheduler_store::StagedCompletion;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +37,12 @@ const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
 #[derive(Clone)]
 pub struct ExecutionStore {
     connection: Arc<Mutex<Connection>>,
+}
+
+impl CompletionProjector for ExecutionStore {
+    fn project(&self, completion: &StagedCompletion) -> Result<(), String> {
+        self.project_task_completion(completion)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,9 +119,11 @@ impl ExecutionStore {
                    status TEXT NOT NULL,
                    attempt INTEGER NOT NULL,
                    started_at TEXT,
-                   completed_at TEXT,
-                   summary TEXT,
-                   lease_owner TEXT,
+                    completed_at TEXT,
+                    summary TEXT,
+                    result_json TEXT,
+                    task_session_projection_id TEXT,
+                    lease_owner TEXT,
                    lease_expires_at INTEGER,
                    updated_at TEXT NOT NULL,
                    PRIMARY KEY (run_id, step_id),
@@ -128,7 +139,15 @@ impl ExecutionStore {
                     created_at TEXT NOT NULL
                   );
                    CREATE INDEX IF NOT EXISTS idx_ai_audit_events_run
-                     ON ai_audit_events(run_id, event_id);",
+                     ON ai_audit_events(run_id, event_id);
+                  CREATE TABLE IF NOT EXISTS task_completion_projection_receipts (
+                    projection_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL UNIQUE,
+                    output_json TEXT NOT NULL,
+                    projected_at INTEGER NOT NULL
+                  );",
             )
             .map_err(|error| format!("Failed to initialize execution database: {error}"))?;
         connection
@@ -142,6 +161,11 @@ impl ExecutionStore {
         let _ = connection.execute("ALTER TABLE step_runs ADD COLUMN lease_owner TEXT", []);
         let _ = connection.execute(
             "ALTER TABLE step_runs ADD COLUMN lease_expires_at INTEGER",
+            [],
+        );
+        let _ = connection.execute("ALTER TABLE step_runs ADD COLUMN result_json TEXT", []);
+        let _ = connection.execute(
+            "ALTER TABLE step_runs ADD COLUMN task_session_projection_id TEXT",
             [],
         );
         let store = Self {
@@ -218,8 +242,9 @@ impl ExecutionStore {
                 .execute(
                     "INSERT INTO step_runs
                        (run_id, step_id, status, attempt, started_at, completed_at, summary,
-                        lease_owner, lease_expires_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                         lease_owner, lease_expires_at, result_json,
+                         task_session_projection_id, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         run.run_id,
                         step.step_id,
@@ -233,6 +258,8 @@ impl ExecutionStore {
                             .or_else(|| existing_step.and_then(|value| value.0.clone())),
                         step.lease_expires_at
                             .or_else(|| existing_step.and_then(|value| value.1)),
+                        existing_step.and_then(|value| value.2.clone()),
+                        existing_step.and_then(|value| value.3.clone()),
                         now,
                     ],
                 )
@@ -244,6 +271,229 @@ impl ExecutionStore {
         drop(connection);
         self.get(&run.run_id)?
             .ok_or_else(|| "Execution run disappeared after save.".to_string())
+    }
+
+    /// Idempotently projects one scheduler-staged Agent completion in a single executions.db transaction.
+    pub(crate) fn project_task_completion(
+        &self,
+        completion: &StagedCompletion,
+    ) -> Result<(), String> {
+        match &completion.output {
+            TaskExecutionOutput::Agent(_) => self.project_agent_task_completion(completion),
+            TaskExecutionOutput::Chat(result) => {
+                if result.conversation_id != completion.conversation_id {
+                    return Err("Chat completion conversation ownership changed.".to_string());
+                }
+                let title = {
+                    let connection = self.connection.lock().map_err(|error| error.to_string())?;
+                    connection
+                        .query_row(
+                            "SELECT title FROM conversations
+                              WHERE conversation_id = ?1 AND workspace_id = ?2",
+                            params![completion.conversation_id, completion.workspace_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("Failed to validate Chat completion conversation: {error}")
+                        })?
+                        .ok_or_else(|| {
+                            "Chat completion conversation does not belong to this workspace."
+                                .to_string()
+                        })?
+                };
+                self.append_conversation_message(
+                    &completion.workspace_id,
+                    &completion.conversation_id,
+                    &title,
+                    &ConversationMessageInput {
+                        id: format!("{}:assistant", completion.projection_id),
+                        role: "agent".to_string(),
+                        text: result.message.clone(),
+                    },
+                )?;
+                Ok(())
+            }
+            // Edit proposals have no conversation projection. The scheduler outbox itself is the
+            // durable authoritative query surface; singular editor review state is not recreated.
+            TaskExecutionOutput::Edit(_) => Ok(()),
+            TaskExecutionOutput::None => {
+                Err("Empty task completion cannot be projected.".to_string())
+            }
+        }
+    }
+
+    fn project_agent_task_completion(&self, completion: &StagedCompletion) -> Result<(), String> {
+        let TaskExecutionOutput::Agent(result) = &completion.output else {
+            unreachable!();
+        };
+        let output_json = serde_json::to_string(&completion.output)
+            .map_err(|error| format!("Failed to encode completion projection: {error}"))?;
+        let message_id = format!("{}:agent", completion.projection_id);
+        let message_text = serde_json::to_string(result)
+            .map_err(|error| format!("Failed to encode Agent conversation result: {error}"))?;
+        let step_status = match result.completion_status {
+            AgentTaskCompletionStatus::Completed => "completed",
+            AgentTaskCompletionStatus::Blocked => "blocked",
+        };
+        let summary = if result.completion_status == AgentTaskCompletionStatus::Blocked {
+            result.blocked_reason.as_deref().unwrap_or(&result.summary)
+        } else {
+            &result.summary
+        };
+        let now = now_millis()?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start completion projection: {error}"))?;
+        let existing = transaction
+            .query_row(
+                "SELECT run_id, conversation_id, message_id, output_json
+                   FROM task_completion_projection_receipts WHERE projection_id = ?1",
+                params![completion.projection_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to check completion projection receipt: {error}"))?;
+        if let Some((run_id, conversation_id, stored_message_id, stored_output)) = existing {
+            if run_id != completion.execution_run_id
+                || conversation_id != completion.conversation_id
+                || stored_message_id != message_id
+                || stored_output != output_json
+            {
+                return Err("Completion projection ID is bound to different content.".to_string());
+            }
+            transaction.commit().map_err(|error| {
+                format!("Failed to commit idempotent completion projection: {error}")
+            })?;
+            return Ok(());
+        }
+        let run_workspace = transaction
+            .query_row(
+                "SELECT contracts.workspace_id
+                   FROM execution_runs runs
+                   JOIN execution_contracts contracts ON contracts.contract_id = runs.contract_id
+                  WHERE runs.run_id = ?1",
+                params![completion.execution_run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to verify completion execution run: {error}"))?
+            .ok_or_else(|| "Completion execution run was not found.".to_string())?;
+        if run_workspace != completion.workspace_id {
+            return Err("Completion execution run does not belong to this workspace.".to_string());
+        }
+        if !conversation_exists_in(
+            &transaction,
+            &completion.workspace_id,
+            &completion.conversation_id,
+        )? {
+            return Err("Completion conversation does not belong to this workspace.".to_string());
+        }
+        let step_projection = transaction
+            .query_row(
+                "SELECT task_session_projection_id FROM step_runs
+                  WHERE run_id = ?1 AND step_id = 'worker.execute'",
+                params![completion.execution_run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to verify worker.execute step: {error}"))?
+            .ok_or_else(|| "Completion execution run has no worker.execute step.".to_string())?;
+        if step_projection
+            .as_deref()
+            .is_some_and(|projection| projection != completion.projection_id)
+        {
+            return Err(
+                "worker.execute already has different Task Session provenance.".to_string(),
+            );
+        }
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM conversation_messages
+                  WHERE conversation_id = ?1",
+                params![completion.conversation_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| {
+                format!("Failed to allocate Agent result message sequence: {error}")
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO conversation_messages
+                   (message_id, conversation_id, sequence, role, text, created_at)
+                 VALUES (?1, ?2, ?3, 'agent', ?4, ?5)",
+                params![
+                    message_id,
+                    completion.conversation_id,
+                    sequence,
+                    message_text,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Failed to record Agent result message: {error}"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE step_runs
+                    SET status = ?3, completed_at = ?4, summary = ?5, result_json = ?6,
+                        task_session_projection_id = ?7, lease_owner = NULL,
+                        lease_expires_at = NULL, updated_at = ?4
+                  WHERE run_id = ?1 AND step_id = ?2
+                    AND (task_session_projection_id IS NULL OR task_session_projection_id = ?7)",
+                params![
+                    completion.execution_run_id,
+                    "worker.execute",
+                    step_status,
+                    now.to_string(),
+                    summary,
+                    output_json,
+                    completion.projection_id
+                ],
+            )
+            .map_err(|error| format!("Failed to project worker.execute result: {error}"))?;
+        if updated != 1 {
+            return Err("worker.execute result provenance changed during projection.".to_string());
+        }
+        if result.completion_status == AgentTaskCompletionStatus::Blocked {
+            transaction
+                .execute(
+                    "UPDATE execution_runs SET status = 'blocked', completed_at = ?2,
+                        updated_at = ?2, revision = revision + 1 WHERE run_id = ?1",
+                    params![completion.execution_run_id, now.to_string()],
+                )
+                .map_err(|error| format!("Failed to project blocked execution run: {error}"))?;
+        }
+        transaction
+            .execute(
+                "UPDATE conversations SET updated_at = ?2 WHERE conversation_id = ?1",
+                params![completion.conversation_id, now],
+            )
+            .map_err(|error| format!("Failed to update projected conversation: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO task_completion_projection_receipts
+                   (projection_id, run_id, conversation_id, message_id, output_json, projected_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    completion.projection_id,
+                    completion.execution_run_id,
+                    completion.conversation_id,
+                    message_id,
+                    output_json,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Failed to record completion projection receipt: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit completion projection: {error}"))
     }
 
     pub fn claim_step(
@@ -775,10 +1025,12 @@ fn load_run(connection: &Connection, run_id: &str) -> Result<Option<ExecutionRun
 fn load_step_leases(
     transaction: &Transaction<'_>,
     run_id: &str,
-) -> Result<BTreeMap<String, (Option<String>, Option<u64>)>, String> {
+) -> Result<BTreeMap<String, (Option<String>, Option<u64>, Option<String>, Option<String>)>, String>
+{
     let mut statement = transaction
         .prepare(
-            "SELECT step_id, lease_owner, lease_expires_at
+            "SELECT step_id, lease_owner, lease_expires_at, result_json,
+                    task_session_projection_id
              FROM step_runs WHERE run_id = ?1",
         )
         .map_err(|error| format!("Failed to load execution step leases: {error}"))?;
@@ -789,6 +1041,8 @@ fn load_step_leases(
                 (
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<u64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ),
             ))
         })
@@ -850,6 +1104,7 @@ fn now_millis() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task_session::{AgentTaskResult, TaskSessionId, TaskSessionState};
 
     fn test_store() -> ExecutionStore {
         let connection = Connection::open_in_memory().unwrap();
@@ -857,6 +1112,149 @@ mod tests {
         ExecutionStore {
             connection: Arc::new(Mutex::new(connection)),
         }
+    }
+
+    fn projection_test_store() -> ExecutionStore {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                "{CONVERSATION_SCHEMA}
+                 CREATE TABLE execution_contracts (
+                   contract_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL
+                 );
+                 CREATE TABLE execution_runs (
+                   run_id TEXT PRIMARY KEY, contract_id TEXT NOT NULL, status TEXT NOT NULL,
+                   completed_at TEXT, updated_at TEXT NOT NULL, revision INTEGER NOT NULL
+                 );
+                 CREATE TABLE step_runs (
+                   run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL,
+                   completed_at TEXT, summary TEXT, result_json TEXT,
+                   task_session_projection_id TEXT, lease_owner TEXT,
+                   lease_expires_at INTEGER, updated_at TEXT NOT NULL,
+                   PRIMARY KEY(run_id, step_id)
+                 );
+                 CREATE TABLE task_completion_projection_receipts (
+                   projection_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                   conversation_id TEXT NOT NULL, message_id TEXT NOT NULL UNIQUE,
+                   output_json TEXT NOT NULL, projected_at INTEGER NOT NULL
+                 );"
+            ))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO execution_contracts (contract_id, workspace_id) VALUES ('contract-1', 'workspace-a')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO execution_runs
+                   (run_id, contract_id, status, updated_at, revision)
+                 VALUES ('run-1', 'contract-1', 'running', '1', 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO step_runs (run_id, step_id, status, updated_at)
+                 VALUES ('run-1', 'worker.execute', 'running', '1')",
+                [],
+            )
+            .unwrap();
+        let store = ExecutionStore {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        store
+            .append_conversation_message(
+                "workspace-a",
+                "conversation-a",
+                "Agent",
+                &ConversationMessageInput {
+                    id: "user-1".to_string(),
+                    role: "user".to_string(),
+                    text: "Do the work".to_string(),
+                },
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn task_completion_projection_is_idempotent_and_records_provenance() {
+        let store = projection_test_store();
+        let completion = StagedCompletion {
+            projection_id: "projection-1".to_string(),
+            session_id: TaskSessionId(1),
+            attempt_id: 2,
+            fencing_token: 3,
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            execution_run_id: "run-1".to_string(),
+            output: TaskExecutionOutput::Agent(AgentTaskResult {
+                summary: "Work completed".to_string(),
+                evidence: vec!["test passed".to_string()],
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AgentTaskCompletionStatus::Completed,
+                blocked_reason: None,
+            }),
+            terminal_state: TaskSessionState::Succeeded,
+        };
+        store
+            .project_task_completion(&completion)
+            .expect("first projection succeeds");
+        store
+            .project_task_completion(&completion)
+            .expect("repeated projection succeeds");
+
+        let messages = store
+            .load_conversation_messages("workspace-a", "conversation-a")
+            .expect("messages loaded");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].id, "projection-1:agent");
+        let connection = store.connection.lock().unwrap();
+        let (status, provenance, receipts): (String, String, u64) = connection
+            .query_row(
+                "SELECT steps.status, steps.task_session_projection_id,
+                        (SELECT COUNT(*) FROM task_completion_projection_receipts)
+                   FROM step_runs steps
+                  WHERE steps.run_id = 'run-1' AND steps.step_id = 'worker.execute'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(provenance, "projection-1");
+        assert_eq!(receipts, 1);
+    }
+
+    #[test]
+    fn chat_completion_projection_is_deterministic_and_idempotent() {
+        let store = projection_test_store();
+        let completion = StagedCompletion {
+            projection_id: "projection-chat".to_string(),
+            session_id: TaskSessionId(2),
+            attempt_id: 3,
+            fencing_token: 4,
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            execution_run_id: String::new(),
+            output: TaskExecutionOutput::Chat(crate::domain::task_session::ChatTaskResult {
+                conversation_id: "conversation-a".to_string(),
+                message: "Recovered assistant response".to_string(),
+            }),
+            terminal_state: TaskSessionState::Succeeded,
+        };
+
+        store.project_task_completion(&completion).unwrap();
+        store.project_task_completion(&completion).unwrap();
+        let messages = store
+            .load_conversation_messages("workspace-a", "conversation-a")
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].id, "projection-chat:assistant");
+        assert_eq!(messages[1].role, "agent");
+        assert_eq!(messages[1].text, "Recovered assistant response");
     }
 
     #[test]

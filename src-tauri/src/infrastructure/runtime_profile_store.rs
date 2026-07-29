@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -72,6 +73,23 @@ impl AgentRuntimeProfile {
         }
         Ok(())
     }
+
+    /// Verifies that persisted revision claims match the profile content.
+    pub fn validate_content_revisions(&self) -> Result<(), String> {
+        if self.rules_revision != content_revision(&self.agent_rules)
+            || self.skills_revision != content_revision(&self.agent_skills)
+        {
+            return Err(
+                "Agent runtime profile rule or skill revision did not match its content."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn content_revision(content: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
 }
 
 #[derive(Clone)]
@@ -115,6 +133,9 @@ impl RuntimeProfileStore {
 
     /// Inserts or replaces one validated Agent runtime profile.
     pub fn save(&self, profile: &AgentRuntimeProfile) -> Result<AgentRuntimeProfile, String> {
+        if profile.id.starts_with("prompt-") {
+            return self.save_immutable(profile);
+        }
         profile.validate()?;
         let encoded = serde_json::to_string(profile)
             .map_err(|error| format!("Failed to encode Agent runtime profile: {error}"))?;
@@ -129,6 +150,43 @@ impl RuntimeProfileStore {
                 params![profile.id, encoded, now_millis()?],
             )
             .map_err(|error| format!("Failed to save Agent runtime profile: {error}"))?;
+        Ok(profile.clone())
+    }
+
+    /// Inserts a content-addressed profile or verifies that an existing value is identical.
+    pub fn save_immutable(
+        &self,
+        profile: &AgentRuntimeProfile,
+    ) -> Result<AgentRuntimeProfile, String> {
+        profile.validate()?;
+        profile.validate_content_revisions()?;
+        let encoded = serde_json::to_string(profile)
+            .map_err(|error| format!("Failed to encode Agent runtime profile: {error}"))?;
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let existing = connection
+            .query_row(
+                "SELECT profile_json FROM agent_runtime_profiles WHERE profile_id = ?1",
+                params![profile.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load Agent runtime profile: {error}"))?;
+        if let Some(existing) = existing {
+            if existing != encoded {
+                return Err(format!(
+                    "Agent runtime profile '{}' is immutable and already has different content.",
+                    profile.id
+                ));
+            }
+            return Ok(profile.clone());
+        }
+        connection
+            .execute(
+                "INSERT INTO agent_runtime_profiles (profile_id, profile_json, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                params![profile.id, encoded, now_millis()?],
+            )
+            .map_err(|error| format!("Failed to save immutable Agent runtime profile: {error}"))?;
         Ok(profile.clone())
     }
 
@@ -220,6 +278,36 @@ mod tests {
         let mut profile = test_profile();
         profile.connector_ids = vec!["jira*".to_string()];
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn content_addressed_profiles_are_idempotent_and_immutable() {
+        let directory = tempdir().expect("temp directory");
+        let store = RuntimeProfileStore::open_at(directory.path().join("profiles.db"))
+            .expect("store opens");
+        let mut profile = test_profile();
+        profile.id = "prompt-content-addressed".to_string();
+        profile.rules_revision = content_revision(&profile.agent_rules);
+        profile.skills_revision = content_revision(&profile.agent_skills);
+
+        store.save(&profile).expect("profile saved");
+        store.save(&profile).expect("identical save is idempotent");
+
+        let mut conflicting = profile.clone();
+        conflicting.model = "openai/gpt-5.1".to_string();
+        assert!(store.save(&conflicting).is_err());
+        assert_eq!(store.get(&profile.id).expect("profile read"), Some(profile));
+    }
+
+    #[test]
+    fn immutable_profiles_reject_forged_content_revisions() {
+        let directory = tempdir().expect("temp directory");
+        let store = RuntimeProfileStore::open_at(directory.path().join("profiles.db"))
+            .expect("store opens");
+        let mut profile = test_profile();
+        profile.id = "prompt-forged".to_string();
+
+        assert!(store.save_immutable(&profile).is_err());
     }
 
     fn test_profile() -> AgentRuntimeProfile {

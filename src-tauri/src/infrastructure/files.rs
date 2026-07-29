@@ -204,6 +204,38 @@ pub fn write_file(
     encoding: TextEncoding,
     line_ending: LineEnding,
 ) -> Result<FileWriteResult, String> {
+    write_file_authorized(
+        root,
+        workspace_id,
+        relative_path,
+        content,
+        expected_version,
+        expected_root_revision,
+        encoding,
+        line_ending,
+        false,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn write_file_authorized(
+    root: &WorkspaceRoot,
+    workspace_id: String,
+    relative_path: String,
+    content: String,
+    expected_version: Option<String>,
+    expected_root_revision: Option<u64>,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
+    require_secure_write: bool,
+    mut authorize: impl FnMut() -> Result<(), String>,
+) -> Result<FileWriteResult, String> {
+    #[cfg(not(target_os = "linux"))]
+    if require_secure_write {
+        return Err(
+            "Secure scheduler workspace writes are unavailable on this platform.".to_string(),
+        );
+    }
     let (root, root_revision) = root.snapshot(&workspace_id)?;
     if expected_root_revision.is_some_and(|expected| expected != root_revision) {
         return Err(
@@ -216,6 +248,13 @@ pub fn write_file(
         return Err("Cannot write over a directory.".to_string());
     }
     if let Some(parent) = path.parent() {
+        if require_secure_write && !parent.is_dir() {
+            return Err(
+                "Secure scheduler workspace writes require an existing parent directory."
+                    .to_string(),
+            );
+        }
+        authorize()?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create parent directory: {error}"))?;
     }
@@ -237,7 +276,23 @@ pub fn write_file(
             MAX_READ_BYTES
         ));
     }
-    atomic_write(&path, &encoded)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "File has no parent directory.".to_string())?;
+    let expected_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("Failed to revalidate save directory: {error}"))?;
+    if !expected_parent.starts_with(&root) {
+        return Err("Save directory escapes the workspace root.".to_string());
+    }
+    authorize()?;
+    atomic_write_workspace(
+        &path,
+        &encoded,
+        &root,
+        &expected_parent,
+        require_secure_write,
+    )?;
     Ok(FileWriteResult {
         version: file_version(&encoded),
         root_revision,
@@ -322,9 +377,183 @@ pub(crate) fn file_version(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+    atomic_write_revalidated(path, content, None)
+}
+
+#[allow(unused_variables)]
+fn atomic_write_workspace(
+    path: &Path,
+    content: &[u8],
+    workspace_root: &Path,
+    expected_parent: &Path,
+    require_secure_write: bool,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return atomic_write_linux(path, content, workspace_root, expected_parent, || {});
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if require_secure_write {
+            return Err(
+                "Secure scheduler workspace writes are unavailable on this platform.".to_string(),
+            );
+        }
+        atomic_write_revalidated(path, content, Some(expected_parent))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_write_linux(
+    path: &Path,
+    content: &[u8],
+    workspace_root: &Path,
+    expected_parent: &Path,
+    after_open: impl FnOnce(),
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct DirectoryFd(RawFd);
+    impl Drop for DirectoryFd {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
+    }
+
     let parent = path
         .parent()
         .ok_or_else(|| "File has no parent directory.".to_string())?;
+    let parent_c = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| "Save directory contains an invalid NUL byte.".to_string())?;
+    let directory_fd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if directory_fd < 0 {
+        return Err(format!(
+            "Failed to open secure save directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let directory_fd = DirectoryFd(directory_fd);
+    let opened_parent = fs::canonicalize(format!("/proc/self/fd/{}", directory_fd.0))
+        .map_err(|error| format!("Failed to verify secure save directory: {error}"))?;
+    if opened_parent != expected_parent || !opened_parent.starts_with(workspace_root) {
+        return Err("Save directory ancestry changed during the write.".to_string());
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "File has no file name.".to_string())?;
+    let file_name = CString::new(file_name.as_bytes())
+        .map_err(|_| "File name contains an invalid NUL byte.".to_string())?;
+    let mut target_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let original_mode = if unsafe {
+        libc::fstatat(
+            directory_fd.0,
+            file_name.as_ptr(),
+            target_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        let stat = unsafe { target_stat.assume_init() };
+        (stat.st_mode & libc::S_IFMT == libc::S_IFREG).then_some(stat.st_mode)
+    } else {
+        None
+    };
+
+    after_open();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_name = CString::new(format!(
+        ".spacesly-save-{}-{timestamp}-{sequence}.tmp",
+        std::process::id()
+    ))
+    .expect("generated temporary file name cannot contain NUL");
+    let temp_fd = unsafe {
+        libc::openat(
+            directory_fd.0,
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(format!(
+            "Failed to create secure temporary save file: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let result = (|| {
+        let mut file = unsafe { File::from_raw_fd(temp_fd) };
+        if let Some(mode) = original_mode {
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|error| format!("Failed to preserve file permissions: {error}"))?;
+        }
+        file.write_all(content)
+            .map_err(|error| format!("Failed to write temporary save file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("Failed to flush temporary save file: {error}"))?;
+        let renamed = unsafe {
+            libc::renameat(
+                directory_fd.0,
+                temp_name.as_ptr(),
+                directory_fd.0,
+                file_name.as_ptr(),
+            )
+        };
+        if renamed < 0 {
+            return Err(format!(
+                "Failed to atomically replace file: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fsync(directory_fd.0) } < 0 {
+            return Err(format!(
+                "Failed to flush save directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        unsafe { libc::unlinkat(directory_fd.0, temp_name.as_ptr(), 0) };
+    }
+    result
+}
+
+fn atomic_write_revalidated(
+    path: &Path,
+    content: &[u8],
+    expected_parent: Option<&Path>,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "File has no parent directory.".to_string())?;
+    let revalidate_parent = || -> Result<(), String> {
+        if let Some(expected) = expected_parent {
+            let current = parent
+                .canonicalize()
+                .map_err(|error| format!("Failed to revalidate save directory: {error}"))?;
+            if current != expected {
+                return Err("Save directory ancestry changed during the write.".to_string());
+            }
+        }
+        Ok(())
+    };
+    revalidate_parent()?;
     let original_permissions = fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
@@ -352,6 +581,7 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("Failed to write temporary save file: {error}"))?;
         file.sync_all()
             .map_err(|error| format!("Failed to flush temporary save file: {error}"))?;
+        revalidate_parent()?;
         fs::rename(&temp_path, path)
             .map_err(|error| format!("Failed to atomically replace file: {error}"))
     })();
@@ -465,6 +695,35 @@ mod tests {
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_write_stays_in_opened_directory_when_parent_is_replaced_by_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().expect("temporary workspace");
+        let workspace = base.path().join("workspace");
+        let inside = workspace.join("inside");
+        let moved = workspace.join("moved");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&inside).expect("inside directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+
+        super::atomic_write_linux(
+            &inside.join("result.txt"),
+            b"contained",
+            &workspace.canonicalize().unwrap(),
+            &inside.canonicalize().unwrap(),
+            || {
+                fs::rename(&inside, &moved).expect("move opened parent");
+                symlink(&outside, &inside).expect("replace parent with outside symlink");
+            },
+        )
+        .expect("directory-relative write succeeds in the opened directory");
+
+        assert!(!outside.join("result.txt").exists());
+        assert_eq!(fs::read(moved.join("result.txt")).unwrap(), b"contained");
+    }
 
     #[test]
     fn rejects_parent_traversal() {

@@ -2,7 +2,8 @@ use super::execution_engine::{
     TaskEventReporter, TaskExecutionContext, TaskExecutionError, TaskExecutor,
 };
 use crate::domain::task_session::{
-    TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionKind,
+    AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskProgress,
+    TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionKind,
 };
 use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
@@ -89,7 +90,10 @@ impl AgentTaskExecutor {
 }
 
 impl TaskExecutor for AgentTaskExecutor {
-    fn execute(&self, context: &TaskExecutionContext) -> Result<(), TaskExecutionError> {
+    fn execute(
+        &self,
+        context: &TaskExecutionContext,
+    ) -> Result<TaskExecutionOutput, TaskExecutionError> {
         context.ensure_current()?;
         let envelope = context
             .request()
@@ -122,21 +126,8 @@ impl TaskExecutor for AgentTaskExecutor {
         let mut resolved = self
             .resolver
             .resolve(&envelope, &runtime_attempt_id)
-            .map_err(TaskExecutionError::blocked)?;
+            .map_err(TaskExecutionError::new)?;
         validate_resolved_task(&envelope, &resolved).map_err(TaskExecutionError::new)?;
-        let requested = envelope
-            .requested_capabilities
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        if requested
-            .iter()
-            .any(|capability| matches!(*capability, "workspace_write" | "shell" | "git"))
-        {
-            return Err(TaskExecutionError::new(
-                "Scheduler Agent runtime does not enable unfenced workspace, shell, or Git mutations.",
-            ));
-        }
         if resolved.config.runtime != "opencode" {
             return Err(TaskExecutionError::new(
                 "Scheduler Agent execution requires the isolated fenced OpenCode runtime.",
@@ -144,8 +135,18 @@ impl TaskExecutor for AgentTaskExecutor {
         }
         resolved.task.session_key = Some(runtime_attempt_id.clone());
         resolved.config.opencode_auto_approve = false;
+        resolved.config.restrict_tools = false;
         resolved.config.fenced_tools_only = true;
         resolved.config.isolated_opencode_process = true;
+        let workspace_root =
+            resolved.config.opencode_workdir.as_deref().ok_or_else(|| {
+                TaskExecutionError::new("Trusted Agent workspace root is required.")
+            })?;
+        resolved.config.task_tool_authority = context.task_tool_authority(
+            &envelope.workspace_id,
+            std::path::PathBuf::from(workspace_root),
+            &envelope.requested_capabilities,
+        )?;
         for server in &mut resolved.config.mcp_servers {
             server.name = format!("spacesly-{}", server.secret_id);
             server.proxy_authority = Some(context.external_authority(
@@ -185,14 +186,27 @@ impl TaskExecutor for AgentTaskExecutor {
         );
         drop(callback_guard);
         let result = result.map_err(TaskExecutionError::new)?;
-        if result.completion_status != AiWorkerCompletionStatus::Completed {
-            return Err(TaskExecutionError::blocked(
-                result
-                    .blocked_reason
-                    .unwrap_or_else(|| "Agent runtime reported a blocked result.".to_string()),
-            ));
-        }
-        Ok(())
+        context.ensure_current()?;
+        context.emit_event(
+            TaskSessionEventKind::Runtime,
+            json!({
+                "type": "agent_result_candidate",
+                "authoritative": false,
+                "result": result,
+            }),
+        )?;
+        let completion_status = match result.completion_status {
+            AiWorkerCompletionStatus::Completed => AgentTaskCompletionStatus::Completed,
+            AiWorkerCompletionStatus::Blocked => AgentTaskCompletionStatus::Blocked,
+        };
+        Ok(TaskExecutionOutput::Agent(AgentTaskResult {
+            summary: result.summary,
+            evidence: result.evidence,
+            details: result.details,
+            next: result.next,
+            completion_status,
+            blocked_reason: result.blocked_reason,
+        }))
     }
 }
 
@@ -564,6 +578,16 @@ mod tests {
             .any(|event| {
                 event.kind == TaskSessionEventKind::Runtime && event.payload["type"] == "text_delta"
             }));
+        assert!(engine
+            .events_after(session.id, 0)
+            .expect("events replayed")
+            .iter()
+            .any(|event| {
+                event.kind == TaskSessionEventKind::Runtime
+                    && event.payload["type"] == "agent_result_candidate"
+                    && event.payload["authoritative"] == false
+                    && event.payload["result"]["completion_status"] == "completed"
+            }));
     }
 
     #[test]
@@ -585,10 +609,18 @@ mod tests {
             directory.path().join("scheduler.db"),
         )
         .expect("engine starts");
+        let first_envelope = test_envelope();
+        let mut second_envelope = test_envelope();
+        let TaskSessionEnvelope::V1(second_session) = &mut second_envelope else {
+            unreachable!();
+        };
+        second_session.subject_id = Some("card-2".to_string());
+        second_session.conversation_id = Some("conversation-2".to_string());
+        second_session.execution_run_id = Some("run-2".to_string());
         let first = engine
             .submit_envelope_with_grants(
                 "isolated-agent-1",
-                &test_envelope(),
+                &first_envelope,
                 vec!["external_tools:jira".to_string()],
                 "test-approval",
             )
@@ -596,7 +628,7 @@ mod tests {
         let second = engine
             .submit_envelope_with_grants(
                 "isolated-agent-2",
-                &test_envelope(),
+                &second_envelope,
                 vec!["external_tools:jira".to_string()],
                 "test-approval",
             )
@@ -704,6 +736,15 @@ mod tests {
             completed.error.as_deref(),
             Some("operator approval required")
         );
+        assert!(engine
+            .events_after(session.id, 0)
+            .expect("events replayed")
+            .iter()
+            .any(|event| {
+                event.payload["type"] == "agent_result_candidate"
+                    && event.payload["result"]["completion_status"] == "blocked"
+                    && event.payload["result"]["blocked_reason"] == "operator approval required"
+            }));
     }
 
     #[test]
@@ -872,6 +913,7 @@ mod tests {
             restrict_tools: false,
             fenced_tools_only: false,
             isolated_opencode_process: false,
+            task_tool_authority: None,
             mcp_servers: vec![AiWorkerMcpServer {
                 name: "jira".to_string(),
                 secret_id: "jira".to_string(),
@@ -887,8 +929,8 @@ mod tests {
         TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
             workspace_id: "workspace-personal".to_string(),
             kind: TaskSessionKind::Agent,
-            subject_id: None,
-            conversation_id: None,
+            subject_id: Some("card-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
             execution_run_id: Some("run-1".to_string()),
             context_digest: execution_contract_digest(&contract).expect("contract digest"),
             runtime_profile_id: "profile-1".to_string(),

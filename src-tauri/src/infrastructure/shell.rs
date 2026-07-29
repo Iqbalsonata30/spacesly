@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 use super::global_environment::redact_global_environment_values;
@@ -53,6 +53,13 @@ struct CapturedStream {
 }
 
 pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandResult, String> {
+    run_shell_command_cancellable(request, || Ok(false))
+}
+
+pub(crate) fn run_shell_command_cancellable(
+    request: ShellCommandRequest,
+    mut cancelled: impl FnMut() -> Result<bool, String>,
+) -> Result<ShellCommandResult, String> {
     let command_text = request.command.trim();
     if command_text.is_empty() {
         return Err("Command is required.".to_string());
@@ -64,6 +71,11 @@ pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandRes
     );
     let mut command = Command::new(shell);
     inject_shell_env(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command
         .args(["-lc", &wrapped_command])
         .stdin(Stdio::null())
@@ -101,16 +113,29 @@ pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandRes
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
             .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
     );
-    let timed_out = match child
-        .wait_timeout(timeout)
-        .map_err(|error| format!("Failed to wait for shell command: {error}"))?
-    {
-        Some(_) => false,
-        None => {
-            let _ = child.kill();
-            true
+    let started_at = Instant::now();
+    let mut timed_out = false;
+    loop {
+        if cancelled()? {
+            terminate_shell_process(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("Shell command assignment was cancelled or became stale.".to_string());
         }
-    };
+        if started_at.elapsed() >= timeout {
+            timed_out = true;
+            terminate_shell_process(&mut child);
+            break;
+        }
+        if child
+            .wait_timeout(Duration::from_millis(50))
+            .map_err(|error| format!("Failed to wait for shell command: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+    }
 
     let status = child
         .wait()
@@ -131,6 +156,14 @@ pub fn run_shell_command(request: ShellCommandRequest) -> Result<ShellCommandRes
         timed_out,
         cwd,
     })
+}
+
+fn terminate_shell_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
 }
 
 pub fn complete_shell_input(
@@ -386,5 +419,21 @@ mod tests {
         .expect("shell command should complete with timeout");
 
         assert!(result.timed_out);
+    }
+
+    #[test]
+    fn cancellable_shell_stops_only_when_its_assignment_check_fails() {
+        let started = Instant::now();
+        let result = run_shell_command_cancellable(
+            ShellCommandRequest {
+                command: "sleep 5".to_string(),
+                workdir: None,
+                timeout_seconds: Some(5),
+            },
+            || Ok(started.elapsed() >= Duration::from_millis(100)),
+        );
+
+        assert!(result.unwrap_err().contains("cancelled or became stale"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

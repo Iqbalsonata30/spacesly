@@ -37,6 +37,7 @@
     terminalInput: string;
     runCardId: string | null;
     onClose: () => void;
+    onCancel: (cardId: string) => void;
     onTerminalInputChange: (value: string) => void;
     onSubmitTerminalInput: () => void;
     onOpenCard: (cardId: string) => void;
@@ -58,6 +59,7 @@
     terminalInput,
     runCardId,
     onClose,
+    onCancel,
     onTerminalInputChange,
     onSubmitTerminalInput,
     onOpenCard,
@@ -131,7 +133,10 @@
         detail: "You can review the task and retry when ready.",
       };
     if (currentProgress < 15)
-      return { title: "Loading execution contract", detail: "The planned work is being prepared for execution." };
+      return {
+        title: "Loading execution contract",
+        detail: "The planned work is being prepared for execution.",
+      };
     if (currentProgress < 35)
       return { title: "Getting ready", detail: "The Agent is gathering the context it needs." };
     if (currentProgress < 75)
@@ -192,27 +197,31 @@
   }
 
   function stepStatusLabel(status: string): string {
-    return {
-      pending: "Pending",
-      ready: "Ready",
-      running: "Running",
-      completed: "Completed",
-      blocked: "Blocked",
-      failed: "Failed",
-      skipped: "Skipped",
-    }[status] ?? status;
+    return (
+      {
+        pending: "Pending",
+        ready: "Ready",
+        running: "Running",
+        completed: "Completed",
+        blocked: "Blocked",
+        failed: "Failed",
+        skipped: "Skipped",
+      }[status] ?? status
+    );
   }
 
   function stepSummary(status: string): string {
-    return {
-      pending: "Waiting for the previous step to finish.",
-      ready: "Ready to begin.",
-      running: "This step is currently in progress.",
-      completed: "This step finished successfully.",
-      blocked: "This step needs attention before the task can continue.",
-      failed: "This step did not complete successfully.",
-      skipped: "This step was not needed.",
-    }[status] ?? "Execution status is being determined.";
+    return (
+      {
+        pending: "Waiting for the previous step to finish.",
+        ready: "Ready to begin.",
+        running: "This step is currently in progress.",
+        completed: "This step finished successfully.",
+        blocked: "This step needs attention before the task can continue.",
+        failed: "This step did not complete successfully.",
+        skipped: "This step was not needed.",
+      }[status] ?? "Execution status is being determined."
+    );
   }
 
   function stepIcon(status: string) {
@@ -228,6 +237,10 @@
     <div class="hero-topline">
       <span class={`status-orb ${runStatus}`}><span></span></span>
       <span class="eyebrow">Agent workspace</span>
+      {#if isWorking && runCardId}
+        <button class="cancel-button" type="button" onclick={() => onCancel(runCardId)}>Stop</button
+        >
+      {/if}
       <button class="close-button" type="button" aria-label="Close Agent console" onclick={onClose}
         ><X size={16} /></button
       >
@@ -319,11 +332,14 @@
           >
             <div class="timeline-rail">
               <span class={`timeline-icon ${stepRun?.status ?? "pending"}`}><Icon size={13} /></span
-              >{#if index < executionRun.contract.workflow.length - 1}<span class="timeline-line"></span>{/if}
+              >{#if index < executionRun.contract.workflow.length - 1}<span class="timeline-line"
+                ></span>{/if}
             </div>
             <div class="timeline-content">
               <div class="timeline-title">
-                <strong>{step.title}</strong><span>{stepStatusLabel(stepRun?.status ?? "pending")}</span>
+                <strong>{step.title}</strong><span
+                  >{stepStatusLabel(stepRun?.status ?? "pending")}</span
+                >
               </div>
               <p>{stepRun?.summary ?? stepSummary(stepRun?.status ?? "pending")}</p>
             </div>
@@ -404,17 +420,25 @@
                 <button
                   class="activity-expand"
                   type="button"
-                  aria-label={expandedActivities[activity.log.id] ? "Hide activity details" : "Show activity details"}
+                  aria-label={expandedActivities[activity.log.id]
+                    ? "Hide activity details"
+                    : "Show activity details"}
                   aria-expanded={expandedActivities[activity.log.id] ?? false}
                   onclick={() => toggleActivity(activity.log.id)}
-                  ><ChevronDown size={14} class={expandedActivities[activity.log.id] ? "rotated" : ""} /></button
+                  ><ChevronDown
+                    size={14}
+                    class={expandedActivities[activity.log.id] ? "rotated" : ""}
+                  /></button
                 >
               </div>
               <p class="activity-summary">{activity.summary}</p>
               <div class="activity-meta">
-                <time title={activity.log.at}>{relativeTimeLabel(activity.log.at, timelineNow)}</time>
+                <time title={activity.log.at}
+                  >{relativeTimeLabel(activity.log.at, timelineNow)}</time
+                >
                 <span>{statusText(activity)}</span>
-                {#if activity.repeatCount > 1}<span>{activity.repeatCount} similar updates</span>{/if}
+                {#if activity.repeatCount > 1}<span>{activity.repeatCount} similar updates</span
+                  >{/if}
               </div>
               {#if expandedActivities[activity.log.id]}
                 <div class="activity-details">
@@ -567,6 +591,20 @@
     border-radius: 9px;
     background: transparent;
     color: #aaa1bb;
+  }
+  .cancel-button {
+    margin-left: auto;
+    border: 1px solid #5b3e46;
+    border-radius: 8px;
+    padding: 5px 9px;
+    background: rgba(157, 67, 82, 0.12);
+    color: #e6a4ae;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+  }
+  .cancel-button + .close-button {
+    margin-left: 0;
   }
   .hero-copy {
     margin-top: 20px;

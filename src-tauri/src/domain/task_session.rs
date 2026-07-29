@@ -687,8 +687,11 @@ impl TaskMcpContext {
 
 impl TaskToolState {
     /// Projects current tool state from the append-only event journal.
+    ///
+    /// Tool calls are identified by attempt, fencing token, and runtime call ID so a retry cannot
+    /// overwrite an earlier attempt that reused the same runtime-generated identifier.
     pub fn from_events(session_id: TaskSessionId, events: &[TaskSessionEvent]) -> Self {
-        let mut calls = BTreeMap::<String, TaskToolCallState>::new();
+        let mut calls = BTreeMap::<(Option<u64>, u64, String), TaskToolCallState>::new();
         for event in events.iter().filter(|event| {
             event.session_id == session_id && event.kind == TaskSessionEventKind::Tool
         }) {
@@ -715,22 +718,24 @@ impl TaskToolState {
                 .map(str::to_string);
             let display_context = event.payload.get("display_context").cloned();
 
-            let entry =
-                calls
-                    .entry(tool_call_id.to_string())
-                    .or_insert_with(|| TaskToolCallState {
-                        tool_call_id: tool_call_id.to_string(),
-                        tool_name: tool_name.clone(),
-                        status: TaskToolStatus::Running,
-                        risk: risk.clone(),
-                        arguments_digest: arguments_digest.clone(),
-                        display_context: display_context.clone(),
-                        attempt_id: event.attempt_id,
-                        fencing_token: event.fencing_token,
-                        started_sequence: event.sequence,
-                        completed_sequence: None,
-                        updated_at: event.created_at,
-                    });
+            let identity = (
+                event.attempt_id,
+                event.fencing_token,
+                tool_call_id.to_string(),
+            );
+            let entry = calls.entry(identity).or_insert_with(|| TaskToolCallState {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.clone(),
+                status: TaskToolStatus::Running,
+                risk: risk.clone(),
+                arguments_digest: arguments_digest.clone(),
+                display_context: display_context.clone(),
+                attempt_id: event.attempt_id,
+                fencing_token: event.fencing_token,
+                started_sequence: event.sequence,
+                completed_sequence: None,
+                updated_at: event.created_at,
+            });
             entry.tool_name = tool_name;
             entry.risk = risk;
             entry.arguments_digest = arguments_digest;
@@ -775,6 +780,8 @@ pub enum TaskSessionState {
     Running,
     /// Cancellation is requested and Worker cleanup is still in progress.
     Cancelling,
+    /// Agent execution finished and its authoritative projections are being committed.
+    Committing,
     /// Mock execution completed successfully.
     Succeeded,
     /// Mock execution returned an error or panicked.
@@ -783,6 +790,61 @@ pub enum TaskSessionState {
     Blocked,
     /// Session was cancelled before dispatch or during execution.
     Cancelled,
+}
+
+/// Structured outcome produced by an Agent runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskResult {
+    pub summary: String,
+    pub evidence: Vec<String>,
+    pub details: Vec<String>,
+    pub next: Vec<String>,
+    pub completion_status: AgentTaskCompletionStatus,
+    pub blocked_reason: Option<String>,
+}
+
+/// Authoritative assistant response produced by a Chat Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChatTaskResult {
+    pub conversation_id: String,
+    pub message: String,
+}
+
+/// Authoritative replacement proposal produced by an Edit Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EditTaskResult {
+    pub file_path: String,
+    pub summary: String,
+    pub content: String,
+}
+
+/// Authoritative terminal disposition reported by an Agent runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentTaskCompletionStatus {
+    Completed,
+    Blocked,
+}
+
+/// Durable structured output returned by a task executor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
+pub enum TaskExecutionOutput {
+    None,
+    Agent(AgentTaskResult),
+    Chat(ChatTaskResult),
+    Edit(EditTaskResult),
+}
+
+/// Query projection for a staged or finalized authoritative task result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskSessionResult {
+    pub session_id: TaskSessionId,
+    pub output: TaskExecutionOutput,
+    pub terminal_state: TaskSessionState,
+    pub projection_error: Option<String>,
+    pub projected_at: Option<u64>,
+    pub finalized_at: Option<u64>,
 }
 
 impl TaskSessionState {
@@ -1142,6 +1204,51 @@ mod tests {
         assert_eq!(state.calls[0].started_sequence, 1);
         assert_eq!(state.calls[0].completed_sequence, Some(2));
         assert_eq!(state.calls[0].updated_at, 110);
+    }
+
+    #[test]
+    fn tool_state_keeps_reused_call_ids_isolated_between_attempts() {
+        let session = TaskSessionId(7);
+        let events = vec![
+            TaskSessionEvent {
+                id: 1,
+                session_id: session,
+                attempt_id: Some(11),
+                fencing_token: 1,
+                sequence: 1,
+                kind: TaskSessionEventKind::Tool,
+                payload: serde_json::json!({
+                    "type": "tool_completed",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "jira_search",
+                    "success": true
+                }),
+                progress: None,
+                created_at: 100,
+            },
+            TaskSessionEvent {
+                id: 2,
+                session_id: session,
+                attempt_id: Some(12),
+                fencing_token: 2,
+                sequence: 2,
+                kind: TaskSessionEventKind::Tool,
+                payload: serde_json::json!({
+                    "type": "tool_started",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "jira_search"
+                }),
+                progress: None,
+                created_at: 110,
+            },
+        ];
+
+        let state = TaskToolState::from_events(session, &events);
+        assert_eq!(state.calls.len(), 2);
+        assert_eq!(state.calls[0].attempt_id, Some(11));
+        assert_eq!(state.calls[0].status, TaskToolStatus::Succeeded);
+        assert_eq!(state.calls[1].attempt_id, Some(12));
+        assert_eq!(state.calls[1].status, TaskToolStatus::Running);
     }
 
     #[test]

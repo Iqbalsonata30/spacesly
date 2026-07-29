@@ -271,7 +271,7 @@ fn write_proxy_error(
     write_proxy_message(&mut *stdout, &response)
 }
 
-fn write_proxy_message(writer: &mut impl Write, message: &Value) -> Result<(), String> {
+pub(crate) fn write_proxy_message(writer: &mut impl Write, message: &Value) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, message)
         .map_err(|error| format!("Failed to serialize proxied MCP message: {error}"))?;
     writer
@@ -1072,7 +1072,7 @@ fn spawn_stderr_reader(stderr: std::process::ChildStderr, buffer: Arc<Mutex<Stri
     });
 }
 
-fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, String> {
+pub(crate) fn read_stdout_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, String> {
     let trimmed = loop {
         let Some(line) = read_bounded_line(reader, MCP_MESSAGE_LIMIT)? else {
             return Ok(None);

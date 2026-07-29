@@ -18,6 +18,7 @@ pub mod scheduler_store;
 pub mod secrets;
 pub mod shell;
 mod shell_env;
+pub mod task_tools;
 pub mod tool_broker;
 pub mod workspace_cache;
 pub mod workspace_search;

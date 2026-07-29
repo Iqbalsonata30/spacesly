@@ -6,14 +6,14 @@
 //! context, and return to idle until the engine is dropped.
 
 use crate::domain::task_session::{
-    TaskCapabilityGrant, TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent,
-    TaskSessionEventInput, TaskSessionEventKind, TaskSessionId, TaskSessionSnapshot,
-    TaskSessionState, TaskSessionUpdate,
+    TaskCapabilityGrant, TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope,
+    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionId,
+    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskSessionUpdate,
 };
 use crate::infrastructure::mcp::mcp_connector_binding_digest;
 use crate::infrastructure::scheduler_store::{
     AssignmentFence, DurableAssignment, DurableOutcome, ExternalAssignmentAuthority, FinishResult,
-    SchedulerStore,
+    SchedulerStore, StagedCompletion, TaskToolAuthority,
 };
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -167,6 +167,34 @@ impl TaskExecutionContext {
                 connector_id,
                 &connector_binding,
             )
+            .map_err(TaskExecutionError::new)
+    }
+
+    /// Creates authority for the assignment-local workspace tool MCP server.
+    pub fn task_tool_authority(
+        &self,
+        workspace_id: &str,
+        workspace_root: PathBuf,
+        requested_capabilities: &[String],
+    ) -> Result<Option<TaskToolAuthority>, TaskExecutionError> {
+        self.ensure_current()?;
+        let capabilities = requested_capabilities
+            .iter()
+            .filter(|capability| self.has_capability(capability))
+            .cloned()
+            .collect::<Vec<_>>();
+        if capabilities.is_empty() {
+            return Ok(None);
+        }
+        self.event_sink
+            .store
+            .task_tool_authority(
+                self.event_sink.fence,
+                workspace_id,
+                workspace_root,
+                &capabilities,
+            )
+            .map(Some)
             .map_err(TaskExecutionError::new)
     }
 
@@ -369,7 +397,46 @@ impl std::error::Error for TaskExecutionError {}
 /// trait without changing Scheduler or Worker Pool ownership.
 pub trait TaskExecutor: Send + Sync + 'static {
     /// Executes one assignment and must periodically observe `context.cancellation()`.
-    fn execute(&self, context: &TaskExecutionContext) -> Result<(), TaskExecutionError>;
+    fn execute(
+        &self,
+        context: &TaskExecutionContext,
+    ) -> Result<TaskExecutionOutput, TaskExecutionError>;
+}
+
+/// Projects a staged scheduler completion into the separate authoritative execution store.
+pub(crate) trait CompletionProjector: Send + Sync + 'static {
+    fn project(&self, completion: &StagedCompletion) -> Result<(), String>;
+}
+
+#[cfg(not(test))]
+struct MissingCompletionProjector;
+
+#[cfg(not(test))]
+impl CompletionProjector for MissingCompletionProjector {
+    fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+        Err("Authoritative Agent completion projector is not configured.".to_string())
+    }
+}
+
+#[cfg(test)]
+struct AcceptingCompletionProjector;
+
+#[cfg(test)]
+impl CompletionProjector for AcceptingCompletionProjector {
+    fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn default_completion_projector() -> Arc<dyn CompletionProjector> {
+    #[cfg(test)]
+    {
+        Arc::new(AcceptingCompletionProjector)
+    }
+    #[cfg(not(test))]
+    {
+        Arc::new(MissingCompletionProjector)
+    }
 }
 
 /// Configurable mock executor used while the real Agent Runtime remains out of scope.
@@ -406,8 +473,11 @@ impl MockTaskExecutor {
 }
 
 impl TaskExecutor for MockTaskExecutor {
-    fn execute(&self, context: &TaskExecutionContext) -> Result<(), TaskExecutionError> {
-        (self.execution)(context)
+    fn execute(
+        &self,
+        context: &TaskExecutionContext,
+    ) -> Result<TaskExecutionOutput, TaskExecutionError> {
+        (self.execution)(context).map(|()| TaskExecutionOutput::None)
     }
 }
 
@@ -473,7 +543,7 @@ impl ExecutionEngine {
         executor: Arc<dyn TaskExecutor>,
     ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open_in_memory().map_err(ExecutionEngineError::Persistence)?;
-        Self::with_store(executor, store)
+        Self::with_store(executor, default_completion_projector(), store)
     }
 
     /// Opens the persistent Scheduler database and starts exactly five reusable Workers.
@@ -486,7 +556,16 @@ impl ExecutionEngine {
         executor: Arc<dyn TaskExecutor>,
     ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open().map_err(ExecutionEngineError::Persistence)?;
-        Self::with_store(executor, store)
+        Self::with_store(executor, default_completion_projector(), store)
+    }
+
+    /// Opens the production scheduler with an injected cross-database completion projector.
+    pub(crate) fn open_persistent_with_executor_and_projector(
+        executor: Arc<dyn TaskExecutor>,
+        projector: Arc<dyn CompletionProjector>,
+    ) -> Result<Self, ExecutionEngineError> {
+        let store = SchedulerStore::open().map_err(ExecutionEngineError::Persistence)?;
+        Self::with_store(executor, projector, store)
     }
 
     /// Opens a persistent Scheduler database at an explicit path.
@@ -503,11 +582,22 @@ impl ExecutionEngine {
         path: PathBuf,
     ) -> Result<Self, ExecutionEngineError> {
         let store = SchedulerStore::open_at(path).map_err(ExecutionEngineError::Persistence)?;
-        Self::with_store(executor, store)
+        Self::with_store(executor, default_completion_projector(), store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_persistent_at_with_executor_and_projector(
+        executor: Arc<dyn TaskExecutor>,
+        projector: Arc<dyn CompletionProjector>,
+        path: PathBuf,
+    ) -> Result<Self, ExecutionEngineError> {
+        let store = SchedulerStore::open_at(path).map_err(ExecutionEngineError::Persistence)?;
+        Self::with_store(executor, projector, store)
     }
 
     fn with_store(
         executor: Arc<dyn TaskExecutor>,
+        projector: Arc<dyn CompletionProjector>,
         store: SchedulerStore,
     ) -> Result<Self, ExecutionEngineError> {
         let (sender, receiver) = mpsc::channel();
@@ -522,6 +612,7 @@ impl ExecutionEngine {
                     receiver,
                     scheduler_sender,
                     executor,
+                    projector,
                     store,
                     scheduler_notifier,
                     startup,
@@ -660,6 +751,16 @@ impl ExecutionEngine {
         receive(response)?
     }
 
+    /// Returns a staged or finalized authoritative structured result.
+    pub fn task_session_result(
+        &self,
+        id: TaskSessionId,
+    ) -> Result<Option<TaskSessionResult>, ExecutionEngineError> {
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::GetResult { id, reply })?;
+        receive(response)?
+    }
+
     /// Removes a terminal session and its task-local scheduler state.
     pub fn remove_session(&self, id: TaskSessionId) -> Result<bool, ExecutionEngineError> {
         let (reply, response) = mpsc::channel();
@@ -760,6 +861,10 @@ enum SchedulerCommand {
         sequence: u64,
         reply: mpsc::Sender<Result<Vec<TaskSessionEvent>, ExecutionEngineError>>,
     },
+    GetResult {
+        id: TaskSessionId,
+        reply: mpsc::Sender<Result<Option<TaskSessionResult>, ExecutionEngineError>>,
+    },
     RemoveSession {
         id: TaskSessionId,
         reply: mpsc::Sender<Result<bool, ExecutionEngineError>>,
@@ -794,7 +899,7 @@ enum WorkerCommand {
 }
 
 enum WorkerOutcome {
-    Succeeded,
+    Succeeded(TaskExecutionOutput),
     Failed(String),
     Blocked(String),
     Cancelled,
@@ -804,6 +909,7 @@ enum WorkerOutcome {
 struct Scheduler {
     store: SchedulerStore,
     notifier: Arc<TaskSessionNotifier>,
+    projector: Arc<dyn CompletionProjector>,
     owner_id: u64,
     active: HashMap<TaskSessionId, ActiveAssignment>,
     workers: Vec<WorkerSlot>,
@@ -814,6 +920,7 @@ fn run_scheduler(
     receiver: mpsc::Receiver<SchedulerMessage>,
     sender: mpsc::Sender<SchedulerMessage>,
     executor: Arc<dyn TaskExecutor>,
+    projector: Arc<dyn CompletionProjector>,
     store: SchedulerStore,
     notifier: Arc<TaskSessionNotifier>,
     startup: mpsc::Sender<Result<(), ExecutionEngineError>>,
@@ -839,11 +946,13 @@ fn run_scheduler(
     let mut scheduler = Scheduler {
         store,
         notifier,
+        projector,
         owner_id,
         active: HashMap::new(),
         workers,
         next_lease_renewal: Instant::now() + LEASE_RENEW_INTERVAL,
     };
+    scheduler.project_pending();
     let _ = startup.send(Ok(()));
     scheduler.dispatch();
 
@@ -919,6 +1028,14 @@ fn run_scheduler(
                             .map_err(ExecutionEngineError::Persistence),
                     );
                 }
+                SchedulerMessage::Command(SchedulerCommand::GetResult { id, reply }) => {
+                    let _ = reply.send(
+                        scheduler
+                            .store
+                            .task_session_result(id)
+                            .map_err(ExecutionEngineError::Persistence),
+                    );
+                }
                 SchedulerMessage::Command(SchedulerCommand::RemoveSession { id, reply }) => {
                     let result = scheduler.remove_session(id);
                     let _ = reply.send(result);
@@ -945,6 +1062,7 @@ fn run_scheduler(
         if Instant::now() >= scheduler.next_lease_renewal {
             scheduler.renew_leases();
         }
+        scheduler.project_pending();
         scheduler.dispatch();
     }
 }
@@ -1075,13 +1193,53 @@ impl Scheduler {
             return;
         }
         let outcome = match outcome {
-            WorkerOutcome::Succeeded => DurableOutcome::Succeeded,
+            WorkerOutcome::Succeeded(TaskExecutionOutput::None) => DurableOutcome::Succeeded,
+            WorkerOutcome::Succeeded(
+                output @ (TaskExecutionOutput::Agent(_)
+                | TaskExecutionOutput::Chat(_)
+                | TaskExecutionOutput::Edit(_)),
+            ) => {
+                if matches!(
+                    self.store.stage_completion(fence, &output),
+                    Ok(FinishResult::Applied)
+                ) {
+                    self.publish_current(session_id);
+                    self.project_pending();
+                }
+                return;
+            }
             WorkerOutcome::Failed(error) => DurableOutcome::Failed(error),
             WorkerOutcome::Blocked(error) => DurableOutcome::Blocked(error),
             WorkerOutcome::Cancelled => DurableOutcome::Cancelled,
         };
         if matches!(self.store.finish(fence, outcome), Ok(FinishResult::Applied)) {
             self.publish_current(session_id);
+        }
+    }
+
+    fn project_pending(&mut self) {
+        let Ok(completions) = self.store.pending_completions() else {
+            return;
+        };
+        for completion in completions {
+            if let Err(error) = self.projector.project(&completion) {
+                let _ = self.store.record_completion_error(&completion, &error);
+                self.publish_current(completion.session_id);
+                continue;
+            }
+            if !self
+                .store
+                .mark_completion_projected(&completion)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if matches!(
+                self.store.finalize_completion(&completion),
+                Ok(FinishResult::Applied)
+            ) {
+                self.publish_current(completion.session_id);
+            }
         }
     }
 
@@ -1184,7 +1342,7 @@ fn start_workers(
                                 WorkerOutcome::Cancelled
                             } else {
                                 match result {
-                                    Ok(Ok(())) => WorkerOutcome::Succeeded,
+                                    Ok(Ok(output)) => WorkerOutcome::Succeeded(output),
                                     Ok(Err(error)) if error.is_blocked() => {
                                         WorkerOutcome::Blocked(error.message().to_string())
                                     }
@@ -1948,6 +2106,98 @@ mod tests {
         let observed = observed.lock().expect("observed lock");
         assert_eq!(observed.len(), 2);
         assert_ne!(observed[0], observed[1]);
+    }
+
+    struct StructuredOutputExecutor;
+
+    impl TaskExecutor for StructuredOutputExecutor {
+        fn execute(
+            &self,
+            _context: &TaskExecutionContext,
+        ) -> Result<TaskExecutionOutput, TaskExecutionError> {
+            Ok(TaskExecutionOutput::Agent(
+                crate::domain::task_session::AgentTaskResult {
+                    summary: "completed".to_string(),
+                    evidence: Vec::new(),
+                    details: Vec::new(),
+                    next: Vec::new(),
+                    completion_status:
+                        crate::domain::task_session::AgentTaskCompletionStatus::Completed,
+                    blocked_reason: None,
+                },
+            ))
+        }
+    }
+
+    struct SwitchableProjector {
+        available: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CompletionProjector for SwitchableProjector {
+        fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.available.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("executions.db unavailable".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn projector_failure_leaves_committing_and_retries_to_terminal() {
+        let directory = tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let projector = Arc::new(SwitchableProjector {
+            available: available.clone(),
+            calls: calls.clone(),
+        });
+        let engine = ExecutionEngine::open_persistent_at_with_executor_and_projector(
+            Arc::new(StructuredOutputExecutor),
+            projector,
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let mut envelope = test_envelope(Vec::new());
+        let TaskSessionEnvelope::V1(session) = &mut envelope else {
+            unreachable!();
+        };
+        session.conversation_id = Some("conversation-1".to_string());
+        let submitted = engine
+            .submit_envelope("project", &envelope)
+            .expect("session submitted");
+        wait_until(|| {
+            engine
+                .session(submitted.id)
+                .expect("session read")
+                .is_some_and(|session| session.state == TaskSessionState::Committing)
+        });
+        let staged = engine
+            .task_session_result(submitted.id)
+            .expect("result queried")
+            .expect("result staged");
+        assert_eq!(staged.terminal_state, TaskSessionState::Succeeded);
+        assert_eq!(
+            staged.projection_error.as_deref(),
+            Some("executions.db unavailable")
+        );
+        assert!(calls.load(Ordering::SeqCst) > 0);
+
+        available.store(true, Ordering::SeqCst);
+        engine.sessions().expect("scheduler tick triggered");
+        let completed = engine
+            .wait_for_terminal(submitted.id, TEST_TIMEOUT)
+            .expect("retry finalizes");
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        let result = engine
+            .task_session_result(submitted.id)
+            .expect("result queried")
+            .expect("result retained");
+        assert!(result.projected_at.is_some());
+        assert!(result.finalized_at.is_some());
+        assert!(result.projection_error.is_none());
     }
 
     fn submit_tasks(engine: &ExecutionEngine, count: usize, prefix: &str) -> Vec<TaskSessionId> {

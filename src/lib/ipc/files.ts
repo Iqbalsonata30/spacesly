@@ -77,6 +77,15 @@ export async function workspaceRootPath(workspaceId: string): Promise<string> {
   return invokeWithPolicy<string>("workspace_root_path", { workspaceId }, IPC_POLICIES.fileRead);
 }
 
+/** Returns the current backend workspace-root revision used by Task Session ownership checks. */
+export async function workspaceRootRevision(workspaceId: string): Promise<number> {
+  return invokeWithPolicy<number>(
+    "workspace_root_revision",
+    { workspaceId },
+    IPC_POLICIES.fileRead,
+  );
+}
+
 export async function setWorkspaceRoot(workspaceId: string, absolutePath: string): Promise<string> {
   return invokeWithPolicy<string>(
     "set_workspace_root",

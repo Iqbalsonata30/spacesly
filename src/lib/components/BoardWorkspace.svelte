@@ -1,6 +1,7 @@
 <script lang="ts">
   import TaskCard from "$lib/components/TaskCard.svelte";
   import type { BoardProjection, CardProjection } from "$lib/ipc";
+  import type { AgentRunSession, AgentTaskCardProjection } from "$lib/agentRun";
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;
@@ -13,6 +14,8 @@
     selectedCardId: string | null;
     draggedCardId: string | null;
     runningWorkerCardIds: Record<string, true>;
+    agentTaskProjections: Record<string, AgentTaskCardProjection | null>;
+    runningAgentSessions: AgentRunSession[];
     cardMinHeight: number;
     doneVisibleLimit: number | "all";
     hasAgentConsoleSession: boolean;
@@ -22,6 +25,7 @@
     onResizeLane: (event: PointerEvent) => void;
     onResizeCard: (event: PointerEvent) => void;
     onOpenAgentConsole: () => void;
+    onOpenAgentSession: (cardId: string) => void;
     onDropCard: (cardId: string, columnId: string) => void;
     onSelectCard: (card: CardProjection) => void;
     onQueueCard: (cardId: string) => void;
@@ -47,6 +51,8 @@
     selectedCardId,
     draggedCardId,
     runningWorkerCardIds,
+    agentTaskProjections,
+    runningAgentSessions,
     cardMinHeight,
     doneVisibleLimit,
     hasAgentConsoleSession,
@@ -56,6 +62,7 @@
     onResizeLane,
     onResizeCard,
     onOpenAgentConsole,
+    onOpenAgentSession,
     onDropCard,
     onSelectCard,
     onQueueCard,
@@ -113,6 +120,19 @@
         <span>Open Agent Console</span>
         <strong>{agentRunProgress}%</strong>
       </button>
+    {/if}
+    {#if runningAgentSessions.length > 1}
+      <details class="running-task-list">
+        <summary>{runningAgentSessions.length} running tasks</summary>
+        <div>
+          {#each runningAgentSessions as session (session.cardId)}
+            <button type="button" onclick={() => onOpenAgentSession(session.cardId)}>
+              <span>{session.title}</span>
+              <strong>{session.taskSessionState ?? session.status} · {session.progress}%</strong>
+            </button>
+          {/each}
+        </div>
+      </details>
     {/if}
   </div>
 
@@ -175,6 +195,7 @@
               executionLabel={executionLabel(card.execution)}
               ticketLabel={ticketLabel(card)}
               isBlocked={isBlocked(card.execution)}
+              agentTask={agentTaskProjections[card.id] ?? null}
               isQueued={column.intent === "queued"}
               showActions={column.intent === "backlog" ||
                 column.intent === "queued" ||
@@ -225,3 +246,43 @@
     {/each}
   </div>
 </div>
+
+<style>
+  .running-task-list {
+    position: relative;
+    color: #aaa1c3;
+    font-size: 12px;
+  }
+  .running-task-list summary {
+    cursor: pointer;
+    font-weight: 800;
+  }
+  .running-task-list > div {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 8px);
+    right: 0;
+    display: grid;
+    width: 280px;
+    padding: 8px;
+    border: 1px solid #2a2835;
+    border-radius: 10px;
+    background: #111017;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+  }
+  .running-task-list button {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    border: 0;
+    padding: 8px;
+    background: transparent;
+    color: #e8e2ef;
+    text-align: left;
+  }
+  .running-task-list button strong {
+    flex: 0 0 auto;
+    color: #95b082;
+    font-size: 10px;
+  }
+</style>

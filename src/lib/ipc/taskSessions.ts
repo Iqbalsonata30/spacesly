@@ -1,9 +1,47 @@
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-const TASK_SESSION_POLL_INTERVAL_MS = 500;
+const TASK_SESSION_UPDATE_EVENT = "task-session-update";
+const taskSessionActivityHandlers = new Set<(update: TaskSessionUpdate) => void>();
+let taskSessionActivityUnlisten: Promise<UnlistenFn> | null = null;
 
 export type TaskSessionState =
-  "queued" | "running" | "cancelling" | "succeeded" | "failed" | "blocked" | "cancelled";
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "committing"
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "cancelled";
+
+export type AgentTaskResult = {
+  summary: string;
+  evidence: string[];
+  details: string[];
+  next: string[];
+  completion_status: "completed" | "blocked";
+  blocked_reason: string | null;
+};
+
+export type ChatTaskResult = { conversation_id: string; message: string };
+
+export type EditTaskResult = { file_path: string; summary: string; content: string };
+
+export type TaskExecutionOutput =
+  | { kind: "none" }
+  | { kind: "agent"; result: AgentTaskResult }
+  | { kind: "chat"; result: ChatTaskResult }
+  | { kind: "edit"; result: EditTaskResult };
+
+export type TaskSessionResult = {
+  session_id: number;
+  output: TaskExecutionOutput;
+  terminal_state: TaskSessionState;
+  projection_error: string | null;
+  projected_at: number | null;
+  finalized_at: number | null;
+};
 
 export type TaskSessionEventKind = "lifecycle" | "activity" | "progress" | "runtime" | "tool";
 
@@ -194,6 +232,11 @@ export type TaskSessionUpdateWatch = {
   acknowledge: (sequence: number) => void;
 };
 
+/** Returns a collision-safe display identity for one attempt-scoped tool call. */
+export function taskToolCallIdentity(call: TaskToolCallState): string {
+  return JSON.stringify([call.attempt_id, call.fencing_token, call.tool_call_id]);
+}
+
 /** Lists durable Task Sessions currently retained by the scheduler projection. */
 export function listTaskSessions(): Promise<TaskSessionSnapshot[]> {
   return invokeWithPolicy("list_task_sessions", {}, IPC_POLICIES.taskSessionRead);
@@ -210,6 +253,17 @@ export function saveAgentRuntimeProfile(
 ): Promise<AgentRuntimeProfile> {
   return invokeWithPolicy(
     "save_agent_runtime_profile",
+    { profile },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+/** Saves a content-addressed profile while rejecting conflicting content for an existing ID. */
+export function saveImmutableAgentRuntimeProfile(
+  profile: AgentRuntimeProfile,
+): Promise<AgentRuntimeProfile> {
+  return invokeWithPolicy(
+    "save_immutable_agent_runtime_profile",
     { profile },
     IPC_POLICIES.taskSessionMutation,
   );
@@ -237,27 +291,33 @@ export function digestTaskSessionPromptInput(input: TaskSessionInputV2): Promise
   );
 }
 
+/** Returns the backend-canonical digest for an immutable Agent execution contract. */
+export function digestAgentExecutionContract(contract: unknown): Promise<string> {
+  return invokeWithPolicy(
+    "digest_agent_execution_contract",
+    { contract },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
 /** Requests cooperative cancellation for one queued or running Task Session. */
 export function cancelTaskSession(sessionId: number): Promise<boolean> {
-  return invokeWithPolicy(
-    "cancel_task_session",
-    { sessionId },
-    IPC_POLICIES.taskSessionMutation,
-  );
+  return invokeWithPolicy("cancel_task_session", { sessionId }, IPC_POLICIES.taskSessionMutation);
 }
 
 /** Removes a retained Task Session projection after terminal completion. */
 export function removeTaskSession(sessionId: number): Promise<boolean> {
-  return invokeWithPolicy(
-    "remove_task_session",
-    { sessionId },
-    IPC_POLICIES.taskSessionMutation,
-  );
+  return invokeWithPolicy("remove_task_session", { sessionId }, IPC_POLICIES.taskSessionMutation);
 }
 
 /** Returns the latest durable projection for one Task Session, if it is still retained. */
 export function getTaskSession(sessionId: number): Promise<TaskSessionSnapshot | null> {
   return invokeWithPolicy("get_task_session", { sessionId }, IPC_POLICIES.taskSessionRead);
+}
+
+/** Returns a staged or finalized authoritative typed result; available before terminal state. */
+export function getTaskSessionResult(sessionId: number): Promise<TaskSessionResult | null> {
+  return invokeWithPolicy("get_task_session_result", { sessionId }, IPC_POLICIES.taskSessionRead);
 }
 
 /** Replays a bounded page of durable Task Session events after a monotonic sequence cursor. */
@@ -291,43 +351,70 @@ export function getTaskSessionMcpContext(sessionId: number): Promise<TaskMcpCont
   );
 }
 
-/** Polls one Task Session projection and emits update hints until explicitly unlistened. */
+/**
+ * Listens for best-effort post-commit Task Session hints through one shared Tauri listener.
+ * Durable event replay remains authoritative because hints may be dropped or coalesced.
+ */
+export async function onTaskSessionActivity(
+  handler: (update: TaskSessionUpdate) => void,
+): Promise<UnlistenFn> {
+  taskSessionActivityHandlers.add(handler);
+  if (!taskSessionActivityUnlisten) {
+    taskSessionActivityUnlisten = listen<unknown>(TASK_SESSION_UPDATE_EVENT, (event) => {
+      if (!isTaskSessionUpdate(event.payload)) return;
+      for (const subscriber of taskSessionActivityHandlers) subscriber(event.payload);
+    });
+  }
+  try {
+    await taskSessionActivityUnlisten;
+  } catch (error) {
+    taskSessionActivityHandlers.delete(handler);
+    taskSessionActivityUnlisten = null;
+    throw error;
+  }
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    taskSessionActivityHandlers.delete(handler);
+    if (taskSessionActivityHandlers.size > 0 || !taskSessionActivityUnlisten) return;
+    const unlisten = taskSessionActivityUnlisten;
+    taskSessionActivityUnlisten = null;
+    void unlisten.then((stop) => stop());
+  };
+}
+
+/** Filters shared post-commit hints for one Task Session until explicitly unlistened. */
 export function onTaskSessionUpdated(
   sessionId: number,
   handler: (update: TaskSessionUpdate) => void,
   initialSequence = 0,
 ): Promise<TaskSessionUpdateWatch> {
-  let active = true;
-  let polling = false;
   let acknowledgedSequence = initialSequence;
-  const poll = async (): Promise<void> => {
-    if (!active || polling) return;
-    polling = true;
-    try {
-      const snapshot = await getTaskSession(sessionId);
-      if (active && snapshot && snapshot.last_event_sequence > acknowledgedSequence) {
-        handler({ session_id: sessionId, latest_sequence: snapshot.last_event_sequence });
-      }
-    } catch {
-      // Durable replay on the next successful poll remains authoritative.
-    } finally {
-      polling = false;
+  return onTaskSessionActivity((update) => {
+    if (update.session_id === sessionId && update.latest_sequence > acknowledgedSequence) {
+      handler(update);
     }
-  };
-  const interval = setInterval(() => void poll(), TASK_SESSION_POLL_INTERVAL_MS);
-  void poll();
-  return Promise.resolve({
-    unlisten: () => {
-      active = false;
-      clearInterval(interval);
-    },
-    acknowledge: (sequence: number) => {
+  }).then((unlisten) => ({
+    unlisten,
+    acknowledge(sequence: number) {
       acknowledgedSequence = Math.max(acknowledgedSequence, sequence);
     },
-  });
+  }));
 }
 
-/** Combines initial durable replay with update polling for one Task Session timeline. */
+function isTaskSessionUpdate(value: unknown): value is TaskSessionUpdate {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.session_id === "number" &&
+    Number.isSafeInteger(candidate.session_id) &&
+    typeof candidate.latest_sequence === "number" &&
+    Number.isSafeInteger(candidate.latest_sequence)
+  );
+}
+
+/** Combines initial durable replay with shared post-commit hints for one Task Session timeline. */
 export async function subscribeTaskSessionReplay(
   sessionId: number,
   afterSequence: number,
@@ -335,9 +422,11 @@ export async function subscribeTaskSessionReplay(
   limit = 100,
 ): Promise<TaskSessionSubscription> {
   let ready = false;
+  let bufferedSequence = afterSequence;
   const watch = await onTaskSessionUpdated(
     sessionId,
     (update) => {
+      bufferedSequence = Math.max(bufferedSequence, update.latest_sequence);
       if (ready) handler(update);
     },
     afterSequence,
@@ -345,6 +434,10 @@ export async function subscribeTaskSessionReplay(
   try {
     const initialPage = await listTaskSessionEvents(sessionId, afterSequence, limit);
     ready = true;
+    watch.acknowledge(initialPage.next_cursor);
+    if (bufferedSequence > initialPage.next_cursor) {
+      handler({ session_id: sessionId, latest_sequence: bufferedSequence });
+    }
     return { initialPage, ...watch };
   } catch (error) {
     watch.unlisten();

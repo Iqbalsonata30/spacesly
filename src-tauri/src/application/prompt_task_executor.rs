@@ -2,8 +2,9 @@ use super::agent_task_executor::{emit_runtime_event, AgentTaskExecutor};
 use super::execution_engine::{TaskExecutionContext, TaskExecutionError, TaskExecutor};
 use super::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use crate::domain::task_session::{
-    TaskEditInputV2, TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1,
-    TaskSessionEventKind, TaskSessionInputV2, TaskSessionKind,
+    ChatTaskResult, EditTaskResult, TaskEditInputV2, TaskExecutionOutput, TaskProgress,
+    TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionInputV2,
+    TaskSessionKind,
 };
 use crate::infrastructure::ai_worker::{
     chat_ai_worker, chat_ai_worker_streaming, propose_ai_edit, AiEditContextFile, AiEditRequest,
@@ -137,7 +138,7 @@ impl PromptTaskExecutor {
         &self,
         context: &TaskExecutionContext,
         envelope: crate::domain::task_session::TaskSessionEnvelopeV2,
-    ) -> Result<(), TaskExecutionError> {
+    ) -> Result<TaskExecutionOutput, TaskExecutionError> {
         envelope.validate().map_err(TaskExecutionError::new)?;
         if prompt_input_digest(&envelope.prompt_input).map_err(TaskExecutionError::new)?
             != envelope.session.context_digest
@@ -224,6 +225,12 @@ impl PromptTaskExecutor {
                         "message": result.message,
                     }),
                 )?;
+                Ok(TaskExecutionOutput::Chat(ChatTaskResult {
+                    conversation_id: envelope.session.conversation_id.ok_or_else(|| {
+                        TaskExecutionError::new("Chat Task Session conversation is required.")
+                    })?,
+                    message: result.message,
+                }))
             }
             TaskSessionInputV2::Edit(input) => {
                 let file_path = input.file_path.clone();
@@ -253,14 +260,21 @@ impl PromptTaskExecutor {
                         "content": result.content,
                     }),
                 )?;
+                Ok(TaskExecutionOutput::Edit(EditTaskResult {
+                    file_path,
+                    summary: result.summary,
+                    content: result.content,
+                }))
             }
         }
-        Ok(())
     }
 }
 
 impl TaskExecutor for PromptTaskExecutor {
-    fn execute(&self, context: &TaskExecutionContext) -> Result<(), TaskExecutionError> {
+    fn execute(
+        &self,
+        context: &TaskExecutionContext,
+    ) -> Result<TaskExecutionOutput, TaskExecutionError> {
         context.ensure_current()?;
         let envelope = context
             .request()
@@ -290,7 +304,10 @@ impl TaskSessionExecutor {
 }
 
 impl TaskExecutor for TaskSessionExecutor {
-    fn execute(&self, context: &TaskExecutionContext) -> Result<(), TaskExecutionError> {
+    fn execute(
+        &self,
+        context: &TaskExecutionContext,
+    ) -> Result<TaskExecutionOutput, TaskExecutionError> {
         let envelope = context
             .request()
             .envelope()
@@ -455,6 +472,29 @@ mod tests {
             .expect("edit completes");
         assert_eq!(chat.state, TaskSessionState::Succeeded);
         assert_eq!(edit.state, TaskSessionState::Succeeded);
+        assert_eq!(
+            engine
+                .task_session_result(chat.id)
+                .expect("chat result query")
+                .expect("chat result")
+                .output,
+            TaskExecutionOutput::Chat(ChatTaskResult {
+                conversation_id: "conversation-1".to_string(),
+                message: "assistant response".to_string(),
+            })
+        );
+        assert_eq!(
+            engine
+                .task_session_result(edit.id)
+                .expect("edit result query")
+                .expect("edit result")
+                .output,
+            TaskExecutionOutput::Edit(EditTaskResult {
+                file_path: "src/main.rs".to_string(),
+                summary: "updated".to_string(),
+                content: "fn main() {}".to_string(),
+            })
+        );
         let cancellation_ids = cancellation_ids.lock().expect("cancellation lock");
         assert_eq!(cancellation_ids.len(), 2);
         assert_ne!(cancellation_ids[0], cancellation_ids[1]);
@@ -541,6 +581,7 @@ mod tests {
             restrict_tools: false,
             fenced_tools_only: false,
             isolated_opencode_process: false,
+            task_tool_authority: None,
             mcp_servers: Vec::new(),
         }
     }

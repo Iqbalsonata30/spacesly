@@ -43,6 +43,17 @@ export {
   loadConversationMessages,
 } from "$lib/ipc/agent";
 export type {
+  AgentRuntimeProfile,
+  AgentTaskResult,
+  TaskChatInputV2,
+  TaskEditInputV2,
+  TaskExecutionOutput,
+  TaskSessionEnvelope,
+  TaskSessionEnvelopeV1,
+  TaskSessionEnvelopeV1Data,
+  TaskSessionEnvelopeV2,
+  TaskSessionInputV2,
+  TaskSessionResult,
   TaskProgress,
   TaskRequest,
   TaskSessionEvent,
@@ -55,10 +66,22 @@ export type {
   TaskSessionUpdateWatch,
 } from "$lib/ipc/taskSessions";
 export {
+  cancelTaskSession,
+  digestTaskSessionPromptInput,
+  digestAgentExecutionContract,
   getTaskSession,
+  getTaskSessionResult,
+  getTaskSessionMcpContext,
+  getTaskSessionToolState,
+  listAgentRuntimeProfiles,
   listTaskSessionEvents,
   listTaskSessions,
   onTaskSessionUpdated,
+  onTaskSessionActivity,
+  removeTaskSession,
+  saveAgentRuntimeProfile,
+  saveImmutableAgentRuntimeProfile,
+  submitTaskSession,
   subscribeTaskSessionReplay,
 } from "$lib/ipc/taskSessions";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
@@ -70,6 +93,7 @@ export {
   unwatchWorkspaceFiles,
   watchWorkspaceFiles,
   workspaceRootPath,
+  workspaceRootRevision,
   writeFile,
 } from "$lib/ipc/files";
 export type { CommitResult, GitChangedFile, GitStatus, GitWorkspaceInfo } from "$lib/ipc/git";
@@ -124,10 +148,7 @@ export {
   saveJiraSecret,
   saveJiraConnectionProfile,
 } from "$lib/ipc/settings";
-export type {
-  GlobalEnvironmentVariable,
-  GlobalEnvironmentVariableInput,
-} from "$lib/ipc/settings";
+export type { GlobalEnvironmentVariable, GlobalEnvironmentVariableInput } from "$lib/ipc/settings";
 export { listActiveExecutionRuns, saveExecutionRun } from "$lib/ipc/execution";
 export type { RecoverySnapshot, RecoverySnapshotInput } from "$lib/ipc/recovery";
 export {

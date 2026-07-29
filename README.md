@@ -104,15 +104,35 @@ optional Jira synchronization.
   enforces capability-based authorization. High-risk operations require explicit
   workspace trust and operator confirmation.
 
+### Scheduler Agent tool isolation
+
+Scheduler-owned OpenCode Agent sessions keep OpenCode's direct file, shell, and Git built-ins
+denied. When a Task Session has a durable `workspace_read`, `workspace_write`, `shell`, or `git`
+grant, Spacesly adds an assignment-local stdio MCP server exposing only the corresponding tools.
+Every call checks the session ID, attempt, owner, fencing token, lease, workspace ownership, and
+durable capability in `scheduler.db` immediately before execution. The workspace root comes only
+from the trusted backend envelope resolver, and file paths and shell working directories cannot
+escape that canonical root. Cancelling or replacing an assignment invalidates only that session's
+authority; running shell commands are terminated when their own fence becomes stale.
+
+External MCP connectors continue to use their existing connector-bound proxy and are unaffected by
+the internal workspace tool server.
+
+Chat and Edit Task Session outputs are retained as authoritative typed results. Chat completion is
+also projected idempotently into its durable conversation, including after restart. An Edit result
+remains queryable after restart, but Spacesly does not automatically reopen the singular editor
+review surface because its transient selection and review layout cannot be restored safely; the
+operator must request or reopen review explicitly.
+
 ---
 
 ## Prerequisites
 
-| Dependency | Version | Notes |
-|---|---|---|
-| [Rust](https://rustup.rs/) | stable (edition 2021) | Install via `rustup` |
-| [Bun](https://bun.sh/) | latest | JavaScript runtime and package manager |
-| WebKit system libraries | — | See [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS |
+| Dependency                 | Version               | Notes                                                                            |
+| -------------------------- | --------------------- | -------------------------------------------------------------------------------- |
+| [Rust](https://rustup.rs/) | stable (edition 2021) | Install via `rustup`                                                             |
+| [Bun](https://bun.sh/)     | latest                | JavaScript runtime and package manager                                           |
+| WebKit system libraries    | —                     | See [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS |
 
 ### Linux System Dependencies
 
@@ -167,6 +187,7 @@ bun run tauri build
 
 The bundled application is written to `src-tauri/target/release/bundle/`. Available
 formats depend on your platform:
+
 - **Linux**: `.deb`, `.AppImage`, `.rpm`
 - **macOS**: `.dmg`, `.app`
 - **Windows**: `.msi`, `.exe`
@@ -174,6 +195,7 @@ formats depend on your platform:
 ### Optimizations
 
 The release profile applies:
+
 - Single codegen unit for cross-module inlining
 - Full LTO (link-time optimization)
 - Optimization level 3
@@ -210,6 +232,7 @@ formatters, Git commands). Each variable can be:
 ### AI Providers
 
 Configured in **Settings → Agent**. Each provider requires:
+
 - A display name
 - Base URL (for OpenAI-compatible APIs)
 - API style (`openai` or `anthropic`)
@@ -217,17 +240,19 @@ Configured in **Settings → Agent**. Each provider requires:
 - API key (stored in secrets)
 
 Built-in provider profiles:
-| Provider | Default Base URL |
-|---|---|
-| OpenAI | `https://api.openai.com/v1` |
-| Anthropic | `https://api.anthropic.com/v1` |
-| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| DeepSeek | `https://api.deepseek.com/v1` |
-| opencode CLI | (local binary) |
+
+| Provider     | Default Base URL                                          |
+| ------------ | --------------------------------------------------------- |
+| OpenAI       | `https://api.openai.com/v1`                               |
+| Anthropic    | `https://api.anthropic.com/v1`                            |
+| Gemini       | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| DeepSeek     | `https://api.deepseek.com/v1`                             |
+| opencode CLI | (local binary)                                            |
 
 ### MCP Servers
 
 Configured in **Settings → MCP**. Each server requires:
+
 - A name
 - Command and arguments (stdio-based)
 - Optional environment variables
@@ -278,6 +303,7 @@ Execution state survives application restart via the durable SQLite store.
 ### Git Operations
 
 The Git panel shows:
+
 - Current branch and status
 - Changed files with diff indicators (M, A, D, U)
 - Stage/unstage individual files or all changes
@@ -288,6 +314,7 @@ The Git panel shows:
 ### File Search
 
 The search panel supports:
+
 - Full-text search across all workspace files
 - File path filtering via the `.gitignore`-aware `ignore` crate
 - Search result preview with context lines
@@ -296,6 +323,7 @@ The search panel supports:
 ### LSP (Language Server Protocol)
 
 LSP servers are configured per workspace. Supported features:
+
 - Diagnostics (errors and warnings in the editor gutter)
 - Completions (autocomplete as you type)
 - Hover information
@@ -404,19 +432,19 @@ spacesly/
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Desktop Shell | [Tauri v2](https://v2.tauri.app/) (WebKit webview) |
-| Frontend | [SvelteKit 5](https://kit.svelte.dev/), Svelte 5 (runes), TypeScript 6 |
-| Bundler | [Vite 8](https://vite.dev/) |
-| Editor | [CodeMirror 6](https://codemirror.net/) (~600 KB, lazy-loaded) |
-| Terminal | [xterm.js 5](https://xtermjs.org/) + addon-fit (~400 KB, lazy-loaded) |
-| Icons | [Lucide Svelte](https://lucide.dev/) |
-| Backend | Rust (edition 2021) |
-| Backend Libs | `tauri` 2, `serde`/`serde_json`, `rusqlite` 0.32 (bundled), `reqwest` 0.12, `tokio`, `portable-pty` 0.9, `notify` 8, `ignore` 0.4, `sha2`, `keyring` 3, `regex` 1, `url` 2 |
-| AI Providers | OpenAI / Anthropic / Gemini / DeepSeek API, opencode CLI |
-| Linting | ESLint 10, Prettier 3, `eslint-plugin-svelte`, `typescript-eslint` |
-| Package Manager | [Bun](https://bun.sh/) |
+| Layer           | Technology                                                                                                                                                                 |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Desktop Shell   | [Tauri v2](https://v2.tauri.app/) (WebKit webview)                                                                                                                         |
+| Frontend        | [SvelteKit 5](https://kit.svelte.dev/), Svelte 5 (runes), TypeScript 6                                                                                                     |
+| Bundler         | [Vite 8](https://vite.dev/)                                                                                                                                                |
+| Editor          | [CodeMirror 6](https://codemirror.net/) (~600 KB, lazy-loaded)                                                                                                             |
+| Terminal        | [xterm.js 5](https://xtermjs.org/) + addon-fit (~400 KB, lazy-loaded)                                                                                                      |
+| Icons           | [Lucide Svelte](https://lucide.dev/)                                                                                                                                       |
+| Backend         | Rust (edition 2021)                                                                                                                                                        |
+| Backend Libs    | `tauri` 2, `serde`/`serde_json`, `rusqlite` 0.32 (bundled), `reqwest` 0.12, `tokio`, `portable-pty` 0.9, `notify` 8, `ignore` 0.4, `sha2`, `keyring` 3, `regex` 1, `url` 2 |
+| AI Providers    | OpenAI / Anthropic / Gemini / DeepSeek API, opencode CLI                                                                                                                   |
+| Linting         | ESLint 10, Prettier 3, `eslint-plugin-svelte`, `typescript-eslint`                                                                                                         |
+| Package Manager | [Bun](https://bun.sh/)                                                                                                                                                     |
 
 ---
 
@@ -447,18 +475,18 @@ bun run format
 
 ### Development Scripts
 
-| Script | Description |
-|---|---|
-| `bun run dev` | Vite dev server only (port 1420) |
-| `bun run build` | Vite production build |
-| `bun run preview` | Vite preview server |
-| `bun run check` | Svelte type-checking |
-| `bun run tauri:dev` | Full Tauri dev mode with Vite HMR |
-| `bun run tauri build` | Production Tauri bundle |
-| `bun run lint` | ESLint check |
-| `bun run lint:fix` | ESLint auto-fix |
-| `bun run format` | Prettier format |
-| `bun run format:check` | Prettier check |
+| Script                 | Description                       |
+| ---------------------- | --------------------------------- |
+| `bun run dev`          | Vite dev server only (port 1420)  |
+| `bun run build`        | Vite production build             |
+| `bun run preview`      | Vite preview server               |
+| `bun run check`        | Svelte type-checking              |
+| `bun run tauri:dev`    | Full Tauri dev mode with Vite HMR |
+| `bun run tauri build`  | Production Tauri bundle           |
+| `bun run lint`         | ESLint check                      |
+| `bun run lint:fix`     | ESLint auto-fix                   |
+| `bun run format`       | Prettier format                   |
+| `bun run format:check` | Prettier check                    |
 
 ---
 

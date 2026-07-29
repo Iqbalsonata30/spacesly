@@ -25,6 +25,7 @@ export function createTaskSessionReplay(sessionId: number): TaskSessionReplaySta
 export function applyTaskSessionEventPage(
   replay: TaskSessionReplayState,
   page: TaskSessionEventPage,
+  maxEvents = 200,
 ): TaskSessionReplayResult {
   let next = replay;
   for (const event of page.events) {
@@ -35,7 +36,7 @@ export function applyTaskSessionEventPage(
     }
     if (event.sequence <= next.cursor) continue;
     if (event.sequence !== next.cursor + 1) return { replay: next, gapDetected: true };
-    next = applyEvent(next, event);
+    next = applyEvent(next, event, maxEvents);
   }
   return { replay: next, gapDetected: false };
 }
@@ -43,13 +44,14 @@ export function applyTaskSessionEventPage(
 function applyEvent(
   replay: TaskSessionReplayState,
   event: TaskSessionEvent,
+  maxEvents: number,
 ): TaskSessionReplayState {
   return {
     ...replay,
     cursor: event.sequence,
     state: lifecycleState(event) ?? replay.state,
     progress: event.progress ?? replay.progress,
-    events: [...replay.events, event],
+    events: [...replay.events, event].slice(-Math.max(0, maxEvents)),
   };
 }
 
@@ -64,6 +66,7 @@ function isTaskSessionState(value: unknown): value is TaskSessionState {
     value === "queued" ||
     value === "running" ||
     value === "cancelling" ||
+    value === "committing" ||
     value === "succeeded" ||
     value === "failed" ||
     value === "blocked" ||

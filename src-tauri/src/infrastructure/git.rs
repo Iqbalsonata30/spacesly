@@ -146,18 +146,15 @@ pub fn checkout_workspace_git_branch(
     let Some(repo_root) = git_repo_root(&workspace_root)? else {
         return Err("Workspace root is not inside a git repository.".to_string());
     };
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err("Branch name is required.".to_string());
-    }
+    let branch = validated_branch_name(&repo_root, &branch)?;
 
     let mut command = Command::new("git");
     inject_global_environment(&mut command);
     let status = command
-        .args(["checkout", branch])
+        .args(["switch", "--", branch.as_str()])
         .current_dir(&repo_root)
         .output()
-        .map_err(|error| format!("Failed to run git checkout: {error}"))?;
+        .map_err(|error| format!("Failed to run git switch: {error}"))?;
     if !status.status.success() {
         return Err(redact_global_environment_values(
             String::from_utf8_lossy(&status.stderr).trim(),
@@ -372,12 +369,9 @@ pub fn merge_workspace_git_branch(
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
     let repo_root = workspace_repo_root(root, &workspace_id)?;
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err("Merge branch is required.".to_string());
-    }
+    let branch = validated_branch_name(&repo_root, &branch)?;
 
-    run_git(&repo_root, ["merge", branch, "--no-edit"])?;
+    run_git_dynamic(&repo_root, &["merge", "--no-edit", "--", &branch])?;
     invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root, workspace_id)
 }
@@ -388,12 +382,9 @@ pub fn rebase_workspace_git_branch(
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
     let repo_root = workspace_repo_root(root, &workspace_id)?;
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err("Rebase branch is required.".to_string());
-    }
+    let branch = validated_branch_name(&repo_root, &branch)?;
 
-    run_git(&repo_root, ["rebase", branch])?;
+    run_git_dynamic(&repo_root, &["rebase", "--", &branch])?;
     invalidate_git_status_for_repo(&repo_root);
     workspace_git_info(root, workspace_id)
 }
@@ -416,11 +407,7 @@ fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
     let mut command = Command::new("git");
     inject_global_environment(&mut command);
-    let output = command
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let output = command.args(args).current_dir(cwd).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -469,6 +456,30 @@ fn normalized_file_path(path: String) -> Result<String, String> {
     } else {
         Ok(path.to_string())
     }
+}
+
+fn validated_branch_name(repo_root: &Path, branch: &str) -> Result<String, String> {
+    if branch.is_empty()
+        || branch != branch.trim()
+        || branch.starts_with('-')
+        || matches!(branch, "@" | "HEAD")
+        || branch.chars().any(char::is_control)
+    {
+        return Err("Branch name is not a canonical Git ref.".to_string());
+    }
+    let full_ref = format!("refs/heads/{branch}");
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let valid = command
+        .args(["check-ref-format", full_ref.as_str()])
+        .current_dir(repo_root)
+        .status()
+        .map_err(|error| format!("Failed to validate Git branch name: {error}"))?
+        .success();
+    if !valid {
+        return Err("Branch name is not a canonical Git ref.".to_string());
+    }
+    Ok(branch.to_string())
 }
 
 fn normalize_git_status(status: char) -> String {
@@ -535,6 +546,33 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn branch_validation_rejects_option_injection_and_invalid_refs() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        for branch in [
+            "--exec=touch /tmp/pwned",
+            "-c core.pager=cat",
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            "feature..branch",
+            "feature/.lock",
+            "feature@{1}",
+            "feature\\branch",
+            "@",
+            "HEAD",
+        ] {
+            assert!(
+                validated_branch_name(repo.path(), branch).is_err(),
+                "accepted adversarial branch {branch:?}"
+            );
+        }
+        assert_eq!(
+            validated_branch_name(repo.path(), "feature/safe-branch").unwrap(),
+            "feature/safe-branch"
+        );
+    }
 
     #[test]
     fn status_cache_requires_invalidation_for_immediate_external_changes() {

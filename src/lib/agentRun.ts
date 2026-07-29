@@ -1,7 +1,19 @@
-import type { AiWorkerTaskResult, ExecutionContract } from "$lib/ipc";
+import type { AiWorkerTaskResult, ExecutionContract, TaskSessionState } from "$lib/ipc";
 import type { GitWorkspaceInfo } from "$lib/ipc/git";
 
-export type AgentRunStatus = "idle" | "running" | "timeout" | "completed" | "blocked";
+export type AgentRunStatus =
+  "idle" | "running" | "timeout" | "completed" | "blocked" | "blocked_for_resume";
+
+export type AgentWorkflowCheckpoint =
+  | "agent_running"
+  | "agent_result_committed"
+  | "verification_completed"
+  | "jira_writeback_started"
+  | "jira_transition_completed"
+  | "jira_writeback_completed"
+  | "workflow_completed";
+
+export type AgentWorkflowRecoveryDecision = { safe: true } | { safe: false; reason: string };
 
 export type AgentRunLog = {
   id: string;
@@ -33,14 +45,7 @@ export type AgentSessionEvent = {
 };
 
 export type ExecutionStepStatus =
-  | "pending"
-  | "ready"
-  | "running"
-  | "completed"
-  | "blocked"
-  | "failed"
-  | "interrupted"
-  | "skipped";
+  "pending" | "ready" | "running" | "completed" | "blocked" | "failed" | "interrupted" | "skipped";
 
 export type StepRun = {
   step_id: string;
@@ -76,6 +81,10 @@ export type AgentRunSession = {
   gitSnapshot: AgentRunGitSnapshot | null;
   transcript: AgentSessionEvent[];
   executionRun: ExecutionRun | null;
+  taskSessionId?: number | null;
+  taskSessionState?: TaskSessionState | null;
+  conversationId?: string | null;
+  workflowCheckpoint?: AgentWorkflowCheckpoint | null;
 };
 
 const ACTIVE_AGENT_RUNS_KEY = "spacesly.agent.active-runs.v1";
@@ -172,6 +181,10 @@ export function createAgentRunSession(
   gitSnapshot: AgentRunGitSnapshot | null,
   transcript: AgentSessionEvent[],
   executionRun: ExecutionRun | null,
+  taskSessionId: number | null = null,
+  conversationId: string | null = null,
+  taskSessionState: TaskSessionState | null = null,
+  workflowCheckpoint: AgentWorkflowCheckpoint | null = null,
 ): AgentRunSession {
   return {
     cardId,
@@ -185,7 +198,64 @@ export function createAgentRunSession(
     gitSnapshot,
     transcript,
     executionRun,
+    taskSessionId,
+    taskSessionState,
+    conversationId,
+    workflowCheckpoint,
   };
+}
+
+/** Derives the last durable workflow boundary without assuming interrupted side effects are safe. */
+export function agentWorkflowCheckpoint(run: ExecutionRun): AgentWorkflowCheckpoint {
+  if (run.status === "completed") return "workflow_completed";
+  const jira = run.step_runs["jira.comment.result"];
+  if (jira?.status === "completed") return "jira_writeback_completed";
+  if (
+    (jira?.status === "running" || jira?.status === "interrupted") &&
+    jira.summary === "Jira Done transition completed; completion comment pending."
+  ) {
+    return "jira_transition_completed";
+  }
+  if (jira?.status === "running" || jira?.status === "interrupted") return "jira_writeback_started";
+  if (run.step_runs["worker.verify"]?.status === "completed") return "verification_completed";
+  if (["completed", "blocked"].includes(run.step_runs["worker.execute"]?.status ?? "")) {
+    return "agent_result_committed";
+  }
+  return "agent_running";
+}
+
+/** Blocks recovery when Jira may have accepted an effect that was not durably confirmed. */
+export function agentWorkflowRecoveryDecision(
+  checkpoint: AgentWorkflowCheckpoint,
+): AgentWorkflowRecoveryDecision {
+  if (checkpoint !== "jira_writeback_started") return { safe: true };
+  return {
+    safe: false,
+    reason:
+      "Jira writeback was started but no durable confirmation was recorded. Reconcile the Jira issue transition and comments manually, then start a new explicitly reviewed run; Spacesly will not replay either action automatically.",
+  };
+}
+
+export type AgentTaskCardProjection = {
+  status: string;
+  progress: number;
+  running: boolean;
+};
+
+/** Projects the authoritative per-card session into the compact board presentation. */
+export function agentTaskCardProjection(
+  session: AgentRunSession | null | undefined,
+): AgentTaskCardProjection | null {
+  if (!session) return null;
+  return {
+    status: session.taskSessionState ?? session.status,
+    progress: session.progress,
+    running: session.status === "running",
+  };
+}
+
+export function runningAgentSessions(sessions: Record<string, AgentRunSession>): AgentRunSession[] {
+  return Object.values(sessions).filter((session) => session.status === "running");
 }
 
 export function createAgentSessionEvent(

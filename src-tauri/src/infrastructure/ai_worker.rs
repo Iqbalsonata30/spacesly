@@ -5,8 +5,9 @@ use super::mcp::{
     MCP_PROXY_CONNECTOR_BINDING_ENV, MCP_PROXY_CONNECTOR_ID_ENV,
 };
 use super::provider_registry::ApiStyle;
-use super::scheduler_store::ExternalAssignmentAuthority;
+use super::scheduler_store::{ExternalAssignmentAuthority, TaskToolAuthority};
 use super::shell_env::inject_shell_env;
+use super::task_tools::TASK_TOOLS_AUTHORITY_ENV;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
@@ -255,6 +256,8 @@ pub struct AiWorkerConfig {
     pub fenced_tools_only: bool,
     #[serde(skip)]
     pub isolated_opencode_process: bool,
+    #[serde(skip)]
+    pub task_tool_authority: Option<TaskToolAuthority>,
     #[serde(default)]
     pub mcp_servers: Vec<AiWorkerMcpServer>,
 }
@@ -299,7 +302,7 @@ pub struct AiWorkerStatus {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AiWorkerTaskResult {
     pub summary: String,
     pub evidence: Vec<String>,
@@ -1827,7 +1830,7 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
     let proxy_executable = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().to_string());
-    let mcp = config
+    let mut mcp = config
         .mcp_servers
         .iter()
         .filter(|server| !server.name.trim().is_empty() && !server.command.is_empty())
@@ -1879,6 +1882,24 @@ fn opencode_mcp_config(config: &AiWorkerConfig) -> Option<Arc<String>> {
             ))
         })
         .collect::<BTreeMap<_, _>>();
+    if let (Some(proxy_executable), Some(authority)) = (
+        proxy_executable.as_ref(),
+        config.task_tool_authority.as_ref(),
+    ) {
+        if !authority.capabilities.is_empty() {
+            mcp.insert(
+                "spacesly-workspace".to_string(),
+                serde_json::json!({
+                    "type": "local",
+                    "command": [proxy_executable, "--spacesly-task-tools"],
+                    "enabled": true,
+                    "environment": {
+                        TASK_TOOLS_AUTHORITY_ENV: serde_json::to_string(authority).ok()?
+                    }
+                }),
+            );
+        }
+    }
     if mcp.is_empty() && !config.restrict_tools && !config.fenced_tools_only {
         return None;
     }
@@ -2851,6 +2872,7 @@ mod tests {
             restrict_tools: false,
             fenced_tools_only: false,
             isolated_opencode_process: false,
+            task_tool_authority: None,
             mcp_servers: Vec::new(),
         }
     }
@@ -3178,6 +3200,41 @@ mod tests {
         }))
         .expect("renderer server decoded");
         assert!(renderer_server.proxy_authority.is_none());
+    }
+
+    #[test]
+    fn scheduler_workspace_tools_are_mcp_only_and_direct_builtins_stay_denied() {
+        let mut config = config_with_governance("", "");
+        config.runtime = "opencode".to_string();
+        config.fenced_tools_only = true;
+        config.task_tool_authority = Some(TaskToolAuthority {
+            scheduler_database: PathBuf::from("/tmp/scheduler.db"),
+            scheduler_instance_id: "instance".to_string(),
+            session_id: crate::domain::task_session::TaskSessionId(1),
+            attempt_id: 2,
+            attempt: 1,
+            owner_id: 3,
+            fencing_token: 4,
+            workspace_id: "workspace-personal".to_string(),
+            workspace_root: PathBuf::from("/tmp"),
+            capabilities: vec!["workspace_read".to_string(), "shell".to_string()],
+        });
+
+        let serialized = opencode_mcp_config(&config).expect("OpenCode config");
+        let parsed: Value = serde_json::from_str(&serialized).expect("valid config");
+        assert_eq!(parsed["permission"]["*"], "deny");
+        assert_eq!(parsed["permission"]["spacesly-workspace_*"], "allow");
+        assert!(parsed["permission"].get("read").is_none());
+        assert!(parsed["permission"].get("bash").is_none());
+        assert_eq!(
+            parsed["mcp"]["spacesly-workspace"]["command"][1],
+            "--spacesly-task-tools"
+        );
+        assert!(
+            parsed["mcp"]["spacesly-workspace"]["environment"][TASK_TOOLS_AUTHORITY_ENV]
+                .as_str()
+                .is_some_and(|value| value.contains("workspace_read"))
+        );
     }
 
     #[test]
