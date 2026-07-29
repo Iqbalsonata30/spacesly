@@ -7,7 +7,7 @@
 use crate::domain::task_session::{
     TaskCapabilityGrant, TaskProgress, TaskRequest, TaskSessionEvent, TaskSessionEventInput,
     TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
-    TaskSessionState,
+    TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -673,6 +673,16 @@ impl SchedulerStore {
             next_cursor,
             has_more,
         })
+    }
+
+    pub(crate) fn tool_state(&self, session_id: TaskSessionId) -> Result<TaskToolState, String> {
+        if self.get_session(session_id)?.is_none() {
+            return Err(format!("Task Session {} was not found.", session_id.0));
+        }
+        Ok(TaskToolState::from_events(
+            session_id,
+            &self.events_after(session_id, 0)?,
+        ))
     }
 
     #[cfg(test)]
@@ -2319,6 +2329,68 @@ mod tests {
         assert_eq!(final_page.next_cursor, 5);
         assert!(!final_page.has_more);
         assert_eq!(final_page.events.len(), 1);
+    }
+
+    #[test]
+    fn tool_state_projects_from_persisted_event_journal() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_at(&TaskRequest::new("tool-state"), 10)
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 20, LEASE_MILLIS, 5)
+            .expect("task claimed")
+            .expect("assignment");
+        store
+            .append_assignment_event_at(
+                assignment.fence,
+                TaskSessionEventInput {
+                    kind: TaskSessionEventKind::Tool,
+                    payload: serde_json::json!({
+                        "type": "tool_started",
+                        "tool_call_id": "tool-1",
+                        "tool_name": "jira_search",
+                        "risk": "low",
+                        "arguments_digest": "abc",
+                        "display_context": { "issue": "ABC-1" }
+                    }),
+                    progress: None,
+                },
+                21,
+            )
+            .expect("tool start appended");
+        store
+            .append_assignment_event_at(
+                assignment.fence,
+                TaskSessionEventInput {
+                    kind: TaskSessionEventKind::Tool,
+                    payload: serde_json::json!({
+                        "type": "tool_completed",
+                        "tool_call_id": "tool-1",
+                        "tool_name": "jira_search",
+                        "success": true,
+                        "risk": "low",
+                        "arguments_digest": "abc",
+                        "display_context": { "issue": "ABC-1" }
+                    }),
+                    progress: None,
+                },
+                22,
+            )
+            .expect("tool completion appended");
+        drop(store);
+
+        let reopened = SchedulerStore::open_query_at(path).expect("query store opens");
+        let state = reopened
+            .tool_state(session.id)
+            .expect("tool state projected");
+        assert_eq!(state.session_id, session.id);
+        assert_eq!(state.calls.len(), 1);
+        assert_eq!(state.calls[0].tool_call_id, "tool-1");
+        assert_eq!(state.calls[0].completed_sequence, Some(4));
     }
 
     #[test]

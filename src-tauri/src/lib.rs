@@ -16,7 +16,7 @@ use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
-    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
+    TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot, TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -1721,6 +1721,17 @@ async fn list_task_session_events(
 }
 
 #[tauri::command]
+async fn get_task_session_tool_state(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<TaskToolState, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.tool_state(TaskSessionId(session_id)))
+        .await
+        .map_err(|error| format!("Get Task Session tool state task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -2388,6 +2399,7 @@ pub fn run() {
             list_task_sessions,
             get_task_session,
             list_task_session_events,
+            get_task_session_tool_state,
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
             submit_task_session,

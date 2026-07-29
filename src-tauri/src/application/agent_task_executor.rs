@@ -333,8 +333,9 @@ fn emit_runtime_event(
 mod tests {
     use super::*;
     use crate::application::execution_engine::ExecutionEngine;
-    use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState};
+    use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState, TaskToolState};
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
+    use crate::infrastructure::tool_broker::ToolDisplayContext;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
@@ -477,6 +478,29 @@ mod tests {
                 authority.fencing_token,
             ));
             self.barrier.wait();
+            on_event(AiWorkerStreamEvent::ToolStarted {
+                tool_call_id: format!("tool-{}", authority.session_id.0),
+                tool_name: "jira_search".to_string(),
+                risk: "low".to_string(),
+                arguments_digest: "abc".to_string(),
+                display_context: ToolDisplayContext {
+                    label: "jira_search".to_string(),
+                    category: "external".to_string(),
+                    target: Some(authority.session_id.0.to_string()),
+                },
+            })?;
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: format!("tool-{}", authority.session_id.0),
+                tool_name: "jira_search".to_string(),
+                success: true,
+                risk: "low".to_string(),
+                arguments_digest: "abc".to_string(),
+                display_context: ToolDisplayContext {
+                    label: "jira_search".to_string(),
+                    category: "external".to_string(),
+                    target: Some(authority.session_id.0.to_string()),
+                },
+            })?;
             on_event(AiWorkerStreamEvent::TextDelta(format!(
                 "session:{}",
                 authority.session_id.0
@@ -594,6 +618,20 @@ mod tests {
             .expect("second events")
             .iter()
             .all(|event| event.session_id == second.id));
+        let first_tools = TaskToolState::from_events(
+            first.id,
+            &engine.events_after(first.id, 0).expect("first events"),
+        );
+        let second_tools = TaskToolState::from_events(
+            second.id,
+            &engine.events_after(second.id, 0).expect("second events"),
+        );
+        assert_eq!(first_tools.calls.len(), 1);
+        assert_eq!(second_tools.calls.len(), 1);
+        assert_ne!(
+            first_tools.calls[0].tool_call_id,
+            second_tools.calls[0].tool_call_id
+        );
     }
 
     #[test]

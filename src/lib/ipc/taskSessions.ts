@@ -90,6 +90,27 @@ export type TaskSessionEventPage = {
   has_more: boolean;
 };
 
+export type TaskToolStatus = "running" | "succeeded" | "failed";
+
+export type TaskToolCallState = {
+  tool_call_id: string;
+  tool_name: string;
+  status: TaskToolStatus;
+  risk: string | null;
+  arguments_digest: string | null;
+  display_context: unknown | null;
+  attempt_id: number | null;
+  fencing_token: number;
+  started_sequence: number;
+  completed_sequence: number | null;
+  updated_at: number;
+};
+
+export type TaskToolState = {
+  session_id: number;
+  calls: TaskToolCallState[];
+};
+
 export type TaskSessionUpdate = {
   session_id: number;
   latest_sequence: number;
@@ -172,6 +193,15 @@ export function listTaskSessionEvents(
   return invokeWithPolicy(
     "list_task_session_events",
     { sessionId, afterSequence, limit },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Returns current per-session tool state projected from the durable event journal. */
+export function getTaskSessionToolState(sessionId: number): Promise<TaskToolState> {
+  return invokeWithPolicy(
+    "get_task_session_tool_state",
+    { sessionId },
     IPC_POLICIES.taskSessionRead,
   );
 }

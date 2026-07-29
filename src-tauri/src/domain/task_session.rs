@@ -6,7 +6,7 @@
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Current schema version for durable Task Session execution envelopes.
 pub const TASK_SESSION_ENVELOPE_VERSION: u32 = 1;
@@ -315,6 +315,127 @@ pub struct TaskSessionEventPage {
     pub has_more: bool,
 }
 
+/// Current lifecycle status for one tool call within a Task Session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskToolStatus {
+    /// Tool call has started but no completion event has been observed.
+    Running,
+    /// Tool call completed successfully.
+    Succeeded,
+    /// Tool call completed with a runtime-reported failure.
+    Failed,
+}
+
+/// Durable read projection for one tool call, derived from the Task Session event journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskToolCallState {
+    /// Runtime-generated tool call identifier scoped to one Task Session attempt.
+    pub tool_call_id: String,
+    /// Display name of the invoked tool.
+    pub tool_name: String,
+    /// Latest known tool call lifecycle status.
+    pub status: TaskToolStatus,
+    /// Risk level reported by the runtime, if available.
+    pub risk: Option<String>,
+    /// Digest of redacted tool arguments, if available.
+    pub arguments_digest: Option<String>,
+    /// Redacted display context for timeline/UI rendering.
+    pub display_context: Option<Value>,
+    /// Assignment attempt that emitted the latest state.
+    pub attempt_id: Option<u64>,
+    /// Fencing token that authorized the latest state.
+    pub fencing_token: u64,
+    /// Event sequence that first introduced this tool call.
+    pub started_sequence: u64,
+    /// Event sequence that completed this tool call, if observed.
+    pub completed_sequence: Option<u64>,
+    /// Timestamp of the latest observed tool event in Unix milliseconds.
+    pub updated_at: u64,
+}
+
+/// Durable read projection of all tool calls owned by one Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskToolState {
+    /// Owning Task Session.
+    pub session_id: TaskSessionId,
+    /// Tool calls ordered by first observed event sequence.
+    pub calls: Vec<TaskToolCallState>,
+}
+
+impl TaskToolState {
+    /// Projects current tool state from the append-only event journal.
+    pub fn from_events(session_id: TaskSessionId, events: &[TaskSessionEvent]) -> Self {
+        let mut calls = BTreeMap::<String, TaskToolCallState>::new();
+        for event in events.iter().filter(|event| {
+            event.session_id == session_id && event.kind == TaskSessionEventKind::Tool
+        }) {
+            let event_type = event.payload.get("type").and_then(Value::as_str);
+            let Some(tool_call_id) = event.payload.get("tool_call_id").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let tool_name = event
+                .payload
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let risk = event
+                .payload
+                .get("risk")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let arguments_digest = event
+                .payload
+                .get("arguments_digest")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let display_context = event.payload.get("display_context").cloned();
+
+            let entry =
+                calls
+                    .entry(tool_call_id.to_string())
+                    .or_insert_with(|| TaskToolCallState {
+                        tool_call_id: tool_call_id.to_string(),
+                        tool_name: tool_name.clone(),
+                        status: TaskToolStatus::Running,
+                        risk: risk.clone(),
+                        arguments_digest: arguments_digest.clone(),
+                        display_context: display_context.clone(),
+                        attempt_id: event.attempt_id,
+                        fencing_token: event.fencing_token,
+                        started_sequence: event.sequence,
+                        completed_sequence: None,
+                        updated_at: event.created_at,
+                    });
+            entry.tool_name = tool_name;
+            entry.risk = risk;
+            entry.arguments_digest = arguments_digest;
+            entry.display_context = display_context;
+            entry.attempt_id = event.attempt_id;
+            entry.fencing_token = event.fencing_token;
+            entry.updated_at = event.created_at;
+            if event_type == Some("tool_completed") {
+                entry.status = if event
+                    .payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    TaskToolStatus::Succeeded
+                } else {
+                    TaskToolStatus::Failed
+                };
+                entry.completed_sequence = Some(event.sequence);
+            }
+        }
+        let mut calls = calls.into_values().collect::<Vec<_>>();
+        calls.sort_by_key(|call| call.started_sequence);
+        Self { session_id, calls }
+    }
+}
+
 /// Stable identifier assigned to one scheduler-managed task session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TaskSessionId(
@@ -565,5 +686,74 @@ mod tests {
 
         envelope.conversation_id = None;
         assert!(envelope.validate_agent_runtime_ownership().is_err());
+    }
+
+    #[test]
+    fn tool_state_projects_started_and_completed_events_for_one_session() {
+        let session = TaskSessionId(7);
+        let other_session = TaskSessionId(8);
+        let events = vec![
+            TaskSessionEvent {
+                id: 1,
+                session_id: session,
+                attempt_id: Some(11),
+                fencing_token: 1,
+                sequence: 1,
+                kind: TaskSessionEventKind::Tool,
+                payload: serde_json::json!({
+                    "type": "tool_started",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "jira_search",
+                    "risk": "low",
+                    "arguments_digest": "abc",
+                    "display_context": { "query": "ABC-1" }
+                }),
+                progress: None,
+                created_at: 100,
+            },
+            TaskSessionEvent {
+                id: 2,
+                session_id: other_session,
+                attempt_id: Some(12),
+                fencing_token: 1,
+                sequence: 1,
+                kind: TaskSessionEventKind::Tool,
+                payload: serde_json::json!({
+                    "type": "tool_completed",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "jira_search",
+                    "success": false
+                }),
+                progress: None,
+                created_at: 101,
+            },
+            TaskSessionEvent {
+                id: 3,
+                session_id: session,
+                attempt_id: Some(11),
+                fencing_token: 1,
+                sequence: 2,
+                kind: TaskSessionEventKind::Tool,
+                payload: serde_json::json!({
+                    "type": "tool_completed",
+                    "tool_call_id": "tool-1",
+                    "tool_name": "jira_search",
+                    "success": true,
+                    "risk": "low",
+                    "arguments_digest": "abc",
+                    "display_context": { "query": "ABC-1" }
+                }),
+                progress: None,
+                created_at: 110,
+            },
+        ];
+
+        let state = TaskToolState::from_events(session, &events);
+        assert_eq!(state.session_id, session);
+        assert_eq!(state.calls.len(), 1);
+        assert_eq!(state.calls[0].status, TaskToolStatus::Succeeded);
+        assert_eq!(state.calls[0].started_sequence, 1);
+        assert_eq!(state.calls[0].completed_sequence, Some(2));
+        assert_eq!(state.calls[0].updated_at, 110);
     }
 }
