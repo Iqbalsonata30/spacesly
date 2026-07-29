@@ -12,12 +12,15 @@ use application::execution_engine::ExecutionEngine;
 use application::files_service::FilesService;
 use application::git_service::GitService;
 use application::jira_service::JiraService;
+use application::prompt_task_executor::{
+    prompt_input_digest, AiWorkerPromptRuntimeRunner, PromptTaskExecutor, TaskSessionExecutor,
+};
 use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
     TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionSnapshot,
-    TaskToolState,
+    TaskSessionInputV2, TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -1647,8 +1650,10 @@ async fn submit_task_session(
     granted_capabilities: Vec<String>,
     execution_engine: State<'_, Arc<ExecutionEngine>>,
 ) -> Result<TaskSessionSnapshot, String> {
-    let TaskSessionEnvelope::V1(session) = &envelope;
-    session.validate_agent_runtime_ownership()?;
+    match &envelope {
+        TaskSessionEnvelope::V1(session) => session.validate_agent_runtime_ownership()?,
+        TaskSessionEnvelope::V2(session) => session.validate()?,
+    }
     let engine = execution_engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine
@@ -1662,6 +1667,11 @@ async fn submit_task_session(
     })
     .await
     .map_err(|error| format!("Submit Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
+fn digest_task_session_prompt_input(input: TaskSessionInputV2) -> Result<String, String> {
+    prompt_input_digest(&input)
 }
 
 #[tauri::command]
@@ -2316,15 +2326,22 @@ pub fn run() {
         .expect("Agent runtime profile store init panicked");
     let ai_run_registry = AiRunRegistry::default();
     let workspace_trust = WorkspaceTrustRegistry::default();
-    let runtime_resolver = StoredAgentRuntimeResolver::new(
+    let runtime_resolver = Arc::new(StoredAgentRuntimeResolver::new(
         runtime_profile_store.clone(),
         execution_store.clone(),
         app_secrets.clone(),
         workspace_root.clone(),
         workspace_trust.clone(),
-    );
-    let task_executor =
-        AgentTaskExecutor::new(Arc::new(runtime_resolver), Arc::new(AiWorkerRuntimeRunner));
+    ));
+    let agent_executor = Arc::new(AgentTaskExecutor::new(
+        runtime_resolver.clone(),
+        Arc::new(AiWorkerRuntimeRunner),
+    ));
+    let prompt_executor = Arc::new(PromptTaskExecutor::new(
+        runtime_resolver,
+        Arc::new(AiWorkerPromptRuntimeRunner),
+    ));
+    let task_executor = TaskSessionExecutor::new(agent_executor, prompt_executor);
     let execution_engine = Arc::new(
         ExecutionEngine::open_persistent_with_executor(Arc::new(task_executor))
             .expect("failed to initialize Task Session execution engine"),
@@ -2416,6 +2433,7 @@ pub fn run() {
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
             submit_task_session,
+            digest_task_session_prompt_input,
             cancel_task_session,
             remove_task_session,
             format_code,

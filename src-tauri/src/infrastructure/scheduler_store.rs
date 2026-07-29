@@ -690,10 +690,7 @@ impl SchedulerStore {
             .get_session(session_id)?
             .ok_or_else(|| format!("Task Session {} was not found.", session_id.0))?;
         let envelope = session.request.envelope()?;
-        let envelope = match envelope.as_ref() {
-            Some(TaskSessionEnvelope::V1(envelope)) => Some(envelope),
-            None => None,
-        };
+        let envelope = envelope.as_ref().map(TaskSessionEnvelope::session);
         Ok(TaskMcpContext::from_parts(
             session_id,
             envelope,

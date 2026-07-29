@@ -96,7 +96,14 @@ impl TaskExecutor for AgentTaskExecutor {
             .envelope()
             .map_err(TaskExecutionError::new)?
             .ok_or_else(|| TaskExecutionError::new("Agent task envelope is required."))?;
-        let TaskSessionEnvelope::V1(envelope) = envelope;
+        let envelope = match envelope {
+            TaskSessionEnvelope::V1(envelope) => envelope,
+            TaskSessionEnvelope::V2(_) => {
+                return Err(TaskExecutionError::new(
+                    "AgentTaskExecutor requires a V1 Agent envelope.",
+                ));
+            }
+        };
         if envelope.kind != TaskSessionKind::Agent {
             return Err(TaskExecutionError::new(
                 "AgentTaskExecutor only accepts Agent Task Sessions.",
@@ -266,7 +273,7 @@ pub fn execution_contract_digest(contract: &serde_json::Value) -> Result<String,
     ))
 }
 
-fn emit_runtime_event(
+pub(crate) fn emit_runtime_event(
     reporter: &TaskEventReporter,
     event: AiWorkerStreamEvent,
 ) -> Result<(), String> {
@@ -787,7 +794,10 @@ mod tests {
 
     #[test]
     fn resolved_opencode_model_must_match_the_envelope() {
-        let TaskSessionEnvelope::V1(envelope) = test_envelope();
+        let envelope = match test_envelope() {
+            TaskSessionEnvelope::V1(envelope) => envelope,
+            TaskSessionEnvelope::V2(_) => panic!("expected V1 Agent envelope"),
+        };
         let mut config = test_config();
         config.opencode_model = "other/model".to_string();
         let resolved = ResolvedAgentTask {

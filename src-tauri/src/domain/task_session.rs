@@ -9,7 +9,20 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 /// Current schema version for durable Task Session execution envelopes.
-pub const TASK_SESSION_ENVELOPE_VERSION: u32 = 1;
+pub const TASK_SESSION_ENVELOPE_VERSION: u32 = 2;
+const TASK_SESSION_ENVELOPE_V1: u32 = 1;
+const MAX_TASK_CHAT_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_TASK_CHAT_CONTEXT_BYTES: usize = 512 * 1024;
+const MAX_TASK_EDIT_CONTENT_BYTES: usize = 256 * 1024;
+const MAX_TASK_EDIT_CONTEXT_FILES: usize = 8;
+const MAX_TASK_EDIT_CONTEXT_FILE_BYTES: usize = 128 * 1024;
+const MAX_TASK_EDIT_COMBINED_BYTES: usize = 512 * 1024;
+const MAX_TASK_EDIT_SELECTION_BYTES: usize = 64 * 1024;
+const MAX_TASK_EDIT_DIAGNOSTICS: usize = 50;
+const MAX_TASK_EDIT_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+const MAX_TASK_PROMPT_METADATA_BYTES: usize = 4 * 1024;
+const MAX_TASK_EDIT_INSTRUCTION_BYTES: usize = 64 * 1024;
+const MAX_TASK_PROMPT_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Runtime category requested by a versioned Task Session envelope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,17 +164,230 @@ impl TaskSessionEnvelopeV1 {
     }
 }
 
+/// Immutable Chat input persisted atomically with a Task Session submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskChatInputV2 {
+    /// Durable user-message identifier already committed to the owning conversation.
+    pub message_id: String,
+    /// Durable sequence of the user message within the owning conversation.
+    pub message_sequence: u64,
+    /// Exact user message sent to the runtime.
+    pub message: String,
+    /// Immutable workspace/terminal context snapshot.
+    pub terminal_context: Option<String>,
+    /// Immutable prior-turn and workspace-selection context snapshot.
+    pub session_context: Option<String>,
+}
+
+/// Immutable selected range supplied to an Edit Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskEditSelectionV2 {
+    /// Zero-based selection start line.
+    pub start_line: usize,
+    /// Zero-based UTF-16 selection start character.
+    pub start_character: usize,
+    /// Zero-based selection end line.
+    pub end_line: usize,
+    /// Zero-based UTF-16 selection end character.
+    pub end_character: usize,
+    /// Exact selected text snapshot.
+    pub text: String,
+}
+
+/// Immutable context-file snapshot supplied to an Edit Task Session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskEditContextFileV2 {
+    /// Workspace-relative context file path.
+    pub file_path: String,
+    /// Exact context file content snapshot.
+    pub content: String,
+}
+
+/// Immutable Edit input persisted atomically with a Task Session submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskEditInputV2 {
+    /// Workspace-relative target file path.
+    pub file_path: String,
+    /// User instruction captured with the source snapshot.
+    pub instruction: String,
+    /// Complete target file content snapshot.
+    pub content: String,
+    /// Optional editor selection captured atomically with the content.
+    pub selection: Option<TaskEditSelectionV2>,
+    /// Explicit pinned context file snapshots.
+    pub context_files: Vec<TaskEditContextFileV2>,
+    /// Redacted diagnostics captured with the edit request.
+    pub diagnostics: Vec<String>,
+}
+
+/// Kind-specific immutable prompt input for envelope schema V2.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "input", rename_all = "snake_case")]
+pub enum TaskSessionInputV2 {
+    /// Immutable Chat turn input.
+    Chat(TaskChatInputV2),
+    /// Immutable Edit proposal input.
+    Edit(TaskEditInputV2),
+}
+
+/// Envelope schema V2 binding common runtime references to immutable Chat/Edit input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskSessionEnvelopeV2 {
+    /// Common runtime identity, ownership, revisions, and capability references.
+    pub session: TaskSessionEnvelopeV1,
+    /// Immutable kind-specific prompt input.
+    pub prompt_input: TaskSessionInputV2,
+}
+
+impl TaskSessionEnvelopeV2 {
+    /// Validates kind-specific immutable prompt ownership before persistence or execution.
+    pub fn validate(&self) -> Result<(), String> {
+        self.session.validate()?;
+        if [
+            self.session.workspace_id.as_str(),
+            self.session.context_digest.as_str(),
+            self.session.runtime_profile_id.as_str(),
+            self.session.model.as_str(),
+            self.session.prompt_template_version.as_str(),
+        ]
+        .iter()
+        .any(|value| value.len() > MAX_TASK_PROMPT_METADATA_BYTES)
+        {
+            return Err("Prompt Task Session metadata exceeds its size limit.".to_string());
+        }
+        for (name, value) in [
+            ("context_revision", self.session.context_revision.as_deref()),
+            ("rules_revision", self.session.rules_revision.as_deref()),
+            ("skills_revision", self.session.skills_revision.as_deref()),
+        ] {
+            if value.is_none_or(|value| value.trim().is_empty() || value != value.trim()) {
+                return Err(format!(
+                    "Prompt Task Session ownership field '{name}' is required."
+                ));
+            }
+        }
+        if !self.session.connector_ids.is_empty()
+            || self
+                .session
+                .requested_capabilities
+                .iter()
+                .any(|capability| capability.starts_with("external_tools:"))
+        {
+            return Err(
+                "Chat/Edit Task Sessions do not enable MCP connectors or external tools."
+                    .to_string(),
+            );
+        }
+        match (&self.session.kind, &self.prompt_input) {
+            (TaskSessionKind::Chat, TaskSessionInputV2::Chat(input)) => {
+                if self
+                    .session
+                    .conversation_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty() || value != value.trim())
+                    || input.message_id.trim().is_empty()
+                    || input.message_id != input.message_id.trim()
+                    || input.message.trim().is_empty()
+                    || input.message != input.message.trim()
+                {
+                    return Err(
+                        "Chat Task Session requires conversation, message ID, and message input."
+                            .to_string(),
+                    );
+                }
+                if input.message.len() > MAX_TASK_CHAT_MESSAGE_BYTES
+                    || input.message_id.len() > MAX_TASK_PROMPT_METADATA_BYTES
+                    || input
+                        .terminal_context
+                        .as_ref()
+                        .is_some_and(|context| context.len() > MAX_TASK_CHAT_CONTEXT_BYTES)
+                    || input
+                        .session_context
+                        .as_ref()
+                        .is_some_and(|context| context.len() > MAX_TASK_CHAT_CONTEXT_BYTES)
+                {
+                    return Err("Chat Task Session input exceeds its size limit.".to_string());
+                }
+            }
+            (TaskSessionKind::Edit, TaskSessionInputV2::Edit(input)) => {
+                if input.file_path.trim().is_empty()
+                    || input.file_path != input.file_path.trim()
+                    || input.instruction.trim().is_empty()
+                    || input.instruction != input.instruction.trim()
+                {
+                    return Err(
+                        "Edit Task Session requires a canonical file path and instruction."
+                            .to_string(),
+                    );
+                }
+                if input.content.len() > MAX_TASK_EDIT_CONTENT_BYTES
+                    || input.file_path.len() > MAX_TASK_PROMPT_METADATA_BYTES
+                    || input.instruction.len() > MAX_TASK_EDIT_INSTRUCTION_BYTES
+                    || input.context_files.len() > MAX_TASK_EDIT_CONTEXT_FILES
+                    || input.selection.as_ref().is_some_and(|selection| {
+                        selection.text.len() > MAX_TASK_EDIT_SELECTION_BYTES
+                    })
+                    || input.diagnostics.len() > MAX_TASK_EDIT_DIAGNOSTICS
+                    || input
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.len() > MAX_TASK_EDIT_DIAGNOSTIC_BYTES)
+                {
+                    return Err("Edit Task Session input exceeds its size limit.".to_string());
+                }
+                let mut paths = HashSet::new();
+                let mut combined_bytes = input.content.len();
+                for file in &input.context_files {
+                    if file.file_path.trim().is_empty()
+                        || file.file_path != file.file_path.trim()
+                        || file.file_path == input.file_path
+                        || file.content.len() > MAX_TASK_EDIT_CONTEXT_FILE_BYTES
+                        || !paths.insert(file.file_path.as_str())
+                    {
+                        return Err("Edit Task Session context file is invalid.".to_string());
+                    }
+                    combined_bytes = combined_bytes.saturating_add(file.content.len());
+                }
+                if combined_bytes > MAX_TASK_EDIT_COMBINED_BYTES {
+                    return Err(
+                        "Edit Task Session combined content exceeds its size limit.".to_string()
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "Task Session kind does not match its immutable prompt input.".to_string(),
+                );
+            }
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("Failed to encode prompt Task Session envelope: {error}"))?;
+        if encoded.len() > MAX_TASK_PROMPT_ENVELOPE_BYTES {
+            return Err("Prompt Task Session envelope exceeds its size limit.".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Versioned durable Task Session execution envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskSessionEnvelope {
     /// Initial non-secret execution-envelope schema.
     V1(TaskSessionEnvelopeV1),
+    /// Immutable kind-specific Chat/Edit prompt-input schema.
+    V2(TaskSessionEnvelopeV2),
 }
 
 #[derive(Deserialize, Serialize)]
-struct TaskSessionEnvelopeWire {
+struct TaskSessionEnvelopeWireV1 {
     schema_version: u32,
     session: TaskSessionEnvelopeV1,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TaskSessionEnvelopeWireV2 {
+    schema_version: u32,
+    session: TaskSessionEnvelopeV2,
 }
 
 impl Serialize for TaskSessionEnvelope {
@@ -170,7 +396,12 @@ impl Serialize for TaskSessionEnvelope {
         S: Serializer,
     {
         match self {
-            Self::V1(session) => TaskSessionEnvelopeWire {
+            Self::V1(session) => TaskSessionEnvelopeWireV1 {
+                schema_version: TASK_SESSION_ENVELOPE_V1,
+                session: session.clone(),
+            }
+            .serialize(serializer),
+            Self::V2(session) => TaskSessionEnvelopeWireV2 {
                 schema_version: TASK_SESSION_ENVELOPE_VERSION,
                 session: session.clone(),
             }
@@ -184,9 +415,18 @@ impl<'de> Deserialize<'de> for TaskSessionEnvelope {
     where
         D: Deserializer<'de>,
     {
-        let wire = TaskSessionEnvelopeWire::deserialize(deserializer)?;
-        match wire.schema_version {
-            TASK_SESSION_ENVELOPE_VERSION => Ok(Self::V1(wire.session)),
+        let value = Value::deserialize(deserializer)?;
+        let version = value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| D::Error::custom("Task Session envelope schema version is required."))?;
+        match version {
+            1 => serde_json::from_value::<TaskSessionEnvelopeWireV1>(value)
+                .map(|wire| Self::V1(wire.session))
+                .map_err(D::Error::custom),
+            2 => serde_json::from_value::<TaskSessionEnvelopeWireV2>(value)
+                .map(|wire| Self::V2(wire.session))
+                .map_err(D::Error::custom),
             version => Err(D::Error::custom(format!(
                 "Unsupported Task Session envelope schema version {version}."
             ))),
@@ -198,7 +438,16 @@ impl TaskSessionEnvelope {
     /// Returns the numeric schema version persisted with this envelope.
     pub fn schema_version(&self) -> u32 {
         match self {
-            Self::V1(_) => TASK_SESSION_ENVELOPE_VERSION,
+            Self::V1(_) => TASK_SESSION_ENVELOPE_V1,
+            Self::V2(_) => TASK_SESSION_ENVELOPE_VERSION,
+        }
+    }
+
+    /// Returns common runtime references regardless of envelope schema version.
+    pub fn session(&self) -> &TaskSessionEnvelopeV1 {
+        match self {
+            Self::V1(session) => session,
+            Self::V2(envelope) => &envelope.session,
         }
     }
 
@@ -206,6 +455,7 @@ impl TaskSessionEnvelope {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::V1(envelope) => envelope.validate(),
+            Self::V2(envelope) => envelope.validate(),
         }
     }
 }
@@ -663,6 +913,71 @@ mod tests {
         assert_eq!(request.envelope().expect("decoded"), Some(envelope));
         assert!(!request.payload.contains("api_key"));
         assert!(!request.payload.contains("secret"));
+    }
+
+    #[test]
+    fn prompt_envelope_v2_round_trips_immutable_chat_input() {
+        let prompt_input = TaskSessionInputV2::Chat(TaskChatInputV2 {
+            message_id: "message-1".to_string(),
+            message_sequence: 1,
+            message: "hello".to_string(),
+            terminal_context: Some("workspace".to_string()),
+            session_context: Some("prior turns".to_string()),
+        });
+        let envelope = TaskSessionEnvelope::V2(TaskSessionEnvelopeV2 {
+            session: TaskSessionEnvelopeV1 {
+                workspace_id: "workspace-personal".to_string(),
+                kind: TaskSessionKind::Chat,
+                subject_id: None,
+                conversation_id: Some("conversation-1".to_string()),
+                execution_run_id: None,
+                context_digest: "sha256:prompt".to_string(),
+                runtime_profile_id: "profile-1".to_string(),
+                model: "openai/gpt-5".to_string(),
+                connector_ids: Vec::new(),
+                requested_capabilities: Vec::new(),
+                prompt_template_version: "prompt-v2".to_string(),
+                context_revision: Some("1".to_string()),
+                rules_revision: Some("rules-v1".to_string()),
+                skills_revision: Some("skills-v1".to_string()),
+            },
+            prompt_input,
+        });
+        let request = TaskRequest::from_envelope("chat", &envelope).expect("serialized");
+        let encoded = serde_json::to_value(&envelope).expect("encoded");
+        assert_eq!(encoded["schema_version"], serde_json::json!(2));
+        assert_eq!(request.envelope().expect("decoded"), Some(envelope));
+    }
+
+    #[test]
+    fn prompt_envelope_v2_rejects_oversized_input_before_enqueue() {
+        let envelope = TaskSessionEnvelope::V2(TaskSessionEnvelopeV2 {
+            session: TaskSessionEnvelopeV1 {
+                workspace_id: "workspace-personal".to_string(),
+                kind: TaskSessionKind::Edit,
+                subject_id: None,
+                conversation_id: None,
+                execution_run_id: None,
+                context_digest: "sha256:prompt".to_string(),
+                runtime_profile_id: "profile-1".to_string(),
+                model: "openai/gpt-5".to_string(),
+                connector_ids: Vec::new(),
+                requested_capabilities: Vec::new(),
+                prompt_template_version: "prompt-v2".to_string(),
+                context_revision: Some("1".to_string()),
+                rules_revision: Some("rules-v1".to_string()),
+                skills_revision: Some("skills-v1".to_string()),
+            },
+            prompt_input: TaskSessionInputV2::Edit(TaskEditInputV2 {
+                file_path: "src/main.rs".to_string(),
+                instruction: "update".to_string(),
+                content: "x".repeat(MAX_TASK_EDIT_CONTENT_BYTES + 1),
+                selection: None,
+                context_files: Vec::new(),
+                diagnostics: Vec::new(),
+            }),
+        });
+        assert!(TaskRequest::from_envelope("oversized", &envelope).is_err());
     }
 
     #[test]

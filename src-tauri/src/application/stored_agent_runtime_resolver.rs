@@ -19,6 +19,12 @@ pub struct StoredAgentRuntimeResolver {
     workspace_trust: WorkspaceTrustRegistry,
 }
 
+/// Trusted non-secret identity and owned runtime configuration for one prompt attempt.
+pub(crate) struct ResolvedPromptRuntime {
+    pub runtime_profile_id: String,
+    pub config: AiWorkerConfig,
+}
+
 impl StoredAgentRuntimeResolver {
     /// Creates a resolver that borrows singleton stores but resolves per-session runtime state.
     ///
@@ -40,18 +46,12 @@ impl StoredAgentRuntimeResolver {
             workspace_trust,
         }
     }
-}
 
-impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
-    fn resolve(
+    /// Resolves one trusted runtime configuration without resolving a kind-specific prompt input.
+    pub(crate) fn resolve_prompt_runtime(
         &self,
         envelope: &TaskSessionEnvelopeV1,
-        runtime_attempt_id: &str,
-    ) -> Result<ResolvedAgentTask, String> {
-        if runtime_attempt_id.trim().is_empty() {
-            return Err("Agent runtime attempt ID is required.".to_string());
-        }
-        envelope.validate_agent_runtime_ownership()?;
+    ) -> Result<ResolvedPromptRuntime, String> {
         let profile = self
             .profiles
             .get(&envelope.runtime_profile_id)?
@@ -68,34 +68,7 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             .require_trusted(&self.workspace_roots, &envelope.workspace_id)?;
         let workspace_revision = self.workspace_roots.revision(&envelope.workspace_id)?;
         if envelope.context_revision.as_deref() != Some(workspace_revision.to_string().as_str()) {
-            return Err("Agent workspace revision did not match the envelope.".to_string());
-        }
-
-        let execution_run_id = envelope
-            .execution_run_id
-            .as_deref()
-            .ok_or_else(|| "Agent execution run ID is required.".to_string())?;
-        let conversation_id = envelope
-            .conversation_id
-            .as_deref()
-            .ok_or_else(|| "Agent conversation ID is required.".to_string())?;
-        if !self
-            .executions
-            .conversation_exists(&envelope.workspace_id, conversation_id)?
-        {
-            return Err("Agent conversation does not belong to this workspace.".to_string());
-        }
-        let run = self
-            .executions
-            .get(execution_run_id)?
-            .ok_or_else(|| format!("Execution run '{execution_run_id}' was not found."))?;
-        if run
-            .contract
-            .get("workspace_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(envelope.workspace_id.as_str())
-        {
-            return Err("Execution contract workspace did not match the envelope.".to_string());
+            return Err("Prompt workspace revision did not match the envelope.".to_string());
         }
 
         let (provider_id, model) = profile
@@ -128,7 +101,7 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        Ok(ResolvedAgentTask {
+        Ok(ResolvedPromptRuntime {
             runtime_profile_id: profile.id,
             config: AiWorkerConfig {
                 workspace_id: envelope.workspace_id.clone(),
@@ -151,6 +124,80 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
                 isolated_opencode_process: true,
                 mcp_servers,
             },
+        })
+    }
+
+    /// Verifies that a Chat prompt references the exact durable user message it owns.
+    pub(crate) fn verify_chat_message(
+        &self,
+        envelope: &TaskSessionEnvelopeV1,
+        message_id: &str,
+        message_sequence: u64,
+        message: &str,
+    ) -> Result<(), String> {
+        let conversation_id = envelope
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| "Chat conversation ID is required.".to_string())?;
+        if !self.executions.conversation_message_matches(
+            &envelope.workspace_id,
+            conversation_id,
+            message_id,
+            message_sequence,
+            "user",
+            message,
+        )? {
+            return Err(
+                "Chat Task Session message was not durably committed to its conversation."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
+    fn resolve(
+        &self,
+        envelope: &TaskSessionEnvelopeV1,
+        runtime_attempt_id: &str,
+    ) -> Result<ResolvedAgentTask, String> {
+        if runtime_attempt_id.trim().is_empty() {
+            return Err("Agent runtime attempt ID is required.".to_string());
+        }
+        envelope.validate_agent_runtime_ownership()?;
+        let runtime = self.resolve_prompt_runtime(envelope)?;
+
+        let execution_run_id = envelope
+            .execution_run_id
+            .as_deref()
+            .ok_or_else(|| "Agent execution run ID is required.".to_string())?;
+        let conversation_id = envelope
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| "Agent conversation ID is required.".to_string())?;
+        if !self
+            .executions
+            .conversation_exists(&envelope.workspace_id, conversation_id)?
+        {
+            return Err("Agent conversation does not belong to this workspace.".to_string());
+        }
+        let run = self
+            .executions
+            .get(execution_run_id)?
+            .ok_or_else(|| format!("Execution run '{execution_run_id}' was not found."))?;
+        if run
+            .contract
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.workspace_id.as_str())
+        {
+            return Err("Execution contract workspace did not match the envelope.".to_string());
+        }
+
+        Ok(ResolvedAgentTask {
+            runtime_profile_id: runtime.runtime_profile_id,
+            config: runtime.config,
             task: AiWorkerTask {
                 execution_contract: Some(run.contract),
                 session_key: Some(runtime_attempt_id.to_string()),

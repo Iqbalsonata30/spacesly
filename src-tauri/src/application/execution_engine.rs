@@ -585,9 +585,7 @@ impl ExecutionEngine {
                 "Task label is required.".to_string(),
             ));
         }
-        let requested = match envelope {
-            TaskSessionEnvelope::V1(session) => &session.requested_capabilities,
-        };
+        let requested = &envelope.session().requested_capabilities;
         if let Some(capability) = capabilities
             .iter()
             .find(|capability| !requested.contains(capability))

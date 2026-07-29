@@ -9,25 +9,76 @@ export type TaskSessionEventKind = "lifecycle" | "activity" | "progress" | "runt
 
 export type TaskSessionKind = "agent" | "chat" | "edit";
 
-export type TaskSessionEnvelope = {
+export type TaskSessionEnvelopeV1Data = {
+  workspace_id: string;
+  kind: TaskSessionKind;
+  subject_id: string | null;
+  conversation_id: string | null;
+  execution_run_id: string | null;
+  context_digest: string;
+  runtime_profile_id: string;
+  model: string;
+  connector_ids: string[];
+  requested_capabilities: string[];
+  prompt_template_version: string;
+  context_revision: string | null;
+  rules_revision: string | null;
+  skills_revision: string | null;
+};
+
+export type TaskSessionEnvelopeV1 = {
   schema_version: 1;
-  session: {
-    workspace_id: string;
-    kind: TaskSessionKind;
-    subject_id: string | null;
-    conversation_id: string | null;
-    execution_run_id: string | null;
-    context_digest: string;
-    runtime_profile_id: string;
-    model: string;
-    connector_ids: string[];
-    requested_capabilities: string[];
-    prompt_template_version: string;
-    context_revision: string | null;
-    rules_revision: string | null;
-    skills_revision: string | null;
+  session: TaskSessionEnvelopeV1Data;
+};
+
+export type TaskChatInputV2 = {
+  kind: "chat";
+  input: {
+    message_id: string;
+    message_sequence: number;
+    message: string;
+    terminal_context: string | null;
+    session_context: string | null;
   };
 };
+
+export type TaskEditInputV2 = {
+  kind: "edit";
+  input: {
+    file_path: string;
+    instruction: string;
+    content: string;
+    selection: {
+      start_line: number;
+      start_character: number;
+      end_line: number;
+      end_character: number;
+      text: string;
+    } | null;
+    context_files: Array<{ file_path: string; content: string }>;
+    diagnostics: string[];
+  };
+};
+
+export type TaskSessionInputV2 = TaskChatInputV2 | TaskEditInputV2;
+
+export type TaskSessionEnvelopeV2 =
+  | {
+      schema_version: 2;
+      session: {
+        session: TaskSessionEnvelopeV1Data & { kind: "chat" };
+        prompt_input: TaskChatInputV2;
+      };
+    }
+  | {
+      schema_version: 2;
+      session: {
+        session: TaskSessionEnvelopeV1Data & { kind: "edit" };
+        prompt_input: TaskEditInputV2;
+      };
+    };
+
+export type TaskSessionEnvelope = TaskSessionEnvelopeV1 | TaskSessionEnvelopeV2;
 
 export type AgentRuntimeProfile = {
   id: string;
@@ -174,6 +225,15 @@ export function submitTaskSession(
     "submit_task_session",
     { label, envelope, grantedCapabilities },
     IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+/** Returns the backend-canonical integrity digest for immutable Chat/Edit prompt input. */
+export function digestTaskSessionPromptInput(input: TaskSessionInputV2): Promise<string> {
+  return invokeWithPolicy(
+    "digest_task_session_prompt_input",
+    { input },
+    IPC_POLICIES.taskSessionRead,
   );
 }
 

@@ -412,6 +412,44 @@ impl ExecutionStore {
         conversation_exists_in(&connection, workspace_id, conversation_id)
     }
 
+    /// Returns whether one durable message exactly matches its conversation, role, and text.
+    pub fn conversation_message_matches(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        sequence: u64,
+        role: &str,
+        text: &str,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT 1
+                   FROM conversation_messages messages
+                   JOIN conversations conversations
+                     ON conversations.conversation_id = messages.conversation_id
+                  WHERE conversations.workspace_id = ?1
+                    AND messages.conversation_id = ?2
+                    AND messages.message_id = ?3
+                    AND messages.sequence = ?4
+                    AND messages.role = ?5
+                    AND messages.text = ?6",
+                params![
+                    workspace_id,
+                    conversation_id,
+                    message_id,
+                    sequence,
+                    role,
+                    text
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|match_| match_.is_some())
+            .map_err(|error| format!("Failed to verify conversation message ownership: {error}"))
+    }
+
     pub fn append_conversation_message(
         &self,
         workspace_id: &str,
@@ -891,6 +929,26 @@ mod tests {
             .unwrap());
         assert!(!store
             .conversation_exists("workspace-b", "conversation-a")
+            .unwrap());
+        assert!(store
+            .conversation_message_matches(
+                "workspace-a",
+                "conversation-a",
+                "message-1",
+                1,
+                "user",
+                "Private"
+            )
+            .unwrap());
+        assert!(!store
+            .conversation_message_matches(
+                "workspace-b",
+                "conversation-a",
+                "message-1",
+                1,
+                "user",
+                "Private"
+            )
             .unwrap());
     }
 
