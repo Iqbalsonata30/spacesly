@@ -360,7 +360,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     struct FakeResolver {
@@ -396,6 +396,10 @@ mod tests {
     struct IsolationRunner {
         barrier: Arc<Barrier>,
         seen: Arc<Mutex<Vec<(String, u64, u64, u64)>>>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        origin: Instant,
+        intervals: Arc<Mutex<Vec<(u64, u128, u128)>>>,
     }
 
     struct BlockedRunner;
@@ -488,6 +492,9 @@ mod tests {
             _cancellation: Arc<AtomicBool>,
             mut on_event: AiWorkerEventCallback,
         ) -> Result<AiWorkerTaskResult, String> {
+            let started_at = self.origin.elapsed().as_millis();
+            let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(current, Ordering::SeqCst);
             let authority = config.mcp_servers[0]
                 .proxy_authority
                 .as_ref()
@@ -526,6 +533,14 @@ mod tests {
                 "session:{}",
                 authority.session_id.0
             )))?;
+            std::thread::sleep(Duration::from_millis(20));
+            let completed_at = self.origin.elapsed().as_millis();
+            self.intervals.lock().expect("interval lock").push((
+                authority.session_id.0,
+                started_at,
+                completed_at,
+            ));
+            self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(AiWorkerTaskResult {
                 summary: "complete".to_string(),
                 evidence: Vec::new(),
@@ -591,17 +606,24 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_agent_sessions_get_isolated_runtime_and_tool_authority() {
+    fn five_agent_sessions_execute_simultaneously_with_isolated_runtime_and_tool_authority() {
         let directory = tempdir().expect("temp directory");
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let intervals = Arc::new(Mutex::new(Vec::new()));
         let executor = AgentTaskExecutor::new(
             Arc::new(FakeResolver {
                 attempts: Arc::new(Mutex::new(Vec::new())),
                 runtime_profile_id: "profile-1".to_string(),
             }),
             Arc::new(IsolationRunner {
-                barrier: Arc::new(Barrier::new(2)),
+                barrier: Arc::new(Barrier::new(5)),
                 seen: seen.clone(),
+                active: active.clone(),
+                maximum: maximum.clone(),
+                origin: Instant::now(),
+                intervals: intervals.clone(),
             }),
         );
         let engine = ExecutionEngine::open_persistent_at_with_executor(
@@ -609,68 +631,80 @@ mod tests {
             directory.path().join("scheduler.db"),
         )
         .expect("engine starts");
-        let first_envelope = test_envelope();
-        let mut second_envelope = test_envelope();
-        let TaskSessionEnvelope::V1(second_session) = &mut second_envelope else {
-            unreachable!();
-        };
-        second_session.subject_id = Some("card-2".to_string());
-        second_session.conversation_id = Some("conversation-2".to_string());
-        second_session.execution_run_id = Some("run-2".to_string());
-        let first = engine
-            .submit_envelope_with_grants(
-                "isolated-agent-1",
-                &first_envelope,
-                vec!["external_tools:jira".to_string()],
-                "test-approval",
-            )
-            .expect("first task submitted");
-        let second = engine
-            .submit_envelope_with_grants(
-                "isolated-agent-2",
-                &second_envelope,
-                vec!["external_tools:jira".to_string()],
-                "test-approval",
-            )
-            .expect("second task submitted");
+        let sessions = (1..=5)
+            .map(|index| {
+                let mut envelope = test_envelope();
+                let TaskSessionEnvelope::V1(session) = &mut envelope else {
+                    unreachable!();
+                };
+                session.subject_id = Some(format!("card-{index}"));
+                session.conversation_id = Some(format!("conversation-{index}"));
+                session.execution_run_id = Some(format!("run-{index}"));
+                engine
+                    .submit_envelope_with_grants(
+                        format!("isolated-agent-{index}"),
+                        &envelope,
+                        vec!["external_tools:jira".to_string()],
+                        "test-approval",
+                    )
+                    .expect("task submitted")
+            })
+            .collect::<Vec<_>>();
 
-        engine
-            .wait_for_terminal(first.id, Duration::from_secs(5))
-            .expect("first completes");
-        engine
-            .wait_for_terminal(second.id, Duration::from_secs(5))
-            .expect("second completes");
+        for session in &sessions {
+            engine
+                .wait_for_terminal(session.id, Duration::from_secs(5))
+                .expect("task completes");
+        }
         let seen = seen.lock().expect("seen lock").clone();
-        assert_eq!(seen.len(), 2);
-        assert_ne!(seen[0].0, seen[1].0);
-        assert_ne!(seen[0].1, seen[1].1);
-        assert_ne!(seen[0].2, seen[1].2);
-        assert_eq!(seen[0].3, 1);
-        assert_eq!(seen[1].3, 1);
-        assert!(engine
-            .events_after(first.id, 0)
-            .expect("first events")
-            .iter()
-            .all(|event| event.session_id == first.id));
-        assert!(engine
-            .events_after(second.id, 0)
-            .expect("second events")
-            .iter()
-            .all(|event| event.session_id == second.id));
-        let first_tools = TaskToolState::from_events(
-            first.id,
-            &engine.events_after(first.id, 0).expect("first events"),
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            seen.iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            5
         );
-        let second_tools = TaskToolState::from_events(
-            second.id,
-            &engine.events_after(second.id, 0).expect("second events"),
+        assert_eq!(
+            seen.iter()
+                .map(|entry| entry.1)
+                .collect::<HashSet<_>>()
+                .len(),
+            5
         );
-        assert_eq!(first_tools.calls.len(), 1);
-        assert_eq!(second_tools.calls.len(), 1);
-        assert_ne!(
-            first_tools.calls[0].tool_call_id,
-            second_tools.calls[0].tool_call_id
+        assert_eq!(maximum.load(Ordering::SeqCst), 5);
+        let intervals = intervals.lock().expect("interval lock").clone();
+        assert_eq!(intervals.len(), 5);
+        let latest_start = intervals.iter().map(|entry| entry.1).max().unwrap();
+        let earliest_finish = intervals.iter().map(|entry| entry.2).min().unwrap();
+        assert!(
+            latest_start < earliest_finish,
+            "all Agent runtime intervals must overlap"
         );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| {
+                    engine
+                        .session(session.id)
+                        .expect("session read")
+                        .expect("session exists")
+                        .worker_id
+                        .expect("worker assigned")
+                })
+                .collect::<HashSet<_>>()
+                .len(),
+            5
+        );
+        for session in sessions {
+            let events = engine.events_after(session.id, 0).expect("events");
+            assert!(events.iter().all(|event| event.session_id == session.id));
+            let tools = TaskToolState::from_events(session.id, &events);
+            assert_eq!(tools.calls.len(), 1);
+            assert!(events.iter().any(|event| {
+                event.kind == TaskSessionEventKind::Runtime && event.payload["type"] == "text_delta"
+            }));
+        }
     }
 
     #[test]

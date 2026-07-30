@@ -4632,8 +4632,17 @@
     targetSessionId = workspaceChatActiveSessionId,
   ): Promise<string> {
     const results: string[] = [];
+    let pendingAgentStarts: Promise<void>[] = [];
+
+    const flushAgentStarts = async () => {
+      if (pendingAgentStarts.length === 0) return;
+      const starts = pendingAgentStarts;
+      pendingAgentStarts = [];
+      await Promise.allSettled(starts);
+    };
 
     for (const action of actions.slice(0, 5)) {
+      if (action.type !== "start_agent") await flushAgentStarts();
       if (action.type === "create_task") {
         const card = createBoardTask(
           action.title,
@@ -4730,7 +4739,7 @@
           },
           targetSessionId,
         );
-        await startWorkerForCard(card.id);
+        pendingAgentStarts.push(startWorkerForCard(card.id, true));
         results.push(
           `Agent start requested for ${ticketLabel(card)}: "${card.title}". Open Agent Console from the board toolbar when you need run details.`,
         );
@@ -4759,6 +4768,8 @@
         );
       }
     }
+
+    await flushAgentStarts();
 
     return results.length > 0
       ? `Command result: ${results.join(" ")}`
@@ -6584,7 +6595,7 @@
     }
   }
 
-  async function startWorkerForCard(cardId: string) {
+  async function startWorkerForCard(cardId: string, backlogAlreadyApproved = false) {
     const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
     if (
       runningWorkerCardIds[cardId] ||
@@ -6610,7 +6621,7 @@
     const runId = `agent-${cardId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
     runningWorkerRunIds = { ...runningWorkerRunIds, [cardId]: runId };
-    if (!(await requestBacklogStartConfirmation(card))) {
+    if (!backlogAlreadyApproved && !(await requestBacklogStartConfirmation(card))) {
       finishWorkerRun(cardId, runId);
       return;
     }
