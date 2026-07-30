@@ -1,7 +1,7 @@
 use super::agent_task_executor::{AgentRuntimeResolver, ResolvedAgentTask};
 use crate::domain::task_session::TaskSessionEnvelopeV1;
 use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerMcpServer, AiWorkerTask};
-use crate::infrastructure::execution_store::ExecutionStore;
+use crate::infrastructure::execution_store::{ChatConversationSnapshot, ExecutionStore};
 use crate::infrastructure::files::WorkspaceRoot;
 use crate::infrastructure::provider_registry;
 use crate::infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
@@ -23,6 +23,7 @@ pub struct StoredAgentRuntimeResolver {
 pub(crate) struct ResolvedPromptRuntime {
     pub runtime_profile_id: String,
     pub config: AiWorkerConfig,
+    pub chat_snapshot: Option<ChatConversationSnapshot>,
 }
 
 impl StoredAgentRuntimeResolver {
@@ -66,9 +67,12 @@ impl StoredAgentRuntimeResolver {
         let workspace = self
             .workspace_trust
             .require_trusted(&self.workspace_roots, &envelope.workspace_id)?;
-        let workspace_revision = self.workspace_roots.revision(&envelope.workspace_id)?;
-        if envelope.context_revision.as_deref() != Some(workspace_revision.to_string().as_str()) {
-            return Err("Prompt workspace revision did not match the envelope.".to_string());
+        if envelope.kind != crate::domain::task_session::TaskSessionKind::Chat {
+            let workspace_revision = self.workspace_roots.revision(&envelope.workspace_id)?;
+            if envelope.context_revision.as_deref() != Some(workspace_revision.to_string().as_str())
+            {
+                return Err("Prompt workspace revision did not match the envelope.".to_string());
+            }
         }
 
         let (provider_id, model) = profile
@@ -124,35 +128,37 @@ impl StoredAgentRuntimeResolver {
                 task_tool_authority: None,
                 mcp_servers,
             },
+            chat_snapshot: None,
         })
     }
 
-    /// Verifies that a Chat prompt references the exact durable user message it owns.
-    pub(crate) fn verify_chat_message(
+    /// Resolves an exact backend-owned Chat snapshot from durable conversation state.
+    pub(crate) fn resolve_chat_snapshot(
         &self,
         envelope: &TaskSessionEnvelopeV1,
         message_id: &str,
         message_sequence: u64,
         message: &str,
-    ) -> Result<(), String> {
+    ) -> Result<ChatConversationSnapshot, String> {
         let conversation_id = envelope
             .conversation_id
             .as_deref()
             .ok_or_else(|| "Chat conversation ID is required.".to_string())?;
-        if !self.executions.conversation_message_matches(
+        self.executions.resolve_chat_snapshot(
             &envelope.workspace_id,
             conversation_id,
             message_id,
             message_sequence,
-            "user",
             message,
-        )? {
-            return Err(
-                "Chat Task Session message was not durably committed to its conversation."
-                    .to_string(),
-            );
-        }
-        Ok(())
+        )
+    }
+
+    /// Revalidates that a resolved Chat snapshot remains the current durable model authority.
+    pub(crate) fn revalidate_chat_snapshot(
+        &self,
+        snapshot: &ChatConversationSnapshot,
+    ) -> Result<(), String> {
+        self.executions.revalidate_chat_snapshot(snapshot)
     }
 }
 

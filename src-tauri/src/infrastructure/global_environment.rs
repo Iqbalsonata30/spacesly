@@ -66,7 +66,11 @@ impl GlobalEnvironmentStore {
     }
 
     pub fn list(&self) -> Result<Vec<GlobalEnvironmentVariableView>, String> {
-        let mut variables = self.variables.lock().map_err(|error| error.to_string())?.clone();
+        let mut variables = self
+            .variables
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
         variables.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(variables.into_iter().map(redacted_view).collect())
     }
@@ -80,7 +84,10 @@ impl GlobalEnvironmentStore {
         Ok(variable.value.clone())
     }
 
-    pub fn save(&self, input: GlobalEnvironmentVariableInput) -> Result<GlobalEnvironmentVariableView, String> {
+    pub fn save(
+        &self,
+        input: GlobalEnvironmentVariableInput,
+    ) -> Result<GlobalEnvironmentVariableView, String> {
         let key = input.key.trim().to_string();
         validate_environment_key(&key)?;
 
@@ -97,14 +104,18 @@ impl GlobalEnvironmentStore {
             .iter()
             .any(|entry| entry.id != id && entry.key == key)
         {
-            return Err(format!("Global environment key '{key}' is already defined."));
+            return Err(format!(
+                "Global environment key '{key}' is already defined."
+            ));
         }
 
         let existing_value = variables
             .iter()
             .find(|entry| entry.id == id)
             .map(|entry| entry.value.clone());
-        let value = input.value.unwrap_or_else(|| existing_value.unwrap_or_default());
+        let value = input
+            .value
+            .unwrap_or_else(|| existing_value.unwrap_or_default());
         if value.is_empty() {
             return Err("Global environment value is required.".to_string());
         }
@@ -188,7 +199,11 @@ fn redacted_view(variable: GlobalEnvironmentVariable) -> GlobalEnvironmentVariab
     GlobalEnvironmentVariableView {
         id: variable.id,
         key: variable.key,
-        value: if variable.secret { String::new() } else { variable.value.clone() },
+        value: if variable.secret {
+            String::new()
+        } else {
+            variable.value.clone()
+        },
         secret: variable.secret,
         enabled: variable.enabled,
         value_set: !variable.value.is_empty(),
@@ -207,7 +222,9 @@ fn validate_environment_key(key: &str) -> Result<(), String> {
         return Err("Environment key must start with a letter or underscore.".to_string());
     }
     if !chars.all(|character| character == '_' || character.is_ascii_alphanumeric()) {
-        return Err("Environment key may only contain letters, numbers, and underscores.".to_string());
+        return Err(
+            "Environment key may only contain letters, numbers, and underscores.".to_string(),
+        );
     }
     Ok(())
 }
@@ -238,7 +255,8 @@ fn load_global_environment_file() -> Result<GlobalEnvironmentFile, String> {
     }
     let raw = fs::read_to_string(&path)
         .map_err(|error| format!("Failed to read global environment: {error}"))?;
-    serde_json::from_str(&raw).map_err(|error| format!("Failed to parse global environment: {error}"))
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("Failed to parse global environment: {error}"))
 }
 
 fn persist_global_environment_file(variables: &[GlobalEnvironmentVariable]) -> Result<(), String> {

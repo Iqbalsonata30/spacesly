@@ -2,9 +2,10 @@ use crate::application::execution_engine::CompletionProjector;
 use crate::domain::execution::{ExecutionRun, StepRun};
 use crate::domain::task_session::{AgentTaskCompletionStatus, TaskExecutionOutput};
 use crate::infrastructure::scheduler_store::StagedCompletion;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,15 +25,19 @@ const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
        message_id TEXT PRIMARY KEY,
        conversation_id TEXT NOT NULL,
        sequence INTEGER NOT NULL,
-       role TEXT NOT NULL,
-       text TEXT NOT NULL,
-       created_at INTEGER NOT NULL,
-       UNIQUE(conversation_id, sequence),
+        role TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        authority TEXT NOT NULL DEFAULT 'legacy_renderer',
+        UNIQUE(conversation_id, sequence),
        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
          ON DELETE CASCADE
      );
-     CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
-       ON conversation_messages(conversation_id, sequence);";
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
+        ON conversation_messages(conversation_id, sequence);";
+
+const MESSAGE_AUTHORITY_RENDERER: &str = "renderer";
+const MESSAGE_AUTHORITY_BACKEND: &str = "backend";
 
 #[derive(Clone)]
 pub struct ExecutionStore {
@@ -76,6 +81,56 @@ pub struct ConversationMessageRecord {
     pub role: String,
     pub text: String,
     pub created_at: u64,
+}
+
+/// One durable user or agent message visible to the Chat model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChatConversationMessage {
+    pub id: String,
+    pub sequence: u64,
+    pub role: String,
+    pub text: String,
+}
+
+/// Backend-owned, immutable model context for one exact durable Chat head.
+///
+/// `revision` is the durable conversation head sequence. `digest` covers only
+/// stable ownership fields and ordered model-visible messages; presentation
+/// metadata and system messages are deliberately excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatConversationSnapshot {
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub messages: Vec<ChatConversationMessage>,
+}
+
+impl ChatConversationSnapshot {
+    /// Returns the exact final durable user message owned by this snapshot.
+    pub fn final_user_message(&self) -> Result<&ChatConversationMessage, String> {
+        self.messages
+            .last()
+            .filter(|message| message.role == "user" && message.sequence == self.revision)
+            .ok_or_else(|| "Chat snapshot does not end with its durable user message.".to_string())
+    }
+
+    /// Renders prior durable model-visible messages in deterministic JSON form.
+    pub fn prior_model_context(&self) -> Result<String, String> {
+        self.final_user_message()?;
+        serde_json::to_string(&self.messages[..self.messages.len().saturating_sub(1)])
+            .map(|history| format!("Durable conversation history (authoritative):\n{history}"))
+            .map_err(|error| format!("Failed to render durable Chat history: {error}"))
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalChatSnapshot<'a> {
+    version: u8,
+    workspace_id: &'a str,
+    conversation_id: &'a str,
+    revision: u64,
+    messages: &'a [ChatConversationMessage],
 }
 
 impl ExecutionStore {
@@ -153,6 +208,7 @@ impl ExecutionStore {
         connection
             .execute_batch(CONVERSATION_SCHEMA)
             .map_err(|error| format!("Failed to initialize conversation database: {error}"))?;
+        migrate_conversation_authority(&connection)?;
         // Keep databases created by earlier builds usable without destructive migrations.
         let _ = connection.execute(
             "ALTER TABLE execution_runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
@@ -302,7 +358,7 @@ impl ExecutionStore {
                                 .to_string()
                         })?
                 };
-                self.append_conversation_message(
+                self.append_conversation_message_with_authority(
                     &completion.workspace_id,
                     &completion.conversation_id,
                     &title,
@@ -311,6 +367,7 @@ impl ExecutionStore {
                         role: "agent".to_string(),
                         text: result.message.clone(),
                     },
+                    MESSAGE_AUTHORITY_BACKEND,
                 )?;
                 Ok(())
             }
@@ -428,14 +485,15 @@ impl ExecutionStore {
         transaction
             .execute(
                 "INSERT INTO conversation_messages
-                   (message_id, conversation_id, sequence, role, text, created_at)
-                 VALUES (?1, ?2, ?3, 'agent', ?4, ?5)",
+                   (message_id, conversation_id, sequence, role, text, created_at, authority)
+                 VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
                 params![
                     message_id,
                     completion.conversation_id,
                     sequence,
                     message_text,
-                    now
+                    now,
+                    MESSAGE_AUTHORITY_BACKEND
                 ],
             )
             .map_err(|error| format!("Failed to record Agent result message: {error}"))?;
@@ -662,42 +720,197 @@ impl ExecutionStore {
         conversation_exists_in(&connection, workspace_id, conversation_id)
     }
 
-    /// Returns whether one durable message exactly matches its conversation, role, and text.
-    pub fn conversation_message_matches(
+    /// Resolves the authoritative model context for an exact durable Chat user message.
+    ///
+    /// Ownership, head equality, contiguous rows, and final message identity are checked
+    /// while holding one store lock. System rows count toward the revision and continuity
+    /// check. System rows and agent rows without backend authority are presentation-only
+    /// and never enter model history or its digest.
+    pub fn resolve_chat_snapshot(
         &self,
         workspace_id: &str,
         conversation_id: &str,
         message_id: &str,
-        sequence: u64,
-        role: &str,
+        message_sequence: u64,
+        message_text: &str,
+    ) -> Result<ChatConversationSnapshot, String> {
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Failed to start durable Chat snapshot read: {error}"))?;
+        let snapshot = resolve_chat_snapshot_in(
+            &transaction,
+            workspace_id,
+            conversation_id,
+            message_id,
+            message_sequence,
+            message_text,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to complete durable Chat snapshot read: {error}"))?;
+        Ok(snapshot)
+    }
+
+    /// Revalidates that a Chat snapshot still represents the current durable head and digest.
+    pub fn revalidate_chat_snapshot(
+        &self,
+        snapshot: &ChatConversationSnapshot,
+    ) -> Result<(), String> {
+        let snapshot_digest = chat_snapshot_digest(
+            &snapshot.workspace_id,
+            &snapshot.conversation_id,
+            snapshot.revision,
+            &snapshot.messages,
+        )?;
+        if snapshot_digest != snapshot.digest {
+            return Err("Resolved Chat snapshot digest is invalid.".to_string());
+        }
+        let final_message = snapshot.final_user_message()?;
+        let current = self.resolve_chat_snapshot(
+            &snapshot.workspace_id,
+            &snapshot.conversation_id,
+            &final_message.id,
+            snapshot.revision,
+            &final_message.text,
+        )?;
+        if current.digest != snapshot.digest {
+            return Err("Durable Chat context changed after runtime resolution.".to_string());
+        }
+        Ok(())
+    }
+
+    /// Atomically appends a backend-owned assistant result if the supplied Chat snapshot
+    /// is still current. The existing conversation title is never changed, and retries
+    /// with the same message ID and content return the original durable row.
+    pub(crate) fn append_chat_assistant_if_current(
+        &self,
+        snapshot: &ChatConversationSnapshot,
+        message_id: &str,
         text: &str,
-    ) -> Result<bool, String> {
-        let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        connection
+    ) -> Result<ConversationMessageRecord, String> {
+        let input = ConversationMessageInput {
+            id: message_id.to_string(),
+            role: "agent".to_string(),
+            text: text.to_string(),
+        };
+        validate_conversation_message(&input)?;
+        let snapshot_digest = chat_snapshot_digest(
+            &snapshot.workspace_id,
+            &snapshot.conversation_id,
+            snapshot.revision,
+            &snapshot.messages,
+        )?;
+        if snapshot_digest != snapshot.digest {
+            return Err("Resolved Chat snapshot digest is invalid.".to_string());
+        }
+        let final_message = snapshot.final_user_message()?;
+        let now = now_millis()?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start assistant append transaction: {error}"))?;
+
+        let existing = transaction
             .query_row(
-                "SELECT 1
+                "SELECT messages.conversation_id, messages.sequence, messages.role, messages.text,
+                        messages.created_at, conversations.workspace_id, messages.authority
                    FROM conversation_messages messages
                    JOIN conversations conversations
                      ON conversations.conversation_id = messages.conversation_id
-                  WHERE conversations.workspace_id = ?1
-                    AND messages.conversation_id = ?2
-                    AND messages.message_id = ?3
-                    AND messages.sequence = ?4
-                    AND messages.role = ?5
-                    AND messages.text = ?6",
-                params![
-                    workspace_id,
-                    conversation_id,
-                    message_id,
-                    sequence,
-                    role,
-                    text
-                ],
-                |_| Ok(()),
+                  WHERE messages.message_id = ?1",
+                params![message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
             )
             .optional()
-            .map(|match_| match_.is_some())
-            .map_err(|error| format!("Failed to verify conversation message ownership: {error}"))
+            .map_err(|error| format!("Failed to check assistant message idempotency: {error}"))?;
+        if let Some((
+            conversation_id,
+            sequence,
+            role,
+            stored_text,
+            created_at,
+            workspace_id,
+            authority,
+        )) = existing
+        {
+            if conversation_id != snapshot.conversation_id
+                || workspace_id != snapshot.workspace_id
+                || sequence != snapshot.revision + 1
+                || role != "agent"
+                || stored_text != text
+                || authority != MESSAGE_AUTHORITY_BACKEND
+            {
+                return Err("Message ID is already bound to different content.".to_string());
+            }
+            transaction.commit().map_err(|error| {
+                format!("Failed to commit idempotent assistant message: {error}")
+            })?;
+            return Ok(ConversationMessageRecord {
+                id: message_id.to_string(),
+                conversation_id,
+                sequence,
+                role,
+                text: stored_text,
+                created_at,
+            });
+        }
+
+        let current = resolve_chat_snapshot_in(
+            &transaction,
+            &snapshot.workspace_id,
+            &snapshot.conversation_id,
+            &final_message.id,
+            snapshot.revision,
+            &final_message.text,
+        )?;
+        if current.digest != snapshot.digest {
+            return Err("Durable Chat context changed after runtime resolution.".to_string());
+        }
+        let sequence = snapshot.revision + 1;
+        transaction
+            .execute(
+                "INSERT INTO conversation_messages
+                   (message_id, conversation_id, sequence, role, text, created_at, authority)
+                 VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
+                params![
+                    message_id,
+                    snapshot.conversation_id,
+                    sequence,
+                    text,
+                    now,
+                    MESSAGE_AUTHORITY_BACKEND
+                ],
+            )
+            .map_err(|error| format!("Failed to append assistant message: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE conversations SET updated_at = ?1
+                  WHERE conversation_id = ?2 AND workspace_id = ?3",
+                params![now, snapshot.conversation_id, snapshot.workspace_id],
+            )
+            .map_err(|error| format!("Failed to update assistant conversation: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit assistant message: {error}"))?;
+        Ok(ConversationMessageRecord {
+            id: message_id.to_string(),
+            conversation_id: snapshot.conversation_id.clone(),
+            sequence,
+            role: "agent".to_string(),
+            text: text.to_string(),
+            created_at: now,
+        })
     }
 
     pub fn append_conversation_message(
@@ -706,6 +919,23 @@ impl ExecutionStore {
         conversation_id: &str,
         title: &str,
         input: &ConversationMessageInput,
+    ) -> Result<ConversationMessageRecord, String> {
+        self.append_conversation_message_with_authority(
+            workspace_id,
+            conversation_id,
+            title,
+            input,
+            MESSAGE_AUTHORITY_RENDERER,
+        )
+    }
+
+    fn append_conversation_message_with_authority(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        title: &str,
+        input: &ConversationMessageInput,
+        authority: &str,
     ) -> Result<ConversationMessageRecord, String> {
         validate_conversation_message(input)?;
         let now = now_millis()?;
@@ -735,8 +965,8 @@ impl ExecutionStore {
         }
         let existing = transaction
             .query_row(
-                "SELECT conversation_id, sequence, role, text, created_at
-                 FROM conversation_messages WHERE message_id = ?1",
+                "SELECT conversation_id, sequence, role, text, created_at, authority
+                  FROM conversation_messages WHERE message_id = ?1",
                 params![input.id],
                 |row| {
                     Ok((
@@ -745,13 +975,21 @@ impl ExecutionStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, u64>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| format!("Failed to check message idempotency: {error}"))?;
-        if let Some((existing_conversation, sequence, role, text, created_at)) = existing {
-            if existing_conversation != conversation_id || role != input.role || text != input.text
+        if let Some((existing_conversation, sequence, role, text, created_at, stored_authority)) =
+            existing
+        {
+            if existing_conversation != conversation_id
+                || role != input.role
+                || text != input.text
+                || (stored_authority != authority
+                    && !(authority == MESSAGE_AUTHORITY_RENDERER
+                        && stored_authority == "legacy_renderer"))
             {
                 return Err("Message ID is already bound to different content.".to_string());
             }
@@ -778,15 +1016,16 @@ impl ExecutionStore {
         transaction
             .execute(
                 "INSERT INTO conversation_messages
-                 (message_id, conversation_id, sequence, role, text, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (message_id, conversation_id, sequence, role, text, created_at, authority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     input.id,
                     conversation_id,
                     sequence,
                     input.role,
                     input.text,
-                    now
+                    now,
+                    authority
                 ],
             )
             .map_err(|error| format!("Failed to append conversation message: {error}"))?;
@@ -1086,6 +1325,129 @@ fn conversation_exists_in(
     Ok(exists.is_some())
 }
 
+fn migrate_conversation_authority(connection: &Connection) -> Result<(), String> {
+    let has_authority = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('conversation_messages') WHERE name = 'authority'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to inspect conversation message schema: {error}"))?
+        .is_some();
+    if !has_authority {
+        // Historical rows must remain presentation-only after migration.
+        connection
+            .execute(
+                "ALTER TABLE conversation_messages
+                 ADD COLUMN authority TEXT NOT NULL DEFAULT 'legacy_renderer'",
+                [],
+            )
+            .map_err(|error| {
+                format!("Failed to migrate conversation message authority: {error}")
+            })?;
+    }
+    Ok(())
+}
+
+fn resolve_chat_snapshot_in(
+    connection: &Connection,
+    workspace_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+    message_sequence: u64,
+    message_text: &str,
+) -> Result<ChatConversationSnapshot, String> {
+    if !conversation_exists_in(connection, workspace_id, conversation_id)? {
+        return Err("Conversation does not belong to this workspace.".to_string());
+    }
+    let head = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM conversation_messages
+             WHERE conversation_id = ?1",
+            params![conversation_id],
+            |row| row.get::<_, u64>(0),
+        )
+        .map_err(|error| format!("Failed to read durable Chat head: {error}"))?;
+    if head > message_sequence {
+        return Err(
+            "Chat message is stale because the durable conversation head advanced.".to_string(),
+        );
+    }
+    if head != message_sequence || head == 0 {
+        return Err(
+            "Chat message sequence does not match the durable conversation head.".to_string(),
+        );
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT message_id, sequence, role, text, authority FROM conversation_messages
+             WHERE conversation_id = ?1 ORDER BY sequence",
+        )
+        .map_err(|error| format!("Failed to prepare durable Chat snapshot: {error}"))?;
+    let rows = statement
+        .query_map(params![conversation_id], |row| {
+            Ok((
+                ChatConversationMessage {
+                    id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    role: row.get(2)?,
+                    text: row.get(3)?,
+                },
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| format!("Failed to query durable Chat snapshot: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to decode durable Chat snapshot: {error}"))?;
+    if rows.len() as u64 != head
+        || rows
+            .iter()
+            .enumerate()
+            .any(|(index, (row, _))| row.sequence != index as u64 + 1)
+    {
+        return Err("Durable Chat message sequence is not contiguous.".to_string());
+    }
+    let final_row = &rows.last().expect("non-empty durable Chat rows").0;
+    if final_row.id != message_id || final_row.role != "user" || final_row.text != message_text {
+        return Err("Chat request does not match the final durable user message.".to_string());
+    }
+    let messages = rows
+        .into_iter()
+        .filter(|(message, authority)| {
+            message.role == "user"
+                || (message.role == "agent" && authority == MESSAGE_AUTHORITY_BACKEND)
+        })
+        .map(|(message, _)| message)
+        .collect::<Vec<_>>();
+    let digest = chat_snapshot_digest(workspace_id, conversation_id, head, &messages)?;
+    Ok(ChatConversationSnapshot {
+        workspace_id: workspace_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        revision: head,
+        digest,
+        messages,
+    })
+}
+
+fn chat_snapshot_digest(
+    workspace_id: &str,
+    conversation_id: &str,
+    revision: u64,
+    messages: &[ChatConversationMessage],
+) -> Result<String, String> {
+    let canonical = serde_json::to_vec(&CanonicalChatSnapshot {
+        version: 1,
+        workspace_id,
+        conversation_id,
+        revision,
+        messages,
+    })
+    .map_err(|error| format!("Failed to serialize canonical Chat snapshot: {error}"))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
 fn database_path() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -1213,18 +1575,21 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].id, "projection-1:agent");
         let connection = store.connection.lock().unwrap();
-        let (status, provenance, receipts): (String, String, u64) = connection
+        let (status, provenance, authority, receipts): (String, String, String, u64) = connection
             .query_row(
                 "SELECT steps.status, steps.task_session_projection_id,
+                        (SELECT authority FROM conversation_messages
+                          WHERE message_id = 'projection-1:agent'),
                         (SELECT COUNT(*) FROM task_completion_projection_receipts)
                    FROM step_runs steps
                   WHERE steps.run_id = 'run-1' AND steps.step_id = 'worker.execute'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(status, "completed");
         assert_eq!(provenance, "projection-1");
+        assert_eq!(authority, MESSAGE_AUTHORITY_BACKEND);
         assert_eq!(receipts, 1);
     }
 
@@ -1255,6 +1620,18 @@ mod tests {
         assert_eq!(messages[1].id, "projection-chat:assistant");
         assert_eq!(messages[1].role, "agent");
         assert_eq!(messages[1].text, "Recovered assistant response");
+        let authority: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT authority FROM conversation_messages
+                  WHERE message_id = 'projection-chat:assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority, MESSAGE_AUTHORITY_BACKEND);
     }
 
     #[test]
@@ -1293,6 +1670,345 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "message-2", 2, "Hi")
+            .unwrap_err();
+        assert!(snapshot.contains("final durable user"));
+    }
+
+    fn append(store: &ExecutionStore, conversation: &str, id: &str, role: &str, text: &str) {
+        store
+            .append_conversation_message(
+                "workspace-a",
+                conversation,
+                "Chat title",
+                &ConversationMessageInput {
+                    id: id.to_string(),
+                    role: role.to_string(),
+                    text: text.to_string(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn chat_snapshot_digest_is_deterministic_and_ignores_presentation_metadata() {
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        append(&store, "conversation-a", "agent-1", "agent", "Hi");
+        append(&store, "conversation-a", "user-2", "user", "Continue");
+        let first = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-2", 3, "Continue")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE conversations SET title = 'Renamed', created_at = 99, updated_at = 100
+                     WHERE conversation_id = 'conversation-a'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE conversation_messages SET created_at = created_at + 1000
+                     WHERE conversation_id = 'conversation-a'",
+                    [],
+                )
+                .unwrap();
+        }
+        let second = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-2", 3, "Continue")
+            .unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.revision, 3);
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-1", "user-2"]
+        );
+        store.revalidate_chat_snapshot(&first).unwrap();
+    }
+
+    #[test]
+    fn chat_snapshot_is_conversation_scoped_and_rejects_stale_head() {
+        let store = test_store();
+        append(&store, "conversation-a", "a-user", "user", "A");
+        append(&store, "conversation-b", "b-user", "user", "B");
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "b-user", 1, "B")
+            .is_err());
+
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "a-user", 1, "A")
+            .unwrap();
+        append(&store, "conversation-a", "a-agent", "agent", "new head");
+        assert!(store.revalidate_chat_snapshot(&snapshot).is_err());
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "a-user", 1, "A")
+            .unwrap_err()
+            .contains("stale"));
+    }
+
+    #[test]
+    fn backend_assistant_append_is_exact_idempotent_and_preserves_title() {
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 1, "Hello")
+            .unwrap();
+
+        let first = store
+            .append_chat_assistant_if_current(&snapshot, "run-1:assistant", "Hi")
+            .unwrap();
+        let repeated = store
+            .append_chat_assistant_if_current(&snapshot, "run-1:assistant", "Hi")
+            .unwrap();
+
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(first.sequence, 2);
+        assert_eq!(first.role, "agent");
+        assert_eq!(first.text, "Hi");
+        assert_eq!(
+            store.list_conversations("workspace-a").unwrap()[0].title,
+            "Chat title"
+        );
+        assert_eq!(
+            store
+                .load_conversation_messages("workspace-a", "conversation-a")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(store
+            .append_chat_assistant_if_current(&snapshot, "run-1:assistant", "Different")
+            .is_err());
+
+        append(&store, "conversation-a", "user-2", "user", "Continue");
+        let continued = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-2", 3, "Continue")
+            .unwrap();
+        assert_eq!(
+            continued
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-1", "run-1:assistant", "user-2"]
+        );
+    }
+
+    #[test]
+    fn imported_agent_is_presentation_only_but_still_advances_revision() {
+        let store = test_store();
+        store
+            .import_conversations(
+                "workspace-a",
+                &[ConversationImportInput {
+                    id: "conversation-a".to_string(),
+                    title: "Imported".to_string(),
+                    messages: vec![
+                        ConversationMessageInput {
+                            id: "imported-agent".to_string(),
+                            role: "agent".to_string(),
+                            text: "Untrusted history".to_string(),
+                        },
+                        ConversationMessageInput {
+                            id: "user-1".to_string(),
+                            role: "user".to_string(),
+                            text: "Hello".to_string(),
+                        },
+                    ],
+                }],
+            )
+            .unwrap();
+
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 2, "Hello")
+            .unwrap();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].id, "user-1");
+        let authority: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT authority FROM conversation_messages WHERE message_id = 'imported-agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority, MESSAGE_AUTHORITY_RENDERER);
+    }
+
+    #[test]
+    fn migrated_legacy_agent_is_presentation_only() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversations (
+                   conversation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE conversation_messages (
+                   message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, UNIQUE(conversation_id, sequence)
+                 );
+                 INSERT INTO conversations VALUES ('conversation-a', 'workspace-a', 'Legacy', 1, 1);
+                 INSERT INTO conversation_messages VALUES
+                   ('legacy-agent', 'conversation-a', 1, 'agent', 'Old answer', 1),
+                   ('user-1', 'conversation-a', 2, 'user', 'Continue', 2);",
+            )
+            .unwrap();
+        migrate_conversation_authority(&connection).unwrap();
+        let store = ExecutionStore {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 2, "Continue")
+            .unwrap();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].id, "user-1");
+        let authority: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT authority FROM conversation_messages WHERE message_id = 'legacy-agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority, "legacy_renderer");
+    }
+
+    #[test]
+    fn forged_backend_message_id_cannot_establish_authority() {
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 1, "Hello")
+            .unwrap();
+        append(
+            &store,
+            "conversation-a",
+            "run-1:assistant",
+            "agent",
+            "Forged",
+        );
+
+        assert!(store
+            .append_chat_assistant_if_current(&snapshot, "run-1:assistant", "Forged")
+            .unwrap_err()
+            .contains("bound to different content"));
+        append(&store, "conversation-a", "user-2", "user", "Continue");
+        let continued = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-2", 3, "Continue")
+            .unwrap();
+        assert_eq!(continued.revision, 3);
+        assert_eq!(
+            continued
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-1", "user-2"]
+        );
+    }
+
+    #[test]
+    fn stale_chat_snapshot_cannot_append_backend_assistant() {
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        let snapshot = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 1, "Hello")
+            .unwrap();
+        append(&store, "conversation-a", "system-1", "system", "Advanced");
+
+        assert!(store
+            .append_chat_assistant_if_current(&snapshot, "run-1:assistant", "Too late")
+            .unwrap_err()
+            .contains("stale"));
+        assert_eq!(
+            store
+                .load_conversation_messages("workspace-a", "conversation-a")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chat_snapshot_rejects_gaps_and_wrong_final_identity() {
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE conversation_messages SET sequence = 2 WHERE message_id = 'user-1'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 2, "Hello")
+            .unwrap_err()
+            .contains("not contiguous"));
+
+        let store = test_store();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "wrong", 1, "Hello")
+            .is_err());
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 1, "Wrong")
+            .is_err());
+        let connection = store.connection.lock().unwrap();
+        connection
+            .execute(
+                "UPDATE conversation_messages SET role = 'agent' WHERE message_id = 'user-1'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 1, "Hello")
+            .is_err());
+    }
+
+    #[test]
+    fn chat_snapshot_excludes_system_rows_and_idempotent_append_keeps_revision() {
+        let store = test_store();
+        append(
+            &store,
+            "conversation-a",
+            "system-1",
+            "system",
+            "renderer only",
+        );
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        let first = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 2, "Hello")
+            .unwrap();
+        append(&store, "conversation-a", "user-1", "user", "Hello");
+        let second = store
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "user-1", 2, "Hello")
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.messages.len(), 1);
+        assert_eq!(first.messages[0].id, "user-1");
+        assert!(!first
+            .prior_model_context()
+            .unwrap()
+            .contains("renderer only"));
     }
 
     #[test]
@@ -1329,25 +2045,11 @@ mod tests {
             .conversation_exists("workspace-b", "conversation-a")
             .unwrap());
         assert!(store
-            .conversation_message_matches(
-                "workspace-a",
-                "conversation-a",
-                "message-1",
-                1,
-                "user",
-                "Private"
-            )
-            .unwrap());
-        assert!(!store
-            .conversation_message_matches(
-                "workspace-b",
-                "conversation-a",
-                "message-1",
-                1,
-                "user",
-                "Private"
-            )
-            .unwrap());
+            .resolve_chat_snapshot("workspace-a", "conversation-a", "message-1", 1, "Private")
+            .is_ok());
+        assert!(store
+            .resolve_chat_snapshot("workspace-b", "conversation-a", "message-1", 1, "Private")
+            .is_err());
     }
 
     #[test]

@@ -92,7 +92,6 @@
     workspaceChatActionRequiresConfirmation,
     workspaceContextRevision,
     workspaceAgentContext,
-    stripWorkspaceActions,
     type WorkspaceChatAction,
     type WorkspaceChatActionContext,
     type WorkspaceChatActionProposal,
@@ -3871,13 +3870,12 @@
     );
     saveUiState();
     const persisted =
-      workspace?.id && "__TAURI_INTERNALS__" in window
-        ? appendConversationMessage(
-            workspace.id,
-            targetSessionId,
-            updatedSession.title,
-            entry,
-          ).catch((reason: unknown) => {
+      workspace?.id && "__TAURI_INTERNALS__" in window && entry.role !== "agent"
+        ? appendConversationMessage(workspace.id, targetSessionId, updatedSession.title, {
+            id: entry.id,
+            role: entry.role,
+            text: entry.text,
+          }).catch((reason: unknown) => {
             appNotice = {
               tone: "error",
               message: reason instanceof Error ? reason.message : String(reason),
@@ -4330,20 +4328,20 @@
 
     try {
       if (!(await ensureAiWorkspaceTrusted(config))) return;
+      const durableUser = appendedUser?.persisted ? await appendedUser.persisted : null;
+      if (!durableUser) {
+        if (appendedUser) {
+          removeWorkspaceChatMessage(
+            appendedUser.entry.id,
+            requestSessionId,
+            appendedUser.activityId,
+            appendedUser.previousTitle,
+          );
+        }
+        throw new Error("Chat message must be durably saved before model execution.");
+      }
       let result: { run_id: string; message: string };
       if (config.runtime === "opencode" && "__TAURI_INTERNALS__" in window) {
-        const durableUser = appendedUser?.persisted ? await appendedUser.persisted : null;
-        if (!durableUser) {
-          if (appendedUser) {
-            removeWorkspaceChatMessage(
-              appendedUser.entry.id,
-              requestSessionId,
-              appendedUser.activityId,
-              appendedUser.previousTitle,
-            );
-          }
-          throw new Error("Chat message must be durably saved before Task Session submission.");
-        }
         const [profile, rootRevision] = await Promise.all([
           ensureOpenCodePromptProfile(config),
           workspaceRootRevision(config.workspace_id),
@@ -4450,10 +4448,13 @@
           config,
           {
             run_id: run.run_id,
+            conversation_id: requestSessionId,
+            message_id: durableUser.id,
+            message_sequence: durableUser.sequence,
             message,
-            terminal_context: requestWorkspaceContext.context,
-            context_revision: requestWorkspaceContext.revision,
-            session_context: requestSessionContext,
+            terminal_context: null,
+            context_revision: null,
+            session_context: null,
             session_key: `chat:${requestSessionId}`,
           },
           (event) => {
@@ -4474,7 +4475,7 @@
       if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) return;
       const response = result.message;
       const actions = extractWorkspaceActions(response);
-      if (result.run_id === "" && workspace?.id) {
+      if (workspace?.id) {
         const messages = await loadConversationMessages(workspace.id, requestSessionId);
         const session = workspaceChatSessions.find((entry) => entry.id === requestSessionId);
         if (session) {
@@ -4492,11 +4493,6 @@
             workspaceChatMessages = updated.messages;
           }
         }
-      } else {
-        appendWorkspaceChat(
-          { role: "agent", text: stripWorkspaceActions(response) },
-          requestSessionId,
-        );
       }
       if (requestId !== workspaceChatRunFor(workspaceChatRuns, requestSessionId).generation) return;
       if (actions.length > 0) {

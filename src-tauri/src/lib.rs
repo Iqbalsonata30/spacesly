@@ -724,12 +724,24 @@ async fn append_conversation_message(
     message: ConversationMessageInput,
     execution_store: State<'_, ExecutionStore>,
 ) -> Result<infrastructure::execution_store::ConversationMessageRecord, String> {
+    validate_renderer_conversation_role(&message)?;
     let store = execution_store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         store.append_conversation_message(&workspace_id, &conversation_id, &title, &message)
     })
     .await
     .map_err(|error| format!("Conversation append task failed: {error}"))?
+}
+
+fn validate_renderer_conversation_role(message: &ConversationMessageInput) -> Result<(), String> {
+    match message.role.as_str() {
+        "user" | "system" => Ok(()),
+        "agent" => Err(
+            "Renderer cannot append agent conversation messages; assistant results are backend-owned."
+                .to_string(),
+        ),
+        _ => Err("Renderer conversation message role must be user or system.".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -763,8 +775,9 @@ async fn prune_conversations(
 #[tauri::command]
 async fn chat_ai_worker(
     mut config: AiWorkerConfig,
-    request: AiWorkerChatRequest,
+    mut request: AiWorkerChatRequest,
     ai_runs: State<'_, AiRunRegistry>,
+    execution_store: State<'_, ExecutionStore>,
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
     secrets: State<'_, AppSecretsStore>,
@@ -772,6 +785,37 @@ async fn chat_ai_worker(
 ) -> Result<AiWorkerChatResult, String> {
     bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
     resolve_ai_secrets(&mut config, secrets.inner())?;
+    let conversation_id = request
+        .conversation_id
+        .as_deref()
+        .ok_or_else(|| "AI chat durable conversation ID is required.".to_string())?;
+    let message_id = request
+        .message_id
+        .as_deref()
+        .ok_or_else(|| "AI chat durable message ID is required.".to_string())?;
+    let message_sequence = request
+        .message_sequence
+        .ok_or_else(|| "AI chat durable message sequence is required.".to_string())?;
+    let chat_snapshot = execution_store.resolve_chat_snapshot(
+        &config.workspace_id,
+        conversation_id,
+        message_id,
+        message_sequence,
+        &request.message,
+    )?;
+    let final_message = chat_snapshot.final_user_message()?;
+    request.message = final_message.text.clone();
+    request.terminal_context = None;
+    request.session_context = Some(chat_snapshot.prior_model_context()?);
+    request.context_revision = Some(format!(
+        "{}:{}",
+        chat_snapshot.revision, chat_snapshot.digest
+    ));
+    config.opencode_auto_approve = false;
+    config.restrict_tools = true;
+    config.fenced_tools_only = true;
+    config.isolated_opencode_process = true;
+    config.mcp_servers.clear();
     let run_id = request
         .run_id
         .clone()
@@ -794,15 +838,14 @@ async fn chat_ai_worker(
     let stream_channel = on_event.clone();
     let stream_run_id = run_id.clone();
     let stream_sequence = event_sequence.clone();
+    let buffered_stream_events = Arc::new(Mutex::new(Vec::new()));
+    let callback_stream_events = buffered_stream_events.clone();
     let stream_callback: Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send> =
         Box::new(move |event| {
-            emit_worker_stream_event(
-                &stream_channel,
-                &stream_run_id,
-                &stream_sequence,
-                event,
-                None,
-            );
+            callback_stream_events
+                .lock()
+                .map_err(|error| error.to_string())?
+                .push(event);
             Ok(())
         });
     let result = if config.runtime == "api" {
@@ -828,6 +871,30 @@ async fn chat_ai_worker(
             }
         }
     };
+    let result = result.and_then(|value| {
+        persist_legacy_chat_assistant(
+            execution_store.inner(),
+            &chat_snapshot,
+            &run_id,
+            &value.message,
+        )?;
+        Ok(value)
+    });
+    if result.is_ok() {
+        for event in buffered_stream_events
+            .lock()
+            .map_err(|error| error.to_string())?
+            .drain(..)
+        {
+            emit_worker_stream_event(
+                &stream_channel,
+                &stream_run_id,
+                &stream_sequence,
+                event,
+                None,
+            );
+        }
+    }
     match result {
         Ok(mut value) => {
             if ai_runs
@@ -883,6 +950,28 @@ async fn chat_ai_worker(
             Err(error)
         }
     }
+}
+
+fn persist_legacy_chat_assistant(
+    execution_store: &ExecutionStore,
+    snapshot: &infrastructure::execution_store::ChatConversationSnapshot,
+    run_id: &str,
+    response: &str,
+) -> Result<(), String> {
+    let action_suffix = regex::Regex::new(r"(?is)\n?SPACESLY_ACTIONS:\s*\[.*\]\s*$")
+        .map_err(|error| format!("Failed to prepare Chat action filter: {error}"))?;
+    let stripped = action_suffix.replace(response, "").trim().to_string();
+    let assistant_text = if stripped.is_empty() {
+        response.trim()
+    } else {
+        &stripped
+    };
+    execution_store.append_chat_assistant_if_current(
+        snapshot,
+        &format!("chat-run:{run_id}:assistant"),
+        assistant_text,
+    )?;
+    Ok(())
 }
 
 fn emit_ai_event(channel: Option<&Channel<AiRuntimeEvent>>, event: AiRuntimeEvent) {
@@ -2238,8 +2327,12 @@ async fn lsp_code_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_backend_provider_profile, file_ipc_error, mcp_ipc_error};
+    use super::{
+        bind_backend_provider_profile, file_ipc_error, mcp_ipc_error,
+        validate_renderer_conversation_role,
+    };
     use crate::infrastructure::ai_worker::AiWorkerConfig;
+    use crate::infrastructure::execution_store::ConversationMessageInput;
     use serde_json::Value;
 
     #[test]
@@ -2332,6 +2425,26 @@ mod tests {
         };
 
         assert!(bind_backend_provider_profile(&mut config).is_err());
+    }
+
+    #[test]
+    fn renderer_cannot_append_agent_conversation_messages() {
+        let error = validate_renderer_conversation_role(&ConversationMessageInput {
+            id: "assistant-1".to_string(),
+            role: "agent".to_string(),
+            text: "Backend result".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(error.contains("backend-owned"));
+        for role in ["user", "system"] {
+            validate_renderer_conversation_role(&ConversationMessageInput {
+                id: format!("{role}-1"),
+                role: role.to_string(),
+                text: "Allowed".to_string(),
+            })
+            .unwrap();
+        }
     }
 }
 

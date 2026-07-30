@@ -285,6 +285,15 @@ pub struct AiWorkerTask {
 pub struct AiWorkerChatRequest {
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Durable conversation ownership identity for authoritative Chat entry points.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// Durable final user message identity for authoritative Chat entry points.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Durable final user message sequence for authoritative Chat entry points.
+    #[serde(default)]
+    pub message_sequence: Option<u64>,
     pub message: String,
     pub terminal_context: Option<String>,
     #[serde(default)]

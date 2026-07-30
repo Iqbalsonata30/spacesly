@@ -11,6 +11,7 @@ use crate::infrastructure::ai_worker::{
     AiEditResult, AiEditSelection, AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig,
     AiWorkerEventCallback,
 };
+use crate::infrastructure::execution_store::ChatConversationSnapshot;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicBool;
@@ -23,15 +24,20 @@ const MAX_PROMPT_RESULT_SUMMARY_BYTES: usize = 64 * 1024;
 pub struct ResolvedPromptTask {
     pub runtime_profile_id: String,
     pub config: AiWorkerConfig,
+    pub chat_snapshot: Option<ChatConversationSnapshot>,
 }
 
 /// Backend authority that resolves trusted Chat/Edit runtime configuration and durable references.
 pub trait PromptRuntimeResolver: Send + Sync + 'static {
+    /// Resolves trusted runtime state and, for Chat, its exact durable model snapshot.
     fn resolve(
         &self,
         envelope: &TaskSessionEnvelopeV1,
         input: &TaskSessionInputV2,
     ) -> Result<ResolvedPromptTask, String>;
+
+    /// Rejects a Chat result if its durable snapshot changed while the model was running.
+    fn revalidate_chat(&self, snapshot: &ChatConversationSnapshot) -> Result<(), String>;
 }
 
 impl PromptRuntimeResolver for StoredAgentRuntimeResolver {
@@ -40,19 +46,27 @@ impl PromptRuntimeResolver for StoredAgentRuntimeResolver {
         envelope: &TaskSessionEnvelopeV1,
         input: &TaskSessionInputV2,
     ) -> Result<ResolvedPromptTask, String> {
-        if let TaskSessionInputV2::Chat(input) = input {
-            self.verify_chat_message(
+        let chat_snapshot = if let TaskSessionInputV2::Chat(input) = input {
+            Some(self.resolve_chat_snapshot(
                 envelope,
                 &input.message_id,
                 input.message_sequence,
                 &input.message,
-            )?;
-        }
-        let runtime = self.resolve_prompt_runtime(envelope)?;
+            )?)
+        } else {
+            None
+        };
+        let mut runtime = self.resolve_prompt_runtime(envelope)?;
+        runtime.chat_snapshot = chat_snapshot;
         Ok(ResolvedPromptTask {
             runtime_profile_id: runtime.runtime_profile_id,
             config: runtime.config,
+            chat_snapshot: runtime.chat_snapshot,
         })
+    }
+
+    fn revalidate_chat(&self, snapshot: &ChatConversationSnapshot) -> Result<(), String> {
+        self.revalidate_chat_snapshot(snapshot)
     }
 }
 
@@ -183,26 +197,54 @@ impl PromptTaskExecutor {
         )?;
         match envelope.prompt_input {
             TaskSessionInputV2::Chat(input) => {
+                let snapshot = resolved.chat_snapshot.ok_or_else(|| {
+                    TaskExecutionError::new("Resolved Chat runtime is missing durable context.")
+                })?;
+                let final_message = snapshot
+                    .final_user_message()
+                    .map_err(TaskExecutionError::new)?;
+                if final_message.id != input.message_id
+                    || final_message.sequence != input.message_sequence
+                    || final_message.text != input.message
+                {
+                    return Err(TaskExecutionError::new(
+                        "Resolved Chat snapshot did not match the requested durable identity.",
+                    ));
+                }
+                let authoritative_message = final_message.text.clone();
+                let authoritative_context = snapshot
+                    .prior_model_context()
+                    .map_err(TaskExecutionError::new)?;
+                let authoritative_revision = format!("{}:{}", snapshot.revision, snapshot.digest);
                 let reporter = context.event_reporter();
+                let buffered_events = Arc::new(Mutex::new(Vec::new()));
                 let callback_open = Arc::new(Mutex::new(true));
                 let callback_guard = CallbackGate {
                     open: callback_open.clone(),
                 };
+                let callback_events = buffered_events.clone();
                 let callback: AiWorkerEventCallback = Box::new(move |event| {
                     let open = callback_open.lock().map_err(|error| error.to_string())?;
                     if !*open {
                         return Err("Chat runtime callback is closed.".to_string());
                     }
-                    emit_runtime_event(&reporter, event)
+                    callback_events
+                        .lock()
+                        .map_err(|error| error.to_string())?
+                        .push(event);
+                    Ok(())
                 });
                 let result = self.runner.chat(
                     resolved.config,
                     AiWorkerChatRequest {
                         run_id: None,
-                        message: input.message,
-                        terminal_context: input.terminal_context,
-                        context_revision: envelope.session.context_revision.clone(),
-                        session_context: input.session_context,
+                        conversation_id: Some(snapshot.conversation_id.clone()),
+                        message_id: Some(final_message.id.clone()),
+                        message_sequence: Some(final_message.sequence),
+                        message: authoritative_message,
+                        terminal_context: None,
+                        context_revision: Some(authoritative_revision),
+                        session_context: Some(authoritative_context),
                         session_key: Some(context.runtime_attempt_id()),
                     },
                     context.cancellation().shared_flag(),
@@ -210,6 +252,16 @@ impl PromptTaskExecutor {
                 );
                 drop(callback_guard);
                 let result = result.map_err(TaskExecutionError::new)?;
+                self.resolver
+                    .revalidate_chat(&snapshot)
+                    .map_err(TaskExecutionError::blocked)?;
+                for event in buffered_events
+                    .lock()
+                    .map_err(|error| TaskExecutionError::new(error.to_string()))?
+                    .drain(..)
+                {
+                    emit_runtime_event(&reporter, event).map_err(TaskExecutionError::new)?;
+                }
                 if result.message.len() > MAX_PROMPT_RESULT_CONTENT_BYTES {
                     return Err(TaskExecutionError::new(
                         "Chat Task Session result exceeds the durable message limit.",
@@ -381,7 +433,28 @@ mod tests {
             Ok(ResolvedPromptTask {
                 runtime_profile_id: envelope.runtime_profile_id.clone(),
                 config: test_config(envelope),
+                chat_snapshot: match _input {
+                    TaskSessionInputV2::Chat(input) => Some(ChatConversationSnapshot {
+                        workspace_id: envelope.workspace_id.clone(),
+                        conversation_id: envelope.conversation_id.clone().unwrap(),
+                        revision: input.message_sequence,
+                        digest: "sha256:test".to_string(),
+                        messages: vec![
+                            crate::infrastructure::execution_store::ChatConversationMessage {
+                                id: input.message_id.clone(),
+                                sequence: input.message_sequence,
+                                role: "user".to_string(),
+                                text: input.message.clone(),
+                            },
+                        ],
+                    }),
+                    TaskSessionInputV2::Edit(_) => None,
+                },
             })
+        }
+
+        fn revalidate_chat(&self, _snapshot: &ChatConversationSnapshot) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -401,6 +474,22 @@ mod tests {
         ) -> Result<AiWorkerChatResult, String> {
             assert!(config.isolated_opencode_process);
             assert!(config.mcp_servers.is_empty());
+            assert_eq!(request.message, "hello");
+            assert_eq!(request.terminal_context, None);
+            assert_eq!(request.conversation_id.as_deref(), Some("conversation-1"));
+            assert_eq!(request.message_id.as_deref(), Some("message-1"));
+            assert_eq!(request.message_sequence, Some(1));
+            assert!(request.session_context.as_deref().unwrap().contains("[]"));
+            assert!(!request
+                .session_context
+                .as_deref()
+                .unwrap()
+                .contains("prior turns"));
+            assert!(!request
+                .context_revision
+                .as_deref()
+                .unwrap()
+                .contains("workspace context"));
             self.cancellation_ids
                 .lock()
                 .expect("cancellation lock")
@@ -513,6 +602,167 @@ mod tests {
             .any(|event| event.payload["type"] == "edit_result_candidate"));
     }
 
+    struct CapturingChatRunner {
+        barrier: Option<Arc<Barrier>>,
+        requests: Arc<Mutex<Vec<AiWorkerChatRequest>>>,
+    }
+
+    impl PromptRuntimeRunner for CapturingChatRunner {
+        fn chat(
+            &self,
+            _config: AiWorkerConfig,
+            request: AiWorkerChatRequest,
+            _cancellation: Arc<AtomicBool>,
+            _on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerChatResult, String> {
+            self.requests.lock().unwrap().push(request);
+            if let Some(barrier) = &self.barrier {
+                barrier.wait();
+            }
+            Ok(AiWorkerChatResult {
+                run_id: String::new(),
+                message: "ok".to_string(),
+            })
+        }
+
+        fn edit(
+            &self,
+            _config: AiWorkerConfig,
+            _request: AiEditRequest,
+            _cancellation: Arc<AtomicBool>,
+        ) -> Result<AiEditResult, String> {
+            unreachable!()
+        }
+    }
+
+    struct ConversationResolver {
+        reject_revalidation: bool,
+    }
+
+    impl PromptRuntimeResolver for ConversationResolver {
+        fn resolve(
+            &self,
+            envelope: &TaskSessionEnvelopeV1,
+            input: &TaskSessionInputV2,
+        ) -> Result<ResolvedPromptTask, String> {
+            let TaskSessionInputV2::Chat(input) = input else {
+                unreachable!()
+            };
+            let conversation_id = envelope.conversation_id.clone().unwrap();
+            Ok(ResolvedPromptTask {
+                runtime_profile_id: envelope.runtime_profile_id.clone(),
+                config: test_config(envelope),
+                chat_snapshot: Some(ChatConversationSnapshot {
+                    workspace_id: envelope.workspace_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    revision: input.message_sequence,
+                    digest: format!("sha256:{conversation_id}"),
+                    messages: vec![
+                        crate::infrastructure::execution_store::ChatConversationMessage {
+                            id: format!("{conversation_id}-prior"),
+                            sequence: 1,
+                            role: "user".to_string(),
+                            text: format!("history:{conversation_id}"),
+                        },
+                        crate::infrastructure::execution_store::ChatConversationMessage {
+                            id: input.message_id.clone(),
+                            sequence: input.message_sequence,
+                            role: "user".to_string(),
+                            text: input.message.clone(),
+                        },
+                    ],
+                }),
+            })
+        }
+
+        fn revalidate_chat(&self, _snapshot: &ChatConversationSnapshot) -> Result<(), String> {
+            if self.reject_revalidation {
+                Err("durable head advanced".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_chat_conversations_receive_only_their_own_backend_history() {
+        let directory = tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = PromptTaskExecutor::new(
+            Arc::new(ConversationResolver {
+                reject_revalidation: false,
+            }),
+            Arc::new(CapturingChatRunner {
+                barrier: Some(Arc::new(Barrier::new(2))),
+                requests: requests.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .unwrap();
+        let first = engine
+            .submit_envelope(
+                "first",
+                &chat_envelope_for("conversation-a", "message-a", 2),
+            )
+            .unwrap();
+        let second = engine
+            .submit_envelope(
+                "second",
+                &chat_envelope_for("conversation-b", "message-b", 2),
+            )
+            .unwrap();
+        engine
+            .wait_for_terminal(first.id, Duration::from_secs(5))
+            .unwrap();
+        engine
+            .wait_for_terminal(second.id, Duration::from_secs(5))
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let conversation = request.conversation_id.as_deref().unwrap();
+            let other = if conversation == "conversation-a" {
+                "conversation-b"
+            } else {
+                "conversation-a"
+            };
+            let context = request.session_context.as_deref().unwrap();
+            assert!(context.contains(&format!("history:{conversation}")));
+            assert!(!context.contains(&format!("history:{other}")));
+        }
+    }
+
+    #[test]
+    fn chat_result_is_rejected_when_backend_snapshot_turns_stale() {
+        let directory = tempdir().unwrap();
+        let executor = PromptTaskExecutor::new(
+            Arc::new(ConversationResolver {
+                reject_revalidation: true,
+            }),
+            Arc::new(CapturingChatRunner {
+                barrier: None,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .unwrap();
+        let chat = engine
+            .submit_envelope("chat", &chat_envelope_for("conversation-a", "message-a", 2))
+            .unwrap();
+        let chat = engine
+            .wait_for_terminal(chat.id, Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(chat.state, TaskSessionState::Succeeded);
+        assert!(engine.task_session_result(chat.id).unwrap().is_none());
+    }
+
     fn chat_envelope() -> TaskSessionEnvelope {
         let prompt_input = TaskSessionInputV2::Chat(TaskChatInputV2 {
             message_id: "message-1".to_string(),
@@ -523,6 +773,26 @@ mod tests {
         });
         TaskSessionEnvelope::V2(TaskSessionEnvelopeV2 {
             session: base_session(TaskSessionKind::Chat, &prompt_input),
+            prompt_input,
+        })
+    }
+
+    fn chat_envelope_for(
+        conversation_id: &str,
+        message_id: &str,
+        sequence: u64,
+    ) -> TaskSessionEnvelope {
+        let prompt_input = TaskSessionInputV2::Chat(TaskChatInputV2 {
+            message_id: message_id.to_string(),
+            message_sequence: sequence,
+            message: format!("message:{conversation_id}"),
+            terminal_context: Some("malicious terminal context".to_string()),
+            session_context: Some("malicious renderer history".to_string()),
+        });
+        let mut session = base_session(TaskSessionKind::Chat, &prompt_input);
+        session.conversation_id = Some(conversation_id.to_string());
+        TaskSessionEnvelope::V2(TaskSessionEnvelopeV2 {
+            session,
             prompt_input,
         })
     }

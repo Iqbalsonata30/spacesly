@@ -89,6 +89,9 @@ export interface ExecutionContractStep {
 
 export interface AiWorkerChatRequest {
   run_id?: string;
+  conversation_id?: string;
+  message_id?: string;
+  message_sequence?: number;
   message: string;
   terminal_context: string | null;
   context_revision: string | null;
@@ -118,15 +121,12 @@ export interface AiWorkerChatResult {
 }
 
 export type ToolOperationRisk =
-  | "read"
-  | "mutation"
-  | "destructive"
-  | "credential_sensitive"
-  | "unknown";
+  "read" | "mutation" | "destructive" | "credential_sensitive" | "unknown";
 
 export interface ToolDisplayContext {
   label: string;
-  category: "files" | "commands" | "git" | "jira" | "kubernetes" | "bamboo" | "runtime" | "external";
+  category:
+    "files" | "commands" | "git" | "jira" | "kubernetes" | "bamboo" | "runtime" | "external";
   target: string | null;
 }
 
@@ -264,7 +264,7 @@ export async function appendConversationMessage(
   workspaceId: string,
   conversationId: string,
   title: string,
-  message: Pick<ConversationMessageRecord, "id" | "role" | "text">,
+  message: Pick<ConversationMessageRecord, "id" | "text"> & { role: "user" | "system" },
 ): Promise<ConversationMessageRecord> {
   return invokeWithPolicy<ConversationMessageRecord>(
     "append_conversation_message",
