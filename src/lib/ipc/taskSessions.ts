@@ -15,6 +15,19 @@ export type TaskSessionState =
   | "blocked"
   | "cancelled";
 
+/** Availability state exposed by the backend scheduler's shared health snapshot. */
+export type SchedulerHealthStatus = "healthy" | "degraded" | "stopping" | "stopped";
+
+/** Read-only scheduler health that does not depend on scheduler command responsiveness. */
+export type SchedulerHealth = {
+  status: SchedulerHealthStatus;
+  last_error: string | null;
+  last_error_at: number | null;
+  consecutive_errors: number;
+  pending_worker_completions: number;
+  pending_projections: number;
+};
+
 export type AgentTaskResult = {
   summary: string;
   evidence: string[];
@@ -240,6 +253,11 @@ export function taskToolCallIdentity(call: TaskToolCallState): string {
 /** Lists durable Task Sessions currently retained by the scheduler projection. */
 export function listTaskSessions(): Promise<TaskSessionSnapshot[]> {
   return invokeWithPolicy("list_task_sessions", {}, IPC_POLICIES.taskSessionRead);
+}
+
+/** Reads scheduler health directly from backend shared state. */
+export function getSchedulerHealth(): Promise<SchedulerHealth> {
+  return invokeWithPolicy("get_scheduler_health", {}, IPC_POLICIES.taskSessionRead);
 }
 
 /** Lists non-secret Agent runtime profiles available for future Task Session submissions. */

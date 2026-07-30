@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +30,8 @@ pub struct SchedulerStore {
     connection: Arc<Mutex<Connection>>,
     instance_id: Arc<str>,
     database_path: Option<Arc<PathBuf>>,
+    #[cfg(test)]
+    resolution_failures: Arc<AtomicUsize>,
 }
 
 /// Non-secret identity checked by a subprocess immediately before forwarding an external call.
@@ -80,7 +84,7 @@ pub(crate) struct DurableAssignment {
 
 /// Terminal outcome accepted by a fenced assignment completion.
 pub(crate) enum DurableOutcome {
-    Succeeded,
+    Succeeded(TaskExecutionOutput),
     Failed(String),
     Blocked(String),
     Cancelled,
@@ -189,6 +193,8 @@ impl SchedulerStore {
             connection: Arc::new(Mutex::new(connection)),
             instance_id: Arc::from(instance_id),
             database_path: Some(Arc::new(canonical_path)),
+            #[cfg(test)]
+            resolution_failures: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -302,7 +308,7 @@ impl SchedulerStore {
                  );
                    CREATE INDEX IF NOT EXISTS idx_scheduler_events_cursor
                      ON scheduler_task_events(session_id, sequence);
-                  CREATE TABLE IF NOT EXISTS scheduler_task_completions (
+                   CREATE TABLE IF NOT EXISTS scheduler_task_completions (
                     session_id INTEGER PRIMARY KEY,
                     projection_id TEXT NOT NULL UNIQUE,
                     attempt_id INTEGER NOT NULL,
@@ -312,7 +318,9 @@ impl SchedulerStore {
                     execution_run_id TEXT NOT NULL,
                     terminal_state TEXT NOT NULL,
                     output_json TEXT NOT NULL,
-                    projection_error TEXT,
+                     projection_error TEXT,
+                     projection_attempt_count INTEGER NOT NULL DEFAULT 0,
+                     next_projection_at INTEGER NOT NULL DEFAULT 0,
                     staged_at INTEGER NOT NULL,
                     projected_at INTEGER,
                     finalized_at INTEGER,
@@ -387,6 +395,18 @@ impl SchedulerStore {
             "progress_json",
             "progress_json TEXT",
         )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_completions",
+            "projection_attempt_count",
+            "projection_attempt_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_completions",
+            "next_projection_at",
+            "next_projection_at INTEGER NOT NULL DEFAULT 0",
+        )?;
         migration
             .execute_batch(
                 "DROP INDEX IF EXISTS idx_scheduler_active_conversation;
@@ -424,6 +444,8 @@ impl SchedulerStore {
             connection: Arc::new(Mutex::new(connection)),
             instance_id: Arc::from(instance_id),
             database_path: database_path.map(Arc::new),
+            #[cfg(test)]
+            resolution_failures: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1238,54 +1260,49 @@ impl SchedulerStore {
         Ok(CancelResult { changed, snapshot })
     }
 
-    pub(crate) fn finish(
+    /// Atomically validates assignment authority and resolves cancellation versus worker outcome.
+    ///
+    /// Structured successful output is staged in the durable projection outbox. All other output
+    /// terminalizes immediately. A concurrent cancellation always wins and becomes `cancelled`.
+    pub(crate) fn resolve_assignment(
         &self,
         fence: AssignmentFence,
         outcome: DurableOutcome,
     ) -> Result<FinishResult, String> {
-        self.finish_at(fence, outcome, now_millis())
+        #[cfg(test)]
+        if self
+            .resolution_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err("Injected durable assignment resolution failure.".to_string());
+        }
+        self.resolve_assignment_at(fence, outcome, now_millis())
     }
 
-    /// Atomically stores an authoritative typed result and moves the session into `committing`.
-    pub(crate) fn stage_completion(
-        &self,
-        fence: AssignmentFence,
-        output: &TaskExecutionOutput,
-    ) -> Result<FinishResult, String> {
-        self.stage_completion_at(fence, output, now_millis())
+    #[cfg(test)]
+    pub(crate) fn fail_next_resolutions(&self, count: usize) {
+        self.resolution_failures.store(count, Ordering::SeqCst);
     }
 
-    fn stage_completion_at(
+    fn resolve_assignment_at(
         &self,
         fence: AssignmentFence,
-        output: &TaskExecutionOutput,
+        outcome: DurableOutcome,
         now: u64,
     ) -> Result<FinishResult, String> {
-        let terminal_state = match output {
-            TaskExecutionOutput::Agent(result) => match result.completion_status {
-                AgentTaskCompletionStatus::Completed => TaskSessionState::Succeeded,
-                AgentTaskCompletionStatus::Blocked => TaskSessionState::Blocked,
-            },
-            TaskExecutionOutput::Chat(_) | TaskExecutionOutput::Edit(_) => {
-                TaskSessionState::Succeeded
-            }
-            TaskExecutionOutput::None => {
-                return Err("Empty task output cannot be staged.".to_string())
-            }
-        };
-        let terminal_state_text = state_text(terminal_state);
-        let output_json = serde_json::to_string(output)
-            .map_err(|error| format!("Failed to encode staged task result: {error}"))?;
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("Failed to start scheduler result staging: {error}"))?;
-        let ownership = transaction
+            .map_err(|error| format!("Failed to start scheduler completion: {error}"))?;
+        let session = transaction
             .query_row(
-                "SELECT workspace_id, conversation_id, execution_run_id
+                "SELECT state, workspace_id, conversation_id, execution_run_id
                    FROM scheduler_task_sessions
-                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
-                    AND state = 'running' AND lease_expires_at > ?4",
+                   WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
+                     AND state IN ('running', 'cancelling') AND lease_expires_at > ?4",
                 params![
                     to_i64(fence.session_id.0)?,
                     to_i64(fence.attempt_id)?,
@@ -1294,18 +1311,19 @@ impl SchedulerStore {
                 ],
                 |row| {
                     Ok((
-                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
-            .map_err(|error| format!("Failed to validate staged result fence: {error}"))?;
-        let Some((workspace_id, conversation_id, execution_run_id)) = ownership else {
+            .map_err(|error| format!("Failed to validate scheduler fence: {error}"))?;
+        let Some((session_state, workspace_id, conversation_id, execution_run_id)) = session else {
             transaction
                 .commit()
-                .map_err(|error| format!("Failed to commit stale result staging: {error}"))?;
+                .map_err(|error| format!("Failed to commit stale scheduler finish: {error}"))?;
             return Ok(FinishResult::Stale);
         };
         let attempt_matches = transaction
@@ -1325,20 +1343,63 @@ impl SchedulerStore {
                 |_| Ok(()),
             )
             .optional()
-            .map_err(|error| format!("Failed to validate staged result attempt: {error}"))?
+            .map_err(|error| format!("Failed to validate scheduler attempt: {error}"))?
             .is_some();
         if !attempt_matches {
             transaction
                 .commit()
-                .map_err(|error| format!("Failed to commit stale result attempt: {error}"))?;
+                .map_err(|error| format!("Failed to commit stale scheduler attempt: {error}"))?;
             return Ok(FinishResult::Stale);
         }
+
+        if session_state == "cancelling" {
+            terminalize_assignment(&transaction, fence, "cancelled", None, now)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit scheduler cancellation: {error}"))?;
+            return Ok(FinishResult::Applied);
+        }
+
+        let DurableOutcome::Succeeded(output) = outcome else {
+            let (state, error) = match outcome {
+                DurableOutcome::Failed(error) => ("failed", Some(error)),
+                DurableOutcome::Blocked(error) => ("blocked", Some(error)),
+                DurableOutcome::Cancelled => ("cancelled", None),
+                DurableOutcome::Succeeded(_) => unreachable!(),
+            };
+            terminalize_assignment(&transaction, fence, state, error.as_deref(), now)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit scheduler completion: {error}"))?;
+            return Ok(FinishResult::Applied);
+        };
+        if matches!(output, TaskExecutionOutput::None) {
+            terminalize_assignment(&transaction, fence, "succeeded", None, now)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit scheduler completion: {error}"))?;
+            return Ok(FinishResult::Applied);
+        }
+
+        let terminal_state = match &output {
+            TaskExecutionOutput::Agent(result) => match result.completion_status {
+                AgentTaskCompletionStatus::Completed => TaskSessionState::Succeeded,
+                AgentTaskCompletionStatus::Blocked => TaskSessionState::Blocked,
+            },
+            TaskExecutionOutput::Chat(_) | TaskExecutionOutput::Edit(_) => {
+                TaskSessionState::Succeeded
+            }
+            TaskExecutionOutput::None => unreachable!(),
+        };
+        let terminal_state_text = state_text(terminal_state);
+        let output_json = serde_json::to_string(&output)
+            .map_err(|error| format!("Failed to encode staged task result: {error}"))?;
         let workspace_id = workspace_id
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "Task completion requires workspace ownership.".to_string())?;
         let conversation_id = conversation_id.filter(|value| !value.trim().is_empty());
         let execution_run_id = execution_run_id.filter(|value| !value.trim().is_empty());
-        match output {
+        match &output {
             TaskExecutionOutput::Agent(_) => {
                 if conversation_id.is_none() || execution_run_id.is_none() {
                     return Err(
@@ -1363,8 +1424,9 @@ impl SchedulerStore {
             .execute(
                 "INSERT INTO scheduler_task_completions
                    (session_id, projection_id, attempt_id, fencing_token, workspace_id,
-                    conversation_id, execution_run_id, terminal_state, output_json, staged_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     conversation_id, execution_run_id, terminal_state, output_json, staged_at,
+                     next_projection_at)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     to_i64(fence.session_id.0)?,
                     projection_id,
@@ -1421,19 +1483,24 @@ impl SchedulerStore {
         Ok(FinishResult::Applied)
     }
 
-    pub(crate) fn pending_completions(&self) -> Result<Vec<StagedCompletion>, String> {
+    /// Returns unprojected completions whose durable retry timestamp is due.
+    pub(crate) fn due_pending_completions(
+        &self,
+        now: u64,
+    ) -> Result<Vec<StagedCompletion>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT projection_id, session_id, attempt_id, fencing_token, workspace_id,
                         conversation_id, execution_run_id, terminal_state, output_json
                    FROM scheduler_task_completions
-                  WHERE finalized_at IS NULL
-                  ORDER BY staged_at, session_id",
+                   WHERE finalized_at IS NULL AND projected_at IS NULL
+                     AND next_projection_at <= ?1
+                   ORDER BY staged_at, session_id",
             )
             .map_err(|error| format!("Failed to prepare pending completions: {error}"))?;
         let completions = statement
-            .query_map([], staged_completion_from_row)
+            .query_map(params![to_i64(now)?], staged_completion_from_row)
             .map_err(|error| format!("Failed to query pending completions: {error}"))?
             .map(|row| {
                 row.map_err(|error| format!("Failed to decode pending completion: {error}"))?
@@ -1441,6 +1508,45 @@ impl SchedulerStore {
             })
             .collect();
         completions
+    }
+
+    /// Returns externally projected completions that still need idempotent scheduler finalization.
+    pub(crate) fn projected_unfinalized_completions(
+        &self,
+    ) -> Result<Vec<StagedCompletion>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT projection_id, session_id, attempt_id, fencing_token, workspace_id,
+                        conversation_id, execution_run_id, terminal_state, output_json
+                   FROM scheduler_task_completions
+                  WHERE finalized_at IS NULL AND projected_at IS NOT NULL
+                  ORDER BY staged_at, session_id",
+            )
+            .map_err(|error| format!("Failed to prepare projected completions: {error}"))?;
+        let completions = statement
+            .query_map([], staged_completion_from_row)
+            .map_err(|error| format!("Failed to query projected completions: {error}"))?
+            .map(|row| {
+                row.map_err(|error| format!("Failed to decode projected completion: {error}"))?
+                    .decode()
+            })
+            .collect();
+        completions
+    }
+
+    pub(crate) fn pending_completion_count(&self) -> Result<usize, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduler_task_completions WHERE finalized_at IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to count pending completions: {error}"))
+            .and_then(|count| {
+                usize::try_from(count).map_err(|_| "Invalid pending completion count.".to_string())
+            })
     }
 
     pub fn task_session_result(
@@ -1491,26 +1597,77 @@ impl SchedulerStore {
         completion: &StagedCompletion,
         error: &str,
     ) -> Result<bool, String> {
-        let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        connection
+        self.record_completion_error_at(completion, error, now_millis())
+    }
+
+    fn record_completion_error_at(
+        &self,
+        completion: &StagedCompletion,
+        error: &str,
+        now: u64,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start completion error recording: {error}"))?;
+        let attempt_count = transaction
+            .query_row(
+                "SELECT projection_attempt_count FROM scheduler_task_completions
+                  WHERE session_id = ?1 AND attempt_id = ?2 AND fencing_token = ?3
+                    AND finalized_at IS NULL",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to read completion projection attempt: {error}"))?;
+        let Some(attempt_count) = attempt_count else {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit stale completion error: {error}"))?;
+            return Ok(false);
+        };
+        let next_attempt = u32::try_from(attempt_count)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let delay = projection_retry_delay_millis(next_attempt);
+        let updated = transaction
             .execute(
-                "UPDATE scheduler_task_completions SET projection_error = ?4
+                "UPDATE scheduler_task_completions
+                    SET projection_error = ?4,
+                        projection_attempt_count = projection_attempt_count + 1,
+                        next_projection_at = ?5
                   WHERE session_id = ?1 AND attempt_id = ?2 AND fencing_token = ?3
                     AND finalized_at IS NULL",
                 params![
                     to_i64(completion.session_id.0)?,
                     to_i64(completion.attempt_id)?,
                     to_i64(completion.fencing_token)?,
-                    error
+                    error,
+                    to_i64(now.saturating_add(delay))?
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| format!("Failed to record completion projection error: {error}"))
+            .map_err(|error| format!("Failed to record completion projection error: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit completion projection error: {error}"))?;
+        Ok(updated == 1)
     }
 
     pub(crate) fn mark_completion_projected(
         &self,
         completion: &StagedCompletion,
+    ) -> Result<bool, String> {
+        self.mark_completion_projected_at(completion, now_millis())
+    }
+
+    fn mark_completion_projected_at(
+        &self,
+        completion: &StagedCompletion,
+        now: u64,
     ) -> Result<bool, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         connection
@@ -1523,7 +1680,7 @@ impl SchedulerStore {
                     to_i64(completion.session_id.0)?,
                     to_i64(completion.attempt_id)?,
                     to_i64(completion.fencing_token)?,
-                    to_i64(now_millis())?
+                    to_i64(now)?
                 ],
             )
             .map(|updated| updated == 1)
@@ -1626,125 +1783,6 @@ impl SchedulerStore {
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit completion finalization: {error}"))?;
-        Ok(FinishResult::Applied)
-    }
-
-    fn finish_at(
-        &self,
-        fence: AssignmentFence,
-        outcome: DurableOutcome,
-        now: u64,
-    ) -> Result<FinishResult, String> {
-        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("Failed to start scheduler completion: {error}"))?;
-        let session_state = transaction
-            .query_row(
-                "SELECT state FROM scheduler_task_sessions
-                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
-                    AND state IN ('running', 'cancelling') AND lease_expires_at > ?4",
-                params![
-                    to_i64(fence.session_id.0)?,
-                    to_i64(fence.attempt_id)?,
-                    to_i64(fence.fencing_token)?,
-                    to_i64(now)?
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| format!("Failed to validate scheduler fence: {error}"))?;
-        let Some(session_state) = session_state else {
-            transaction
-                .commit()
-                .map_err(|error| format!("Failed to commit stale scheduler finish: {error}"))?;
-            return Ok(FinishResult::Stale);
-        };
-        let attempt_matches = transaction
-            .query_row(
-                "SELECT 1 FROM scheduler_task_attempts
-                  WHERE attempt_id = ?1 AND session_id = ?2 AND attempt_number = ?3
-                    AND owner_id = ?4 AND fencing_token = ?5 AND state = 'running'
-                    AND lease_expires_at > ?6",
-                params![
-                    to_i64(fence.attempt_id)?,
-                    to_i64(fence.session_id.0)?,
-                    i64::from(fence.attempt),
-                    to_i64(fence.owner_id)?,
-                    to_i64(fence.fencing_token)?,
-                    to_i64(now)?
-                ],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| format!("Failed to validate scheduler attempt: {error}"))?
-            .is_some();
-        if !attempt_matches {
-            transaction
-                .commit()
-                .map_err(|error| format!("Failed to commit stale scheduler attempt: {error}"))?;
-            return Ok(FinishResult::Stale);
-        }
-
-        let (state, attempt_state, error) = if session_state == "cancelling" {
-            ("cancelled", "cancelled", None)
-        } else {
-            match outcome {
-                DurableOutcome::Succeeded => ("succeeded", "succeeded", None),
-                DurableOutcome::Failed(error) => ("failed", "failed", Some(error)),
-                DurableOutcome::Blocked(error) => ("blocked", "blocked", Some(error)),
-                DurableOutcome::Cancelled => ("cancelled", "cancelled", None),
-            }
-        };
-        transaction
-            .execute(
-                "UPDATE scheduler_task_attempts
-                    SET state = ?2, lease_expires_at = NULL, completed_at = ?3, error = ?4
-                  WHERE attempt_id = ?1",
-                params![
-                    to_i64(fence.attempt_id)?,
-                    attempt_state,
-                    to_i64(now)?,
-                    error
-                ],
-            )
-            .map_err(|error| format!("Failed to finish scheduler attempt: {error}"))?;
-        transaction
-            .execute(
-                "UPDATE scheduler_task_sessions
-                    SET state = ?2, active_attempt_id = NULL, lease_expires_at = NULL,
-                        completed_at = ?3, error = ?4
-                  WHERE session_id = ?1 AND active_attempt_id = ?5 AND fencing_token = ?6",
-                params![
-                    to_i64(fence.session_id.0)?,
-                    state,
-                    to_i64(now)?,
-                    error,
-                    to_i64(fence.attempt_id)?,
-                    to_i64(fence.fencing_token)?
-                ],
-            )
-            .map_err(|error| format!("Failed to finish scheduler session: {error}"))?;
-        append_event_in_transaction(
-            &transaction,
-            fence.session_id,
-            Some(fence.attempt_id),
-            fence.fencing_token,
-            &TaskSessionEventInput {
-                kind: TaskSessionEventKind::Lifecycle,
-                payload: json!({ "state": state, "error": error }),
-                progress: Some(TaskProgress {
-                    phase: state.to_string(),
-                    completed: 1,
-                    total: Some(1),
-                }),
-            },
-            now,
-        )?;
-        transaction
-            .commit()
-            .map_err(|error| format!("Failed to commit scheduler completion: {error}"))?;
-        drop(connection);
         Ok(FinishResult::Applied)
     }
 
@@ -1869,6 +1907,68 @@ fn staged_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Store
         terminal_state: row.get(7)?,
         output_json: row.get(8)?,
     })
+}
+
+fn terminalize_assignment(
+    transaction: &Transaction<'_>,
+    fence: AssignmentFence,
+    state: &str,
+    error: Option<&str>,
+    now: u64,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "UPDATE scheduler_task_attempts
+                SET state = ?2, lease_expires_at = NULL, completed_at = ?3, error = ?4
+              WHERE attempt_id = ?1 AND state = 'running'",
+            params![to_i64(fence.attempt_id)?, state, to_i64(now)?, error],
+        )
+        .map_err(|error| format!("Failed to finish scheduler attempt: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE scheduler_task_sessions
+                SET state = ?2, active_attempt_id = NULL, lease_expires_at = NULL,
+                    completed_at = ?3, error = ?4
+              WHERE session_id = ?1 AND active_attempt_id = ?5 AND fencing_token = ?6",
+            params![
+                to_i64(fence.session_id.0)?,
+                state,
+                to_i64(now)?,
+                error,
+                to_i64(fence.attempt_id)?,
+                to_i64(fence.fencing_token)?
+            ],
+        )
+        .map_err(|error| format!("Failed to finish scheduler session: {error}"))?;
+    append_event_in_transaction(
+        transaction,
+        fence.session_id,
+        Some(fence.attempt_id),
+        fence.fencing_token,
+        &TaskSessionEventInput {
+            kind: TaskSessionEventKind::Lifecycle,
+            payload: json!({ "state": state, "error": error }),
+            progress: Some(TaskProgress {
+                phase: state.to_string(),
+                completed: 1,
+                total: Some(1),
+            }),
+        },
+        now,
+    )?;
+    Ok(())
+}
+
+fn projection_retry_delay_millis(attempt: u32) -> u64 {
+    const BASE_MILLIS: u64 = 100;
+    const CAP_MILLIS: u64 = 30_000;
+    BASE_MILLIS
+        .saturating_mul(
+            1_u64
+                .checked_shl(attempt.saturating_sub(1).min(63))
+                .unwrap_or(u64::MAX),
+        )
+        .min(CAP_MILLIS)
 }
 
 impl StoredSession {
@@ -2765,7 +2865,11 @@ mod tests {
         assert!(second.fence.fencing_token > first.fence.fencing_token);
         assert!(matches!(
             store
-                .finish_at(first.fence, DurableOutcome::Succeeded, 1_012)
+                .resolve_assignment_at(
+                    first.fence,
+                    DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                    1_012,
+                )
                 .expect("stale finish checked"),
             FinishResult::Stale
         ));
@@ -2875,7 +2979,11 @@ mod tests {
             thread::spawn(move || {
                 barrier.wait();
                 first
-                    .finish_at(assignment.fence, DurableOutcome::Succeeded, 20)
+                    .resolve_assignment_at(
+                        assignment.fence,
+                        DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                        20,
+                    )
                     .expect("first finish")
             })
         };
@@ -2884,7 +2992,11 @@ mod tests {
             thread::spawn(move || {
                 barrier.wait();
                 second
-                    .finish_at(assignment.fence, DurableOutcome::Succeeded, 20)
+                    .resolve_assignment_at(
+                        assignment.fence,
+                        DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                        20,
+                    )
                     .expect("second finish")
             })
         };
@@ -2962,7 +3074,11 @@ mod tests {
         );
         assert!(matches!(
             store
-                .finish_at(assignment.fence, DurableOutcome::Succeeded, 30)
+                .resolve_assignment_at(
+                    assignment.fence,
+                    DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                    30,
+                )
                 .expect("task finished"),
             FinishResult::Applied
         ));
@@ -3160,7 +3276,11 @@ mod tests {
             .is_none());
 
         store
-            .finish_at(first_assignment.fence, DurableOutcome::Succeeded, 20)
+            .resolve_assignment_at(
+                first_assignment.fence,
+                DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                20,
+            )
             .expect("first finished");
         let conflicting_assignment = store
             .claim_next_at(owner, 3, 21, LEASE_MILLIS, 5)
@@ -3201,7 +3321,11 @@ mod tests {
             let output = agent_output(status);
             assert!(matches!(
                 store
-                    .stage_completion_at(assignment.fence, &output, 20)
+                    .resolve_assignment_at(
+                        assignment.fence,
+                        DurableOutcome::Succeeded(output.clone()),
+                        20,
+                    )
                     .expect("result staged"),
                 FinishResult::Applied
             ));
@@ -3233,6 +3357,98 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_atomically_wins_over_structured_worker_completion() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_at(
+                &owned_agent_request("cancel", "conversation-cancel", "subject-cancel"),
+                1,
+            )
+            .expect("session enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("session claimed")
+            .expect("assignment");
+        store
+            .cancel_at(session.id, 20)
+            .expect("cancellation requested");
+
+        assert!(matches!(
+            store
+                .resolve_assignment_at(
+                    assignment.fence,
+                    DurableOutcome::Succeeded(agent_output(AgentTaskCompletionStatus::Completed)),
+                    21,
+                )
+                .expect("completion resolved"),
+            FinishResult::Applied
+        ));
+        assert_eq!(
+            store
+                .get_session(session.id)
+                .expect("session read")
+                .expect("session exists")
+                .state,
+            TaskSessionState::Cancelled
+        );
+        assert!(store
+            .task_session_result(session.id)
+            .expect("result queried")
+            .is_none());
+    }
+
+    #[test]
+    fn projection_retry_backoff_is_exact_and_caps_at_thirty_seconds() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        store
+            .enqueue_at(
+                &owned_agent_request("retry", "conversation-retry", "subject-retry"),
+                1,
+            )
+            .expect("session enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("session claimed")
+            .expect("assignment");
+        store
+            .resolve_assignment_at(
+                assignment.fence,
+                DurableOutcome::Succeeded(agent_output(AgentTaskCompletionStatus::Completed)),
+                20,
+            )
+            .expect("completion staged");
+        let mut completion = store
+            .due_pending_completions(20)
+            .expect("pending queried")
+            .pop()
+            .expect("completion due");
+
+        let mut now = 1_000;
+        for attempt in 1..=12 {
+            store
+                .record_completion_error_at(&completion, "retry", now)
+                .expect("error recorded");
+            let delay = projection_retry_delay_millis(attempt);
+            assert!(store
+                .due_pending_completions(now.saturating_add(delay).saturating_sub(1))
+                .expect("not-due queried")
+                .is_empty());
+            completion = store
+                .due_pending_completions(now.saturating_add(delay))
+                .expect("due queried")
+                .pop()
+                .expect("completion due exactly");
+            now = now.saturating_add(delay);
+        }
+        assert_eq!(projection_retry_delay_millis(1), 100);
+        assert_eq!(projection_retry_delay_millis(2), 200);
+        assert_eq!(projection_retry_delay_millis(10), 30_000);
+        assert_eq!(projection_retry_delay_millis(u32::MAX), 30_000);
+    }
+
+    #[test]
     fn stale_fence_cannot_stage_result_and_committing_keeps_ownership_locked() {
         let store = SchedulerStore::open_in_memory().expect("store opens");
         let owner = store.register_owner().expect("owner registered");
@@ -3257,18 +3473,18 @@ mod tests {
         stale.fencing_token += 1;
         assert!(matches!(
             store
-                .stage_completion_at(
+                .resolve_assignment_at(
                     stale,
-                    &agent_output(AgentTaskCompletionStatus::Completed),
+                    DurableOutcome::Succeeded(agent_output(AgentTaskCompletionStatus::Completed)),
                     20
                 )
                 .expect("stale result rejected"),
             FinishResult::Stale
         ));
         store
-            .stage_completion_at(
+            .resolve_assignment_at(
                 assignment.fence,
-                &agent_output(AgentTaskCompletionStatus::Completed),
+                DurableOutcome::Succeeded(agent_output(AgentTaskCompletionStatus::Completed)),
                 20,
             )
             .expect("result staged");
@@ -3508,7 +3724,7 @@ mod tests {
             .enqueue_at(&TaskRequest::new("reclaimed-authority"), 40)
             .expect("second task enqueued");
         store
-            .finish_at(first.fence, DurableOutcome::Cancelled, 41)
+            .resolve_assignment_at(first.fence, DurableOutcome::Cancelled, 41)
             .expect("first task cancelled");
         let stale = store
             .claim_next_at(owner, 2, 50, LEASE_MILLIS, 5)
@@ -3528,7 +3744,11 @@ mod tests {
             .is_err());
         assert!(matches!(
             store
-                .finish_at(stale.fence, DurableOutcome::Succeeded, 1_051)
+                .resolve_assignment_at(
+                    stale.fence,
+                    DurableOutcome::Succeeded(TaskExecutionOutput::None),
+                    1_051,
+                )
                 .expect("expired finish checked"),
             FinishResult::Stale
         ));

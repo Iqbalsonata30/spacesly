@@ -15,19 +15,79 @@ use crate::infrastructure::scheduler_store::{
     AssignmentFence, DurableAssignment, DurableOutcome, ExternalAssignmentAuthority, FinishResult,
     SchedulerStore, StagedCompletion, TaskToolAuthority,
 };
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Fixed number of long-lived workers owned by one execution engine.
 pub const MAX_EXECUTION_WORKERS: usize = 5;
 const ASSIGNMENT_LEASE_DURATION: Duration = Duration::from_secs(30);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum time a public scheduler command waits for its coordinator reply.
+const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time engine construction waits for scheduler startup.
+const STARTUP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum total time Drop waits for cooperative scheduler shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SCHEDULER_TICK: Duration = Duration::from_millis(10);
+const COMPLETION_RETRY_BASE: Duration = Duration::from_millis(10);
+const COMPLETION_RETRY_CAP: Duration = Duration::from_secs(1);
+
+/// High-level availability state of the execution scheduler.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerHealthStatus {
+    /// No tracked scheduler operation is currently failing.
+    Healthy,
+    /// At least one durable or channel operation requires retry or operator attention.
+    Degraded,
+    /// Shutdown has started and assignment authority is being revoked.
+    Stopping,
+    /// The coordinator has stopped; noncooperative in-process threads may be detached.
+    Stopped,
+}
+
+/// Directly readable scheduler health snapshot independent of the scheduler command channel.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SchedulerHealth {
+    /// Current scheduler availability state.
+    pub status: SchedulerHealthStatus,
+    /// Most recent unresolved scheduler error.
+    pub last_error: Option<String>,
+    /// Unix epoch milliseconds for `last_error`.
+    pub last_error_at: Option<u64>,
+    /// Number of consecutive unresolved errors.
+    pub consecutive_errors: u64,
+    /// Worker outcomes retained until atomic durable resolution succeeds or becomes stale.
+    pub pending_worker_completions: usize,
+    /// Durable structured completions awaiting projection/finalization.
+    pub pending_projections: usize,
+}
+
+impl Default for SchedulerHealth {
+    fn default() -> Self {
+        Self {
+            status: SchedulerHealthStatus::Healthy,
+            last_error: None,
+            last_error_at: None,
+            consecutive_errors: 0,
+            pending_worker_completions: 0,
+            pending_projections: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SchedulerHealthState {
+    snapshot: SchedulerHealth,
+    errors: HashMap<String, (String, u64, u64)>,
+}
 
 /// Observable lifecycle state of one reusable worker slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +552,8 @@ pub enum ExecutionEngineError {
     SessionNotTerminal(TaskSessionId),
     /// The caller timed out waiting for a terminal session state.
     WaitTimeout(TaskSessionId),
+    /// The scheduler accepted a command but did not reply within the documented bound.
+    CommandTimeout,
     /// The submitted request failed validation.
     InvalidRequest(String),
     /// Durable Scheduler storage could not complete an operation.
@@ -511,6 +573,7 @@ impl Display for ExecutionEngineError {
             Self::WaitTimeout(id) => {
                 write!(formatter, "Timed out waiting for task session {}.", id.0)
             }
+            Self::CommandTimeout => formatter.write_str("Execution scheduler command timed out."),
             Self::InvalidRequest(message) => formatter.write_str(message),
             Self::Persistence(message) => {
                 write!(formatter, "Scheduler persistence failed: {message}")
@@ -523,13 +586,13 @@ impl std::error::Error for ExecutionEngineError {}
 
 /// Backend-owned execution engine containing one Scheduler and five long-lived Workers.
 ///
-/// Dropping the engine requests cooperative cancellation, shuts down every Worker, and joins the
-/// Scheduler thread. The current mock boundary must cooperate with cancellation to guarantee a
-/// bounded shutdown.
+/// Dropping the engine revokes durable owner authority and waits only up to `SHUTDOWN_TIMEOUT`.
+/// Noncooperative in-process worker/projector threads may detach after fencing prevents authority.
 pub struct ExecutionEngine {
     sender: mpsc::Sender<SchedulerMessage>,
     notifier: Arc<TaskSessionNotifier>,
     scheduler: Option<JoinHandle<()>>,
+    health: Arc<Mutex<SchedulerHealthState>>,
 }
 
 impl ExecutionEngine {
@@ -605,6 +668,8 @@ impl ExecutionEngine {
         let scheduler_sender = sender.clone();
         let notifier = Arc::new(TaskSessionNotifier::default());
         let scheduler_notifier = notifier.clone();
+        let health = Arc::new(Mutex::new(SchedulerHealthState::default()));
+        let scheduler_health = health.clone();
         let scheduler = thread::Builder::new()
             .name("spacesly-execution-scheduler".to_string())
             .spawn(move || {
@@ -615,22 +680,32 @@ impl ExecutionEngine {
                     projector,
                     store,
                     scheduler_notifier,
+                    scheduler_health,
                     startup,
                 )
             })
             .map_err(|_| ExecutionEngineError::SchedulerUnavailable)?;
-        match startup_result.recv() {
+        match startup_result.recv_timeout(STARTUP_REPLY_TIMEOUT) {
             Ok(Ok(())) => Ok(Self {
                 sender,
                 notifier,
                 scheduler: Some(scheduler),
+                health,
             }),
             Ok(Err(error)) => {
-                let _ = scheduler.join();
+                if scheduler.is_finished() {
+                    let _ = scheduler.join();
+                }
                 Err(error)
             }
-            Err(_) => {
-                let _ = scheduler.join();
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(scheduler);
+                Err(ExecutionEngineError::CommandTimeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if scheduler.is_finished() {
+                    let _ = scheduler.join();
+                }
                 Err(ExecutionEngineError::SchedulerUnavailable)
             }
         }
@@ -700,6 +775,21 @@ impl ExecutionEngine {
     /// Subscribes to best-effort post-commit wake-ups; durable replay remains authoritative.
     pub fn subscribe_updates(&self) -> mpsc::Receiver<TaskSessionUpdate> {
         self.notifier.subscribe()
+    }
+
+    /// Returns scheduler health directly from shared state without a scheduler command round-trip.
+    pub fn health(&self) -> SchedulerHealth {
+        self.health
+            .lock()
+            .map(|health| health.snapshot.clone())
+            .unwrap_or_else(|_| SchedulerHealth {
+                status: SchedulerHealthStatus::Degraded,
+                last_error: Some("Scheduler health lock is poisoned.".to_string()),
+                last_error_at: Some(epoch_millis()),
+                consecutive_errors: 1,
+                pending_worker_completions: 0,
+                pending_projections: 0,
+            })
     }
 
     /// Requests cancellation of a queued or running task session.
@@ -776,9 +866,20 @@ impl ExecutionEngine {
     ) -> Result<TaskSessionSnapshot, ExecutionEngineError> {
         let deadline = Instant::now() + timeout;
         loop {
-            let session = self
-                .session(id)?
-                .ok_or(ExecutionEngineError::SessionNotFound(id))?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ExecutionEngineError::WaitTimeout(id));
+            }
+            let (reply, response) = mpsc::channel();
+            self.send(SchedulerCommand::GetSession { id, reply })?;
+            let reply_timeout = remaining.min(COMMAND_REPLY_TIMEOUT);
+            let response = match receive_timeout(response, reply_timeout) {
+                Err(ExecutionEngineError::CommandTimeout) if reply_timeout == remaining => {
+                    return Err(ExecutionEngineError::WaitTimeout(id));
+                }
+                result => result?,
+            };
+            let session = response?.ok_or(ExecutionEngineError::SessionNotFound(id))?;
             if session.state.is_terminal() {
                 return Ok(session);
             }
@@ -805,8 +906,14 @@ impl ExecutionEngine {
             .send(SchedulerMessage::Command(SchedulerCommand::Shutdown {
                 reply,
             }));
-        let _ = response.recv();
-        let _ = scheduler.join();
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let _ = response.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        while !scheduler.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if scheduler.is_finished() {
+            let _ = scheduler.join();
+        }
     }
 }
 
@@ -817,9 +924,17 @@ impl Drop for ExecutionEngine {
 }
 
 fn receive<T>(response: mpsc::Receiver<T>) -> Result<T, ExecutionEngineError> {
-    response
-        .recv()
-        .map_err(|_| ExecutionEngineError::SchedulerUnavailable)
+    receive_timeout(response, COMMAND_REPLY_TIMEOUT)
+}
+
+fn receive_timeout<T>(
+    response: mpsc::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, ExecutionEngineError> {
+    response.recv_timeout(timeout).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => ExecutionEngineError::CommandTimeout,
+        mpsc::RecvTimeoutError::Disconnected => ExecutionEngineError::SchedulerUnavailable,
+    })
 }
 
 enum SchedulerMessage {
@@ -828,6 +943,10 @@ enum SchedulerMessage {
         worker_id: usize,
         fence: AssignmentFence,
         outcome: WorkerOutcome,
+    },
+    ProjectionFinished {
+        completion: StagedCompletion,
+        result: Result<(), String>,
     },
 }
 
@@ -872,12 +991,20 @@ enum SchedulerCommand {
     Shutdown {
         reply: mpsc::Sender<()>,
     },
+    #[cfg(test)]
+    Pause {
+        duration: Duration,
+        reply: mpsc::Sender<()>,
+    },
 }
 
 // Process-local state for one durable assignment owned by this Scheduler instance.
 struct ActiveAssignment {
     fence: AssignmentFence,
     cancellation: TaskCancellation,
+    pending_outcome: Option<WorkerOutcome>,
+    resolution_attempts: u32,
+    next_resolution_attempt: Instant,
 }
 
 // Scheduler-owned channel and join handle for one long-lived Worker.
@@ -898,6 +1025,7 @@ enum WorkerCommand {
     Shutdown,
 }
 
+#[derive(Clone)]
 enum WorkerOutcome {
     Succeeded(TaskExecutionOutput),
     Failed(String),
@@ -909,11 +1037,20 @@ enum WorkerOutcome {
 struct Scheduler {
     store: SchedulerStore,
     notifier: Arc<TaskSessionNotifier>,
-    projector: Arc<dyn CompletionProjector>,
+    projection_sender: mpsc::Sender<ProjectionCommand>,
+    projection_handle: Option<JoinHandle<()>>,
+    projection_in_flight: Option<String>,
+    health: Arc<Mutex<SchedulerHealthState>>,
     owner_id: u64,
     active: HashMap<TaskSessionId, ActiveAssignment>,
     workers: Vec<WorkerSlot>,
+    released_workers: VecDeque<usize>,
     next_lease_renewal: Instant,
+}
+
+enum ProjectionCommand {
+    Project(StagedCompletion),
+    Shutdown,
 }
 
 fn run_scheduler(
@@ -923,6 +1060,7 @@ fn run_scheduler(
     projector: Arc<dyn CompletionProjector>,
     store: SchedulerStore,
     notifier: Arc<TaskSessionNotifier>,
+    health: Arc<Mutex<SchedulerHealthState>>,
     startup: mpsc::Sender<Result<(), ExecutionEngineError>>,
 ) {
     let owner_id = match store.register_owner() {
@@ -936,9 +1074,18 @@ fn run_scheduler(
         let _ = startup.send(Err(ExecutionEngineError::Persistence(error)));
         return;
     }
-    let workers = match start_workers(sender, executor) {
+    let mut workers = match start_workers(sender.clone(), executor) {
         Ok(workers) => workers,
         Err(error) => {
+            let _ = startup.send(Err(error));
+            return;
+        }
+    };
+    let (projection_sender, projection_receiver) = mpsc::channel();
+    let projection_handle = match start_projection_worker(sender, projection_receiver, projector) {
+        Ok(handle) => handle,
+        Err(error) => {
+            stop_worker_slots(&mut workers);
             let _ = startup.send(Err(error));
             return;
         }
@@ -946,20 +1093,24 @@ fn run_scheduler(
     let mut scheduler = Scheduler {
         store,
         notifier,
-        projector,
+        projection_sender,
+        projection_handle: Some(projection_handle),
+        projection_in_flight: None,
+        health,
         owner_id,
         active: HashMap::new(),
         workers,
+        released_workers: VecDeque::new(),
         next_lease_renewal: Instant::now() + LEASE_RENEW_INTERVAL,
     };
-    scheduler.project_pending();
     let _ = startup.send(Ok(()));
     scheduler.dispatch();
 
     'scheduler: loop {
         let wait = scheduler
             .next_lease_renewal
-            .saturating_duration_since(Instant::now());
+            .saturating_duration_since(Instant::now())
+            .min(SCHEDULER_TICK);
         match receiver.recv_timeout(wait) {
             Ok(message) => match message {
                 SchedulerMessage::Command(SchedulerCommand::Submit { request, reply }) => {
@@ -1041,9 +1192,14 @@ fn run_scheduler(
                     let _ = reply.send(result);
                 }
                 SchedulerMessage::Command(SchedulerCommand::Shutdown { reply }) => {
-                    scheduler.shutdown_workers();
+                    scheduler.shutdown();
                     let _ = reply.send(());
                     break 'scheduler;
+                }
+                #[cfg(test)]
+                SchedulerMessage::Command(SchedulerCommand::Pause { duration, reply }) => {
+                    thread::sleep(duration);
+                    let _ = reply.send(());
                 }
                 SchedulerMessage::WorkerFinished {
                     worker_id,
@@ -1052,17 +1208,22 @@ fn run_scheduler(
                 } => {
                     scheduler.finish(worker_id, fence, outcome);
                 }
+                SchedulerMessage::ProjectionFinished { completion, result } => {
+                    scheduler.projection_finished(completion, result);
+                }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                scheduler.shutdown_workers();
+                scheduler.record_error("channel", "Scheduler command channel disconnected.");
+                scheduler.shutdown();
                 break;
             }
         }
         if Instant::now() >= scheduler.next_lease_renewal {
             scheduler.renew_leases();
         }
-        scheduler.project_pending();
+        scheduler.retry_pending_worker_completions();
+        scheduler.dispatch_projection();
         scheduler.dispatch();
     }
 }
@@ -1091,11 +1252,23 @@ impl Scheduler {
 
     fn dispatch(&mut self) {
         loop {
-            let Some(worker_index) = self
-                .workers
-                .iter()
-                .position(|worker| worker.snapshot.state == WorkerState::Idle)
-            else {
+            let worker_index = if self.active.is_empty() {
+                self.released_workers
+                    .front()
+                    .copied()
+                    .filter(|index| self.workers[*index].snapshot.state == WorkerState::Idle)
+            } else {
+                None
+            }
+            .or_else(|| {
+                self.workers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, worker)| worker.snapshot.state == WorkerState::Idle)
+                    .min_by_key(|(_, worker)| worker.snapshot.completed_sessions)
+                    .map(|(index, _)| index)
+            });
+            let Some(worker_index) = worker_index else {
                 return;
             };
             let worker_id = self.workers[worker_index].snapshot.id;
@@ -1107,9 +1280,26 @@ impl Scheduler {
             );
             self.publish_all_current();
             let assignment = match claim {
-                Ok(Some(assignment)) => assignment,
-                Ok(None) | Err(_) => return,
+                Ok(Some(assignment)) => {
+                    self.record_success("claim");
+                    assignment
+                }
+                Ok(None) => {
+                    self.record_success("claim");
+                    return;
+                }
+                Err(error) => {
+                    self.record_error("claim", error);
+                    return;
+                }
             };
+            if let Some(position) = self
+                .released_workers
+                .iter()
+                .position(|index| *index == worker_index)
+            {
+                self.released_workers.remove(position);
+            }
             let session_id = assignment.fence.session_id;
             let cancellation = TaskCancellation::default();
             let event_sink = TaskEventSink {
@@ -1127,6 +1317,9 @@ impl Scheduler {
                 ActiveAssignment {
                     fence: assignment.assignment.fence,
                     cancellation,
+                    pending_outcome: None,
+                    resolution_attempts: 0,
+                    next_resolution_attempt: Instant::now(),
                 },
             );
             self.workers[worker_index].snapshot.state = WorkerState::Running;
@@ -1137,21 +1330,14 @@ impl Scheduler {
                 .send(WorkerCommand::Execute(assignment))
                 .is_err()
             {
-                if let Some(active) = self.active.remove(&session_id) {
-                    if matches!(
-                        self.store.finish(
-                            active.fence,
-                            DurableOutcome::Failed(
-                                "Worker channel closed before dispatch.".to_string(),
-                            ),
-                        ),
-                        Ok(FinishResult::Applied)
-                    ) {
-                        self.publish_current(session_id);
-                    }
+                if let Some(active) = self.active.get_mut(&session_id) {
+                    active.pending_outcome = Some(WorkerOutcome::Failed(
+                        "Worker channel closed before dispatch.".to_string(),
+                    ));
                 }
                 self.workers[worker_index].snapshot.state = WorkerState::Stopped;
-                self.workers[worker_index].snapshot.session_id = None;
+                self.record_error("channel", "Worker channel closed before dispatch.");
+                self.try_resolve_completion(session_id);
             }
         }
     }
@@ -1177,70 +1363,167 @@ impl Scheduler {
 
     fn finish(&mut self, worker_id: usize, fence: AssignmentFence, outcome: WorkerOutcome) {
         let session_id = fence.session_id;
-        let Some(worker) = self.workers.iter_mut().find(|worker| {
+        let Some(_) = self.workers.iter().find(|worker| {
             worker.snapshot.id == worker_id && worker.snapshot.session_id == Some(session_id)
         }) else {
             return;
         };
-        worker.snapshot.state = WorkerState::Idle;
-        worker.snapshot.session_id = None;
-        worker.snapshot.completed_sessions = worker.snapshot.completed_sessions.saturating_add(1);
-
-        let Some(active) = self.active.remove(&session_id) else {
+        let Some(active) = self.active.get_mut(&session_id) else {
             return;
         };
         if active.fence != fence {
             return;
         }
-        let outcome = match outcome {
-            WorkerOutcome::Succeeded(TaskExecutionOutput::None) => DurableOutcome::Succeeded,
-            WorkerOutcome::Succeeded(
-                output @ (TaskExecutionOutput::Agent(_)
-                | TaskExecutionOutput::Chat(_)
-                | TaskExecutionOutput::Edit(_)),
-            ) => {
-                if matches!(
-                    self.store.stage_completion(fence, &output),
-                    Ok(FinishResult::Applied)
-                ) {
-                    self.publish_current(session_id);
-                    self.project_pending();
-                }
-                return;
-            }
+        active.pending_outcome = Some(outcome);
+        active.next_resolution_attempt = Instant::now();
+        self.update_pending_worker_health();
+        self.try_resolve_completion(session_id);
+    }
+
+    fn retry_pending_worker_completions(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .active
+            .iter()
+            .filter_map(|(session_id, active)| {
+                (active.pending_outcome.is_some() && active.next_resolution_attempt <= now)
+                    .then_some(*session_id)
+            })
+            .collect::<Vec<_>>();
+        for session_id in due {
+            self.try_resolve_completion(session_id);
+        }
+    }
+
+    fn try_resolve_completion(&mut self, session_id: TaskSessionId) {
+        let Some(active) = self.active.get(&session_id) else {
+            return;
+        };
+        let fence = active.fence;
+        let Some(outcome) = active.pending_outcome.clone() else {
+            return;
+        };
+        let durable = match outcome {
+            WorkerOutcome::Succeeded(output) => DurableOutcome::Succeeded(output),
             WorkerOutcome::Failed(error) => DurableOutcome::Failed(error),
             WorkerOutcome::Blocked(error) => DurableOutcome::Blocked(error),
             WorkerOutcome::Cancelled => DurableOutcome::Cancelled,
         };
-        if matches!(self.store.finish(fence, outcome), Ok(FinishResult::Applied)) {
-            self.publish_current(session_id);
+        match self.store.resolve_assignment(fence, durable) {
+            Ok(FinishResult::Applied | FinishResult::Stale) => {
+                self.active.remove(&session_id);
+                if let Some((worker_index, worker)) = self
+                    .workers
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, worker)| worker.snapshot.session_id == Some(session_id))
+                {
+                    if worker.snapshot.state != WorkerState::Stopped {
+                        worker.snapshot.state = WorkerState::Idle;
+                        self.released_workers.push_back(worker_index);
+                    }
+                    worker.snapshot.session_id = None;
+                    worker.snapshot.completed_sessions =
+                        worker.snapshot.completed_sessions.saturating_add(1);
+                }
+                self.publish_current(session_id);
+                self.record_success("completion");
+            }
+            Err(error) => {
+                if let Some(active) = self.active.get_mut(&session_id) {
+                    active.resolution_attempts = active.resolution_attempts.saturating_add(1);
+                    active.next_resolution_attempt = Instant::now()
+                        + retry_delay(
+                            active.resolution_attempts,
+                            COMPLETION_RETRY_BASE,
+                            COMPLETION_RETRY_CAP,
+                        );
+                }
+                self.record_error("completion", error);
+            }
         }
+        self.update_pending_worker_health();
     }
 
-    fn project_pending(&mut self) {
-        let Ok(completions) = self.store.pending_completions() else {
+    fn dispatch_projection(&mut self) {
+        if self.projection_in_flight.is_some() {
+            self.refresh_pending_projection_health();
             return;
-        };
-        for completion in completions {
-            if let Err(error) = self.projector.project(&completion) {
-                let _ = self.store.record_completion_error(&completion, &error);
-                self.publish_current(completion.session_id);
-                continue;
+        }
+        match self.store.projected_unfinalized_completions() {
+            Ok(completions) => {
+                self.record_success("pending-query");
+                if let Some(completion) = completions.into_iter().next() {
+                    match self.store.finalize_completion(&completion) {
+                        Ok(FinishResult::Applied | FinishResult::Stale) => {
+                            self.publish_current(completion.session_id);
+                            self.record_success("projection-finalization");
+                        }
+                        Err(error) => self.record_error("projection-finalization", error),
+                    }
+                    self.refresh_pending_projection_health();
+                    return;
+                }
             }
-            if !self
-                .store
-                .mark_completion_projected(&completion)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if matches!(
-                self.store.finalize_completion(&completion),
-                Ok(FinishResult::Applied)
-            ) {
-                self.publish_current(completion.session_id);
+            Err(error) => {
+                self.record_error("pending-query", error);
+                return;
             }
         }
+        let completions = match self.store.due_pending_completions(epoch_millis()) {
+            Ok(completions) => {
+                self.record_success("pending-query");
+                completions
+            }
+            Err(error) => {
+                self.record_error("pending-query", error);
+                return;
+            }
+        };
+        let Some(completion) = completions.into_iter().next() else {
+            self.refresh_pending_projection_health();
+            return;
+        };
+        self.projection_in_flight = Some(completion.projection_id.clone());
+        if self
+            .projection_sender
+            .send(ProjectionCommand::Project(completion))
+            .is_err()
+        {
+            self.projection_in_flight = None;
+            self.record_error("channel", "Completion projection channel closed.");
+        }
+        self.refresh_pending_projection_health();
+    }
+
+    fn projection_finished(&mut self, completion: StagedCompletion, result: Result<(), String>) {
+        if self.projection_in_flight.as_deref() != Some(completion.projection_id.as_str()) {
+            return;
+        }
+        self.projection_in_flight = None;
+        match result {
+            Err(error) => match self.store.record_completion_error(&completion, &error) {
+                Ok(_) => {
+                    self.publish_current(completion.session_id);
+                    self.record_error("projection", error);
+                }
+                Err(store_error) => self.record_error("projection-bookkeeping", store_error),
+            },
+            Ok(()) => match self.store.mark_completion_projected(&completion) {
+                Ok(true) => match self.store.finalize_completion(&completion) {
+                    Ok(FinishResult::Applied | FinishResult::Stale) => {
+                        self.publish_current(completion.session_id);
+                        self.record_success("projection");
+                        self.record_success("projection-bookkeeping");
+                        self.record_success("projection-finalization");
+                    }
+                    Err(error) => self.record_error("projection-finalization", error),
+                },
+                Ok(false) => self.record_success("projection-bookkeeping"),
+                Err(error) => self.record_error("projection-bookkeeping", error),
+            },
+        }
+        self.refresh_pending_projection_health();
     }
 
     fn remove_session(&mut self, id: TaskSessionId) -> Result<bool, ExecutionEngineError> {
@@ -1263,6 +1546,7 @@ impl Scheduler {
         for (session_id, active) in &self.active {
             match self.store.renew(active.fence, ASSIGNMENT_LEASE_DURATION) {
                 Ok(true) => {
+                    self.record_success("renew");
                     if self
                         .store
                         .get_session(*session_id)
@@ -1273,39 +1557,125 @@ impl Scheduler {
                         active.cancellation.cancel();
                     }
                 }
-                Ok(false) | Err(_) => active.cancellation.cancel(),
-            }
-        }
-        if self
-            .store
-            .recover_expired()
-            .is_ok_and(|recovered| recovered > 0)
-        {
-            if let Ok(sessions) = self.store.list_sessions() {
-                for session in sessions {
-                    self.publish(&session);
+                Ok(false) => active.cancellation.cancel(),
+                Err(error) => {
+                    active.cancellation.cancel();
+                    self.record_error("renew", error);
                 }
             }
+        }
+        match self.store.recover_expired() {
+            Ok(recovered) if recovered > 0 => {
+                self.record_success("recovery");
+                if let Ok(sessions) = self.store.list_sessions() {
+                    for session in sessions {
+                        self.publish(&session);
+                    }
+                }
+            }
+            Ok(_) => self.record_success("recovery"),
+            Err(error) => self.record_error("recovery", error),
         }
         self.next_lease_renewal = Instant::now() + LEASE_RENEW_INTERVAL;
     }
 
-    fn shutdown_workers(&mut self) {
+    fn shutdown(&mut self) {
+        self.set_health_status(SchedulerHealthStatus::Stopping);
         for active in self.active.values() {
             active.cancellation.cancel();
+        }
+        if let Err(error) = self.store.abandon_owner(self.owner_id) {
+            self.record_error("shutdown", error);
         }
         for worker in &self.workers {
             let _ = worker.sender.send(WorkerCommand::Shutdown);
         }
+        let _ = self.projection_sender.send(ProjectionCommand::Shutdown);
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT / 2;
         for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
-            }
+            join_if_finished_before(&mut worker.handle, deadline);
             worker.snapshot.state = WorkerState::Stopped;
             worker.snapshot.session_id = None;
         }
-        let _ = self.store.abandon_owner(self.owner_id);
+        join_if_finished_before(&mut self.projection_handle, deadline);
         self.active.clear();
+        self.update_pending_worker_health();
+        self.refresh_pending_projection_health();
+        self.set_health_status(SchedulerHealthStatus::Stopped);
+    }
+
+    fn update_pending_worker_health(&self) {
+        if let Ok(mut health) = self.health.lock() {
+            health.snapshot.pending_worker_completions = self
+                .active
+                .values()
+                .filter(|active| active.pending_outcome.is_some())
+                .count();
+        }
+    }
+
+    fn refresh_pending_projection_health(&self) {
+        match self.store.pending_completion_count() {
+            Ok(count) => {
+                self.record_success("projection-count");
+                if let Ok(mut health) = self.health.lock() {
+                    health.snapshot.pending_projections = count;
+                }
+            }
+            Err(error) => self.record_error("projection-count", error),
+        }
+    }
+
+    fn record_error(&self, operation: &str, error: impl Into<String>) {
+        if let Ok(mut health) = self.health.lock() {
+            let now = epoch_millis();
+            let error = error.into();
+            let consecutive = health
+                .errors
+                .get(operation)
+                .map_or(1, |(_, _, count)| count.saturating_add(1));
+            health
+                .errors
+                .insert(operation.to_string(), (error.clone(), now, consecutive));
+            if !matches!(
+                health.snapshot.status,
+                SchedulerHealthStatus::Stopping | SchedulerHealthStatus::Stopped
+            ) {
+                health.snapshot.status = SchedulerHealthStatus::Degraded;
+            }
+            health.snapshot.last_error = Some(format!("{operation}: {error}"));
+            health.snapshot.last_error_at = Some(now);
+            health.snapshot.consecutive_errors = consecutive;
+        }
+    }
+
+    fn record_success(&self, operation: &str) {
+        if let Ok(mut health) = self.health.lock() {
+            health.errors.remove(operation);
+            if health.snapshot.status == SchedulerHealthStatus::Degraded {
+                if let Some((operation, (error, at, consecutive))) = health
+                    .errors
+                    .iter()
+                    .max_by_key(|(_, (_, at, _))| *at)
+                    .map(|(operation, value)| (operation.clone(), value.clone()))
+                {
+                    health.snapshot.last_error = Some(format!("{operation}: {error}"));
+                    health.snapshot.last_error_at = Some(at);
+                    health.snapshot.consecutive_errors = consecutive;
+                } else {
+                    health.snapshot.status = SchedulerHealthStatus::Healthy;
+                    health.snapshot.last_error = None;
+                    health.snapshot.last_error_at = None;
+                    health.snapshot.consecutive_errors = 0;
+                }
+            }
+        }
+    }
+
+    fn set_health_status(&self, status: SchedulerHealthStatus) {
+        if let Ok(mut health) = self.health.lock() {
+            health.snapshot.status = status;
+        }
     }
 }
 
@@ -1389,17 +1759,77 @@ fn start_workers(
     Ok(workers)
 }
 
+fn start_projection_worker(
+    scheduler: mpsc::Sender<SchedulerMessage>,
+    receiver: mpsc::Receiver<ProjectionCommand>,
+    projector: Arc<dyn CompletionProjector>,
+) -> Result<JoinHandle<()>, ExecutionEngineError> {
+    thread::Builder::new()
+        .name("spacesly-completion-projector".to_string())
+        .spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    ProjectionCommand::Project(completion) => {
+                        let result =
+                            catch_unwind(AssertUnwindSafe(|| projector.project(&completion)))
+                                .unwrap_or_else(|_| {
+                                    Err("Completion projector panicked.".to_string())
+                                });
+                        if scheduler
+                            .send(SchedulerMessage::ProjectionFinished { completion, result })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ProjectionCommand::Shutdown => break,
+                }
+            }
+        })
+        .map_err(|_| ExecutionEngineError::SchedulerUnavailable)
+}
+
 fn stop_worker_slots(workers: &mut [WorkerSlot]) {
     for worker in workers.iter() {
         let _ = worker.sender.send(WorkerCommand::Shutdown);
     }
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT / 2;
     for worker in workers.iter_mut() {
-        if let Some(handle) = worker.handle.take() {
-            let _ = handle.join();
-        }
+        join_if_finished_before(&mut worker.handle, deadline);
         worker.snapshot.state = WorkerState::Stopped;
         worker.snapshot.session_id = None;
     }
+}
+
+fn join_if_finished_before(handle: &mut Option<JoinHandle<()>>, deadline: Instant) {
+    while handle.as_ref().is_some_and(|handle| !handle.is_finished()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if handle.as_ref().is_some_and(JoinHandle::is_finished) {
+        if let Some(handle) = handle.take() {
+            let _ = handle.join();
+        }
+    } else {
+        let _ = handle.take();
+    }
+}
+
+fn retry_delay(attempt: u32, base: Duration, cap: Duration) -> Duration {
+    base.saturating_mul(
+        1_u32
+            .checked_shl(attempt.saturating_sub(1).min(31))
+            .unwrap_or(u32::MAX),
+    )
+    .min(cap)
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1906,6 +2336,67 @@ mod tests {
     }
 
     #[test]
+    fn fifty_tasks_drain_through_five_reused_workers_without_state_leaks() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let engine = ExecutionEngine::new(MockTaskExecutor::new({
+            let active = active.clone();
+            let maximum = maximum.clone();
+            move |context| {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                while maximum.load(Ordering::SeqCst) < MAX_EXECUTION_WORKERS {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                context.emit_event(
+                    TaskSessionEventKind::Activity,
+                    serde_json::json!({
+                        "label": context.request().label,
+                        "worker_id": context.worker_id()
+                    }),
+                )?;
+                thread::sleep(Duration::from_millis(3));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }))
+        .expect("engine starts");
+        let sessions = submit_tasks(&engine, 50, "stress");
+
+        wait_for_all(&engine, &sessions);
+
+        assert_eq!(maximum.load(Ordering::SeqCst), MAX_EXECUTION_WORKERS);
+        let workers = engine.workers().expect("workers listed");
+        assert_eq!(workers.len(), MAX_EXECUTION_WORKERS);
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.completed_sessions)
+                .sum::<u64>(),
+            50
+        );
+        assert!(workers.iter().all(|worker| worker.completed_sessions > 1));
+        for session_id in &sessions {
+            let snapshot = engine
+                .session(*session_id)
+                .expect("session read")
+                .expect("session retained");
+            assert_eq!(snapshot.state, TaskSessionState::Succeeded);
+            let events = engine.events_after(*session_id, 0).expect("events read");
+            assert!(events.iter().all(|event| event.session_id == *session_id));
+            let activity = events
+                .iter()
+                .find(|event| event.kind == TaskSessionEventKind::Activity)
+                .expect("activity retained");
+            assert_eq!(activity.payload["label"], snapshot.request.label);
+        }
+        for session_id in sessions {
+            assert!(engine.remove_session(session_id).expect("session removed"));
+        }
+        assert!(engine.sessions().expect("sessions listed").is_empty());
+    }
+
+    #[test]
     fn durable_grants_reach_only_the_granted_assignment() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let engine = ExecutionEngine::new(MockTaskExecutor::new({
@@ -2184,9 +2675,10 @@ mod tests {
             Some("executions.db unavailable")
         );
         assert!(calls.load(Ordering::SeqCst) > 0);
+        wait_until(|| engine.health().status == SchedulerHealthStatus::Degraded);
+        assert!(engine.health().pending_projections > 0);
 
         available.store(true, Ordering::SeqCst);
-        engine.sessions().expect("scheduler tick triggered");
         let completed = engine
             .wait_for_terminal(submitted.id, TEST_TIMEOUT)
             .expect("retry finalizes");
@@ -2198,6 +2690,259 @@ mod tests {
         assert!(result.projected_at.is_some());
         assert!(result.finalized_at.is_some());
         assert!(result.projection_error.is_none());
+        assert_eq!(engine.health().status, SchedulerHealthStatus::Healthy);
+        assert_eq!(engine.health().pending_projections, 0);
+    }
+
+    #[test]
+    fn restart_finalizes_already_projected_completion_without_reprojection() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("scheduler.db");
+        let session_id = {
+            let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+            let owner = store.register_owner().expect("owner registered");
+            let mut envelope = test_envelope(Vec::new());
+            let TaskSessionEnvelope::V1(session) = &mut envelope else {
+                unreachable!();
+            };
+            session.conversation_id = Some("conversation-restart".to_string());
+            let request = TaskRequest::from_envelope("restart-projected", &envelope)
+                .expect("request encoded");
+            let session = store.enqueue(&request).expect("session enqueued");
+            let assignment = store
+                .claim_next(owner, 1, ASSIGNMENT_LEASE_DURATION, MAX_EXECUTION_WORKERS)
+                .expect("session claimed")
+                .expect("assignment");
+            store
+                .resolve_assignment(
+                    assignment.fence,
+                    DurableOutcome::Succeeded(TaskExecutionOutput::Agent(
+                        crate::domain::task_session::AgentTaskResult {
+                            summary: "completed".to_string(),
+                            evidence: Vec::new(),
+                            details: Vec::new(),
+                            next: Vec::new(),
+                            completion_status:
+                                crate::domain::task_session::AgentTaskCompletionStatus::Completed,
+                            blocked_reason: None,
+                        },
+                    )),
+                )
+                .expect("completion staged");
+            let completion = store
+                .due_pending_completions(epoch_millis())
+                .expect("completion queried")
+                .pop()
+                .expect("completion due");
+            assert!(store
+                .mark_completion_projected(&completion)
+                .expect("projection marked"));
+            session.id
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = ExecutionEngine::open_persistent_at_with_executor_and_projector(
+            Arc::new(StructuredOutputExecutor),
+            Arc::new(SwitchableProjector {
+                available: Arc::new(AtomicBool::new(true)),
+                calls: calls.clone(),
+            }),
+            path,
+        )
+        .expect("engine reopens");
+        assert_eq!(
+            engine
+                .wait_for_terminal(session_id, TEST_TIMEOUT)
+                .expect("completion finalized")
+                .state,
+            TaskSessionState::Succeeded
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct GatedProjector {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl CompletionProjector for GatedProjector {
+        fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(())
+        }
+    }
+
+    struct ProjectorIsolationExecutor;
+
+    impl TaskExecutor for ProjectorIsolationExecutor {
+        fn execute(
+            &self,
+            context: &TaskExecutionContext,
+        ) -> Result<TaskExecutionOutput, TaskExecutionError> {
+            if context.request().label == "structured" {
+                return StructuredOutputExecutor.execute(context);
+            }
+            while !context.cancellation().is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(TaskExecutionOutput::None)
+        }
+    }
+
+    #[test]
+    fn slow_projector_does_not_block_commands_or_cancellation() {
+        let directory = tempdir().expect("temporary directory");
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let engine = ExecutionEngine::open_persistent_at_with_executor_and_projector(
+            Arc::new(ProjectorIsolationExecutor),
+            Arc::new(GatedProjector {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let mut envelope = test_envelope(Vec::new());
+        let TaskSessionEnvelope::V1(session) = &mut envelope else {
+            unreachable!();
+        };
+        session.conversation_id = Some("conversation-gated".to_string());
+        let structured = engine
+            .submit_envelope("structured", &envelope)
+            .expect("structured session submitted");
+        wait_until(|| entered.load(Ordering::SeqCst));
+
+        let cancellable = engine
+            .submit(TaskRequest::new("cancellable"))
+            .expect("plain session submitted");
+        wait_until(|| {
+            engine
+                .session(cancellable.id)
+                .expect("session read")
+                .is_some_and(|session| session.state == TaskSessionState::Running)
+        });
+        let started = Instant::now();
+        assert!(engine.cancel(cancellable.id).expect("session cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            engine
+                .wait_for_terminal(cancellable.id, TEST_TIMEOUT)
+                .expect("cancellation terminal")
+                .state,
+            TaskSessionState::Cancelled
+        );
+        assert_eq!(
+            engine
+                .session(structured.id)
+                .expect("structured read")
+                .expect("structured retained")
+                .state,
+            TaskSessionState::Committing
+        );
+        release.store(true, Ordering::SeqCst);
+        engine
+            .wait_for_terminal(structured.id, TEST_TIMEOUT)
+            .expect("structured finalizes");
+    }
+
+    #[test]
+    fn worker_slot_is_retained_until_durable_completion_retry_succeeds() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        store.fail_next_resolutions(5);
+        let returned = Arc::new(AtomicBool::new(false));
+        let engine = ExecutionEngine::with_store(
+            Arc::new(MockTaskExecutor::new({
+                let returned = returned.clone();
+                move |_| {
+                    returned.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })),
+            default_completion_projector(),
+            store,
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit(TaskRequest::new("durable-retry"))
+            .expect("session submitted");
+        wait_until(|| returned.load(Ordering::SeqCst));
+        wait_until(|| engine.health().pending_worker_completions == 1);
+        let retained = engine
+            .workers()
+            .expect("workers read")
+            .into_iter()
+            .find(|worker| worker.session_id == Some(session.id))
+            .expect("worker retained");
+        assert_eq!(retained.state, WorkerState::Running);
+        assert_eq!(engine.health().status, SchedulerHealthStatus::Degraded);
+
+        engine
+            .wait_for_terminal(session.id, TEST_TIMEOUT)
+            .expect("completion retry succeeds");
+        assert_eq!(engine.health().pending_worker_completions, 0);
+        assert_eq!(
+            engine
+                .workers()
+                .expect("workers read")
+                .into_iter()
+                .find(|worker| worker.id == retained.id)
+                .expect("worker retained")
+                .state,
+            WorkerState::Idle
+        );
+    }
+
+    #[test]
+    fn command_receive_timeout_is_explicit() {
+        let engine = ExecutionEngine::new(MockTaskExecutor::succeeding(Duration::ZERO))
+            .expect("engine starts");
+        let (pause_reply, pause_response) = mpsc::channel();
+        engine
+            .send(SchedulerCommand::Pause {
+                duration: Duration::from_millis(50),
+                reply: pause_reply,
+            })
+            .expect("pause sent");
+        let (reply, response) = mpsc::channel();
+        engine
+            .send(SchedulerCommand::ListWorkers { reply })
+            .expect("command sent");
+        assert_eq!(
+            receive_timeout(response, Duration::from_millis(5)),
+            Err(ExecutionEngineError::CommandTimeout)
+        );
+        pause_response
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("scheduler resumes");
+    }
+
+    #[test]
+    fn shutdown_is_bounded_when_executor_ignores_cancellation() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let engine = ExecutionEngine::new(MockTaskExecutor::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_| {
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok(())
+            }
+        }))
+        .expect("engine starts");
+        engine
+            .submit(TaskRequest::new("noncooperative"))
+            .expect("session submitted");
+        wait_until(|| entered.load(Ordering::SeqCst));
+        let started = Instant::now();
+        drop(engine);
+        assert!(started.elapsed() <= SHUTDOWN_TIMEOUT + Duration::from_millis(250));
+        release.store(true, Ordering::SeqCst);
     }
 
     fn submit_tasks(engine: &ExecutionEngine, count: usize, prefix: &str) -> Vec<TaskSessionId> {

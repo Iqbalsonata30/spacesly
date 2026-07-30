@@ -45,6 +45,8 @@ export {
 export type {
   AgentRuntimeProfile,
   AgentTaskResult,
+  SchedulerHealth,
+  SchedulerHealthStatus,
   TaskChatInputV2,
   TaskEditInputV2,
   TaskExecutionOutput,
@@ -69,6 +71,7 @@ export {
   cancelTaskSession,
   digestTaskSessionPromptInput,
   digestAgentExecutionContract,
+  getSchedulerHealth,
   getTaskSession,
   getTaskSessionResult,
   getTaskSessionMcpContext,

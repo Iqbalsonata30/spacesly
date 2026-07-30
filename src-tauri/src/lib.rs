@@ -14,7 +14,7 @@ use application::agent_task_executor::{
     execution_contract_digest, AgentTaskExecutor, AiWorkerRuntimeRunner,
 };
 use application::app::AppState;
-use application::execution_engine::ExecutionEngine;
+use application::execution_engine::{ExecutionEngine, SchedulerHealth};
 use application::files_service::FilesService;
 use application::git_service::GitService;
 use application::jira_service::JiraService;
@@ -1724,6 +1724,12 @@ async fn cancel_task_session(
     .map_err(|error| format!("Cancel Task Session task failed: {error}"))?
 }
 
+/// Returns scheduler health from shared memory without waiting on the scheduler command channel.
+#[tauri::command]
+fn get_scheduler_health(execution_engine: State<'_, Arc<ExecutionEngine>>) -> SchedulerHealth {
+    execution_engine.health()
+}
+
 #[tauri::command]
 async fn remove_task_session(
     session_id: u64,
@@ -2495,6 +2501,7 @@ pub fn run() {
             save_execution_run,
             list_active_execution_runs,
             list_task_sessions,
+            get_scheduler_health,
             get_task_session,
             get_task_session_result,
             list_task_session_events,
