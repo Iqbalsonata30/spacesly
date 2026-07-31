@@ -89,21 +89,40 @@ export async function invokeWithPolicy<T>(
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, command: string): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const startedAt = performance.now();
+  let timedOut = false;
 
   return new Promise<T>((resolve, reject) => {
     timeoutId = setTimeout(() => {
+      timedOut = true;
+      const elapsedMs = Math.round(performance.now() - startedAt);
       reject(
-        new IpcPolicyError(command, "timeout", `${command} timed out after ${timeoutMs}ms.`, true),
+        new IpcPolicyError(
+          command,
+          "timeout",
+          `${command} timed out after ${elapsedMs}ms (limit ${timeoutMs}ms).`,
+          true,
+        ),
       );
     }, timeoutMs);
 
     promise.then(
       (value) => {
         if (timeoutId) clearTimeout(timeoutId);
+        if (timedOut) {
+          console.warn(`${command} completed after its IPC timeout.`, {
+            elapsedMs: Math.round(performance.now() - startedAt),
+          });
+        }
         resolve(value);
       },
       (reason) => {
         if (timeoutId) clearTimeout(timeoutId);
+        if (timedOut) {
+          console.warn(`${command} failed after its IPC timeout.`, {
+            elapsedMs: Math.round(performance.now() - startedAt),
+          });
+        }
         reject(reason);
       },
     );

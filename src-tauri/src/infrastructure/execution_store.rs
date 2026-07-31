@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const SLOW_CONVERSATION_LIST: Duration = Duration::from_millis(250);
 
 const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
        conversation_id TEXT PRIMARY KEY,
@@ -685,7 +687,11 @@ impl ExecutionStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ConversationRecord>, String> {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let lock_wait = lock_started_at.elapsed();
+        let query_started_at = Instant::now();
         let mut statement = connection
             .prepare(
                 "SELECT conversation_id, workspace_id, title, created_at, updated_at
@@ -705,6 +711,17 @@ impl ExecutionStore {
             .map_err(|error| format!("Failed to query conversations: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Failed to decode conversation: {error}"))?;
+        let query_duration = query_started_at.elapsed();
+        let total_duration = started_at.elapsed();
+        if total_duration >= SLOW_CONVERSATION_LIST {
+            eprintln!(
+                "slow list_conversations store workspace_id={workspace_id:?} lock_wait_ms={} query_ms={} total_ms={} rows={}",
+                lock_wait.as_millis(),
+                query_duration.as_millis(),
+                total_duration.as_millis(),
+                conversations.len()
+            );
+        }
         Ok(conversations)
     }
 

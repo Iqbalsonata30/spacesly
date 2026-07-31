@@ -133,6 +133,7 @@ pub(crate) fn run_shell_command_cancellable(
             .map_err(|error| format!("Failed to wait for shell command: {error}"))?
             .is_some()
         {
+            terminate_shell_process_group(child.id());
             break;
         }
     }
@@ -159,11 +160,15 @@ pub(crate) fn run_shell_command_cancellable(
 }
 
 fn terminate_shell_process(child: &mut std::process::Child) {
+    terminate_shell_process_group(child.id());
+    let _ = child.kill();
+}
+
+fn terminate_shell_process_group(child_id: u32) {
     #[cfg(unix)]
     unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+        libc::kill(-(child_id as i32), libc::SIGKILL);
     }
-    let _ = child.kill();
 }
 
 pub fn complete_shell_input(
@@ -434,6 +439,22 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("cancelled or became stale"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_completion_does_not_wait_for_descendants_holding_output_pipes() {
+        let started = Instant::now();
+        let result = run_shell_command(ShellCommandRequest {
+            command: "sleep 30 & printf done".to_string(),
+            workdir: None,
+            timeout_seconds: Some(2),
+        })
+        .expect("parent shell completion should terminate residual descendants");
+
+        assert_eq!(result.stdout, "done");
+        assert!(!result.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

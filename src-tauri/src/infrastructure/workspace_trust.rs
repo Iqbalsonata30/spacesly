@@ -47,12 +47,6 @@ impl WorkspaceTrustRegistry {
 
     pub fn trust_path(&self, path: &Path) -> Result<WorkspaceTrustStatus, String> {
         let path = canonical_workspace_path(path)?;
-        if is_home_directory(&path) {
-            return Err(
-                "The home directory cannot be trusted as an AI execution workspace. Open a specific project folder first."
-                    .to_string(),
-            );
-        }
         self.trusted_paths
             .lock()
             .map_err(|error| error.to_string())?
@@ -113,18 +107,12 @@ fn canonical_workspace_path(path: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn is_home_directory(path: &Path) -> bool {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| home.canonicalize().ok())
-        .is_some_and(|home| home == path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::WorkspaceTrustRegistry;
     use crate::infrastructure::files::WorkspaceRoot;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn trust_is_bound_to_the_canonical_workspace_root() {
@@ -159,10 +147,31 @@ mod tests {
     }
 
     #[test]
-    fn home_directory_is_never_implicitly_trustable() {
+    fn home_directory_requires_explicit_trust() {
         let roots = WorkspaceRoot::home().unwrap();
         let registry = WorkspaceTrustRegistry::default();
-        assert!(registry.trust(&roots, "workspace-personal").is_err());
+        assert!(
+            !registry
+                .status(&roots, "workspace-personal")
+                .unwrap()
+                .trusted
+        );
+        assert!(
+            registry
+                .trust(&roots, "workspace-personal")
+                .unwrap()
+                .trusted
+        );
+        assert_eq!(
+            registry
+                .require_trusted(&roots, "workspace-personal")
+                .unwrap(),
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        );
     }
 
     #[test]

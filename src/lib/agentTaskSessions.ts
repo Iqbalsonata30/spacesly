@@ -21,6 +21,7 @@ import {
 export const AGENT_TASK_TEMPLATE_VERSION = "agent-task-v1";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+const RECONCILIATION_INTERVAL_MS = 5_000;
 const BUILTIN_CAPABILITIES = ["workspace_read", "workspace_write", "shell", "git"];
 
 /** Immutable profile identity and authority requested by one Agent submission. */
@@ -31,6 +32,12 @@ export type AgentTaskProfileBinding = {
   capabilities: string[];
   rulesRevision: string;
   skillsRevision: string;
+};
+
+export type AgentConnectorPlan = {
+  connectorIds: string[];
+  requiredDomains: string[];
+  unresolvedDomains: string[];
 };
 
 /** Durable conversation context and envelope prepared before scheduler submission. */
@@ -123,6 +130,106 @@ export function agentTaskCapabilities(config: AiWorkerConfig): {
   };
 }
 
+/** Selects the smallest configured external connector set matching the immutable task intent. */
+export function planAgentTaskConnectors(
+  config: AiWorkerConfig,
+  contract: ExecutionContract,
+): AgentConnectorPlan {
+  const intent = normalizedIntentText(contract);
+  const descriptors = config.mcp_servers.map((server, index) => ({
+    id: server.secret_id.trim(),
+    index,
+    domains: normalizedTerms(server.domains),
+    intentTerms: normalizedTerms(server.intent_terms),
+  }));
+  const requiredDomains = new Set<string>();
+  if (contract.constraints.may_update_jira) requiredDomains.add("jira");
+  if (
+    contract.ticket.provider === "jira" &&
+    ["jira", "issue", "ticket"].some((term) => intentIncludes(intent, term))
+  ) {
+    requiredDomains.add("jira");
+  }
+  for (const descriptor of descriptors) {
+    if (
+      [...descriptor.domains, ...descriptor.intentTerms].some((term) =>
+        intentIncludes(intent, term),
+      )
+    ) {
+      descriptor.domains.forEach((domain) => requiredDomains.add(domain));
+    }
+  }
+
+  const uncovered = new Set(requiredDomains);
+  const selected: string[] = [];
+  while (uncovered.size > 0) {
+    let best: (typeof descriptors)[number] | null = null;
+    let bestCoverage = 0;
+    for (const descriptor of descriptors) {
+      if (!descriptor.id || selected.includes(descriptor.id)) continue;
+      const coverage = descriptor.domains.filter((domain) => uncovered.has(domain)).length;
+      if (
+        coverage > bestCoverage ||
+        (coverage === bestCoverage && best && descriptor.index < best.index)
+      ) {
+        best = descriptor;
+        bestCoverage = coverage;
+      }
+    }
+    if (!best || bestCoverage === 0) break;
+    selected.push(best.id);
+    best.domains.forEach((domain) => uncovered.delete(domain));
+  }
+
+  return {
+    connectorIds: selected.sort(),
+    requiredDomains: [...requiredDomains].sort(),
+    unresolvedDomains: [...uncovered].sort(),
+  };
+}
+
+export function selectAgentTaskConnectors(
+  config: AiWorkerConfig,
+  contract: ExecutionContract,
+): AiWorkerConfig {
+  const selected = new Set(planAgentTaskConnectors(config, contract).connectorIds);
+  return {
+    ...config,
+    mcp_servers: config.mcp_servers.filter((server) => selected.has(server.secret_id.trim())),
+  };
+}
+
+function normalizedIntentText(contract: ExecutionContract): string {
+  const activeWorkflow = contract.workflow.filter((step) => step.status !== "completed");
+  return normalizeIntent(
+    [
+      contract.objective.summary,
+      ...contract.objective.success_criteria,
+      contract.task_context.description,
+      contract.task_context.execution_detail,
+      contract.ticket.title,
+      ...contract.ticket.labels,
+      ...activeWorkflow.flatMap((step) => [step.title, step.type]),
+      contract.runtime_inputs.operator_notes ?? "",
+    ].join(" "),
+  );
+}
+
+function normalizedTerms(values: string[] | undefined): string[] {
+  return [...new Set((values ?? []).map(normalizeIntent).filter(Boolean))];
+}
+
+function normalizeIntent(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9#]+/g, " ")
+    .trim();
+}
+
+function intentIncludes(intent: string, term: string): boolean {
+  return Boolean(term) && ` ${intent} `.includes(` ${term} `);
+}
+
 /** Saves and returns a content-addressed immutable OpenCode Agent profile. */
 export async function ensureOpenCodeAgentProfile(
   config: AiWorkerConfig,
@@ -190,7 +297,10 @@ export async function prepareAgentTaskSession(
   dependencies: Partial<AgentTaskSessionDependencies> = {},
 ): Promise<PreparedAgentTaskSession> {
   const deps = { ...defaultDependencies, ...dependencies };
-  const profile = await ensureOpenCodeAgentProfile(config, deps);
+  const profile = await ensureOpenCodeAgentProfile(
+    selectAgentTaskConnectors(config, contract),
+    deps,
+  );
   const contextDigest = await deps.digestContract(contract);
   const conversationId = await agentConversationId(config.workspace_id, cardId);
   const contextMessageId = `agent-context-${contextDigest.replace(/^sha256:/, "")}`;
@@ -331,7 +441,7 @@ export async function waitForAgentTaskSession(
       if (hintedSequence <= cursor) {
         const observedGeneration = generation;
         await new Promise<void>((resolve) => {
-          const reconcile = setTimeout(resolveWake, 1_000);
+          const reconcile = setTimeout(resolveWake, RECONCILIATION_INTERVAL_MS);
           function resolveWake() {
             clearTimeout(reconcile);
             if (wake === resolveWake) wake = null;

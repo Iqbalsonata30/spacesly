@@ -6,6 +6,8 @@ export interface AiWorkerMcpServer {
   secret_id: string;
   command: string[];
   environment?: Record<string, string>;
+  domains?: string[];
+  intent_terms?: string[];
 }
 
 export interface AiWorkerConfig {

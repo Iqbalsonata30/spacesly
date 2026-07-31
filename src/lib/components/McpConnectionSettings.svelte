@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { parseArgsText, parseEnvText, type McpServerSettings } from "$lib/settings";
+  import {
+    defaultMcpIntentMetadata,
+    parseArgsText,
+    parseEnvText,
+    type McpServerSettings,
+  } from "$lib/settings";
 
   let {
     server,
@@ -41,6 +46,17 @@
     }
   }
 
+  function intentList(value: string): string[] {
+    return [
+      ...new Set(
+        value
+          .split(/[\n,]/)
+          .map((entry) => entry.trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ];
+  }
+
   function updateEnvKey(key: string, value: string) {
     onUpdate({
       env: {
@@ -55,7 +71,9 @@
   }
 
   function envPlaceholder(key: string, placeholder: string): string {
-    return configuredEnvKeys.includes(key) ? "Saved securely. Enter a new value to replace it." : placeholder;
+    return configuredEnvKeys.includes(key)
+      ? "Saved securely. Enter a new value to replace it."
+      : placeholder;
   }
 
   function genericEnvPlaceholder(): string {
@@ -86,15 +104,41 @@
     <span>Connection Type</span>
     <select
       value={server.kind}
-      oninput={(event) =>
-        onUpdate({ kind: event.currentTarget.value as McpServerSettings["kind"] })}
+      oninput={(event) => {
+        const kind = event.currentTarget.value as McpServerSettings["kind"];
+        onUpdate({ kind, ...defaultMcpIntentMetadata(kind, server.name) });
+      }}
     >
       <option value="generic">Generic MCP</option>
       <option value="jira">Jira</option>
       <option value="ocp">OpenShift / OCP</option>
       <option value="bamboo">Bamboo</option>
+      <option value="bitbucket">Bitbucket</option>
     </select>
   </label>
+
+  <div class="field-row">
+    <label>
+      <span>Agent Domains</span>
+      <input
+        placeholder="jira, kubernetes"
+        value={server.domains.join(", ")}
+        oninput={(event) => onUpdate({ domains: intentList(event.currentTarget.value) })}
+      />
+    </label>
+    <label>
+      <span>Task Intent Phrases</span>
+      <textarea
+        placeholder="deploy, prerelease, pod logs"
+        value={server.intentTerms.join(", ")}
+        oninput={(event) => onUpdate({ intentTerms: intentList(event.currentTarget.value) })}
+      ></textarea>
+    </label>
+  </div>
+  <p class="field-help">
+    Spacesly loads this connector for Agent tasks only when the task matches these domains or
+    phrases.
+  </p>
 
   <label>
     <span>Command</span>
@@ -150,7 +194,7 @@
       <label>
         <span>Kubeconfig Path</span>
         <input
-           placeholder={envPlaceholder("KUBECONFIG", "/home/user/.kube/config")}
+          placeholder={envPlaceholder("KUBECONFIG", "/home/user/.kube/config")}
           value={envValue("KUBECONFIG")}
           oninput={(event) => updateEnvKey("KUBECONFIG", event.currentTarget.value)}
         />
@@ -159,7 +203,7 @@
         <label>
           <span>Cluster API Server</span>
           <input
-           placeholder={envPlaceholder("OPENSHIFT_SERVER", "https://api.cluster:6443")}
+            placeholder={envPlaceholder("OPENSHIFT_SERVER", "https://api.cluster:6443")}
             value={envValue("OPENSHIFT_SERVER")}
             oninput={(event) => updateEnvKey("OPENSHIFT_SERVER", event.currentTarget.value)}
           />
@@ -168,7 +212,7 @@
           <span>Token</span>
           <input
             type="password"
-             placeholder={envPlaceholder("OPENSHIFT_TOKEN", "OpenShift/Kubernetes token")}
+            placeholder={envPlaceholder("OPENSHIFT_TOKEN", "OpenShift/Kubernetes token")}
             value={envValue("OPENSHIFT_TOKEN")}
             oninput={(event) => updateEnvKey("OPENSHIFT_TOKEN", event.currentTarget.value)}
           />
@@ -179,7 +223,7 @@
       <label>
         <span>Bamboo URL</span>
         <input
-           placeholder={envPlaceholder("BAMBOO_URL", "https://bamboo.company.id")}
+          placeholder={envPlaceholder("BAMBOO_URL", "https://bamboo.company.id")}
           value={envValue("BAMBOO_URL")}
           oninput={(event) => updateEnvKey("BAMBOO_URL", event.currentTarget.value)}
         />
@@ -188,7 +232,7 @@
         <label>
           <span>Username</span>
           <input
-           placeholder={envPlaceholder("BAMBOO_USERNAME", "user")}
+            placeholder={envPlaceholder("BAMBOO_USERNAME", "user")}
             value={envValue("BAMBOO_USERNAME")}
             oninput={(event) => updateEnvKey("BAMBOO_USERNAME", event.currentTarget.value)}
           />
@@ -197,7 +241,7 @@
           <span>Token</span>
           <input
             type="password"
-             placeholder={envPlaceholder("BAMBOO_TOKEN", "Bamboo token")}
+            placeholder={envPlaceholder("BAMBOO_TOKEN", "Bamboo token")}
             value={envValue("BAMBOO_TOKEN")}
             oninput={(event) => updateEnvKey("BAMBOO_TOKEN", event.currentTarget.value)}
           />
@@ -209,7 +253,7 @@
         <span>Environment</span>
         <textarea
           class="env-config"
-           placeholder={genericEnvPlaceholder()}
+          placeholder={genericEnvPlaceholder()}
           oninput={(event) => updateEnv(event.currentTarget.value)}
           value={Object.entries(server.env)
             .map(([key, value]) => `${key}=${value}`)

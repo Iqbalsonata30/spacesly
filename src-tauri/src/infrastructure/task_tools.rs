@@ -97,7 +97,7 @@ fn tool_definitions(authority: &TaskToolAuthority) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": { "type": "string", "description": "Relative path or absolute path inside the assigned workspace." },
                     "list": { "type": "boolean", "default": false }
                 },
                 "required": ["path"],
@@ -112,7 +112,7 @@ fn tool_definitions(authority: &TaskToolAuthority) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": { "type": "string", "description": "Relative path or absolute path inside the assigned workspace." },
                     "content": { "type": "string" },
                     "expected_version": { "type": "string" }
                 },
@@ -177,7 +177,10 @@ fn call_tool(
     match name {
         "workspace_read" => {
             authorize(authority, "workspace_read")?;
-            let path = string_argument(arguments, "path")?;
+            let path = resolve_workspace_file_path(
+                &authority.workspace_root,
+                string_argument(arguments, "path")?,
+            )?;
             if arguments
                 .get("list")
                 .and_then(Value::as_bool)
@@ -186,20 +189,23 @@ fn call_tool(
                 serde_json::to_value(list_directory(
                     roots,
                     authority.workspace_id.clone(),
-                    path.to_string(),
+                    path.clone(),
                 )?)
                 .map_err(|error| error.to_string())
             } else {
                 serde_json::to_value(read_file_at_root(
                     roots,
                     authority.workspace_id.clone(),
-                    path.to_string(),
+                    path,
                 )?)
                 .map_err(|error| error.to_string())
             }
         }
         "workspace_write" => {
-            let path = string_argument(arguments, "path")?;
+            let path = resolve_workspace_file_path(
+                &authority.workspace_root,
+                string_argument(arguments, "path")?,
+            )?;
             let content = string_argument(arguments, "content")?;
             let expected_version = arguments
                 .get("expected_version")
@@ -210,7 +216,7 @@ fn call_tool(
             serde_json::to_value(write_file_authorized(
                 roots,
                 authority.workspace_id.clone(),
-                path.to_string(),
+                path,
                 content.to_string(),
                 expected_version,
                 None,
@@ -323,6 +329,29 @@ fn validate_relative_path(path: &str) -> Result<String, String> {
         return Err("Git file path must remain inside the assigned workspace.".to_string());
     }
     Ok(path.to_string_lossy().to_string())
+}
+
+fn resolve_workspace_file_path(root: &Path, path: &str) -> Result<String, String> {
+    let expanded;
+    let path = Path::new(path);
+    let path = if path == Path::new("~") || path.starts_with("~/") {
+        let relative = path
+            .strip_prefix("~")
+            .expect("home-relative path prefix was checked");
+        expanded = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not configured for the workspace file path.".to_string())?
+            .join(relative);
+        expanded.as_path()
+    } else {
+        path
+    };
+    if !path.is_absolute() {
+        return Ok(path.to_string_lossy().to_string());
+    }
+    path.strip_prefix(root)
+        .map(|relative| relative.to_string_lossy().to_string())
+        .map_err(|_| "Workspace file path escapes the assigned workspace.".to_string())
 }
 
 fn authorize(authority: &TaskToolAuthority, capability: &str) -> Result<(), String> {
@@ -480,6 +509,23 @@ mod tests {
         assert!(
             resolve_workdir(&root, Some(std::env::temp_dir().to_string_lossy().as_ref())).is_err()
         );
+    }
+
+    #[test]
+    fn workspace_file_path_accepts_absolute_paths_only_inside_assigned_workspace() {
+        let directory = tempdir().expect("workspace");
+        let root = directory.path().canonicalize().expect("workspace root");
+
+        assert_eq!(
+            resolve_workspace_file_path(&root, "iqbalsonata.txt").unwrap(),
+            "iqbalsonata.txt"
+        );
+        assert_eq!(
+            resolve_workspace_file_path(&root, root.join("iqbalsonata.txt").to_str().unwrap())
+                .unwrap(),
+            "iqbalsonata.txt"
+        );
+        assert!(resolve_workspace_file_path(&root, "/tmp/iqbalsonata.txt").is_err());
     }
 
     #[test]

@@ -600,8 +600,7 @@ fn home_dir() -> Result<PathBuf, String> {
 }
 
 fn validate_relative_path(relative_path: &str) -> Result<PathBuf, String> {
-    let trimmed = relative_path.trim_matches('/');
-    let path = Path::new(trimmed);
+    let path = Path::new(relative_path);
     if path.is_absolute() {
         return Err("Absolute paths are not allowed.".to_string());
     }
@@ -729,6 +728,7 @@ mod tests {
     fn rejects_parent_traversal() {
         assert!(validate_relative_path("../secret").is_err());
         assert!(validate_relative_path("src/../../secret").is_err());
+        assert!(validate_relative_path("/home/user/secret").is_err());
     }
 
     #[test]

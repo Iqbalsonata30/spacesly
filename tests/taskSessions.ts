@@ -11,6 +11,7 @@ import {
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
   executeAgentTaskSession,
+  planAgentTaskConnectors,
   prepareAgentTaskSession,
   validateAgentTaskSessionResult,
   waitForAgentTaskSession,
@@ -267,6 +268,98 @@ const authoritativeResult: import("../src/lib/ipc/agent").AiWorkerTaskResult = {
   blocked_reason: null,
 };
 
+const intentConfig: AiWorkerConfig = {
+  ...config,
+  mcp_servers: [
+    {
+      name: "Jira",
+      secret_id: "jira",
+      command: ["jira"],
+      domains: ["jira"],
+      intent_terms: ["jira", "ticket", "deploy", "deployment", "prerelease"],
+    },
+    {
+      name: "Kubernetes",
+      secret_id: "kubernetes",
+      command: ["kubernetes"],
+      domains: ["kubernetes"],
+      intent_terms: ["kubernetes", "pod", "deploy", "deployment", "prerelease"],
+    },
+    {
+      name: "Bamboo",
+      secret_id: "bamboo",
+      command: ["bamboo"],
+      domains: ["bamboo"],
+      intent_terms: ["bamboo", "bamboo build", "deploy", "deployment", "prerelease"],
+    },
+    {
+      name: "Bitbucket",
+      secret_id: "bitbucket",
+      command: ["bitbucket"],
+      domains: ["bitbucket"],
+      intent_terms: ["bitbucket", "pull request", "pr", "review pr"],
+    },
+    {
+      name: "Unrelated",
+      secret_id: "unrelated",
+      command: ["unrelated"],
+      domains: ["unrelated"],
+      intent_terms: ["unrelated service"],
+    },
+  ],
+};
+
+function contractFor(summary: string, provider: "jira" | "local" = "local"): ExecutionContract {
+  return {
+    ...contract,
+    objective: { ...contract.objective, summary },
+    task_context: { ...contract.task_context, description: summary },
+    ticket: { ...contract.ticket, provider, title: summary },
+  };
+}
+
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Create README.md")).connectorIds,
+  [],
+  "filesystem tasks should not load external connector schemas",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Create README.md", "jira")).connectorIds,
+  [],
+  "a linked ticket should not add Jira schemas to a filesystem-only task",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Commit the local changes")).connectorIds,
+  [],
+  "Git-only tasks should remain on the built-in Git capability",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Build a small UI component")).connectorIds,
+  [],
+  "ordinary code build language should not select Bamboo",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Deploy service to prerelease")).connectorIds,
+  ["bamboo", "jira", "kubernetes"],
+  "deployment tasks should select only matching operational domains",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Review PR #42")).connectorIds,
+  ["bitbucket"],
+  "pull-request tasks should select only the configured Bitbucket domain",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Update the linked issue", "jira"))
+    .connectorIds,
+  ["jira"],
+  "structured Jira tasks should select only the Jira domain",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Inspect the unrelated service")).connectorIds,
+  ["unrelated"],
+  "declared generic connector intent should remain available",
+);
+
 assertEqual(
   agentTaskCapabilities(config),
   {
@@ -308,12 +401,15 @@ assertEqual(
 );
 
 const alternateWorkdirProfiles: AgentRuntimeProfile[] = [];
-await ensureOpenCodeAgentProfile({ ...config, opencode_workdir: "/workspace/other" }, {
-  saveProfile: async (profile) => {
-    alternateWorkdirProfiles.push(profile);
-    return profile;
+await ensureOpenCodeAgentProfile(
+  { ...config, opencode_workdir: "/workspace/other" },
+  {
+    saveProfile: async (profile) => {
+      alternateWorkdirProfiles.push(profile);
+      return profile;
+    },
   },
-});
+);
 assertEqual(
   alternateWorkdirProfiles[0]?.id === savedProfile?.id,
   false,
@@ -355,6 +451,7 @@ assertEqual(
     conversationStable: prepared.conversationId === preparedAgain.conversationId,
     messageStable: appendedMessages[0]?.id === appendedMessages[1]?.id,
     contractIncluded: appendedMessages[0]?.text.includes("contract-1") ?? false,
+    selectedConnectors: prepared.envelope.session.connector_ids,
   },
   {
     schema: 1,
@@ -363,6 +460,7 @@ assertEqual(
     conversationStable: true,
     messageStable: true,
     contractIncluded: true,
+    selectedConnectors: [],
   },
   "V1 envelope and durable context should be deterministic per card and contract",
 );

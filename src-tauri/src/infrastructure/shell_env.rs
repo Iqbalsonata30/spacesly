@@ -74,9 +74,9 @@ fn login_shell_command(shell: &str, script: &str) -> Command {
     let mut command = Command::new(shell);
 
     if shell_name == "fish" {
-        command.args(["--login", "--interactive", "-c", script]);
+        command.args(["--login", "-c", script]);
     } else {
-        command.args(["-lic", script]);
+        command.args(["-lc", script]);
     }
 
     command.stderr(Stdio::null());
@@ -109,7 +109,7 @@ fn parse_env_output(stdout: &str, delimiter: &str) -> Option<HashMap<String, Str
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_runtime_env_key;
+    use super::{is_safe_runtime_env_key, login_shell_command};
 
     #[test]
     fn shell_environment_allowlist_excludes_credentials() {
@@ -118,5 +118,16 @@ mod tests {
         assert!(!is_safe_runtime_env_key("AWS_ACCESS_KEY_ID"));
         assert!(!is_safe_runtime_env_key("OPENAI_API_KEY"));
         assert!(!is_safe_runtime_env_key("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn login_environment_resolution_is_non_interactive() {
+        let command = login_shell_command("/bin/bash", "env");
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(arguments, ["-lc", "env"]);
     }
 }

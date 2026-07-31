@@ -18,6 +18,7 @@ import {
 } from "$lib/ipc/taskSessions";
 
 export const PROMPT_TASK_TEMPLATE_VERSION = "prompt-task-v2";
+const RECONCILIATION_INTERVAL_MS = 5_000;
 
 export type PromptTaskProfileBinding = {
   runtimeProfileId: string;
@@ -215,7 +216,7 @@ export async function waitForPromptTaskSession(
       if (hintedSequence <= cursor) {
         const observedGeneration = generation;
         await new Promise<void>((resolve) => {
-          const reconcile = setTimeout(resolveWake, 1_000);
+          const reconcile = setTimeout(resolveWake, RECONCILIATION_INTERVAL_MS);
           function resolveWake() {
             clearTimeout(reconcile);
             if (wake === resolveWake) wake = null;

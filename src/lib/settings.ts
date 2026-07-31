@@ -4,10 +4,89 @@ import { normalizeOpencodeModel } from "$lib/opencodeModels";
 export interface McpServerSettings {
   id: string;
   name: string;
-  kind: "generic" | "jira" | "ocp" | "bamboo";
+  kind: "generic" | "jira" | "ocp" | "bamboo" | "bitbucket";
   command: string;
   args: string[];
   env: Record<string, string>;
+  domains: string[];
+  intentTerms: string[];
+}
+
+export function defaultMcpIntentMetadata(
+  kind: McpServerSettings["kind"],
+  name = "",
+): Pick<McpServerSettings, "domains" | "intentTerms"> {
+  switch (kind) {
+    case "jira":
+      return {
+        domains: ["jira"],
+        intentTerms: [
+          "jira",
+          "jira issue",
+          "jql",
+          "ticket",
+          "deploy",
+          "deployment",
+          "prerelease",
+          "preploy",
+        ],
+      };
+    case "ocp":
+      return {
+        domains: ["kubernetes"],
+        intentTerms: [
+          "kubernetes",
+          "openshift",
+          "ocp",
+          "pod",
+          "pods",
+          "namespace",
+          "rollout",
+          "deploy",
+          "deployment",
+          "prerelease",
+          "preploy",
+        ],
+      };
+    case "bamboo":
+      return {
+        domains: ["bamboo"],
+        intentTerms: [
+          "bamboo",
+          "bamboo build",
+          "build plan",
+          "deploy",
+          "deployment",
+          "deployment project",
+          "prerelease",
+          "preploy",
+        ],
+      };
+    case "bitbucket":
+      return {
+        domains: ["bitbucket"],
+        intentTerms: ["bitbucket", "pull request", "pr", "review pr", "approve pr", "merge pr"],
+      };
+    default:
+      return genericMcpIntentMetadata(name);
+  }
+}
+
+function genericMcpIntentMetadata(
+  name: string,
+): Pick<McpServerSettings, "domains" | "intentTerms"> {
+  const words = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((word) => word && !["new", "generic", "mcp", "server", "connector"].includes(word));
+  if (words.length === 0) return { domains: [], intentTerms: [] };
+  const phrase = words.join(" ");
+  return {
+    domains: [words.join("-")],
+    intentTerms: [...new Set([phrase, ...words.filter((word) => word.length > 2)])],
+  };
 }
 
 export interface JiraSyncSettings {
@@ -71,6 +150,7 @@ export const defaultSettings: AppSettings = {
       command: "",
       args: [],
       env: {},
+      ...defaultMcpIntentMetadata("jira"),
     },
   ],
   jira: {
@@ -203,9 +283,7 @@ export function hasAnySecret(secrets: AppSecrets): boolean {
     secrets.jira_personal_access_token ||
     secrets.jira_password ||
     Object.values(secrets.ai_api_keys).some((value) => value.trim()) ||
-    Object.values(secrets.mcp_env).some((env) =>
-      Object.values(env).some((value) => value.trim()),
-    ),
+    Object.values(secrets.mcp_env).some((env) => Object.values(env).some((value) => value.trim())),
   );
 }
 
@@ -243,6 +321,8 @@ export function createMcpServer(): McpServerSettings {
     command: "",
     args: [],
     env: {},
+    domains: [],
+    intentTerms: [],
   };
 }
 
@@ -506,22 +586,42 @@ function splitCommand(value: string): string[] {
 
 function normalizeServer(value: unknown): McpServerSettings {
   const server = value as Partial<McpServerSettings>;
+  const kind = normalizeKind(server.kind);
+  const defaults = defaultMcpIntentMetadata(kind, String(server.name ?? "MCP Server"));
 
   return {
     id: String(server.id ?? ""),
     name: String(server.name ?? "MCP Server"),
-    kind: normalizeKind(server.kind),
+    kind,
     command: String(server.command ?? ""),
     args: Array.isArray(server.args) ? server.args.map(String) : [],
     env:
       server.env && typeof server.env === "object" && !Array.isArray(server.env)
         ? Object.fromEntries(Object.entries(server.env).map(([key, entry]) => [key, String(entry)]))
         : {},
+    domains: normalizeIntentList(server.domains, defaults.domains),
+    intentTerms: normalizeIntentList(server.intentTerms, defaults.intentTerms),
   };
 }
 
 function normalizeKind(value: unknown): McpServerSettings["kind"] {
-  return value === "jira" || value === "ocp" || value === "bamboo" || value === "generic"
+  return value === "jira" ||
+    value === "ocp" ||
+    value === "bamboo" ||
+    value === "bitbucket" ||
+    value === "generic"
     ? value
     : "generic";
+}
+
+function normalizeIntentList(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  return [
+    ...new Set(
+      value
+        .map(String)
+        .map((entry) => entry.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
 }

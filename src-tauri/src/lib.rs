@@ -707,10 +707,32 @@ async fn list_conversations(
     workspace_id: String,
     execution_store: State<'_, ExecutionStore>,
 ) -> Result<Vec<infrastructure::execution_store::ConversationRecord>, String> {
+    let received_at = std::time::Instant::now();
     let store = execution_store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.list_conversations(&workspace_id))
-        .await
-        .map_err(|error| format!("Conversation list task failed: {error}"))?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let blocking_queue_duration = received_at.elapsed();
+        let store_started_at = std::time::Instant::now();
+        let result = store.list_conversations(&workspace_id);
+        (
+            workspace_id,
+            blocking_queue_duration,
+            store_started_at.elapsed(),
+            result,
+        )
+    })
+    .await
+    .map_err(|error| format!("Conversation list task failed: {error}"))?;
+    let total_duration = received_at.elapsed();
+    if total_duration >= std::time::Duration::from_millis(250) {
+        eprintln!(
+            "slow list_conversations ipc workspace_id={:?} blocking_queue_ms={} store_ms={} total_ms={}",
+            result.0,
+            result.1.as_millis(),
+            result.2.as_millis(),
+            total_duration.as_millis()
+        );
+    }
+    result.3
 }
 
 #[tauri::command]

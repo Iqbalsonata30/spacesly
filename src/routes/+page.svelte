@@ -3703,6 +3703,8 @@
             name: `spacesly-${server.id}`,
             secret_id: server.id,
             command,
+            domains: server.domains,
+            intent_terms: server.intentTerms,
           },
         ];
       }),
@@ -5787,7 +5789,7 @@
       const label = typeof context.label === "string" ? context.label : payload.tool_name;
       const failed = payload.type === "tool_completed" && payload.success === false;
       tone = failed ? "error" : "info";
-      summary = `${payload.type === "tool_completed" ? (failed ? "Failed" : "Completed") : "Started"}: ${String(label ?? "Agent tool")}.`;
+      summary = `${payload.type === "tool_completed" ? (failed ? "Tool failed" : "Tool completed; task still running") : "Tool started"}: ${String(label ?? "Agent tool")}.`;
     } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
       summary = "Agent result staged for authoritative Task Session commit.";
     }
@@ -6928,7 +6930,7 @@
                     cardId,
                     event.success ? "info" : "error",
                     event.display_context.category,
-                    `${event.success ? "Completed" : "Failed"}: ${event.display_context.label}.`,
+                    `${event.success ? "Tool completed; task still running" : "Tool failed"}: ${event.display_context.label}.`,
                     [
                       `Category: ${event.display_context.category}`,
                       ...(event.display_context.target

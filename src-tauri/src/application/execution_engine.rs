@@ -35,7 +35,7 @@ const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum total time Drop waits for cooperative scheduler shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const SCHEDULER_TICK: Duration = Duration::from_millis(10);
+const PROJECTION_RETRY_POLL: Duration = Duration::from_millis(100);
 const COMPLETION_RETRY_BASE: Duration = Duration::from_millis(10);
 const COMPLETION_RETRY_CAP: Duration = Duration::from_secs(1);
 
@@ -1104,13 +1104,11 @@ fn run_scheduler(
         next_lease_renewal: Instant::now() + LEASE_RENEW_INTERVAL,
     };
     let _ = startup.send(Ok(()));
+    scheduler.dispatch_projection();
     scheduler.dispatch();
 
     'scheduler: loop {
-        let wait = scheduler
-            .next_lease_renewal
-            .saturating_duration_since(Instant::now())
-            .min(SCHEDULER_TICK);
+        let wait = scheduler.next_wake_delay();
         match receiver.recv_timeout(wait) {
             Ok(message) => match message {
                 SchedulerMessage::Command(SchedulerCommand::Submit { request, reply }) => {
@@ -1229,6 +1227,25 @@ fn run_scheduler(
 }
 
 impl Scheduler {
+    fn next_wake_delay(&self) -> Duration {
+        let now = Instant::now();
+        let mut deadline = self.next_lease_renewal;
+        for active in self.active.values() {
+            if active.pending_outcome.is_some() {
+                deadline = deadline.min(active.next_resolution_attempt);
+            }
+        }
+        let pending_projections = self
+            .health
+            .lock()
+            .map(|health| health.snapshot.pending_projections)
+            .unwrap_or(1);
+        if self.projection_in_flight.is_none() && pending_projections > 0 {
+            deadline = deadline.min(now + PROJECTION_RETRY_POLL);
+        }
+        deadline.saturating_duration_since(now)
+    }
+
     fn publish(&self, snapshot: &TaskSessionSnapshot) {
         self.notifier.publish(TaskSessionUpdate {
             session_id: snapshot.id,
