@@ -291,10 +291,11 @@ pub(crate) fn emit_runtime_event(
     reporter: &TaskEventReporter,
     event: AiWorkerStreamEvent,
 ) -> Result<(), String> {
-    let (kind, payload) = match event {
+    let (kind, payload, failure) = match event {
         AiWorkerStreamEvent::TextDelta(text) => (
             TaskSessionEventKind::Runtime,
             json!({ "type": "text_delta", "text": text }),
+            None,
         ),
         AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
@@ -312,26 +313,40 @@ pub(crate) fn emit_runtime_event(
                 "arguments_digest": arguments_digest,
                 "display_context": display_context,
             }),
+            None,
         ),
         AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success,
+            error,
             risk,
             arguments_digest,
             display_context,
-        } => (
-            TaskSessionEventKind::Tool,
-            json!({
-                "type": "tool_completed",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "success": success,
-                "risk": risk,
-                "arguments_digest": arguments_digest,
-                "display_context": display_context,
-            }),
-        ),
+        } => {
+            let failure = (!success).then(|| {
+                format!(
+                    "External tool '{tool_name}' failed. Cause: {}",
+                    error
+                        .as_deref()
+                        .unwrap_or("The runtime did not provide an error detail.")
+                )
+            });
+            (
+                TaskSessionEventKind::Tool,
+                json!({
+                    "type": "tool_completed",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "success": success,
+                    "error": error,
+                    "risk": risk,
+                    "arguments_digest": arguments_digest,
+                    "display_context": display_context,
+                }),
+                failure,
+            )
+        },
         AiWorkerStreamEvent::UsageUpdated {
             input_tokens,
             output_tokens,
@@ -342,12 +357,13 @@ pub(crate) fn emit_runtime_event(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
             }),
+            None,
         ),
     };
     reporter
         .emit_event(kind, payload)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -403,6 +419,33 @@ mod tests {
     }
 
     struct BlockedRunner;
+
+    struct ToolFailureRunner;
+
+    impl AgentRuntimeRunner for ToolFailureRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            _task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "jira_search".to_string(),
+                success: false,
+                error: Some("Connection refused while reading stdout.".to_string()),
+                risk: "read".to_string(),
+                arguments_digest: "digest".to_string(),
+                display_context: ToolDisplayContext {
+                    label: "Reading from external tool".to_string(),
+                    category: "external".to_string(),
+                    target: None,
+                },
+            })?;
+            unreachable!("failed tool callback must terminate execution")
+        }
+    }
 
     impl AgentRuntimeRunner for BlockedRunner {
         fn execute(
@@ -521,6 +564,7 @@ mod tests {
                 tool_call_id: format!("tool-{}", authority.session_id.0),
                 tool_name: "jira_search".to_string(),
                 success: true,
+                error: None,
                 risk: "low".to_string(),
                 arguments_digest: "abc".to_string(),
                 display_context: ToolDisplayContext {
@@ -779,6 +823,53 @@ mod tests {
                     && event.payload["result"]["completion_status"] == "blocked"
                     && event.payload["result"]["blocked_reason"] == "operator approval required"
             }));
+    }
+
+    #[test]
+    fn scheduler_agent_executor_terminalizes_failed_tool_with_original_cause() {
+        let directory = tempdir().expect("temp directory");
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            Arc::new(ToolFailureRunner),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "failed-tool-agent",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task fails");
+
+        assert_eq!(completed.state, TaskSessionState::Failed);
+        assert_eq!(
+            completed.error.as_deref(),
+            Some(
+                "External tool 'jira_search' failed. Cause: Connection refused while reading stdout."
+            )
+        );
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        assert!(events.iter().any(|event| {
+            event.kind == TaskSessionEventKind::Tool
+                && event.payload["type"] == "tool_completed"
+                && event.payload["success"] == false
+                && event.payload["error"] == "Connection refused while reading stdout."
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == TaskSessionEventKind::Lifecycle
+                && event.payload["state"] == "failed"
+        }));
     }
 
     #[test]

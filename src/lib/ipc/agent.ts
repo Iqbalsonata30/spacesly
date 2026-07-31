@@ -151,6 +151,7 @@ export type AiRuntimeEvent =
       tool_call_id: string;
       tool_name: string;
       success: boolean;
+      error: string | null;
       risk: ToolOperationRisk;
       operation_id: string;
       arguments_digest: string;

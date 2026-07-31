@@ -592,6 +592,7 @@ async fn execute_ai_worker_task(
                         ));
                     }
                 }
+                let tool_failure = tool_failure_error(&event);
                 emit_worker_stream_event(
                     &worker_stream_channel,
                     &worker_stream_run_id,
@@ -599,6 +600,9 @@ async fn execute_ai_worker_task(
                     event,
                     Some(&worker_stream_store),
                 );
+                if let Some(error) = tool_failure {
+                    return Err(error);
+                }
                 Ok(())
             });
         let result = execute_ai_worker_task_impl(config, task, cancellation, Some(worker_callback));
@@ -607,21 +611,27 @@ async fn execute_ai_worker_task(
                 if value.completion_status
                     == infrastructure::ai_worker::AiWorkerCompletionStatus::Completed =>
             {
-                ("completed", Some(value.summary.as_str()))
+                ("completed", value.summary.clone())
             }
-            Ok(value) => ("blocked", Some(value.summary.as_str())),
+            Ok(value) => ("blocked", value.summary.clone()),
             Err(error) if error.to_lowercase().contains("cancelled") => {
-                ("cancelled", Some(error.as_str()))
+                ("cancelled", error.clone())
             }
-            Err(error) => ("failed", Some(error.as_str())),
+            Err(error) => ("failed", error.clone()),
         };
-        let _ = store.finish_step(
+        if let Err(persistence_error) = store.finish_step(
             &worker_run_id,
             "worker.execute",
             &worker_run_id,
             status,
-            summary,
-        );
+            Some(&summary),
+        ) {
+            let _ = registry.finish(&worker_run_id);
+            let _ = runtime.finish(&worker_run_id, AiRunStatus::Failed);
+            return Err(format!(
+                "Failed to persist terminal execution state: {persistence_error}. Original outcome: {summary}"
+            ));
+        }
         let _ = registry.finish(&worker_run_id);
         let runtime_status = match status {
             "completed" => AiRunStatus::Completed,
@@ -1035,6 +1045,7 @@ fn emit_worker_stream_event(
             tool_call_id,
             tool_name,
             success,
+            error,
             risk,
             arguments_digest,
             display_context,
@@ -1051,6 +1062,7 @@ fn emit_worker_stream_event(
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_name,
                     "success": success,
+                    "error": error,
                     "risk": risk,
                     "operation_id": operation_id,
                     "arguments_digest": arguments_digest,
@@ -1064,6 +1076,7 @@ fn emit_worker_stream_event(
                 tool_call_id,
                 tool_name,
                 success,
+                error,
                 risk,
                 operation_id,
                 arguments_digest,
@@ -1081,6 +1094,24 @@ fn emit_worker_stream_event(
         },
     };
     emit_ai_event(Some(channel), runtime_event);
+}
+
+fn tool_failure_error(event: &AiWorkerStreamEvent) -> Option<String> {
+    let AiWorkerStreamEvent::ToolCompleted {
+        tool_name,
+        success: false,
+        error,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(format!(
+        "External tool '{tool_name}' failed. Cause: {}",
+        error
+            .as_deref()
+            .unwrap_or("The runtime did not provide an error detail.")
+    ))
 }
 
 fn bind_tool_capable_ai_workspace(
@@ -2329,10 +2360,11 @@ async fn lsp_code_actions(
 mod tests {
     use super::{
         bind_backend_provider_profile, file_ipc_error, mcp_ipc_error,
-        validate_renderer_conversation_role,
+        tool_failure_error, validate_renderer_conversation_role,
     };
-    use crate::infrastructure::ai_worker::AiWorkerConfig;
+    use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerStreamEvent};
     use crate::infrastructure::execution_store::ConversationMessageInput;
+    use crate::infrastructure::tool_broker::ToolDisplayContext;
     use serde_json::Value;
 
     #[test]
@@ -2347,6 +2379,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("MCP test failed"));
+    }
+
+    #[test]
+    fn failed_tool_completion_becomes_terminal_worker_error_with_cause() {
+        let error = tool_failure_error(&AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "jira_search".to_string(),
+            success: false,
+            error: Some("Connection refused while reading stdout.".to_string()),
+            risk: "read".to_string(),
+            arguments_digest: "digest".to_string(),
+            display_context: ToolDisplayContext {
+                label: "Reading from external tool".to_string(),
+                category: "external".to_string(),
+                target: None,
+            },
+        })
+        .expect("failed tool must stop worker");
+
+        assert_eq!(
+            error,
+            "External tool 'jira_search' failed. Cause: Connection refused while reading stdout."
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub enum AiRuntimeEvent {
         tool_call_id: String,
         tool_name: String,
         success: bool,
+        error: Option<String>,
         risk: String,
         operation_id: String,
         arguments_digest: String,

@@ -237,19 +237,25 @@ impl ExecutionStore {
         let transaction = connection
             .transaction()
             .map_err(|error| format!("Failed to start execution transaction: {error}"))?;
-        let current_revision = transaction
+        let current = transaction
             .query_row(
-                "SELECT revision FROM execution_runs WHERE run_id = ?1",
+                "SELECT revision, status FROM execution_runs WHERE run_id = ?1",
                 params![run.run_id],
-                |row| row.get::<_, u64>(0),
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|error| format!("Failed to read execution revision: {error}"))?;
-        if let Some(current_revision) = current_revision {
+        if let Some((current_revision, current_status)) = current {
             if current_revision != run.revision {
                 return Err(format!(
                     "Execution run '{}' is stale (expected revision {}, current revision {}). Reload before saving.",
                     run.run_id, run.revision, current_revision
+                ));
+            }
+            if is_terminal_status(&current_status) && run.status != current_status {
+                return Err(format!(
+                    "Execution run '{}' terminal status '{}' is immutable.",
+                    run.run_id, current_status
                 ));
             }
         } else if run.revision != 0 {
@@ -572,9 +578,14 @@ impl ExecutionStore {
                 "UPDATE step_runs
                  SET status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?1),
                      lease_owner = ?2, lease_expires_at = ?3, updated_at = ?1
-                 WHERE run_id = ?4 AND step_id = ?5
-                   AND (status IN ('pending', 'ready', 'interrupted')
-                        OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
+                  WHERE run_id = ?4 AND step_id = ?5
+                    AND (status IN ('pending', 'ready', 'interrupted')
+                         OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))
+                    AND EXISTS (
+                      SELECT 1 FROM execution_runs
+                       WHERE execution_runs.run_id = step_runs.run_id
+                         AND execution_runs.status NOT IN ('blocked', 'failed', 'completed', 'cancelled')
+                    )",
                 params![now.to_string(), owner, expires, run_id, step_id],
             )
             .map_err(|error| format!("Failed to claim execution step: {error}"))?;
@@ -583,13 +594,17 @@ impl ExecutionStore {
                 "Execution step {step_id} is already claimed or unavailable."
             ));
         }
-        transaction
+        let run_updated = transaction
             .execute(
                 "UPDATE execution_runs SET status = 'running', updated_at = ?1,
-                 revision = revision + 1 WHERE run_id = ?2",
+                 revision = revision + 1 WHERE run_id = ?2
+                   AND status NOT IN ('blocked', 'failed', 'completed', 'cancelled')",
                 params![now.to_string(), run_id],
             )
             .map_err(|error| format!("Failed to update claimed execution run: {error}"))?;
+        if run_updated != 1 {
+            return Err("Execution run is terminal or unavailable.".to_string());
+        }
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit step claim: {error}"))
@@ -603,20 +618,17 @@ impl ExecutionStore {
         status: &str,
         summary: Option<&str>,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let updated = connection
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start step completion: {error}"))?;
+        let now = now_millis()?.to_string();
+        let updated = transaction
             .execute(
                 "UPDATE step_runs SET status = ?1, completed_at = ?2, summary = ?3,
                  lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
                  WHERE run_id = ?4 AND step_id = ?5 AND lease_owner = ?6",
-                params![
-                    status,
-                    now_millis()?.to_string(),
-                    summary,
-                    run_id,
-                    step_id,
-                    owner
-                ],
+                params![status, now, summary, run_id, step_id, owner],
             )
             .map_err(|error| format!("Failed to finish execution step: {error}"))?;
         if updated == 0 {
@@ -624,7 +636,25 @@ impl ExecutionStore {
                 "Execution step {step_id} lease is not owned by this worker."
             ));
         }
-        Ok(())
+        if matches!(status, "blocked" | "failed" | "cancelled") {
+            let run_updated = transaction
+                .execute(
+                    "UPDATE execution_runs
+                        SET status = ?1, current_step_ids_json = '[]', completed_at = ?2,
+                            updated_at = ?2, revision = revision + 1
+                      WHERE run_id = ?3 AND status = 'running'",
+                    params![status, now, run_id],
+                )
+                .map_err(|error| format!("Failed to terminalize execution run: {error}"))?;
+            if run_updated != 1 {
+                return Err(
+                    "Execution run was not running during terminal step completion.".to_string(),
+                );
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit step completion: {error}"))
     }
 
     pub fn get(&self, run_id: &str) -> Result<Option<ExecutionRun>, String> {
@@ -1301,6 +1331,10 @@ fn validate_run(run: &ExecutionRun) -> Result<(), String> {
     Ok(())
 }
 
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "blocked" | "failed" | "completed" | "cancelled")
+}
+
 fn contract_string<'a>(contract: &'a Value, field: &str) -> Result<&'a str, String> {
     contract
         .get(field)
@@ -1470,7 +1504,26 @@ mod tests {
 
     fn test_store() -> ExecutionStore {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CONVERSATION_SCHEMA).unwrap();
+        connection
+            .execute_batch(&format!(
+                "{CONVERSATION_SCHEMA}
+                 CREATE TABLE execution_contracts (
+                   contract_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+                   version INTEGER NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE execution_runs (
+                   run_id TEXT PRIMARY KEY, contract_id TEXT NOT NULL, status TEXT NOT NULL,
+                   current_step_ids_json TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
+                   updated_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE step_runs (
+                   run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL,
+                   attempt INTEGER NOT NULL, started_at TEXT, completed_at TEXT, summary TEXT,
+                   lease_owner TEXT, lease_expires_at INTEGER, updated_at TEXT NOT NULL,
+                   PRIMARY KEY (run_id, step_id)
+                 );"
+            ))
+            .unwrap();
         ExecutionStore {
             connection: Arc::new(Mutex::new(connection)),
         }
@@ -1632,6 +1685,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(authority, MESSAGE_AUTHORITY_BACKEND);
+    }
+
+    #[test]
+    fn terminal_step_completion_atomically_terminalizes_execution_run() {
+        let store = test_store();
+        for status in ["failed", "blocked", "cancelled"] {
+            let run_id = format!("run-{status}");
+            let contract_id = format!("contract-{status}");
+            let run = ExecutionRun {
+                run_id: run_id.clone(),
+                contract: serde_json::json!({
+                    "contract_id": contract_id,
+                    "task_id": format!("task-{status}"),
+                    "workspace_id": "workspace-1",
+                    "version": 1,
+                    "created_at": "2026-07-31T00:00:00Z"
+                }),
+                status: "pending".to_string(),
+                current_step_ids: vec!["worker.execute".to_string()],
+                step_runs: BTreeMap::from([(
+                    "worker.execute".to_string(),
+                    StepRun {
+                        step_id: "worker.execute".to_string(),
+                        status: "ready".to_string(),
+                        attempt: 0,
+                        started_at: None,
+                        completed_at: None,
+                        summary: None,
+                        lease_owner: None,
+                        lease_expires_at: None,
+                    },
+                )]),
+                started_at: "2026-07-31T00:00:00Z".to_string(),
+                completed_at: None,
+                revision: 0,
+            };
+            store.save(&run).unwrap();
+            store
+                .claim_step(&run_id, "worker.execute", "worker-1", 60_000)
+                .unwrap();
+            store
+                .finish_step(
+                    &run_id,
+                    "worker.execute",
+                    "worker-1",
+                    status,
+                    Some("External tool failed. Cause: connection refused."),
+                )
+                .unwrap();
+
+            let completed = store.get(&run_id).unwrap().unwrap();
+            assert_eq!(completed.status, status);
+            assert!(completed.completed_at.is_some());
+            assert!(completed.current_step_ids.is_empty());
+            let step = &completed.step_runs["worker.execute"];
+            assert_eq!(step.status, status);
+            assert_eq!(
+                step.summary.as_deref(),
+                Some("External tool failed. Cause: connection refused.")
+            );
+            assert!(step.lease_owner.is_none());
+            assert!(step.lease_expires_at.is_none());
+
+            let mut restarted = completed.clone();
+            restarted.status = "running".to_string();
+            assert!(store.save(&restarted).is_err());
+            assert!(store
+                .claim_step(&run_id, "worker.execute", "worker-2", 60_000)
+                .is_err());
+        }
     }
 
     #[test]

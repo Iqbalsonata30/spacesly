@@ -364,6 +364,7 @@ pub enum AiWorkerStreamEvent {
         tool_call_id: String,
         tool_name: String,
         success: bool,
+        error: Option<String>,
         risk: String,
         arguments_digest: String,
         display_context: ToolDisplayContext,
@@ -2819,11 +2820,22 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .unwrap_or_else(|| serde_json::json!({}));
     let arguments_digest = argument_digest(&arguments).ok()?;
     let display_context = tool_display_context(&tool_name, &arguments);
+    let error = part
+        .get("state")
+        .and_then(|state| {
+            ["error", "message", "stderr"]
+                .iter()
+                .find_map(|key| state.get(*key).and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     match status {
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success: true,
+            error: None,
             risk,
             arguments_digest,
             display_context,
@@ -2832,6 +2844,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             tool_call_id,
             tool_name,
             success: false,
+            error,
             risk,
             arguments_digest,
             display_context,
@@ -3699,9 +3712,26 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
                 success: true,
+                error: None,
                 risk: "mutation".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
                 display_context: tool_display_context("shell", &serde_json::json!({})),
+            })
+        );
+
+        let failed = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"call-2","tool":"jira_search","state":{"status":"error","error":"Connection refused while reading stdout."}}}"#,
+        );
+        assert_eq!(
+            failed,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-2".to_string(),
+                tool_name: "jira_search".to_string(),
+                success: false,
+                error: Some("Connection refused while reading stdout.".to_string()),
+                risk: "read".to_string(),
+                arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
+                display_context: tool_display_context("jira_search", &serde_json::json!({})),
             })
         );
     }
