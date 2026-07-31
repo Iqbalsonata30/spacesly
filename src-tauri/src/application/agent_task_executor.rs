@@ -860,15 +860,36 @@ mod tests {
             )
         );
         let events = engine.events_after(session.id, 0).expect("events replayed");
+        let terminal = events
+            .iter()
+            .find(|event| {
+                event.kind == TaskSessionEventKind::Lifecycle
+                    && event.payload["state"] == "failed"
+            })
+            .expect("terminal lifecycle event");
+        assert_eq!(completed.attempt_id, terminal.attempt_id);
+        assert_eq!(completed.fencing_token, terminal.fencing_token);
+        assert_eq!(completed.last_event_sequence, terminal.sequence);
+        assert_eq!(
+            completed.progress,
+            Some(TaskProgress {
+                phase: "failed".to_string(),
+                completed: 1,
+                total: Some(1),
+            })
+        );
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert!(engine
+            .task_session_result(session.id)
+            .expect("authoritative result query")
+            .is_none());
         assert!(events.iter().any(|event| {
             event.kind == TaskSessionEventKind::Tool
                 && event.payload["type"] == "tool_completed"
                 && event.payload["success"] == false
                 && event.payload["error"] == "Connection refused while reading stdout."
-        }));
-        assert!(events.iter().any(|event| {
-            event.kind == TaskSessionEventKind::Lifecycle
-                && event.payload["state"] == "failed"
         }));
     }
 

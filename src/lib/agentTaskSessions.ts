@@ -388,17 +388,47 @@ export function validateAgentTaskSessionResult(
   if (candidateAttemptId !== null && candidateAttemptId !== snapshot.attempt_id) {
     throw new Error("Task Session result candidate came from a stale assignment attempt.");
   }
+  if (snapshot.state === "failed" || snapshot.state === "cancelled") {
+    if (authoritative !== null) {
+      throw taskSessionResultMismatch(snapshot, authoritative);
+    }
+    throw new Error(
+      snapshot.error?.trim() ||
+        `Task Session ${snapshot.id} ended in terminal state ${snapshot.state} without a structured Agent result.`,
+    );
+  }
   if (
     !authoritative ||
     authoritative.session_id !== snapshot.id ||
     authoritative.terminal_state !== snapshot.state
   ) {
-    throw new Error("Task Session authoritative result did not match its terminal projection.");
+    throw taskSessionResultMismatch(snapshot, authoritative);
   }
   if (authoritative.output.kind !== "agent") {
     throw new Error("Task Session did not stage an authoritative Agent result.");
   }
   return { session: snapshot, result: authoritative.output.result };
+}
+
+function taskSessionResultMismatch(
+  snapshot: TaskSessionSnapshot,
+  authoritative: TaskSessionResult | null,
+): Error {
+  return new Error(
+    `Task Session authoritative result did not match its terminal projection. ${JSON.stringify({
+      authoritative,
+      projection: {
+        session_id: snapshot.id,
+        terminal_state: snapshot.state,
+        attempt_id: snapshot.attempt_id,
+        fencing_token: snapshot.fencing_token,
+        progress: snapshot.progress,
+        error: snapshot.error,
+        completed_at: snapshot.completed_at,
+        last_event_sequence: snapshot.last_event_sequence,
+      },
+    })}`,
+  );
 }
 
 /** Extracts the V1 Agent envelope from a retained scheduler request for conservative recovery. */

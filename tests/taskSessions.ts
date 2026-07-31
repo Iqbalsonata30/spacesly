@@ -411,6 +411,39 @@ try {
 }
 assertEqual(staleAttemptRejected, true, "a stale candidate attempt should be rejected");
 
+const failedSnapshot = {
+  ...terminalSnapshot(11),
+  state: "failed" as const,
+  error: "External tool 'jira_search' failed. Cause: Connection refused.",
+};
+let failedTerminalError = "";
+try {
+  validateAgentTaskSessionResult(failedSnapshot, null, 4, 7, null);
+} catch (reason) {
+  failedTerminalError = reason instanceof Error ? reason.message : String(reason);
+}
+assertEqual(
+  failedTerminalError,
+  "External tool 'jira_search' failed. Cause: Connection refused.",
+  "failed terminal without a completion outbox row should preserve its scheduler error",
+);
+
+let unexpectedFailedResultRejected = false;
+try {
+  validateAgentTaskSessionResult(failedSnapshot, taskResult(11), 4, 7, null);
+} catch (reason) {
+  unexpectedFailedResultRejected =
+    reason instanceof Error &&
+    reason.message.includes("authoritative result did not match its terminal projection") &&
+    reason.message.includes('"terminal_state":"succeeded"') &&
+    reason.message.includes('"terminal_state":"failed"');
+}
+assertEqual(
+  unexpectedFailedResultRejected,
+  true,
+  "failed terminal must reject an unexpected structured authoritative result with a field diff",
+);
+
 const submittedIds: number[] = [];
 let nextSessionId = 20;
 const independentDependencies: Partial<AgentTaskSessionDependencies> = {

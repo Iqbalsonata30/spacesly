@@ -1837,11 +1837,15 @@ impl SchedulerStore {
 
 const SESSION_COLUMNS: &str =
     "session_id, label, payload, state, worker_id, dispatch_sequence, attempt_count,
-     active_attempt_id, fencing_token, lease_expires_at, error, created_at, started_at,
+     COALESCE(active_attempt_id, (SELECT MAX(attempt_id) FROM scheduler_task_attempts
+       WHERE scheduler_task_attempts.session_id = scheduler_task_sessions.session_id)),
+     fencing_token, lease_expires_at, error, created_at, started_at,
      completed_at, progress_phase, progress_completed, progress_total, next_event_sequence";
 const SESSION_SELECT_ALL: &str =
     "SELECT session_id, label, payload, state, worker_id, dispatch_sequence, attempt_count,
-            active_attempt_id, fencing_token, lease_expires_at, error, created_at, started_at,
+            COALESCE(active_attempt_id, (SELECT MAX(attempt_id) FROM scheduler_task_attempts
+              WHERE scheduler_task_attempts.session_id = scheduler_task_sessions.session_id)),
+            fencing_token, lease_expires_at, error, created_at, started_at,
             completed_at, progress_phase, progress_completed, progress_total, next_event_sequence
        FROM scheduler_task_sessions ORDER BY session_id";
 

@@ -924,7 +924,7 @@ pub struct TaskSessionSnapshot {
     pub dispatch_sequence: Option<u64>,
     /// Number of execution attempts made by this session.
     pub attempt: u32,
-    /// Active assignment attempt identifier.
+    /// Current assignment attempt, or the terminal assignment after completion.
     pub attempt_id: Option<u64>,
     /// Monotonic token that fences stale Worker completions.
     pub fencing_token: u64,

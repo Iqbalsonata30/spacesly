@@ -129,7 +129,7 @@ fn tool_definitions(authority: &TaskToolAuthority) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "workdir": { "type": "string" },
+                    "workdir": { "type": "string", "description": "Relative path or absolute path inside the assigned workspace." },
                     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 }
                 },
                 "required": ["command"],
@@ -348,8 +348,8 @@ fn string_argument<'a>(
 fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, String> {
     let relative = relative.unwrap_or("");
     let path = Path::new(relative);
-    if path.is_absolute()
-        || path.components().any(|component| {
+    if !path.is_absolute()
+        && path.components().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -358,8 +358,12 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
     {
         return Err("Shell workdir must remain inside the assigned workspace.".to_string());
     }
-    let resolved = root
-        .join(path)
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let resolved = candidate
         .canonicalize()
         .map_err(|error| format!("Failed to resolve shell workdir: {error}"))?;
     if !resolved.starts_with(root) || !resolved.is_dir() {
@@ -371,12 +375,59 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
-    fn shell_workdir_rejects_path_escape() {
-        let root = std::env::temp_dir().canonicalize().expect("temp root");
+    fn shell_workdir_accepts_absolute_paths_only_inside_assigned_workspace() {
+        let directory = tempdir().expect("workspace");
+        let root = directory.path().canonicalize().expect("workspace root");
+        let child = root.join("child");
+        std::fs::create_dir(&child).expect("child directory");
+
+        assert_eq!(resolve_workdir(&root, None).unwrap(), root);
+        assert_eq!(resolve_workdir(&root, Some("child")).unwrap(), child);
+        assert_eq!(
+            resolve_workdir(&root, Some(root.to_string_lossy().as_ref())).unwrap(),
+            root
+        );
+        assert_eq!(
+            resolve_workdir(&root, Some(child.to_string_lossy().as_ref())).unwrap(),
+            child
+        );
         assert!(resolve_workdir(&root, Some("../outside")).is_err());
-        assert!(resolve_workdir(&root, Some("/tmp")).is_err());
+        assert!(resolve_workdir(&root, Some(std::env::temp_dir().to_string_lossy().as_ref())).is_err());
+    }
+
+    #[test]
+    fn shell_workdir_resolution_has_no_cross_workspace_state() {
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let first_root = first.path().canonicalize().expect("first root");
+        let second_root = second.path().canonicalize().expect("second root");
+
+        assert_eq!(
+            resolve_workdir(&first_root, Some(first_root.to_string_lossy().as_ref())).unwrap(),
+            first_root
+        );
+        assert_eq!(
+            resolve_workdir(&second_root, Some(second_root.to_string_lossy().as_ref())).unwrap(),
+            second_root
+        );
+        assert!(resolve_workdir(&first_root, Some(second_root.to_string_lossy().as_ref())).is_err());
+        assert!(resolve_workdir(&second_root, Some(first_root.to_string_lossy().as_ref())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_workdir_rejects_symlink_escape_after_canonicalization() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        let root = workspace.path().canonicalize().expect("workspace root");
+        let link = root.join("outside-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+
+        assert!(resolve_workdir(&root, Some("outside-link")).is_err());
+        assert!(resolve_workdir(&root, Some(link.to_string_lossy().as_ref())).is_err());
     }
 
     #[test]
