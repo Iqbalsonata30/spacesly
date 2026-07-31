@@ -296,13 +296,28 @@ assertEqual(
     idIsContentAddressed: savedProfile?.id.startsWith("agent-") ?? false,
     connectors: savedProfile?.connector_ids,
     template: savedProfile?.prompt_template_version,
+    workdir: savedProfile?.opencode_workdir,
   },
   {
     idIsContentAddressed: true,
     connectors: ["alpha", "zeta"],
     template: "agent-task-v1",
+    workdir: "/workspace",
   },
   "profile identity should include canonical connectors and template version",
+);
+
+const alternateWorkdirProfiles: AgentRuntimeProfile[] = [];
+await ensureOpenCodeAgentProfile({ ...config, opencode_workdir: "/workspace/other" }, {
+  saveProfile: async (profile) => {
+    alternateWorkdirProfiles.push(profile);
+    return profile;
+  },
+});
+assertEqual(
+  alternateWorkdirProfiles[0]?.id === savedProfile?.id,
+  false,
+  "profile identity should bind the configured working directory",
 );
 
 const appendedMessages: Array<{ conversationId: string; id: string; text: string }> = [];

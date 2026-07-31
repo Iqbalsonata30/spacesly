@@ -136,6 +136,7 @@ export type AgentRuntimeProfile = {
   runtime: "opencode";
   model: string;
   opencode_command: string;
+  opencode_workdir: string | null;
   agent_rules: string;
   agent_skills: string;
   temperature: number;

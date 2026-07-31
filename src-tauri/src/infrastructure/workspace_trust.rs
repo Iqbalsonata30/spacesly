@@ -21,7 +21,11 @@ impl WorkspaceTrustRegistry {
         roots: &WorkspaceRoot,
         workspace_id: &str,
     ) -> Result<WorkspaceTrustStatus, String> {
-        let path = roots.path(workspace_id)?;
+        self.status_path(&roots.path(workspace_id)?)
+    }
+
+    pub fn status_path(&self, path: &Path) -> Result<WorkspaceTrustStatus, String> {
+        let path = canonical_workspace_path(path)?;
         let trusted = self
             .trusted_paths
             .lock()
@@ -38,7 +42,11 @@ impl WorkspaceTrustRegistry {
         roots: &WorkspaceRoot,
         workspace_id: &str,
     ) -> Result<WorkspaceTrustStatus, String> {
-        let path = roots.path(workspace_id)?;
+        self.trust_path(&roots.path(workspace_id)?)
+    }
+
+    pub fn trust_path(&self, path: &Path) -> Result<WorkspaceTrustStatus, String> {
+        let path = canonical_workspace_path(path)?;
         if is_home_directory(&path) {
             return Err(
                 "The home directory cannot be trusted as an AI execution workspace. Open a specific project folder first."
@@ -48,8 +56,8 @@ impl WorkspaceTrustRegistry {
         self.trusted_paths
             .lock()
             .map_err(|error| error.to_string())?
-            .insert(path);
-        self.status(roots, workspace_id)
+            .insert(path.clone());
+        self.status_path(&path)
     }
 
     pub fn require_trusted(
@@ -66,6 +74,43 @@ impl WorkspaceTrustRegistry {
         }
         Ok(PathBuf::from(status.path))
     }
+
+    pub fn require_trusted_path(&self, path: &Path) -> Result<PathBuf, String> {
+        let status = self.status_path(path)?;
+        if !status.trusted {
+            return Err(format!(
+                "Workspace is not trusted for AI tool execution: {}",
+                status.path
+            ));
+        }
+        Ok(PathBuf::from(status.path))
+    }
+}
+
+fn canonical_workspace_path(path: &Path) -> Result<PathBuf, String> {
+    let expanded;
+    let path = if path == Path::new("~") || path.starts_with("~/") {
+        let relative = path
+            .strip_prefix("~")
+            .expect("home-relative path prefix was checked");
+        expanded = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not configured for the AI working directory.".to_string())?
+            .join(relative);
+        expanded.as_path()
+    } else {
+        path
+    };
+    if !path.is_absolute() {
+        return Err("AI working directory must be an absolute or home-relative path.".to_string());
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize AI working directory: {error}"))?;
+    if !path.is_dir() {
+        return Err("AI working directory must be a directory.".to_string());
+    }
+    Ok(path)
 }
 
 fn is_home_directory(path: &Path) -> bool {
@@ -118,5 +163,34 @@ mod tests {
         let roots = WorkspaceRoot::home().unwrap();
         let registry = WorkspaceTrustRegistry::default();
         assert!(registry.trust(&roots, "workspace-personal").is_err());
+    }
+
+    #[test]
+    fn configured_working_directory_has_independent_exact_trust() {
+        let base = std::env::temp_dir().join(format!(
+            "spacesly-configured-workdir-trust-{}",
+            std::process::id()
+        ));
+        let workspace = base.join("workspace");
+        let configured = base.join("configured");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&configured).unwrap();
+        let roots = WorkspaceRoot::home().unwrap();
+        roots
+            .set_path("workspace-personal", workspace.clone())
+            .unwrap();
+        let registry = WorkspaceTrustRegistry::default();
+
+        registry.trust_path(&configured).unwrap();
+
+        assert_eq!(
+            registry.require_trusted_path(&configured).unwrap(),
+            configured.canonicalize().unwrap()
+        );
+        assert!(registry
+            .require_trusted(&roots, "workspace-personal")
+            .is_err());
+
+        let _ = fs::remove_dir_all(base);
     }
 }

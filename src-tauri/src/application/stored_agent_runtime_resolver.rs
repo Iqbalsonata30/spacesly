@@ -8,6 +8,7 @@ use crate::infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeP
 use crate::infrastructure::secrets::AppSecretsStore;
 use crate::infrastructure::workspace_trust::WorkspaceTrustRegistry;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Production resolver for scheduler-owned Agent attempts.
 #[derive(Clone)]
@@ -64,9 +65,12 @@ impl StoredAgentRuntimeResolver {
             })?;
         validate_profile_binding(envelope, &profile)?;
 
-        let workspace = self
-            .workspace_trust
-            .require_trusted(&self.workspace_roots, &envelope.workspace_id)?;
+        let workspace = resolve_profile_workspace(
+            &profile,
+            &self.workspace_roots,
+            &self.workspace_trust,
+            &envelope.workspace_id,
+        )?;
         if envelope.kind != crate::domain::task_session::TaskSessionKind::Chat {
             let workspace_revision = self.workspace_roots.revision(&envelope.workspace_id)?;
             if envelope.context_revision.as_deref() != Some(workspace_revision.to_string().as_str())
@@ -162,6 +166,18 @@ impl StoredAgentRuntimeResolver {
     }
 }
 
+fn resolve_profile_workspace(
+    profile: &AgentRuntimeProfile,
+    roots: &WorkspaceRoot,
+    trust: &WorkspaceTrustRegistry,
+    workspace_id: &str,
+) -> Result<PathBuf, String> {
+    match profile.opencode_workdir.as_deref() {
+        Some(path) => trust.require_trusted_path(Path::new(path)),
+        None => trust.require_trusted(roots, workspace_id),
+    }
+}
+
 impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
     fn resolve(
         &self,
@@ -242,6 +258,7 @@ mod tests {
     use super::*;
     use crate::domain::task_session::TaskSessionKind;
     use crate::infrastructure::runtime_profile_store::content_revision;
+    use tempfile::tempdir;
 
     #[test]
     fn profile_binding_rejects_unapproved_connector() {
@@ -257,6 +274,28 @@ mod tests {
         assert!(validate_profile_binding(&envelope, &test_profile()).is_ok());
         envelope.rules_revision = Some("stale".to_string());
         assert!(validate_profile_binding(&envelope, &test_profile()).is_err());
+    }
+
+    #[test]
+    fn configured_working_directory_is_the_resolved_workspace_authority() {
+        let directory = tempdir().unwrap();
+        let open_workspace = directory.path().join("open-workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&open_workspace).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        let roots = WorkspaceRoot::home().unwrap();
+        roots
+            .set_path("workspace-personal", open_workspace)
+            .unwrap();
+        let trust = WorkspaceTrustRegistry::default();
+        trust.trust_path(&configured).unwrap();
+        let mut profile = test_profile();
+        profile.opencode_workdir = Some(configured.to_string_lossy().to_string());
+
+        assert_eq!(
+            resolve_profile_workspace(&profile, &roots, &trust, "workspace-personal").unwrap(),
+            configured.canonicalize().unwrap()
+        );
     }
 
     fn test_envelope() -> TaskSessionEnvelopeV1 {
@@ -284,6 +323,7 @@ mod tests {
             runtime: "opencode".to_string(),
             model: "openai/gpt-5.5".to_string(),
             opencode_command: "opencode".to_string(),
+            opencode_workdir: None,
             agent_rules: "Use evidence.".to_string(),
             agent_skills: "Verify changes.".to_string(),
             temperature: 0.2,

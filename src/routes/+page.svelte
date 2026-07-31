@@ -3713,13 +3713,14 @@
     if (config.runtime !== "opencode") return true;
     if (!workspace) return false;
     try {
-      const status = await aiWorkspaceTrustStatus(workspace.id);
+      const workingDirectory = config.opencode_workdir?.trim() || null;
+      const status = await aiWorkspaceTrustStatus(workspace.id, workingDirectory);
       if (status.trusted) return true;
       const confirmed = window.confirm(
         `Trust ${status.path} for AI tool execution? OpenCode agents may read and modify files and run commands inside this workspace.`,
       );
       if (!confirmed) return false;
-      await trustAiWorkspace(workspace.id);
+      await trustAiWorkspace(workspace.id, workingDirectory);
       return true;
     } catch (reason: unknown) {
       appNotice = {
@@ -7678,7 +7679,7 @@
                       <label>
                         <span>Working directory</span>
                         <input
-                          placeholder="Optional. Defaults to Spacesly current process directory."
+                          placeholder="Optional. Defaults to the open workspace folder."
                           value={settings.aiWorker.opencodeWorkdir}
                           oninput={(event) => {
                             settings = {

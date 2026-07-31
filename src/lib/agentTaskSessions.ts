@@ -135,11 +135,13 @@ export async function ensureOpenCodeAgentProfile(
   const { connectorIds, capabilities } = agentTaskCapabilities(config);
   const rulesRevision = `sha256:${await sha256(config.agent_rules)}`;
   const skillsRevision = `sha256:${await sha256(config.agent_skills)}`;
+  const opencodeWorkdir = config.opencode_workdir?.trim() || null;
   const identity = await sha256(
     JSON.stringify({
       runtime: "opencode",
       model: config.opencode_model.trim(),
       opencodeCommand: config.opencode_command.trim(),
+      opencodeWorkdir,
       rulesRevision,
       skillsRevision,
       temperature: config.temperature,
@@ -152,6 +154,7 @@ export async function ensureOpenCodeAgentProfile(
     runtime: "opencode",
     model: config.opencode_model.trim(),
     opencode_command: config.opencode_command.trim(),
+    opencode_workdir: opencodeWorkdir,
     agent_rules: config.agent_rules,
     agent_skills: config.agent_skills,
     temperature: config.temperature,

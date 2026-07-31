@@ -14,6 +14,7 @@ pub struct AgentRuntimeProfile {
     pub runtime: String,
     pub model: String,
     pub opencode_command: String,
+    pub opencode_workdir: Option<String>,
     pub agent_rules: String,
     pub agent_skills: String,
     pub temperature: f32,
@@ -55,6 +56,16 @@ impl AgentRuntimeProfile {
         }
         if self.runtime != "opencode" {
             return Err("Scheduler Agent profiles must use the OpenCode runtime.".to_string());
+        }
+        if self.opencode_workdir.as_deref().is_some_and(|path| {
+            path.trim().is_empty()
+                || path != path.trim()
+                || (!PathBuf::from(path).is_absolute() && !path.starts_with("~/"))
+        }) {
+            return Err(
+                "Agent runtime profile working directory must be an absolute or home-relative path without surrounding whitespace."
+                    .to_string(),
+            );
         }
         if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
             return Err("Agent runtime profile temperature must be between 0 and 2.".to_string());
@@ -316,6 +327,7 @@ mod tests {
             runtime: "opencode".to_string(),
             model: "openai/gpt-5".to_string(),
             opencode_command: "opencode".to_string(),
+            opencode_workdir: None,
             agent_rules: "Use evidence.".to_string(),
             agent_skills: "Verify changes.".to_string(),
             temperature: 0.2,

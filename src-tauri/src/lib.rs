@@ -89,6 +89,7 @@ use infrastructure::workspace_search::{
     WorkspaceSearchRequest, WorkspaceSearchResponse,
 };
 use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1126,7 +1127,10 @@ fn bind_tool_capable_ai_workspace(
     if workspace_id.is_empty() {
         return Err("AI workspace ID is required for OpenCode execution.".to_string());
     }
-    let path = trust.require_trusted(roots, workspace_id)?;
+    let path = match config.opencode_workdir.as_deref().map(str::trim) {
+        Some(path) if !path.is_empty() => trust.require_trusted_path(Path::new(path))?,
+        _ => trust.require_trusted(roots, workspace_id)?,
+    };
     config.opencode_workdir = Some(path.to_string_lossy().to_string());
     Ok(())
 }
@@ -1134,19 +1138,27 @@ fn bind_tool_capable_ai_workspace(
 #[tauri::command]
 fn ai_workspace_trust_status(
     workspace_id: String,
+    working_directory: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
 ) -> Result<WorkspaceTrustStatus, String> {
-    workspace_trust.status(&workspace_root, &workspace_id)
+    match working_directory.as_deref().map(str::trim) {
+        Some(path) if !path.is_empty() => workspace_trust.status_path(Path::new(path)),
+        _ => workspace_trust.status(&workspace_root, &workspace_id),
+    }
 }
 
 #[tauri::command]
 fn trust_ai_workspace(
     workspace_id: String,
+    working_directory: Option<String>,
     workspace_root: State<'_, WorkspaceRoot>,
     workspace_trust: State<'_, WorkspaceTrustRegistry>,
 ) -> Result<WorkspaceTrustStatus, String> {
-    workspace_trust.trust(&workspace_root, &workspace_id)
+    match working_directory.as_deref().map(str::trim) {
+        Some(path) if !path.is_empty() => workspace_trust.trust_path(Path::new(path)),
+        _ => workspace_trust.trust(&workspace_root, &workspace_id),
+    }
 }
 
 #[tauri::command]

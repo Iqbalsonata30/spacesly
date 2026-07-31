@@ -55,6 +55,7 @@ export async function ensureOpenCodePromptProfile(
   }
   const opencodeCommand = config.opencode_command.trim();
   const opencodeModel = config.opencode_model.trim();
+  const opencodeWorkdir = config.opencode_workdir?.trim() || null;
   const rulesRevision = `sha256:${await sha256(config.agent_rules)}`;
   const skillsRevision = `sha256:${await sha256(config.agent_skills)}`;
   const profileIdentity = await sha256(
@@ -62,6 +63,7 @@ export async function ensureOpenCodePromptProfile(
       runtime: config.runtime,
       model: opencodeModel,
       command: opencodeCommand,
+      opencodeWorkdir,
       rulesRevision,
       skillsRevision,
       temperature: config.temperature,
@@ -73,6 +75,7 @@ export async function ensureOpenCodePromptProfile(
     runtime: "opencode",
     model: opencodeModel,
     opencode_command: opencodeCommand,
+    opencode_workdir: opencodeWorkdir,
     agent_rules: config.agent_rules,
     agent_skills: config.agent_skills,
     temperature: config.temperature,

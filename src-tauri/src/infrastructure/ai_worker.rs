@@ -1311,6 +1311,7 @@ where
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                terminate_agent_process_group(child.id());
                 let _ = stdout_thread.join();
                 while let Ok(line) = line_rx.try_recv() {
                     process_line(line?)?;
@@ -1422,15 +1423,19 @@ fn run_monitored_command(
 }
 
 fn terminate_agent_process(child: &mut Child) {
+    terminate_agent_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_agent_process_group(child_id: u32) {
     #[cfg(unix)]
     {
-        let process_group = -(child.id() as i32);
+        let process_group = -(child_id as i32);
         unsafe {
             libc::kill(process_group, libc::SIGKILL);
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn read_limited_with_limit(reader: &mut impl Read, output_limit: usize) -> Result<Vec<u8>, String> {
@@ -3340,6 +3345,30 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(streamed.len(), 2);
         assert!(String::from_utf8_lossy(&output.stdout).contains("one"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_runner_does_not_wait_for_descendants_holding_output_pipes() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "sleep 10 & printf '{\"part\":{\"type\":\"text\",\"text\":\"done\"}}\\n'",
+        ]);
+        let started = Instant::now();
+
+        let output = run_cancellable_jsonl_command(
+            command,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(1),
+            4096,
+            "test",
+            |_| Ok(()),
+        )
+        .expect("parent process completion must terminate residual descendants");
+
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

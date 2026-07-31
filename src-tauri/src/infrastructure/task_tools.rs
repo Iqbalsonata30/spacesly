@@ -375,7 +375,89 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task_session::{
+        TaskRequest, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionKind,
+    };
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn fenced_shell_tool_returns_response_after_file_creation() {
+        let directory = tempdir().expect("test directory");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let root = workspace.canonicalize().expect("workspace root");
+        let store = SchedulerStore::open_at(directory.path().join("scheduler.db"))
+            .expect("scheduler store");
+        let owner = store.register_owner().expect("scheduler owner");
+        store
+            .enqueue_with_grants(
+                &TaskRequest {
+                    label: "create-file".to_string(),
+                    payload: serde_json::to_string(&TaskSessionEnvelope::V1(
+                        TaskSessionEnvelopeV1 {
+                            workspace_id: "workspace-test".to_string(),
+                            kind: TaskSessionKind::Agent,
+                            subject_id: Some("card-1".to_string()),
+                            conversation_id: Some("conversation-1".to_string()),
+                            execution_run_id: Some("run-1".to_string()),
+                            context_digest: "digest".to_string(),
+                            runtime_profile_id: "profile-1".to_string(),
+                            model: "openai/test".to_string(),
+                            connector_ids: Vec::new(),
+                            requested_capabilities: vec!["shell".to_string()],
+                            prompt_template_version: "agent-v1".to_string(),
+                            context_revision: Some("1".to_string()),
+                            rules_revision: Some("rules".to_string()),
+                            skills_revision: Some("skills".to_string()),
+                        },
+                    ))
+                    .expect("task envelope"),
+                },
+                &["shell".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 1)
+            .expect("claim succeeds")
+            .expect("assignment");
+        let authority = store
+            .task_tool_authority(
+                assignment.fence,
+                "workspace-test",
+                root.clone(),
+                &["shell".to_string()],
+            )
+            .expect("tool authority");
+        let roots = WorkspaceRoot::home().expect("workspace roots");
+        roots
+            .set_path("workspace-test", root.clone())
+            .expect("workspace registered");
+        let started = Instant::now();
+        let response = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "shell",
+                    "arguments": {
+                        "command": "printf 'created' > created.txt && test -f created.txt",
+                        "workdir": root,
+                        "timeout_seconds": 5
+                    }
+                }
+            }),
+        )
+        .expect("shell tool response");
+
+        assert_eq!(response["exit_code"], 0);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("created.txt")).unwrap(),
+            "created"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn shell_workdir_accepts_absolute_paths_only_inside_assigned_workspace() {
@@ -395,7 +477,9 @@ mod tests {
             child
         );
         assert!(resolve_workdir(&root, Some("../outside")).is_err());
-        assert!(resolve_workdir(&root, Some(std::env::temp_dir().to_string_lossy().as_ref())).is_err());
+        assert!(
+            resolve_workdir(&root, Some(std::env::temp_dir().to_string_lossy().as_ref())).is_err()
+        );
     }
 
     #[test]
@@ -413,8 +497,12 @@ mod tests {
             resolve_workdir(&second_root, Some(second_root.to_string_lossy().as_ref())).unwrap(),
             second_root
         );
-        assert!(resolve_workdir(&first_root, Some(second_root.to_string_lossy().as_ref())).is_err());
-        assert!(resolve_workdir(&second_root, Some(first_root.to_string_lossy().as_ref())).is_err());
+        assert!(
+            resolve_workdir(&first_root, Some(second_root.to_string_lossy().as_ref())).is_err()
+        );
+        assert!(
+            resolve_workdir(&second_root, Some(first_root.to_string_lossy().as_ref())).is_err()
+        );
     }
 
     #[cfg(unix)]

@@ -330,18 +330,24 @@ export async function cancelAiRun(runId: string): Promise<boolean> {
   return invokeWithPolicy<boolean>("cancel_ai_run", { runId }, IPC_POLICIES.pty);
 }
 
-export async function aiWorkspaceTrustStatus(workspaceId: string): Promise<AiWorkspaceTrustStatus> {
+export async function aiWorkspaceTrustStatus(
+  workspaceId: string,
+  workingDirectory?: string | null,
+): Promise<AiWorkspaceTrustStatus> {
   return invokeWithPolicy<AiWorkspaceTrustStatus>(
     "ai_workspace_trust_status",
-    { workspaceId },
+    { workspaceId, workingDirectory: workingDirectory?.trim() || null },
     IPC_POLICIES.fileRead,
   );
 }
 
-export async function trustAiWorkspace(workspaceId: string): Promise<AiWorkspaceTrustStatus> {
+export async function trustAiWorkspace(
+  workspaceId: string,
+  workingDirectory?: string | null,
+): Promise<AiWorkspaceTrustStatus> {
   return invokeWithPolicy<AiWorkspaceTrustStatus>(
     "trust_ai_workspace",
-    { workspaceId },
+    { workspaceId, workingDirectory: workingDirectory?.trim() || null },
     IPC_POLICIES.fileWrite,
   );
 }
