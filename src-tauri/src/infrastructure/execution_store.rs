@@ -1519,7 +1519,8 @@ mod tests {
                  CREATE TABLE step_runs (
                    run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL,
                    attempt INTEGER NOT NULL, started_at TEXT, completed_at TEXT, summary TEXT,
-                   lease_owner TEXT, lease_expires_at INTEGER, updated_at TEXT NOT NULL,
+                   lease_owner TEXT, lease_expires_at INTEGER, result_json TEXT,
+                   task_session_projection_id TEXT, updated_at TEXT NOT NULL,
                    PRIMARY KEY (run_id, step_id)
                  );"
             ))
