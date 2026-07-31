@@ -9,7 +9,7 @@ use crate::domain::task_session::{
 use crate::infrastructure::ai_worker::{
     chat_ai_worker, chat_ai_worker_streaming, propose_ai_edit, AiEditContextFile, AiEditRequest,
     AiEditResult, AiEditSelection, AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig,
-    AiWorkerEventCallback,
+    AiWorkerEventCallback, AiWorkerStreamEvent,
 };
 use crate::infrastructure::execution_store::ChatConversationSnapshot;
 use serde_json::json;
@@ -255,11 +255,12 @@ impl PromptTaskExecutor {
                 self.resolver
                     .revalidate_chat(&snapshot)
                     .map_err(TaskExecutionError::blocked)?;
-                for event in buffered_events
+                let events = buffered_events
                     .lock()
                     .map_err(|error| TaskExecutionError::new(error.to_string()))?
                     .drain(..)
-                {
+                    .collect();
+                for event in coalesce_runtime_events(events) {
                     emit_runtime_event(&reporter, event).map_err(TaskExecutionError::new)?;
                 }
                 if result.message.len() > MAX_PROMPT_RESULT_CONTENT_BYTES {
@@ -320,6 +321,36 @@ impl PromptTaskExecutor {
             }
         }
     }
+}
+
+fn coalesce_runtime_events(events: Vec<AiWorkerStreamEvent>) -> Vec<AiWorkerStreamEvent> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    let mut text = String::new();
+    let mut usage = None;
+    for event in events {
+        match event {
+            AiWorkerStreamEvent::TextDelta(delta) => text.push_str(&delta),
+            event @ AiWorkerStreamEvent::UsageUpdated { .. } if !text.is_empty() => {
+                usage = Some(event);
+            }
+            event => {
+                if !text.is_empty() {
+                    coalesced.push(AiWorkerStreamEvent::TextDelta(std::mem::take(&mut text)));
+                }
+                if let Some(usage) = usage.take() {
+                    coalesced.push(usage);
+                }
+                coalesced.push(event);
+            }
+        }
+    }
+    if !text.is_empty() {
+        coalesced.push(AiWorkerStreamEvent::TextDelta(text));
+    }
+    if let Some(usage) = usage {
+        coalesced.push(usage);
+    }
+    coalesced
 }
 
 impl TaskExecutor for PromptTaskExecutor {
@@ -417,10 +448,35 @@ mod tests {
     use crate::domain::task_session::{
         TaskChatInputV2, TaskEditInputV2, TaskSessionEnvelopeV2, TaskSessionState,
     };
-    use crate::infrastructure::ai_worker::AiWorkerStreamEvent;
     use std::sync::Barrier;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn prompt_text_deltas_are_coalesced_with_latest_usage_retained() {
+        let events = coalesce_runtime_events(vec![
+            AiWorkerStreamEvent::TextDelta("one ".to_string()),
+            AiWorkerStreamEvent::TextDelta("two".to_string()),
+            AiWorkerStreamEvent::UsageUpdated {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+            AiWorkerStreamEvent::TextDelta(" three".to_string()),
+        ]);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AiWorkerStreamEvent::TextDelta(text) if text == "one two three"
+        ));
+        assert!(matches!(
+            &events[1],
+            AiWorkerStreamEvent::UsageUpdated {
+                input_tokens: 10,
+                output_tokens: 2
+            }
+        ));
+    }
 
     struct FakeResolver;
 

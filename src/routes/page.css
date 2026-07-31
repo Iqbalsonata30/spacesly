@@ -218,9 +218,6 @@ button:active:not(:disabled) {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  transition:
-    grid-template-columns 180ms ease,
-    gap 180ms ease;
 }
 
 .workspace-body.is-hidden,

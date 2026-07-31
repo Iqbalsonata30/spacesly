@@ -36,6 +36,7 @@
     terminalLines: AgentTerminalLine[];
     terminalInput: string;
     runCardId: string | null;
+    cancelPending: boolean;
     onClose: () => void;
     onCancel: (cardId: string) => void;
     onTerminalInputChange: (value: string) => void;
@@ -58,6 +59,7 @@
     terminalLines,
     terminalInput,
     runCardId,
+    cancelPending,
     onClose,
     onCancel,
     onTerminalInputChange,
@@ -103,6 +105,7 @@
       .filter(Boolean)
       .slice(0, 4),
   );
+  let latestActivityItems = $derived(timelineActivities(logs, 10));
 
   $effect(() => {
     if (!isWorking) return;
@@ -111,10 +114,6 @@
     }, 1000);
     return () => window.clearInterval(timer);
   });
-
-  function latestActivities() {
-    return timelineActivities(logs, 10);
-  }
 
   function userFacingActivity(
     currentStatus: AgentRunStatus,
@@ -238,7 +237,11 @@
       <span class={`status-orb ${runStatus}`}><span></span></span>
       <span class="eyebrow">Agent workspace</span>
       {#if isWorking && runCardId}
-        <button class="cancel-button" type="button" onclick={() => onCancel(runCardId)}>Stop</button
+        <button
+          class="cancel-button"
+          type="button"
+          disabled={cancelPending}
+          onclick={() => onCancel(runCardId)}>{cancelPending ? "Stopping..." : "Stop"}</button
         >
       {/if}
       <button class="close-button" type="button" aria-label="Close Agent console" onclick={onClose}
@@ -260,7 +263,7 @@
               : "Current activity"}</span
         ><strong>{progress}%</strong>
       </div>
-      <div class="progress-track"><span style={`width: ${progress}%`}></span></div>
+      <div class="progress-track"><span style={`transform: scaleX(${progress / 100})`}></span></div>
       <div class="activity-now">
         <span class="pulse-dot"></span><strong>{userActivity.title}</strong><span
           >{userActivity.detail}</span
@@ -402,10 +405,10 @@
       <span>Latest activity</span><small>{logs.length} event{logs.length === 1 ? "" : "s"}</small>
     </div>
     <div class="activity-feed">
-      {#if latestActivities().length === 0}
+      {#if latestActivityItems.length === 0}
         <div class="empty-activity">The Agent will show meaningful progress here as it works.</div>
       {:else}
-        {#each latestActivities() as activity (activity.log.id)}
+        {#each latestActivityItems as activity (activity.log.id)}
           <article
             class="activity-item"
             class:error={activity.status === "failed"}
@@ -653,7 +656,8 @@
     height: 100%;
     border-radius: inherit;
     background: linear-gradient(90deg, #775cff, #b19cff);
-    transition: width 0.35s ease;
+    transform-origin: left;
+    transition: transform 0.35s ease;
   }
   .activity-now {
     gap: 7px;

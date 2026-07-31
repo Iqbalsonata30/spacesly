@@ -89,6 +89,7 @@ use infrastructure::workspace_search::{
     WorkspaceSearchRequest, WorkspaceSearchResponse,
 };
 use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2634,9 +2635,27 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("spacesly-task-session-events".to_string())
                 .spawn(move || {
-                    while let Ok(update) = task_session_updates.recv() {
-                        let _ =
-                            app_handle.emit::<TaskSessionUpdate>(TASK_SESSION_UPDATE_EVENT, update);
+                    while let Ok(first) = task_session_updates.recv() {
+                        let mut latest = HashMap::from([(first.session_id, first)]);
+                        let deadline = std::time::Instant::now() + Duration::from_millis(8);
+                        loop {
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match task_session_updates.recv_timeout(remaining) {
+                                Ok(update) => {
+                                    latest.insert(update.session_id, update);
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                        for update in latest.into_values() {
+                            let _ = app_handle
+                                .emit::<TaskSessionUpdate>(TASK_SESSION_UPDATE_EVENT, update);
+                        }
                     }
                 })?;
             Ok(())

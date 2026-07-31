@@ -304,6 +304,7 @@
     lastPosition: number;
     axis: "x" | "y";
     pointerId: number;
+    pendingDelta: number;
   };
 
   type OpenEditorFile = DocumentSession;
@@ -402,6 +403,7 @@
     "agent",
   );
   let settingsError = $state<string | null>(null);
+  let settingsSaving = $state(false);
   let settings = $state<AppSettings>(initialSettings);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let aiProviderSecrets = $state<Record<string, boolean>>({});
@@ -436,12 +438,15 @@
   let agentConsoleCardId = $state<string | null>(null);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
+  const cancellingAgentCardIds = new SvelteSet<string>();
   let latestAgentSessionId = $state<string | null>(null);
   let workspaceShellWorkdir = $state(initialUiState.workspaceShellWorkdir);
   let workspaceTerminalContainer: HTMLDivElement | null = $state(null);
   let workspaceTerminal: XtermTerminal | null = null;
   let workspaceFitAddon: XtermFitAddon | null = null;
   let workspaceTerminalResizeObserver: ResizeObserver | null = null;
+  let workspaceTerminalWidth = 0;
+  let workspaceTerminalHeight = 0;
   let workspaceTerminalOpened = $state(false);
   const workspaceTerminalId = "main-workspace-terminal";
   let workspaceTerminalRuntime: Promise<{
@@ -493,6 +498,12 @@
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRuns = $state<WorkspaceChatRuns>({});
+  // Stream buffers stay non-reactive so token arrival cannot invalidate the UI more than once per frame.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const workspaceChatPendingStreams = new Map<
+    string,
+    { generation: number; text: string; frame: number }
+  >();
   const recoveringPromptSessionIds = new SvelteSet<number>();
   let workspaceChatSession = $state<ChatSessionState>(initialUiState.workspaceChatSession);
   let workspaceChatSessions = $state<ChatSessionState[]>(initialUiState.workspaceChatSessions);
@@ -502,9 +513,11 @@
   let workspaceChatMessages = $state<WorkspaceChatMessage[]>(initialUiState.workspaceChatMessages);
   let layoutPrefs = $state<LayoutPrefs>(loadLayoutPrefs());
   let layoutResizeDrag: LayoutResizeDrag | null = null;
+  let layoutResizeFrameId: number | null = null;
   let uiStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let appNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let terminalFrameId: number | null = null;
+  let terminalFrameShouldFocus = false;
   let fileEntries = $state<FileEntry[]>([]);
   let fileDirectory = $state("");
   let fileRootLabel = $state("~");
@@ -761,9 +774,7 @@
   });
 
   $effect(() => {
-    if (agentConsoleOpen && hasAgentConsoleSession) {
-      void loadAgentConsoleRuntime();
-    }
+    if (hasAgentConsoleSession) void loadAgentConsoleRuntime();
   });
 
   $effect(() => {
@@ -889,9 +900,11 @@
     if (appNoticeTimer) clearTimeout(appNoticeTimer);
     if (recoverySyncTimer) clearTimeout(recoverySyncTimer);
     if (terminalFrameId !== null) window.cancelAnimationFrame(terminalFrameId);
-    for (const run of Object.values(workspaceChatRuns)) {
-      if (run.streamFrame !== null) window.cancelAnimationFrame(run.streamFrame);
+    if (layoutResizeFrameId !== null) window.cancelAnimationFrame(layoutResizeFrameId);
+    for (const pending of workspaceChatPendingStreams.values()) {
+      window.cancelAnimationFrame(pending.frame);
     }
+    workspaceChatPendingStreams.clear();
     if (editorDiagnosticTimer) clearTimeout(editorDiagnosticTimer);
     resolveBacklogStartConfirmation(false);
     flushUiState();
@@ -1360,8 +1373,9 @@
   }
 
   async function persistSettingsAndSecrets(value: AppSettings) {
+    const writes: Promise<unknown>[] = [];
     for (const [providerId, apiKey] of Object.entries(appSecrets.ai_api_keys)) {
-      await saveAiProviderSecret(providerId, apiKey);
+      writes.push(saveAiProviderSecret(providerId, apiKey));
     }
     for (const server of value.mcpServers) {
       if (server.kind !== "jira" && server.command.trim()) {
@@ -1369,31 +1383,40 @@
           mcpEnvEditedServerIds.has(server.id) || Object.keys(server.env).length > 0
             ? server.env
             : null;
-        await saveMcpEnvironmentSecret(server.id, server.command, server.args, environment);
+        writes.push(saveMcpEnvironmentSecret(server.id, server.command, server.args, environment));
       }
     }
     const jiraServer = value.mcpServers.find((server) => server.id === value.jira.serverId);
     if (value.jira.baseUrl.trim()) {
-      await saveJiraConnectionProfile({
-        base_url: value.jira.baseUrl,
-        auth_mode: value.jira.authMode,
-        username: value.jira.username,
-        command: jiraServer?.command ?? "",
-        args: jiraServer?.args ?? [],
-      });
+      writes.push(
+        saveJiraConnectionProfile({
+          base_url: value.jira.baseUrl,
+          auth_mode: value.jira.authMode,
+          username: value.jira.username,
+          command: jiraServer?.command ?? "",
+          args: jiraServer?.args ?? [],
+        }),
+      );
     }
     if (appSecrets.jira_api_token.trim()) {
-      await saveJiraSecret("api_token", appSecrets.jira_api_token);
+      writes.push(saveJiraSecret("api_token", appSecrets.jira_api_token));
     }
     if (appSecrets.jira_personal_access_token.trim()) {
-      await saveJiraSecret("personal_access_token", appSecrets.jira_personal_access_token);
+      writes.push(saveJiraSecret("personal_access_token", appSecrets.jira_personal_access_token));
     }
     if (appSecrets.jira_password.trim()) {
-      await saveJiraSecret("password", appSecrets.jira_password);
+      writes.push(saveJiraSecret("password", appSecrets.jira_password));
     }
-    aiProviderSecrets = await aiProviderSecretStatuses();
-    mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
-    jiraSecrets = await jiraSecretStatuses();
+    const writeResults = await Promise.allSettled(writes);
+    const failedWrite = writeResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failedWrite) throw failedWrite.reason;
+    [aiProviderSecrets, mcpEnvironmentSecrets, jiraSecrets] = await Promise.all([
+      aiProviderSecretStatuses(),
+      mcpEnvironmentSecretStatuses(),
+      jiraSecretStatuses(),
+    ]);
     appSecrets = {
       jira_api_token: "",
       jira_personal_access_token: "",
@@ -3258,16 +3281,23 @@
   }
 
   function scheduleWorkspaceTerminalActivation() {
+    scheduleWorkspaceTerminalFit(true);
+  }
+
+  function scheduleWorkspaceTerminalFit(focus = false) {
+    terminalFrameShouldFocus ||= focus;
     if (terminalFrameId !== null) return;
 
     terminalFrameId = window.requestAnimationFrame(() => {
       terminalFrameId = null;
+      const shouldFocus = terminalFrameShouldFocus;
+      terminalFrameShouldFocus = false;
       if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer) return;
       workspaceFitAddon.fit();
       resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(
         () => {},
       );
-      workspaceTerminal.focus();
+      if (shouldFocus) workspaceTerminal.focus();
     });
   }
 
@@ -3461,6 +3491,7 @@
       axis,
       pointerId: event.pointerId,
       lastPosition: axis === "x" ? event.clientX : event.clientY,
+      pendingDelta: 0,
     };
   }
 
@@ -3469,6 +3500,16 @@
     const position = layoutResizeDrag.axis === "x" ? event.clientX : event.clientY;
     const delta = position - layoutResizeDrag.lastPosition;
     layoutResizeDrag.lastPosition = position;
+    layoutResizeDrag.pendingDelta += delta;
+    if (layoutResizeFrameId !== null) return;
+    layoutResizeFrameId = window.requestAnimationFrame(flushLayoutResize);
+  }
+
+  function flushLayoutResize() {
+    layoutResizeFrameId = null;
+    if (!layoutResizeDrag || layoutResizeDrag.pendingDelta === 0) return;
+    const delta = layoutResizeDrag.pendingDelta;
+    layoutResizeDrag.pendingDelta = 0;
     resizeLayout(
       layoutResizeDrag.key,
       delta,
@@ -3480,6 +3521,11 @@
 
   function endLayoutResize(event: PointerEvent) {
     if (!layoutResizeDrag || event.pointerId !== layoutResizeDrag.pointerId) return;
+    if (layoutResizeFrameId !== null) {
+      window.cancelAnimationFrame(layoutResizeFrameId);
+      layoutResizeFrameId = null;
+    }
+    flushLayoutResize();
     const target = event.currentTarget as HTMLElement;
     try {
       target.releasePointerCapture(event.pointerId);
@@ -3735,6 +3781,7 @@
 
   async function hydrateDurableConversations(workspaceId: string) {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const hydrationStartedAt = Date.now();
     durableConversationWorkspaceId = workspaceId;
     try {
       const records = await listConversations(workspaceId);
@@ -3747,7 +3794,7 @@
             messages: session.messages,
           })),
         );
-        void recoverRetainedChatTaskSessions(workspaceId);
+        void recoverRetainedChatTaskSessions(workspaceId, hydrationStartedAt);
         return;
       }
 
@@ -3781,7 +3828,7 @@
       workspaceChatSession = active;
       workspaceChatMessages = active.messages;
       saveUiState();
-      void recoverRetainedChatTaskSessions(workspaceId);
+      void recoverRetainedChatTaskSessions(workspaceId, hydrationStartedAt);
     } catch (reason: unknown) {
       durableConversationWorkspaceId = null;
       appNotice = {
@@ -3791,10 +3838,17 @@
     }
   }
 
-  async function recoverRetainedChatTaskSessions(workspaceId: string) {
+  async function recoverRetainedChatTaskSessions(workspaceId: string, hydrationStartedAt: number) {
     const sessions = await listTaskSessions().catch(() => []);
     for (const snapshot of sessions) {
       if (recoveringPromptSessionIds.has(snapshot.id)) continue;
+      if (
+        taskSessionIsTerminal(snapshot) &&
+        snapshot.completed_at !== null &&
+        snapshot.completed_at < hydrationStartedAt
+      ) {
+        continue;
+      }
       let envelope: import("$lib/ipc/taskSessions").TaskSessionEnvelopeV2;
       try {
         envelope = JSON.parse(snapshot.request.payload);
@@ -4126,13 +4180,17 @@
       writePtyTerminal(workspaceTerminalId, bytes).catch(() => {});
     });
 
-    workspaceTerminalResizeObserver = new ResizeObserver(() => {
-      if (!workspaceTerminal || !workspaceFitAddon || !workspaceTerminalContainer?.offsetHeight)
+    workspaceTerminalResizeObserver = new ResizeObserver(([entry]) => {
+      if (!entry || entry.contentRect.width <= 0 || entry.contentRect.height <= 0) return;
+      if (
+        entry.contentRect.width === workspaceTerminalWidth &&
+        entry.contentRect.height === workspaceTerminalHeight
+      ) {
         return;
-      workspaceFitAddon.fit();
-      resizePtyTerminal(workspaceTerminalId, workspaceTerminal.rows, workspaceTerminal.cols).catch(
-        () => {},
-      );
+      }
+      workspaceTerminalWidth = entry.contentRect.width;
+      workspaceTerminalHeight = entry.contentRect.height;
+      scheduleWorkspaceTerminalFit();
     });
     workspaceTerminalResizeObserver.observe(workspaceTerminalContainer);
 
@@ -4245,13 +4303,16 @@
   }
 
   function flushWorkspaceChatStream(sessionId: string, generation: number) {
+    const pending = workspaceChatPendingStreams.get(sessionId);
+    if (!pending || pending.generation !== generation) return;
+    workspaceChatPendingStreams.delete(sessionId);
     workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (run) =>
       run.generation !== generation
         ? run
         : {
             ...run,
             streamFrame: null,
-            streamingText: run.streamingText + run.streamBuffer,
+            streamingText: run.streamingText + pending.text,
             streamBuffer: "",
           },
     );
@@ -4260,20 +4321,27 @@
   function queueWorkspaceChatDelta(sessionId: string, generation: number, delta: string) {
     const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
     if (run.generation !== generation) return;
-    const streamFrame =
-      run.streamFrame ??
-      requestAnimationFrame(() => flushWorkspaceChatStream(sessionId, generation));
-    workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (current) =>
-      current.generation === generation
-        ? { ...current, streamBuffer: current.streamBuffer + delta, streamFrame }
-        : current,
-    );
+    const pending = workspaceChatPendingStreams.get(sessionId);
+    if (pending?.generation === generation) {
+      pending.text += delta;
+      return;
+    }
+    if (pending) cancelAnimationFrame(pending.frame);
+    workspaceChatPendingStreams.set(sessionId, {
+      generation,
+      text: delta,
+      frame: requestAnimationFrame(() => flushWorkspaceChatStream(sessionId, generation)),
+    });
   }
 
   function resetWorkspaceChatStream(sessionId: string, generation?: number) {
     const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
     if (generation !== undefined && run.generation !== generation) return;
-    if (run.streamFrame !== null) cancelAnimationFrame(run.streamFrame);
+    const pending = workspaceChatPendingStreams.get(sessionId);
+    if (pending) {
+      cancelAnimationFrame(pending.frame);
+      workspaceChatPendingStreams.delete(sessionId);
+    }
     workspaceChatRuns = updateWorkspaceChatRun(workspaceChatRuns, sessionId, (current) => ({
       ...current,
       streamFrame: null,
@@ -4384,34 +4452,32 @@
           (event) => {
             const run = workspaceChatRunFor(workspaceChatRuns, requestSessionId);
             if (requestId !== run.generation) return;
-            workspaceChatRuns = updateWorkspaceChatRun(
-              workspaceChatRuns,
-              requestSessionId,
-              (current) => ({
-                ...current,
-                state:
-                  event.kind === "lifecycle" &&
-                  typeof event.payload === "object" &&
-                  event.payload !== null &&
-                  !Array.isArray(event.payload) &&
-                  typeof (event.payload as Record<string, unknown>).state === "string"
-                    ? ((event.payload as Record<string, unknown>).state as typeof current.state)
-                    : current.state,
-                progress: event.progress ?? current.progress,
-              }),
-            );
-            if (event.kind !== "runtime") return;
-            if (event.attempt_id === null) return;
-            if (streamedAttemptId !== event.attempt_id) {
-              resetWorkspaceChatStream(requestSessionId, requestId);
-              streamedAttemptId = event.attempt_id;
-            }
             const payload =
               typeof event.payload === "object" &&
               event.payload !== null &&
               !Array.isArray(event.payload)
                 ? (event.payload as Record<string, unknown>)
                 : null;
+            const lifecycleState =
+              event.kind === "lifecycle" && typeof payload?.state === "string"
+                ? (payload.state as typeof run.state)
+                : null;
+            if (lifecycleState !== null || event.progress) {
+              workspaceChatRuns = updateWorkspaceChatRun(
+                workspaceChatRuns,
+                requestSessionId,
+                (current) => ({
+                  ...current,
+                  state: lifecycleState ?? current.state,
+                  progress: event.progress ?? current.progress,
+                }),
+              );
+            }
+            if (event.kind !== "runtime" || event.attempt_id === null) return;
+            if (streamedAttemptId !== event.attempt_id) {
+              resetWorkspaceChatStream(requestSessionId, requestId);
+              streamedAttemptId = event.attempt_id;
+            }
             if (
               payload !== null &&
               payload.type === "text_delta" &&
@@ -4551,7 +4617,11 @@
   function cancelWorkspaceChat() {
     const sessionId = workspaceChatActiveSessionId;
     const run = workspaceChatRunFor(workspaceChatRuns, sessionId);
-    if (run.streamFrame !== null) cancelAnimationFrame(run.streamFrame);
+    const pending = workspaceChatPendingStreams.get(sessionId);
+    if (pending) {
+      cancelAnimationFrame(pending.frame);
+      workspaceChatPendingStreams.delete(sessionId);
+    }
     const runId = run.legacyRunId;
     const taskSessionId = run.taskSessionId;
     workspaceChatRuns = cancelWorkspaceChatRun(workspaceChatRuns, sessionId);
@@ -5197,6 +5267,7 @@
   }
 
   async function persistSettings() {
+    if (settingsSaving) return;
     const nextSettings = settingsWithInstructionDrafts();
     settings = nextSettings;
 
@@ -5205,11 +5276,14 @@
       return;
     }
 
+    settingsSaving = true;
     try {
       await persistSettingsAndSecrets(nextSettings);
     } catch (reason: unknown) {
       settingsError = reason instanceof Error ? reason.message : String(reason);
       return;
+    } finally {
+      settingsSaving = false;
     }
     closeSettings();
     settingsError = null;
@@ -5513,7 +5587,13 @@
     const nextSession = transform(session);
     latestAgentSessionId = cardId;
     agentRunSessions[cardId] = nextSession;
-    agentRunSessions = retainAgentSessions(agentRunSessions);
+    if (
+      session.status === "running" &&
+      nextSession.status !== "running" &&
+      Object.keys(agentRunSessions).length > MAX_RETAINED_AGENT_SESSIONS
+    ) {
+      agentRunSessions = retainAgentSessions(agentRunSessions);
+    }
   }
 
   function retainAgentSessions(
@@ -5765,20 +5845,21 @@
         ? (event.payload as Record<string, unknown>)
         : {};
     const eventType = typeof payload.type === "string" ? payload.type : event.kind;
-    if (event.progress) {
-      const { completed, total } = event.progress;
-      const progress = total && total > 0 ? 35 + Math.round((completed / total) * 35) : 55;
-      setAgentProgressForCard(cardId, progress);
+    const eventProgress = event.progress
+      ? event.progress.total && event.progress.total > 0
+        ? 35 + Math.round((event.progress.completed / event.progress.total) * 35)
+        : 55
+      : null;
+    if (event.kind === "runtime" && eventType === "text_delta") {
+      if (eventProgress !== null) setAgentProgressForCard(cardId, eventProgress);
+      return;
     }
-    if (event.kind === "runtime" && eventType === "text_delta") return;
 
     let tone: AgentRunLog["tone"] = "info";
     let summary = `Task Session ${event.kind}: ${eventType}.`;
+    let taskSessionState: AgentRunSession["taskSessionState"] | undefined;
     if (event.kind === "lifecycle" && typeof payload.state === "string") {
-      updateAgentSessionForCard(cardId, (session) => ({
-        ...session,
-        taskSessionState: payload.state as NonNullable<AgentRunSession["taskSessionState"]>,
-      }));
+      taskSessionState = payload.state as NonNullable<AgentRunSession["taskSessionState"]>;
       tone = payload.state === "failed" || payload.state === "blocked" ? "error" : "info";
       summary = `Task Session entered ${payload.state}.`;
     } else if (event.kind === "tool") {
@@ -5793,18 +5874,40 @@
     } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
       summary = "Agent result staged for authoritative Task Session commit.";
     }
-    appendStructuredAgentLogForCard(
-      cardId,
-      tone,
-      event.kind,
-      summary,
-      [
-        `Task Session event sequence: ${event.sequence}`,
-        `Assignment attempt: ${event.attempt_id ?? "unassigned"}`,
-      ],
-      event.progress ? [`Progress phase: ${event.progress.phase}`] : [],
-      [],
-    );
+    const message = [
+      `STATUS: ${tone === "error" ? "Blocked" : "Running"}`,
+      `SUMMARY: ${summary}`,
+      "EVIDENCE:",
+      `- Task Session event sequence: ${event.sequence}`,
+      `- Assignment attempt: ${event.attempt_id ?? "unassigned"}`,
+      "DETAILS:",
+      ...(event.progress ? [`- Progress phase: ${event.progress.phase}`] : []),
+    ].join("\n");
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      progress:
+        eventProgress === null
+          ? session.progress
+          : Math.max(session.progress, Math.min(100, eventProgress)),
+      taskSessionState: taskSessionState ?? session.taskSessionState,
+      logs: capList(
+        [
+          ...session.logs,
+          {
+            id: `run-${Date.now().toString(36)}-${session.logs.length}`,
+            at: new Date().toLocaleTimeString(undefined, {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            }),
+            tone,
+            label: event.kind,
+            message,
+          },
+        ],
+        MAX_AGENT_LOGS,
+      ),
+    }));
   }
 
   function buildAgentContextExport(config: AiWorkerConfig, contract: ExecutionContract): string {
@@ -6149,18 +6252,28 @@
 
   async function cancelAgentRunForCard(cardId: string) {
     const session = agentSessionForCard(cardId);
-    if (!session || session.status !== "running") return;
-    const legacyRunId = runningWorkerRunIds[cardId];
-    const cancelled =
-      session.taskSessionId != null
-        ? await cancelTaskSession(session.taskSessionId).catch(() => false)
-        : legacyRunId
-          ? await cancelAiWorkerTask(legacyRunId).catch(() => false)
-          : false;
-    if (cancelled && session.taskSessionId != null) {
+    if (!session || session.status !== "running" || cancellingAgentCardIds.has(cardId)) return;
+    cancellingAgentCardIds.add(cardId);
+    if (session.taskSessionId != null) {
       updateAgentSessionForCard(cardId, (current) => ({
         ...current,
         taskSessionState: "cancelling",
+      }));
+    }
+    const legacyRunId = runningWorkerRunIds[cardId];
+    const cancelled = await (session.taskSessionId != null
+      ? cancelTaskSession(session.taskSessionId).catch(() => false)
+      : legacyRunId
+        ? cancelAiWorkerTask(legacyRunId).catch(() => false)
+        : Promise.resolve(false));
+    cancellingAgentCardIds.delete(cardId);
+    if (!cancelled && session.taskSessionId != null) {
+      updateAgentSessionForCard(cardId, (current) => ({
+        ...current,
+        taskSessionState:
+          current.taskSessionState === "cancelling"
+            ? session.taskSessionState
+            : current.taskSessionState,
       }));
     }
     appendStructuredAgentLogForCard(
@@ -8360,8 +8473,11 @@
                       {testingWorker ? "Testing Agent..." : "Test Agent"}
                     </button>
                   {/if}
-                  <button class="save-settings" type="button" onclick={persistSettings}
-                    >Save settings</button
+                  <button
+                    class="save-settings"
+                    type="button"
+                    onclick={persistSettings}
+                    disabled={settingsSaving}>{settingsSaving ? "Saving..." : "Save settings"}</button
                   >
                 </footer>
               </form>
@@ -8458,6 +8574,9 @@
                 result={visibleAgentRunResult}
                 executionRun={visibleExecutionRun}
                 runStatus={visibleAgentRunStatus}
+                cancelPending={Boolean(
+                  agentConsoleCardId && cancellingAgentCardIds.has(agentConsoleCardId)
+                )}
                 terminalLines={visibleAgentTerminalLines}
                 terminalInput={agentTerminalInput}
                 runCardId={agentConsoleCardId}
