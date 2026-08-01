@@ -10,6 +10,7 @@ import {
   agentTaskCandidateFromEvent,
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
+  executionRepositoryContext,
   executeAgentTaskSession,
   planAgentTaskConnectors,
   prepareAgentTaskSession,
@@ -224,6 +225,26 @@ const config: AiWorkerConfig = {
     { name: "A", secret_id: "alpha", command: ["alpha"] },
   ],
 };
+
+assertEqual(
+  executionRepositoryContext(
+    { ...config, opencode_workdir: "/home/iqbalsonata" },
+    {
+      is_git_repo: true,
+      repo_root: "/home/iqbalsonata/BRI",
+      current_branch: "main",
+      branches: ["main"],
+      head_commit: "abc",
+      upstream_branch: null,
+      dirty_worktree: false,
+      ahead_count: 0,
+      behind_count: 0,
+    },
+    "/home/iqbalsonata/BRI",
+  ).root_path,
+  "/home/iqbalsonata",
+  "configured Agent workdir should override the open Git workspace in execution contracts",
+);
 const contract = {
   contract_id: "contract-1",
   version: 1,

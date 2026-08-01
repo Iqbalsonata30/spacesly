@@ -13,7 +13,7 @@
     displayColumns: BoardDisplayColumn[];
     selectedCardId: string | null;
     draggedCardId: string | null;
-    runningWorkerCardIds: Record<string, true>;
+    runningWorkerCardIds: Set<string>;
     agentTaskProjections: Record<string, AgentTaskCardProjection | null>;
     runningAgentSessions: AgentRunSession[];
     cardMinHeight: number;
@@ -186,10 +186,10 @@
             <TaskCard
               {card}
               selected={selectedCardId === card.id}
-              canStartAgent={canStartAgent(card, Boolean(runningWorkerCardIds[card.id]))}
+              canStartAgent={canStartAgent(card, runningWorkerCardIds.has(card.id))}
               actionLabel={agentActionLabel(
                 card,
-                Boolean(runningWorkerCardIds[card.id]),
+                runningWorkerCardIds.has(card.id),
                 Boolean(operatorNotesForCard(card.id)),
               )}
               executionLabel={executionLabel(card.execution)}

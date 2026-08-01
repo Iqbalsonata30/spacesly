@@ -7,6 +7,14 @@
   import NewTaskPopover from "$lib/components/NewTaskPopover.svelte";
   import NotificationStack from "$lib/components/NotificationStack.svelte";
   import SegmentedControl from "$lib/components/SegmentedControl.svelte";
+  import SettingsActionBar from "$lib/components/settings/SettingsActionBar.svelte";
+  import SettingsCard from "$lib/components/settings/SettingsCard.svelte";
+  import SettingsHelperText from "$lib/components/settings/SettingsHelperText.svelte";
+  import SettingsInput from "$lib/components/settings/SettingsInput.svelte";
+  import SettingsLabel from "$lib/components/settings/SettingsLabel.svelte";
+  import SettingsPage from "$lib/components/settings/SettingsPage.svelte";
+  import SettingsRow from "$lib/components/settings/SettingsRow.svelte";
+  import ValidationMessage from "$lib/components/settings/ValidationMessage.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
   import {
@@ -118,6 +126,7 @@
   import {
     AgentTaskSessionTimeoutError,
     agentEnvelopeFromSnapshot,
+    executionRepositoryContext,
     executeAgentTaskSession,
     prepareAgentTaskSession,
     waitForAgentTaskSession,
@@ -363,6 +372,16 @@
   };
 
   type ChatSessionState = WorkspaceChatSession;
+  const settingsTabOrder = [
+    "agent",
+    "rules",
+    "skills",
+    "mcp",
+    "jira",
+    "environment",
+    "theme",
+  ] as const;
+  type SettingsTab = (typeof settingsTabOrder)[number];
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;
@@ -375,6 +394,7 @@
     cardById: Map<string, CardProjection>;
     columnById: Map<string, BoardProjection["columns"][number]>;
     columnByIntent: Map<ColumnIntent, BoardProjection["columns"][number]>;
+    cardColumnIdById: Map<string, string>;
     cardColumnIntentById: Map<string, ColumnIntent>;
   };
 
@@ -388,7 +408,7 @@
   let loadingBoards = $state(false);
   let connectingJira = $state(false);
   let testingWorker = $state(false);
-  let runningWorkerCardIds = $state<Record<string, true>>({});
+  const runningWorkerCardIds = new SvelteSet<string>();
   let runningWorkerRunIds = $state<Record<string, string>>({});
   let connectionMessage = $state<string | null>(null);
   let workerStatus = $state<AiWorkerStatus | null>(null);
@@ -399,9 +419,10 @@
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
   let mcpToolsByServer = $state<Record<string, string[]>>({});
   let settingsOpen = $state(false);
-  let settingsTab = $state<"agent" | "rules" | "skills" | "mcp" | "environment" | "jira" | "theme">(
-    "agent",
-  );
+  let settingsDialog: HTMLDivElement | null = $state(null);
+  let settingsForm: HTMLFormElement | null = $state(null);
+  let settingsOpener: HTMLElement | null = null;
+  let settingsTab = $state<SettingsTab>("agent");
   let settingsError = $state<string | null>(null);
   let settingsSaving = $state(false);
   let settings = $state<AppSettings>(initialSettings);
@@ -955,6 +976,7 @@
     const cardById = new SvelteMap<string, CardProjection>();
     const columnById = new SvelteMap<string, BoardProjection["columns"][number]>();
     const columnByIntent = new SvelteMap<ColumnIntent, BoardProjection["columns"][number]>();
+    const cardColumnIdById = new SvelteMap<string, string>();
     const cardColumnIntentById = new SvelteMap<string, ColumnIntent>();
 
     for (const column of activeBoard?.columns ?? []) {
@@ -964,11 +986,19 @@
       for (const card of column.cards) {
         cards.push(card);
         cardById.set(card.id, card);
+        cardColumnIdById.set(card.id, column.id);
         cardColumnIntentById.set(card.id, column.intent);
       }
     }
 
-    return { cards, cardById, columnById, columnByIntent, cardColumnIntentById };
+    return {
+      cards,
+      cardById,
+      columnById,
+      columnByIntent,
+      cardColumnIdById,
+      cardColumnIntentById,
+    };
   });
   let activeCards = $derived(boardIndex.cards);
   let renderedCardCount = $derived(
@@ -978,6 +1008,7 @@
   let activeCardIds = $derived(new Set(activeCardById.keys()));
   let activeColumnById = $derived(boardIndex.columnById);
   let activeColumnByIntent = $derived(boardIndex.columnByIntent);
+  let cardColumnIdById = $derived(boardIndex.cardColumnIdById);
   let cardColumnIntentById = $derived(boardIndex.cardColumnIntentById);
   let selectedCard = $derived<CardProjection | null>(
     selectedCardId ? (activeCardById.get(selectedCardId) ?? null) : null,
@@ -3301,18 +3332,65 @@
     });
   }
 
-  function openSettings(tab?: typeof settingsTab) {
+  function openSettings(tab?: SettingsTab) {
     if (tab) settingsTab = tab;
+    settingsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     settingsOpen = true;
+    void tick().then(() => {
+      settingsForm?.scrollTo({ top: 0 });
+      document.getElementById(`${settingsTab}-settings-tab`)?.focus();
+    });
   }
 
   function closeSettings() {
     settingsOpen = false;
+    const opener = settingsOpener;
+    settingsOpener = null;
+    void tick().then(() => opener?.focus());
   }
 
-  function switchSettingsTab(tab: typeof settingsTab) {
+  function switchSettingsTab(tab: SettingsTab) {
     if (settingsTab === tab) return;
     settingsTab = tab;
+    void tick().then(() => settingsForm?.scrollTo({ top: 0 }));
+  }
+
+  function handleSettingsTabKeydown(event: KeyboardEvent, tab: SettingsTab) {
+    const current = settingsTabOrder.indexOf(tab);
+    let next: number;
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") next = current + 1;
+    else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = current - 1;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = settingsTabOrder.length - 1;
+    else return;
+    event.preventDefault();
+    const target = settingsTabOrder[(next + settingsTabOrder.length) % settingsTabOrder.length];
+    switchSettingsTab(target);
+    void tick().then(() => document.getElementById(`${target}-settings-tab`)?.focus());
+  }
+
+  function handleSettingsDialogKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeSettings();
+      return;
+    }
+    if (event.key !== "Tab" || !settingsDialog) return;
+    const focusable = [
+      ...settingsDialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ].filter((element) => !element.hidden && element.offsetParent !== null);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
   async function loadGlobalEnvironmentRuntime() {
@@ -3763,12 +3841,14 @@
     try {
       const workingDirectory = config.opencode_workdir?.trim() || null;
       const status = await aiWorkspaceTrustStatus(workspace.id, workingDirectory);
-      if (status.trusted) return true;
-      const confirmed = window.confirm(
-        `Trust ${status.path} for AI tool execution? OpenCode agents may read and modify files and run commands inside this workspace.`,
-      );
-      if (!confirmed) return false;
-      await trustAiWorkspace(workspace.id, workingDirectory);
+      if (!status.trusted) {
+        const confirmed = window.confirm(
+          `Trust ${status.path} for AI tool execution? OpenCode agents may read and modify files and run commands inside this workspace.`,
+        );
+        if (!confirmed) return false;
+        await trustAiWorkspace(workspace.id, workingDirectory);
+      }
+      config.opencode_workdir = status.path;
       return true;
     } catch (reason: unknown) {
       appNotice = {
@@ -5345,21 +5425,12 @@
   function updateActiveBoard(transform: (board: BoardProjection) => BoardProjection): boolean {
     if (!workspace) return false;
 
-    const [project, ...otherProjects] = workspace.projects;
-    const [board, ...otherBoards] = project?.boards ?? [];
+    const project = workspace.projects[0];
+    const board = project?.boards[0];
     if (!project || !board) return false;
 
     const nextBoard = transform(board);
-    workspace = {
-      ...workspace,
-      projects: [
-        {
-          ...project,
-          boards: [nextBoard, ...otherBoards],
-        },
-        ...otherProjects,
-      ],
-    };
+    project.boards[0] = nextBoard;
     return true;
   }
 
@@ -5376,6 +5447,7 @@
     if (!targetColumn) return;
 
     const targetIntent = targetColumn.intent;
+    const sourceColumnId = cardColumnIdById.get(cardId);
     const cardForTarget = {
       ...(targetIntent ? withCompletionMetadata(movedCard, targetIntent) : movedCard),
       ...(execution !== undefined ? { execution } : {}),
@@ -5385,6 +5457,7 @@
       !updateActiveBoard((board) => ({
         ...board,
         columns: board.columns.map((column) => {
+          if (column.id !== sourceColumnId && column.id !== targetColumnId) return column;
           const cards = column.cards.filter((card) => card.id !== cardId);
           return column.id === targetColumnId
             ? { ...column, cards: [...cards, cardForTarget] }
@@ -5415,13 +5488,15 @@
       return false;
     }
 
+    const sourceColumnId = cardColumnIdById.get(cardId);
     if (
       !updateActiveBoard((board) => ({
         ...board,
-        columns: board.columns.map((column) => ({
-          ...column,
-          cards: column.cards.filter((entry) => entry.id !== cardId),
-        })),
+        columns: board.columns.map((column) =>
+          column.id === sourceColumnId
+            ? { ...column, cards: column.cards.filter((entry) => entry.id !== cardId) }
+            : column,
+        ),
       }))
     )
       return false;
@@ -5954,6 +6029,7 @@
     operatorNotes: string | null,
     previousOutput: string | null,
     jiraTransitionCompleted: boolean,
+    repository: ExecutionContract["repository"],
   ): ExecutionContract {
     const completedSteps = jiraTransitionCompleted ? ["jira.transition.in_progress"] : [];
     const workflow: ExecutionContract["workflow"] = [
@@ -6017,11 +6093,7 @@
       remaining_steps: workflow
         .filter((step) => step.status === "remaining")
         .map((step) => step.step_id),
-      repository: {
-        root_path: workspaceGitInfo?.repo_root ?? workspaceRoot,
-        branch: workspaceGitInfo?.current_branch ?? null,
-        head_commit: workspaceGitInfo?.head_commit ?? null,
-      },
+      repository,
       constraints: {
         execution_only: true,
         planning_completed: true,
@@ -6492,16 +6564,21 @@
     if (!workspace) return;
     const completedAt =
       typeof execution === "object" && "completed" in execution ? Date.now() : null;
+    const sourceColumnId = cardColumnIdById.get(cardId);
 
     if (
       !updateActiveBoard((board) => ({
         ...board,
-        columns: board.columns.map((column) => ({
-          ...column,
-          cards: column.cards.map((card) =>
-            card.id === cardId ? { ...card, execution, completedAt } : card,
-          ),
-        })),
+        columns: board.columns.map((column) =>
+          column.id === sourceColumnId
+            ? {
+                ...column,
+                cards: column.cards.map((card) =>
+                  card.id === cardId ? { ...card, execution, completedAt } : card,
+                ),
+              }
+            : column,
+        ),
       }))
     )
       return;
@@ -6714,7 +6791,7 @@
   async function startWorkerForCard(cardId: string, backlogAlreadyApproved = false) {
     const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
     if (
-      runningWorkerCardIds[cardId] ||
+      runningWorkerCardIds.has(cardId) ||
       agentSessionForCard(cardId)?.status === "running" ||
       (retainedTaskState &&
         ["queued", "running", "cancelling", "committing"].includes(retainedTaskState))
@@ -6735,19 +6812,36 @@
       return;
     }
     const runId = `agent-${cardId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    runningWorkerCardIds = { ...runningWorkerCardIds, [cardId]: true };
+    runningWorkerCardIds.add(cardId);
     runningWorkerRunIds = { ...runningWorkerRunIds, [cardId]: runId };
     if (!backlogAlreadyApproved && !(await requestBacklogStartConfirmation(card))) {
       finishWorkerRun(cardId, runId);
       return;
     }
 
+    const sourceIntent = cardColumnIntentById.get(cardId);
+    const sourceColumnId = cardColumnIdById.get(cardId);
+    const sourceExecution = card.execution;
+    const shouldMoveToInProgress = sourceIntent !== "in_progress";
+    let optimisticallyMoved = false;
+    const rollbackPreflightMove = () => {
+      if (!optimisticallyMoved || !sourceColumnId) return;
+      moveCard(cardId, sourceColumnId, sourceExecution, false);
+      optimisticallyMoved = false;
+    };
+    if (shouldMoveToInProgress) {
+      moveCard(cardId, inProgressColumnId, "running", false);
+      optimisticallyMoved = true;
+    }
+
     const config = buildAiWorkerConfig();
     if (!config) {
+      rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
       return;
     }
     if (!(await ensureAiWorkspaceTrusted(config))) {
+      rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
       return;
     }
@@ -6769,6 +6863,7 @@
         await grantAiRunCapabilities(runId, grantedCapabilities);
       } catch (reason) {
         await releaseAiWorkerRun(runId).catch(() => false);
+        rollbackPreflightMove();
         finishWorkerRun(cardId, runId);
         const message = reason instanceof Error ? reason.message : String(reason);
         appNotice = { tone: "error", message };
@@ -6807,14 +6902,15 @@
         message: `${isContinuation ? "Agent continuing" : "Agent started"} ${ticketLabel(card)} with ${runtimeLabel}.`,
       };
 
+      let executionGitInfo = workspaceGitInfo;
       if (config.runtime === "opencode") {
-        const runGitInfo = config.opencode_workdir?.trim()
+        executionGitInfo = config.opencode_workdir?.trim()
           ? await getPathGitInfo(config.opencode_workdir.trim())
           : await getWorkspaceGitInfo(workspace?.id);
-        setAgentRunGitSnapshotForCard(cardId, gitSnapshotFromInfo(runGitInfo));
+        setAgentRunGitSnapshotForCard(cardId, gitSnapshotFromInfo(executionGitInfo));
       }
 
-      if (cardColumnIntent(cardId) !== "in_progress") {
+      if (shouldMoveToInProgress) {
         appendStructuredAgentLogForCard(
           cardId,
           "info",
@@ -6824,7 +6920,7 @@
           [`Local board projection moved to In Progress.`],
           ["Continue with Jira and runtime setup."],
         );
-        moveCard(cardId, inProgressColumnId, "running");
+        if (!optimisticallyMoved) moveCard(cardId, inProgressColumnId, "running");
       } else {
         updateCardExecution(cardId, "running");
       }
@@ -6927,6 +7023,7 @@
                   operatorNotes,
                   previousOutput,
                   jiraTransitionCompleted,
+                  executionRepositoryContext(config, executionGitInfo, workspaceRoot),
                 ),
               );
       setAgentRunOutputForCard(cardId, buildAgentContextExport(config, executionRun.contract));
@@ -7390,9 +7487,8 @@
 
   function finishWorkerRun(cardId: string, runId: string) {
     if (runningWorkerRunIds[cardId] !== runId) return;
-    const { [cardId]: _finishedCard, ...remainingCards } = runningWorkerCardIds;
     const { [cardId]: _finishedRun, ...remainingRunIds } = runningWorkerRunIds;
-    runningWorkerCardIds = remainingCards;
+    runningWorkerCardIds.delete(cardId);
     runningWorkerRunIds = remainingRunIds;
   }
 </script>
@@ -7464,10 +7560,13 @@
     {#if settingsOpen}
       <section class="settings-backdrop" aria-label="Settings dialog">
         <div
+          bind:this={settingsDialog}
           class="settings-panel"
           role="dialog"
           aria-modal="true"
           aria-labelledby="settings-title"
+          tabindex="-1"
+          onkeydown={handleSettingsDialogKeydown}
         >
           <header>
             <div>
@@ -7478,64 +7577,106 @@
           </header>
 
           <div class:mcp={settingsTab === "mcp"} class="settings-grid">
-            <aside class="settings-nav" aria-label="Settings navigation">
+            <div class="settings-nav" aria-label="Settings navigation" role="tablist">
               <button
+                id="agent-settings-tab"
                 class:active={settingsTab === "agent"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "agent"}
+                aria-controls="agent-settings-panel"
+                tabindex={settingsTab === "agent" ? 0 : -1}
                 onclick={() => switchSettingsTab("agent")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "agent")}
               >
                 <strong>Agent</strong>
                 <span>Model and worker runtime</span>
               </button>
               <button
+                id="rules-settings-tab"
                 class:active={settingsTab === "rules"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "rules"}
+                aria-controls="rules-settings-panel"
+                tabindex={settingsTab === "rules" ? 0 : -1}
                 onclick={() => switchSettingsTab("rules")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "rules")}
               >
                 <strong>Rules</strong>
                 <span>Operating guardrails</span>
               </button>
               <button
+                id="skills-settings-tab"
                 class:active={settingsTab === "skills"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "skills"}
+                aria-controls="skills-settings-panel"
+                tabindex={settingsTab === "skills" ? 0 : -1}
                 onclick={() => switchSettingsTab("skills")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "skills")}
               >
                 <strong>Skills</strong>
                 <span>Reusable playbooks</span>
               </button>
               <button
+                id="mcp-settings-tab"
                 class:active={settingsTab === "mcp"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "mcp"}
+                aria-controls="mcp-settings-panel"
+                tabindex={settingsTab === "mcp" ? 0 : -1}
                 onclick={() => switchSettingsTab("mcp")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "mcp")}
               >
                 <strong>MCP</strong>
                 <span>Tools and server connections</span>
               </button>
               <button
+                id="jira-settings-tab"
                 class:active={settingsTab === "jira"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "jira"}
+                aria-controls="jira-settings-panel"
+                tabindex={settingsTab === "jira" ? 0 : -1}
                 onclick={() => switchSettingsTab("jira")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "jira")}
               >
                 <strong>Jira</strong>
                 <span>Board sync and credentials</span>
               </button>
               <button
+                id="environment-settings-tab"
                 class:active={settingsTab === "environment"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "environment"}
+                aria-controls="environment-settings-panel"
+                tabindex={settingsTab === "environment" ? 0 : -1}
                 onclick={() => switchSettingsTab("environment")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "environment")}
               >
                 <strong>Global Environment</strong>
                 <span>Process environment variables</span>
               </button>
               <button
+                id="theme-settings-tab"
                 class:active={settingsTab === "theme"}
                 type="button"
+                role="tab"
+                aria-selected={settingsTab === "theme"}
+                aria-controls="theme-settings-panel"
+                tabindex={settingsTab === "theme" ? 0 : -1}
                 onclick={() => switchSettingsTab("theme")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "theme")}
               >
                 <strong>Theme</strong>
                 <span>Appearance preferences</span>
               </button>
-            </aside>
+            </div>
 
             {#if settingsTab === "mcp"}
               <aside class="server-list">
@@ -7569,48 +7710,67 @@
               </aside>
             {/if}
 
-            {#if selectedServer}
-              <form class="settings-form" onsubmit={(event) => event.preventDefault()}>
-                {#if settingsTab === "mcp"}
-                  {#if mcpConnectionModule}
-                    {@const McpConnectionSettings = mcpConnectionModule.default}
-                    <McpConnectionSettings
-                      server={selectedServer}
-                      jiraBaseUrl={settings.jira.baseUrl}
-                      jiraPrincipal={settings.jira.username}
-                      jiraAuthMode={settings.jira.authMode}
-                      configuredEnvKeys={mcpEnvironmentSecrets[selectedServer.id] ?? []}
-                      onUpdate={updateSelectedServer}
-                      onError={(message) => (settingsError = message)}
-                    />
-                  {:else}
-                    <section class="settings-section">
-                      <div>
-                        <p class="section-kicker">MCP Connection</p>
-                        <h3>Loading connection settings</h3>
-                      </div>
-                      <p class="field-help">
-                        Preparing MCP controls only when this settings tab is opened.
-                      </p>
-                    </section>
-                  {/if}
+            <form
+              bind:this={settingsForm}
+              class="settings-form"
+              onsubmit={(event) => event.preventDefault()}
+            >
+              {#if settingsTab === "mcp"}
+                {#if selectedServer && mcpConnectionModule}
+                  {@const McpConnectionSettings = mcpConnectionModule.default}
+                  <McpConnectionSettings
+                    server={selectedServer}
+                    jiraBaseUrl={settings.jira.baseUrl}
+                    jiraPrincipal={settings.jira.username}
+                    jiraAuthMode={settings.jira.authMode}
+                    configuredEnvKeys={mcpEnvironmentSecrets[selectedServer.id] ?? []}
+                    onUpdate={updateSelectedServer}
+                    onError={(message) => (settingsError = message)}
+                  />
+                {:else if selectedServer}
+                  <SettingsPage
+                    id="mcp-settings"
+                    eyebrow="MCP connection"
+                    title="Loading connection settings"
+                    description="Preparing MCP controls only when this settings tab is opened."
+                  >
+                    <SettingsCard tone="subtle">
+                      <p class="field-help">Loading server configuration...</p>
+                    </SettingsCard>
+                  </SettingsPage>
+                {:else}
+                  <SettingsPage
+                    id="mcp-settings"
+                    eyebrow="MCP connections"
+                    title="No connection selected"
+                    description="Add an MCP connection to configure external Agent tools."
+                  >
+                    <SettingsCard tone="subtle">
+                      <button type="button" class="add-server" onclick={addMcpServer}
+                        >＋ Add MCP connection</button
+                      >
+                    </SettingsCard>
+                  </SettingsPage>
                 {/if}
+              {/if}
 
-                {#if settingsTab === "agent"}
-                  <div class="settings-section worker-section">
-                    <div>
-                      <p class="section-kicker">Agent</p>
-                      <h3>Model runtime</h3>
-                    </div>
-                    <p class="field-help">
-                      Choose a supported provider and model. Spacesly configures the endpoint
-                      automatically and only asks for the credential that provider requires.
-                    </p>
-
-                    <div class="runtime-options" aria-label="Agent runtime">
+              {#if settingsTab === "agent"}
+                <SettingsPage
+                  id="agent-settings"
+                  eyebrow="Agent"
+                  title="Model runtime"
+                  description="Choose how the Agent runs, which model it uses, and where credentials are stored."
+                >
+                  <SettingsCard
+                    title="Runtime"
+                    description="Select one execution runtime. Authentication stays scoped to that runtime."
+                  >
+                    <div class="runtime-options" role="radiogroup" aria-label="Agent runtime">
                       <button
                         class:active={settings.aiWorker.runtime === "api"}
                         type="button"
+                        role="radio"
+                        aria-checked={settings.aiWorker.runtime === "api"}
                         onclick={() => {
                           settings = {
                             ...settings,
@@ -7625,6 +7785,8 @@
                       <button
                         class:active={settings.aiWorker.runtime === "opencode"}
                         type="button"
+                        role="radio"
+                        aria-checked={settings.aiWorker.runtime === "opencode"}
                         onclick={() => {
                           settings = {
                             ...settings,
@@ -7637,7 +7799,16 @@
                         <span>Use local opencode auth, including OpenAI OAuth.</span>
                       </button>
                     </div>
+                  </SettingsCard>
 
+                  <SettingsCard
+                    title={settings.aiWorker.runtime === "api"
+                      ? "Provider configuration"
+                      : "OpenCode configuration"}
+                    description={settings.aiWorker.runtime === "api"
+                      ? "Configure the provider, model, and secure API credential."
+                      : "Use your local OpenCode installation and existing authentication."}
+                  >
                     {#if settings.aiWorker.runtime === "api"}
                       <div class="field-row">
                         <label>
@@ -7817,82 +7988,81 @@
                         this runtime.
                       </p>
                     {/if}
+                  </SettingsCard>
 
+                  <SettingsCard title="Connection status" tone="subtle">
                     <div class="worker-status">
                       <span class:connected={workerConnected}></span>
                       <strong>{workerStatusLabel}</strong>
                     </div>
-                  </div>
-                {/if}
+                    {#snippet actions()}
+                      <button
+                        class="connect-jira"
+                        type="button"
+                        onclick={testWorkerConnection}
+                        disabled={testingWorker}
+                      >
+                        {testingWorker ? "Testing Agent..." : "Test Agent"}
+                      </button>
+                    {/snippet}
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
 
-                {#if settingsTab === "rules"}
-                  <div class="settings-section guidance-section rules-section">
-                    <div class="guidance-hero">
-                      <div>
-                        <p class="section-kicker">Agent Governance</p>
-                        <h3>Rules that every run must follow</h3>
-                        <span
-                          >Keep these short, explicit, and enforceable. They are injected into Agent
-                          tasks and chat before user instructions.</span
-                        >
-                      </div>
-                      <strong>Always on</strong>
-                    </div>
-
+              {#if settingsTab === "rules"}
+                <SettingsPage
+                  id="rules-settings"
+                  eyebrow="Agent governance"
+                  title="Rules"
+                  description="Define concise guardrails that are applied before task and chat instructions."
+                  badge="Always on"
+                >
+                  <SettingsCard title="Rule behavior" tone="subtle">
                     <div class="guidance-metrics" aria-label="Rules behavior">
-                      <div>
-                        <strong>Priority</strong>
-                        <span>Higher than task text</span>
-                      </div>
-                      <div>
-                        <strong>Scope</strong>
-                        <span>All Agent actions</span>
-                      </div>
-                      <div>
-                        <strong>Format</strong>
-                        <span>One rule per line</span>
-                      </div>
+                      <div><strong>Priority</strong><span>Higher than task text</span></div>
+                      <div><strong>Scope</strong><span>All Agent actions</span></div>
+                      <div><strong>Format</strong><span>One rule per line</span></div>
                     </div>
+                  </SettingsCard>
+                  <SettingsCard
+                    title="Operating rules"
+                    description="Keep each rule direct, enforceable, and limited to one behavior."
+                  >
+                    <SettingsLabel text="Rules applied to every run" forId="agent-rules-input">
+                      <SettingsInput wide>
+                        <textarea
+                          id="agent-rules-input"
+                          bind:this={agentRulesTextarea}
+                          class="agent-instruction-field"
+                          rows="10"
+                          spellcheck="false"
+                          placeholder="Never mark a task done unless it was actually executed and verified.&#10;Do not touch secrets unless explicitly requested.&#10;Block instead of guessing when tools or access are missing."
+                          value={settings.aiWorker.agentRules}
+                          onblur={commitAgentRulesDraft}></textarea>
+                      </SettingsInput>
+                    </SettingsLabel>
+                    <SettingsHelperText>
+                      Use direct verbs such as verify, block, ask, avoid, and require. Avoid vague
+                      preferences that cannot be checked.
+                    </SettingsHelperText>
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
 
-                    <label class="guidance-editor">
-                      <span>Operating rules</span>
-                      <textarea
-                        bind:this={agentRulesTextarea}
-                        class="agent-instruction-field"
-                        rows="10"
-                        spellcheck="false"
-                        placeholder="Never mark a task done unless it was actually executed and verified.&#10;Do not touch secrets unless explicitly requested.&#10;Block instead of guessing when tools or access are missing."
-                        value={settings.aiWorker.agentRules}
-                        onblur={commitAgentRulesDraft}></textarea>
-                    </label>
-
-                    <div class="guidance-examples">
-                      <strong>Good rules</strong>
-                      <span>Use direct verbs: verify, block, ask, avoid, require.</span>
-                      <span>Avoid vague preferences like “be smart” or “do your best”.</span>
-                    </div>
-                  </div>
-                {/if}
-
-                {#if settingsTab === "skills"}
-                  <div class="settings-section guidance-section skills-section">
-                    <div class="guidance-hero">
-                      <div>
-                        <p class="section-kicker">Agent Playbooks</p>
-                        <h3>Skills the Agent can reuse</h3>
-                        <span
-                          >Describe repeatable work patterns for your domain. The Agent applies them
-                          only when relevant to a task.</span
-                        >
-                      </div>
-                      <strong>Contextual</strong>
-                    </div>
-
+              {#if settingsTab === "skills"}
+                <SettingsPage
+                  id="skills-settings"
+                  eyebrow="Agent playbooks"
+                  title="Skills"
+                  description="Describe reusable work patterns that the Agent applies only when they match a task."
+                  badge="Contextual"
+                >
+                  <SettingsCard title="Examples" tone="subtle">
                     <div class="skill-template-grid" aria-label="Skill examples">
                       <div>
                         <strong>Bamboo diagnostics</strong>
                         <span
-                          >Check latest build, fetch logs, identify failing job, summarize evidence.</span
+                          >Check builds, fetch logs, identify the failing job, summarize evidence.</span
                         >
                       </div>
                       <div>
@@ -7902,52 +8072,61 @@
                         >
                       </div>
                     </div>
+                  </SettingsCard>
+                  <SettingsCard
+                    title="Reusable skills"
+                    description="Name each skill, then list its ordered investigation or execution steps."
+                  >
+                    <SettingsLabel text="Skill definitions" forId="agent-skills-input">
+                      <SettingsInput wide>
+                        <textarea
+                          id="agent-skills-input"
+                          bind:this={agentSkillsTextarea}
+                          class="agent-instruction-field"
+                          rows="12"
+                          spellcheck="false"
+                          placeholder="Skill: Bamboo diagnostics&#10;Check latest build status, fetch logs, identify failing job, summarize evidence.&#10;&#10;Skill: OCP troubleshooting&#10;Check pod status, recent events, logs, and resource usage before guessing."
+                          value={settings.aiWorker.agentSkills}
+                          onblur={commitAgentSkillsDraft}></textarea>
+                      </SettingsInput>
+                    </SettingsLabel>
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
 
-                    <label class="guidance-editor">
-                      <span>Reusable skills</span>
-                      <textarea
-                        bind:this={agentSkillsTextarea}
-                        class="agent-instruction-field"
-                        rows="12"
-                        spellcheck="false"
-                        placeholder="Skill: Bamboo diagnostics&#10;Check latest build status, fetch logs, identify failing job, summarize evidence.&#10;&#10;Skill: OCP troubleshooting&#10;Check pod status, recent events, logs, and resource usage before guessing."
-                        value={settings.aiWorker.agentSkills}
-                        onblur={commitAgentSkillsDraft}></textarea>
-                    </label>
-                  </div>
-                {/if}
-
-                {#if settingsTab === "environment"}
-                  <div class="settings-section">
-                    <div>
-                      <p class="section-kicker">Global Environment</p>
-                      <h3>Process environment variables</h3>
-                    </div>
-                    <p class="field-help">
-                      Variables defined here are automatically injected into every process that
-                      Spacesly launches — terminals, shell commands, MCP servers, formatters, git
-                      operations, and Agent workers.
-                    </p>
-
-                    <div class="field-row">
-                      <label>
-                        <span>Search</span>
-                        <input
-                          type="search"
-                          placeholder="Filter by key…"
-                          value={globalEnvironmentSearch}
-                          oninput={(event) => (globalEnvironmentSearch = event.currentTarget.value)}
-                        />
-                      </label>
+              {#if settingsTab === "environment"}
+                <SettingsPage
+                  id="environment-settings"
+                  eyebrow="Global environment"
+                  title="Process environment variables"
+                  description="Inject shared variables into terminals, shell commands, MCP servers, formatters, Git operations, and Agent workers."
+                >
+                  <SettingsCard
+                    title="Variables"
+                    description="Secrets stay in secure storage. Existing secret values remain hidden until explicitly revealed."
+                  >
+                    <SettingsRow align="end">
+                      <SettingsLabel text="Search" forId="environment-search">
+                        <SettingsInput>
+                          <input
+                            id="environment-search"
+                            type="search"
+                            placeholder="Filter by key..."
+                            value={globalEnvironmentSearch}
+                            oninput={(event) =>
+                              (globalEnvironmentSearch = event.currentTarget.value)}
+                          />
+                        </SettingsInput>
+                      </SettingsLabel>
                       <button
                         type="button"
                         class="add-env-btn"
                         onclick={addGlobalEnvironmentVariable}
                         disabled={globalEnvironmentLoading}
                       >
-                        ＋ Add Variable
+                        + Add Variable
                       </button>
-                    </div>
+                    </SettingsRow>
 
                     {#if globalEnvironmentLoading && globalEnvironmentVariables.length === 0}
                       <p class="field-help">Loading environment variables…</p>
@@ -7964,12 +8143,15 @@
                             class="env-row"
                             class:env-draft={variable.draft}
                             class:env-secret={variable.secret}
+                            role="group"
+                            aria-label={`Environment variable ${variable.key || "new variable"}`}
                           >
                             <div class="env-row-fields">
                               <input
                                 class="env-key-input"
                                 type="text"
                                 placeholder="KEY_NAME"
+                                aria-label={`Key for ${variable.key || "new environment variable"}`}
                                 value={variable.key}
                                 disabled={!variable.editing && !variable.draft}
                                 oninput={(event) =>
@@ -7982,6 +8164,7 @@
                                   class="env-value-input"
                                   type={variable.secret ? "password" : "text"}
                                   placeholder="value"
+                                  aria-label={`Value for ${variable.key || "new environment variable"}`}
                                   value={variable.revealed || !variable.secret
                                     ? variable.value
                                     : ""}
@@ -7996,6 +8179,7 @@
                                   class="env-value-input"
                                   type="password"
                                   placeholder="••••••••"
+                                  aria-label={`Stored value for ${variable.key || "environment variable"}`}
                                   disabled
                                 />
                               {/if}
@@ -8020,7 +8204,7 @@
                                       enabled: event.currentTarget.checked,
                                     })}
                                 />
-                                <span>On</span>
+                                <span>Enabled</span>
                               </label>
                             </div>
                             <div class="env-row-actions">
@@ -8029,6 +8213,7 @@
                                   type="button"
                                   class="env-save-btn"
                                   onclick={() => saveGlobalEnvironmentEntry(variable)}
+                                  aria-label={`Save ${variable.key || "new environment variable"}`}
                                   disabled={globalEnvironmentLoading}
                                 >
                                   Save
@@ -8038,6 +8223,7 @@
                                   type="button"
                                   class="env-reveal-btn"
                                   onclick={() => revealGlobalEnvironment(variable.id)}
+                                  aria-label={`Reveal ${variable.key}`}
                                 >
                                   Reveal
                                 </button>
@@ -8046,6 +8232,7 @@
                                   type="button"
                                   class="env-hide-btn"
                                   onclick={() => hideGlobalEnvironment(variable.id)}
+                                  aria-label={`Hide ${variable.key}`}
                                 >
                                   Hide
                                 </button>
@@ -8055,6 +8242,7 @@
                                 class="env-edit-btn"
                                 onclick={() =>
                                   updateGlobalEnvironmentDraft(variable.id, { editing: true })}
+                                aria-label={`Edit ${variable.key}`}
                                 disabled={variable.draft || variable.editing}
                               >
                                 Edit
@@ -8063,6 +8251,7 @@
                                 type="button"
                                 class="env-delete-btn"
                                 onclick={() => removeGlobalEnvironment(variable.id)}
+                                aria-label={`Delete ${variable.key || "new environment variable"}`}
                                 disabled={globalEnvironmentLoading}
                               >
                                 Delete
@@ -8072,19 +8261,20 @@
                         {/each}
                       </div>
                     {/if}
-                  </div>
-                {/if}
-                {#if settingsTab === "jira"}
-                  <div class="jira-section settings-section">
-                    <div>
-                      <p class="section-kicker">Jira</p>
-                      <h3>Jira Board Sync</h3>
-                    </div>
-                    <p class="field-help">
-                      Configure Jira once. These credentials power board sync, card transitions,
-                      Jira comments, and the selected Jira MCP connection.
-                    </p>
-
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
+              {#if settingsTab === "jira"}
+                <SettingsPage
+                  id="jira-settings"
+                  eyebrow="Jira"
+                  title="Board synchronization"
+                  description="Configure one Jira identity for board sync, card transitions, comments, and the Jira MCP connection."
+                >
+                  <SettingsCard
+                    title="Connection"
+                    description="Choose the Jira MCP runtime and verify the shared connection."
+                  >
                     <label>
                       <span>Jira MCP Runtime</span>
                       <select
@@ -8108,8 +8298,29 @@
                       Only the MCP command lives in the MCP tab. Its Jira identity is inherited from
                       this page so credentials do not drift.
                     </p>
+                    {#snippet actions()}
+                      <button
+                        class="connect-jira"
+                        type="button"
+                        onclick={connectJira}
+                        disabled={connectingJira}
+                      >
+                        {connectingJira ? "Connecting..." : "Connect Jira"}
+                      </button>
+                      <button
+                        type="button"
+                        onclick={testJiraConnection}
+                        disabled={testingConnection}
+                      >
+                        {testingConnection ? "Testing..." : "Test connection"}
+                      </button>
+                    {/snippet}
+                  </SettingsCard>
 
-                    <h3>Credentials</h3>
+                  <SettingsCard
+                    title="Credentials"
+                    description="Authentication details are encrypted and stored outside application settings."
+                  >
                     <label>
                       <span>Authentication Method</span>
                       <select
@@ -8211,8 +8422,12 @@
                         />
                       </label>
                     {/if}
+                  </SettingsCard>
 
-                    <h3>Board sync</h3>
+                  <SettingsCard
+                    title="Board synchronization"
+                    description="Select a board or narrow synchronization with project and board filters."
+                  >
                     <div class="field-row board-picker-row">
                       <label>
                         <span>Jira Board</span>
@@ -8298,7 +8513,12 @@
                           })}
                       />
                     </label>
-
+                  </SettingsCard>
+                  <SettingsCard
+                    title="Advanced"
+                    description="Control sync limits, MCP tool names, and the JQL query used to discover work."
+                    tone="subtle"
+                  >
                     <div class="field-row">
                       <label>
                         <span>Cards Per Sync Page</span>
@@ -8377,8 +8597,8 @@
                         />
                       </label>
                     </div>
-                    <label>
-                      <span>JQL</span>
+                    <div class="settings-query-field">
+                      <label for="jira-jql">JQL</label>
                       <div class="jql-presets">
                         <button type="button" onclick={() => applyJqlPreset("assigned")}
                           >Assigned to me</button
@@ -8391,97 +8611,78 @@
                         >
                       </div>
                       <textarea
+                        id="jira-jql"
                         value={settings.jira.jql}
                         oninput={(event) =>
                           (settings = {
                             ...settings,
                             jira: { ...settings.jira, jql: event.currentTarget.value },
                           })}></textarea>
-                    </label>
-                  </div>
-                {/if}
-
-                {#if settingsTab === "theme"}
-                  <div class="settings-section theme-section">
-                    <div>
-                      <p class="section-kicker">Theme</p>
-                      <h3>Appearance</h3>
                     </div>
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
+
+              {#if settingsTab === "theme"}
+                <SettingsPage
+                  id="theme-settings"
+                  eyebrow="Theme"
+                  title="Appearance"
+                  description="Review the active visual theme used throughout the Spacesly desktop workspace."
+                >
+                  <SettingsCard title="Active theme" tone="subtle">
                     <div class="theme-card">
                       <strong>Dark command center</strong>
                       <span
-                        >Current Spacesly theme. Future color, density, and typography controls will
-                        live here instead of crowding integration settings.</span
+                        >The current Spacesly theme keeps editor, terminal, board, and Settings
+                        surfaces visually consistent.</span
                       >
                     </div>
+                  </SettingsCard>
+                </SettingsPage>
+              {/if}
+
+              <ValidationMessage error={settingsError} success={connectionMessage} />
+
+              {#if settingsTab === "mcp" && selectedMcpTools.length > 0}
+                <details class="tool-list">
+                  <summary>Available MCP tools ({selectedMcpTools.length})</summary>
+                  <div>
+                    {#each selectedMcpTools as tool (tool)}
+                      <code>{tool}</code>
+                    {/each}
                   </div>
-                {/if}
+                </details>
+              {/if}
 
-                {#if settingsError}
-                  <p class="settings-error">{settingsError}</p>
-                {/if}
-
-                {#if connectionMessage}
-                  <p class="settings-success">{connectionMessage}</p>
-                {/if}
-
-                {#if settingsTab === "mcp" && selectedMcpTools.length > 0}
-                  <details class="tool-list">
-                    <summary>Available MCP tools ({selectedMcpTools.length})</summary>
-                    <div>
-                      {#each selectedMcpTools as tool (tool)}
-                        <code>{tool}</code>
-                      {/each}
-                    </div>
-                  </details>
-                {/if}
-
-                <footer>
-                  {#if settingsTab === "mcp"}
-                    <button type="button" onclick={removeSelectedServer}> Remove </button>
-                    <button type="button" onclick={disconnectSelectedMcpServer}>
-                      Disconnect
-                    </button>
-                    <button
-                      type="button"
-                      onclick={testSelectedMcpConnection}
-                      disabled={testingConnection}
-                    >
-                      {testingConnection ? "Testing..." : "Test connection"}
-                    </button>
-                  {/if}
-                  {#if settingsTab === "jira"}
-                    <button
-                      class="connect-jira"
-                      type="button"
-                      onclick={connectJira}
-                      disabled={connectingJira}
-                    >
-                      {connectingJira ? "Connecting..." : "Connect Jira"}
-                    </button>
-                    <button type="button" onclick={testJiraConnection} disabled={testingConnection}>
-                      {testingConnection ? "Testing..." : "Test connection"}
-                    </button>
-                  {/if}
-                  {#if settingsTab === "agent"}
-                    <button
-                      class="connect-jira"
-                      type="button"
-                      onclick={testWorkerConnection}
-                      disabled={testingWorker}
-                    >
-                      {testingWorker ? "Testing Agent..." : "Test Agent"}
-                    </button>
-                  {/if}
+              <SettingsActionBar>
+                {#if settingsTab === "mcp"}
+                  <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
+                    Remove
+                  </button>
                   <button
-                    class="save-settings"
                     type="button"
-                    onclick={persistSettings}
-                    disabled={settingsSaving}>{settingsSaving ? "Saving..." : "Save settings"}</button
+                    onclick={disconnectSelectedMcpServer}
+                    disabled={!selectedServer}
                   >
-                </footer>
-              </form>
-            {/if}
+                    Disconnect
+                  </button>
+                  <button
+                    type="button"
+                    onclick={testSelectedMcpConnection}
+                    disabled={!selectedServer || testingConnection}
+                  >
+                    {testingConnection ? "Testing..." : "Test connection"}
+                  </button>
+                {/if}
+                <button
+                  class="save-settings"
+                  type="button"
+                  onclick={persistSettings}
+                  disabled={settingsSaving}>{settingsSaving ? "Saving..." : "Save settings"}</button
+                >
+              </SettingsActionBar>
+            </form>
           </div>
         </div>
       </section>
@@ -8575,7 +8776,7 @@
                 executionRun={visibleExecutionRun}
                 runStatus={visibleAgentRunStatus}
                 cancelPending={Boolean(
-                  agentConsoleCardId && cancellingAgentCardIds.has(agentConsoleCardId)
+                  agentConsoleCardId && cancellingAgentCardIds.has(agentConsoleCardId),
                 )}
                 terminalLines={visibleAgentTerminalLines}
                 terminalInput={agentTerminalInput}
@@ -8689,13 +8890,13 @@
                     type="button"
                     disabled={!canStartAgent(
                       selectedCard,
-                      Boolean(runningWorkerCardIds[selectedCard.id]),
+                      runningWorkerCardIds.has(selectedCard.id),
                     )}
                     onclick={() => void startWorkerForCard(selectedCard.id)}
                   >
                     {agentActionLabel(
                       selectedCard,
-                      Boolean(runningWorkerCardIds[selectedCard.id]),
+                      runningWorkerCardIds.has(selectedCard.id),
                       Boolean(operatorNotesForCard(selectedCard.id)),
                     )}
                   </button>

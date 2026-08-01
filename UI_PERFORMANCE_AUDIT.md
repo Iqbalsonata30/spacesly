@@ -167,3 +167,15 @@ Recommended next measurements on representative production data:
 3. Reassess board virtualization only when traces show more than 100-200 simultaneously rendered cards.
 4. Measure retained Task Session payload growth after several weeks of normal use before introducing a new paginated index contract.
 5. Introduce safe speculative Chat streaming only with a revocation/reservation protocol that preserves durable conversation authority.
+
+## Board Interaction Follow-up
+
+Task creation and Start were subsequently traced to broad board invalidation and delayed phase projection:
+
+- Active-board updates replaced the complete workspace root, invalidating unrelated workspace-derived state.
+- Card moves recreated and filtered every lane, including lanes that did not contain the card.
+- Start waited for workspace trust and Git discovery before projecting the card into In Progress.
+
+The board now replaces only its active board, preserves untouched lane identities, and indexes each card's exact source column. Start projects an approved card into In Progress before asynchronous preflight work, with rollback if configuration, trust, reservation, or capability setup fails.
+
+In a controlled 800-card board benchmark, moving one card improved from 0.0275 ms to 0.0164 ms of pure projection work, a 40.4% reduction. More importantly, lane objects recreated per move fell from four to two, preventing unrelated lanes and cards from receiving changed props.

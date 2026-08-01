@@ -5,6 +5,15 @@
     parseEnvText,
     type McpServerSettings,
   } from "$lib/settings";
+  import SettingsCard from "$lib/components/settings/SettingsCard.svelte";
+  import SettingsDescription from "$lib/components/settings/SettingsDescription.svelte";
+  import SettingsGroup from "$lib/components/settings/SettingsGroup.svelte";
+  import SettingsHelperText from "$lib/components/settings/SettingsHelperText.svelte";
+  import SettingsInput from "$lib/components/settings/SettingsInput.svelte";
+  import SettingsLabel from "$lib/components/settings/SettingsLabel.svelte";
+  import SettingsPage from "$lib/components/settings/SettingsPage.svelte";
+  import SettingsRow from "$lib/components/settings/SettingsRow.svelte";
+  import SettingsSection from "$lib/components/settings/SettingsSection.svelte";
 
   let {
     server,
@@ -83,198 +92,217 @@
   }
 </script>
 
-<section class="settings-section">
-  <div>
-    <p class="section-kicker">MCP Connection</p>
-    <h3>Server runtime</h3>
-  </div>
-
-  <p class="field-help">
-    MCP servers extend the OpenCode Agent with tools from external services. Spacesly starts this
-    local stdio server when the Agent runs; use Test connection to verify startup and discover its
-    tools before executing a task.
-  </p>
-
-  <label>
-    <span>Connection Name</span>
-    <input value={server.name} oninput={(event) => onUpdate({ name: event.currentTarget.value })} />
-  </label>
-
-  <label>
-    <span>Connection Type</span>
-    <select
-      value={server.kind}
-      oninput={(event) => {
-        const kind = event.currentTarget.value as McpServerSettings["kind"];
-        onUpdate({ kind, ...defaultMcpIntentMetadata(kind, server.name) });
-      }}
-    >
-      <option value="generic">Generic MCP</option>
-      <option value="jira">Jira</option>
-      <option value="ocp">OpenShift / OCP</option>
-      <option value="bamboo">Bamboo</option>
-      <option value="bitbucket">Bitbucket</option>
-    </select>
-  </label>
-
-  <div class="field-row">
-    <label>
-      <span>Agent Domains</span>
-      <input
-        placeholder="jira, kubernetes"
-        value={server.domains.join(", ")}
-        oninput={(event) => onUpdate({ domains: intentList(event.currentTarget.value) })}
-      />
-    </label>
-    <label>
-      <span>Task Intent Phrases</span>
-      <textarea
-        placeholder="deploy, prerelease, pod logs"
-        value={server.intentTerms.join(", ")}
-        oninput={(event) => onUpdate({ intentTerms: intentList(event.currentTarget.value) })}
-      ></textarea>
-    </label>
-  </div>
-  <p class="field-help">
-    Spacesly loads this connector for Agent tasks only when the task matches these domains or
-    phrases.
-  </p>
-
-  <label>
-    <span>Command</span>
-    <input
-      placeholder="uvx"
-      value={server.command}
-      oninput={(event) => updateCommand(event.currentTarget.value)}
-    />
-  </label>
-
-  <label>
-    <span>Arguments</span>
-    <textarea
-      placeholder={JSON.stringify(["--transport", "stdio"])}
-      oninput={(event) => updateArgs(event.currentTarget.value)}
-      value={JSON.stringify(server.args)}></textarea>
-  </label>
-
-  <div class="type-config">
-    {#if server.kind === "jira"}
-      <div class="inherited-card">
-        <div>
-          <p class="section-kicker">Jira Identity</p>
-          <h3>Inherited from Jira Sync</h3>
-        </div>
-        <p>
-          Jira MCP uses the same account as board sync. Configure credentials once in the Jira tab;
-          Spacesly injects the right environment variables when this MCP server starts.
-        </p>
-        <div class="inherited-grid">
-          <span>
-            <strong>Site</strong>
-            <code>{jiraBaseUrl || "Not configured"}</code>
-          </span>
-          <span>
-            <strong>Principal</strong>
-            <code>{jiraPrincipal || (jiraAuthMode === "pat" ? "PAT only" : "Not configured")}</code>
-          </span>
-          <span>
-            <strong>Auth</strong>
-            <code
-              >{jiraAuthMode === "api_token"
-                ? "API token"
-                : jiraAuthMode === "pat"
-                  ? "Personal access token"
-                  : "Username + password"}</code
+<SettingsPage
+  id="mcp-settings"
+  eyebrow="MCP connection"
+  title={server.name || "Server runtime"}
+  description="Configure the local stdio process, Agent routing metadata, and secure service values."
+>
+  <SettingsSection
+    title="Connection"
+    description="Define the server identity and command Spacesly starts for this connection."
+  >
+    <SettingsCard>
+      <SettingsRow>
+        <SettingsLabel text="Connection name" forId="mcp-connection-name">
+          <SettingsInput>
+            <input
+              id="mcp-connection-name"
+              value={server.name}
+              oninput={(event) => onUpdate({ name: event.currentTarget.value })}
+            />
+          </SettingsInput>
+        </SettingsLabel>
+        <SettingsLabel text="Connection type" forId="mcp-connection-type">
+          <SettingsInput>
+            <select
+              id="mcp-connection-type"
+              value={server.kind}
+              oninput={(event) => {
+                const kind = event.currentTarget.value as McpServerSettings["kind"];
+                onUpdate({ kind, ...defaultMcpIntentMetadata(kind, server.name) });
+              }}
             >
-          </span>
-        </div>
-      </div>
-    {:else if server.kind === "ocp"}
-      <p class="section-kicker">OpenShift / Kubernetes MCP Config</p>
+              <option value="generic">Generic MCP</option>
+              <option value="jira">Jira</option>
+              <option value="ocp">OpenShift / OCP</option>
+              <option value="bamboo">Bamboo</option>
+              <option value="bitbucket">Bitbucket</option>
+            </select>
+          </SettingsInput>
+        </SettingsLabel>
+      </SettingsRow>
+
+      <SettingsGroup
+        title="Agent routing"
+        description="Load this connection only when task intent matches its configured scope."
+      >
+        <SettingsRow>
+          <label>
+            <span>Agent Domains</span>
+            <input
+              placeholder="jira, kubernetes"
+              value={server.domains.join(", ")}
+              oninput={(event) => onUpdate({ domains: intentList(event.currentTarget.value) })}
+            />
+          </label>
+          <label>
+            <span>Task Intent Phrases</span>
+            <textarea
+              placeholder="deploy, prerelease, pod logs"
+              value={server.intentTerms.join(", ")}
+              oninput={(event) => onUpdate({ intentTerms: intentList(event.currentTarget.value) })}
+            ></textarea>
+          </label>
+        </SettingsRow>
+        <SettingsHelperText>
+          Spacesly loads this connector for Agent tasks only when the task matches these domains or
+          phrases.
+        </SettingsHelperText>
+      </SettingsGroup>
+
       <label>
-        <span>Kubeconfig Path</span>
+        <span>Command</span>
         <input
-          placeholder={envPlaceholder("KUBECONFIG", "/home/user/.kube/config")}
-          value={envValue("KUBECONFIG")}
-          oninput={(event) => updateEnvKey("KUBECONFIG", event.currentTarget.value)}
+          placeholder="uvx"
+          value={server.command}
+          oninput={(event) => updateCommand(event.currentTarget.value)}
         />
       </label>
-      <div class="field-row">
-        <label>
-          <span>Cluster API Server</span>
-          <input
-            placeholder={envPlaceholder("OPENSHIFT_SERVER", "https://api.cluster:6443")}
-            value={envValue("OPENSHIFT_SERVER")}
-            oninput={(event) => updateEnvKey("OPENSHIFT_SERVER", event.currentTarget.value)}
-          />
-        </label>
-        <label>
-          <span>Token</span>
-          <input
-            type="password"
-            placeholder={envPlaceholder("OPENSHIFT_TOKEN", "OpenShift/Kubernetes token")}
-            value={envValue("OPENSHIFT_TOKEN")}
-            oninput={(event) => updateEnvKey("OPENSHIFT_TOKEN", event.currentTarget.value)}
-          />
-        </label>
-      </div>
-    {:else if server.kind === "bamboo"}
-      <p class="section-kicker">Bamboo MCP Config</p>
+
       <label>
-        <span>Bamboo URL</span>
-        <input
-          placeholder={envPlaceholder("BAMBOO_URL", "https://bamboo.company.id")}
-          value={envValue("BAMBOO_URL")}
-          oninput={(event) => updateEnvKey("BAMBOO_URL", event.currentTarget.value)}
-        />
-      </label>
-      <div class="field-row">
-        <label>
-          <span>Username</span>
-          <input
-            placeholder={envPlaceholder("BAMBOO_USERNAME", "user")}
-            value={envValue("BAMBOO_USERNAME")}
-            oninput={(event) => updateEnvKey("BAMBOO_USERNAME", event.currentTarget.value)}
-          />
-        </label>
-        <label>
-          <span>Token</span>
-          <input
-            type="password"
-            placeholder={envPlaceholder("BAMBOO_TOKEN", "Bamboo token")}
-            value={envValue("BAMBOO_TOKEN")}
-            oninput={(event) => updateEnvKey("BAMBOO_TOKEN", event.currentTarget.value)}
-          />
-        </label>
-      </div>
-    {:else}
-      <p class="section-kicker">Generic MCP Config</p>
-      <label>
-        <span>Environment</span>
+        <span>Arguments</span>
         <textarea
-          class="env-config"
-          placeholder={genericEnvPlaceholder()}
-          oninput={(event) => updateEnv(event.currentTarget.value)}
-          value={Object.entries(server.env)
-            .map(([key, value]) => `${key}=${value}`)
-            .join("\n")}></textarea>
+          placeholder={JSON.stringify(["--transport", "stdio"])}
+          oninput={(event) => updateArgs(event.currentTarget.value)}
+          value={JSON.stringify(server.args)}></textarea>
       </label>
-    {/if}
-  </div>
-</section>
+    </SettingsCard>
+  </SettingsSection>
+
+  <SettingsSection
+    title="Service configuration"
+    description="Connection values are stored securely when Settings are saved."
+  >
+    <SettingsCard>
+      <div class="type-config">
+        {#if server.kind === "jira"}
+          <div class="inherited-card">
+            <div>
+              <p class="section-kicker">Jira Identity</p>
+              <h3>Inherited from Jira Sync</h3>
+            </div>
+            <SettingsDescription>
+              Jira MCP uses the same account as board sync. Configure credentials once in the Jira
+              tab; Spacesly injects the right environment variables when this MCP server starts.
+            </SettingsDescription>
+            <div class="inherited-grid">
+              <span>
+                <strong>Site</strong>
+                <code>{jiraBaseUrl || "Not configured"}</code>
+              </span>
+              <span>
+                <strong>Principal</strong>
+                <code
+                  >{jiraPrincipal || (jiraAuthMode === "pat" ? "PAT only" : "Not configured")}</code
+                >
+              </span>
+              <span>
+                <strong>Auth</strong>
+                <code
+                  >{jiraAuthMode === "api_token"
+                    ? "API token"
+                    : jiraAuthMode === "pat"
+                      ? "Personal access token"
+                      : "Username + password"}</code
+                >
+              </span>
+            </div>
+          </div>
+        {:else if server.kind === "ocp"}
+          <p class="section-kicker">OpenShift / Kubernetes MCP Config</p>
+          <label>
+            <span>Kubeconfig Path</span>
+            <input
+              placeholder={envPlaceholder("KUBECONFIG", "/home/user/.kube/config")}
+              value={envValue("KUBECONFIG")}
+              oninput={(event) => updateEnvKey("KUBECONFIG", event.currentTarget.value)}
+            />
+          </label>
+          <div class="field-row">
+            <label>
+              <span>Cluster API Server</span>
+              <input
+                placeholder={envPlaceholder("OPENSHIFT_SERVER", "https://api.cluster:6443")}
+                value={envValue("OPENSHIFT_SERVER")}
+                oninput={(event) => updateEnvKey("OPENSHIFT_SERVER", event.currentTarget.value)}
+              />
+            </label>
+            <label>
+              <span>Token</span>
+              <input
+                type="password"
+                placeholder={envPlaceholder("OPENSHIFT_TOKEN", "OpenShift/Kubernetes token")}
+                value={envValue("OPENSHIFT_TOKEN")}
+                oninput={(event) => updateEnvKey("OPENSHIFT_TOKEN", event.currentTarget.value)}
+              />
+            </label>
+          </div>
+        {:else if server.kind === "bamboo"}
+          <p class="section-kicker">Bamboo MCP Config</p>
+          <label>
+            <span>Bamboo URL</span>
+            <input
+              placeholder={envPlaceholder("BAMBOO_URL", "https://bamboo.company.id")}
+              value={envValue("BAMBOO_URL")}
+              oninput={(event) => updateEnvKey("BAMBOO_URL", event.currentTarget.value)}
+            />
+          </label>
+          <div class="field-row">
+            <label>
+              <span>Username</span>
+              <input
+                placeholder={envPlaceholder("BAMBOO_USERNAME", "user")}
+                value={envValue("BAMBOO_USERNAME")}
+                oninput={(event) => updateEnvKey("BAMBOO_USERNAME", event.currentTarget.value)}
+              />
+            </label>
+            <label>
+              <span>Token</span>
+              <input
+                type="password"
+                placeholder={envPlaceholder("BAMBOO_TOKEN", "Bamboo token")}
+                value={envValue("BAMBOO_TOKEN")}
+                oninput={(event) => updateEnvKey("BAMBOO_TOKEN", event.currentTarget.value)}
+              />
+            </label>
+          </div>
+        {:else}
+          <p class="section-kicker">Generic MCP Config</p>
+          <label>
+            <span>Environment</span>
+            <textarea
+              class="env-config"
+              placeholder={genericEnvPlaceholder()}
+              oninput={(event) => updateEnv(event.currentTarget.value)}
+              value={Object.entries(server.env)
+                .map(([key, value]) => `${key}=${value}`)
+                .join("\n")}></textarea>
+          </label>
+          <SettingsHelperText>
+            Enter one `KEY=value` pair per line. Existing secure values remain unchanged when
+            omitted.
+          </SettingsHelperText>
+        {/if}
+      </div>
+    </SettingsCard>
+  </SettingsSection>
+</SettingsPage>
 
 <style>
-  .settings-section,
   .type-config {
     display: grid;
     gap: 14px;
-  }
-
-  .settings-section {
-    border: 1px solid #2a2832;
-    border-radius: 12px;
-    padding: 14px;
-    background: rgba(17, 16, 22, 0.56);
   }
 
   .type-config {

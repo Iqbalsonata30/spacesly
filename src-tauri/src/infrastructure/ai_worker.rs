@@ -219,12 +219,7 @@ fn agent_execution_scope(config: &AiWorkerConfig) -> Result<Option<String>, Stri
     if config.runtime != "opencode" {
         return Ok(None);
     }
-    let path = config
-        .opencode_workdir
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    let path = opencode_workdir(config)
         .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?);
     let normalized = path.canonicalize().unwrap_or(path);
     Ok(Some(normalized.to_string_lossy().to_string()))

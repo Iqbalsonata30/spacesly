@@ -1,5 +1,6 @@
 import type { AiWorkerConfig, AiWorkerTaskResult, ExecutionContract } from "$lib/ipc/agent";
 import { appendConversationMessage } from "$lib/ipc/agent";
+import type { GitWorkspaceInfo } from "$lib/ipc/git";
 import {
   cancelTaskSession,
   digestAgentExecutionContract,
@@ -23,6 +24,20 @@ export const AGENT_TASK_TEMPLATE_VERSION = "agent-task-v1";
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const RECONCILIATION_INTERVAL_MS = 5_000;
 const BUILTIN_CAPABILITIES = ["workspace_read", "workspace_write", "shell", "git"];
+
+export function executionRepositoryContext(
+  config: AiWorkerConfig,
+  gitInfo: GitWorkspaceInfo | null,
+  workspaceRoot: string | null,
+): ExecutionContract["repository"] {
+  const configuredRoot =
+    config.runtime === "opencode" ? config.opencode_workdir?.trim() || null : null;
+  return {
+    root_path: configuredRoot ?? gitInfo?.repo_root ?? workspaceRoot,
+    branch: gitInfo?.current_branch ?? null,
+    head_commit: gitInfo?.head_commit ?? null,
+  };
+}
 
 /** Immutable profile identity and authority requested by one Agent submission. */
 export type AgentTaskProfileBinding = {
