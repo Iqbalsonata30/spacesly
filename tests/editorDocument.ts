@@ -217,6 +217,125 @@ assertEqual(
   false,
   "collapsed activities should not expose runtime terminology",
 );
+assertEqual(
+  lifecycleActivities.filter(({ status }) => status === "running").length,
+  0,
+  "successful completion should finalize every running activity",
+);
+assertEqual(
+  lifecycleActivities.slice(1).every(({ status }) => status === "completed"),
+  true,
+  "successful completion should leave all preceding lifecycle activities completed",
+);
+
+const activeLifecycleActivities = timelineActivities([
+  {
+    id: "active-queued",
+    at: "04:30:01 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered queued.",
+  },
+  {
+    id: "active-running",
+    at: "04:30:02 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered running.",
+  },
+  {
+    id: "active-progress",
+    at: "04:30:03 AM",
+    tone: "info",
+    label: "progress",
+    message: "SUMMARY: Task Session progress.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
+]);
+assertEqual(
+  activeLifecycleActivities.filter(({ status }) => status === "running").length,
+  1,
+  "only the latest business activity should remain running",
+);
+assertEqual(
+  activeLifecycleActivities[0].title,
+  "Executing Task",
+  "the newest business activity should own the running state",
+);
+
+const failedLifecycleActivities = timelineActivities([
+  {
+    id: "failed-running",
+    at: "04:31:01 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered running.",
+  },
+  {
+    id: "failed-progress",
+    at: "04:31:02 AM",
+    tone: "info",
+    label: "progress",
+    message: "SUMMARY: Task Session progress.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
+  {
+    id: "failed-terminal",
+    at: "04:31:03 AM",
+    tone: "error",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered failed.",
+  },
+]);
+assertEqual(
+  failedLifecycleActivities.filter(({ status }) => status === "running").length,
+  0,
+  "failed completion should leave no running activities",
+);
+assertEqual(
+  failedLifecycleActivities[0].status,
+  "failed",
+  "the latest failed activity should be failed",
+);
+
+const replayedTerminalActivities = timelineActivities([
+  {
+    id: "replay-running",
+    at: "04:32:01 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered running.",
+  },
+  {
+    id: "replay-succeeded",
+    at: "04:32:02 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered succeeded.",
+  },
+  {
+    id: "replay-stale",
+    at: "04:32:03 AM",
+    tone: "info",
+    label: "progress",
+    message: "SUMMARY: Task Session progress.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
+  {
+    id: "replay-succeeded",
+    at: "04:32:02 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered succeeded.",
+  },
+]);
+assertEqual(
+  replayedTerminalActivities.filter(({ status }) => status === "running").length,
+  0,
+  "replay after terminal state should never restore a running activity",
+);
+assertEqual(
+  replayedTerminalActivities.filter(({ title }) => title === "Execution Completed").length,
+  1,
+  "duplicate durable terminal events should be idempotent",
+);
 
 const jiraActivities = timelineActivities([
   {
@@ -252,6 +371,45 @@ assertEqual(
   ),
   true,
   "technical metadata should remain available in expanded sections",
+);
+
+const interleavedJiraActivities = timelineActivities([
+  {
+    id: "jira-interleaved-start",
+    at: "04:30:06 AM",
+    tone: "info",
+    label: "tool",
+    message: "SUMMARY: Tool started: Reading Jira issue APP-1.",
+  },
+  {
+    id: "workspace-interleaved",
+    at: "04:30:07 AM",
+    tone: "info",
+    label: "tool",
+    message: "SUMMARY: Tool started: Reading src/main.rs.",
+  },
+  {
+    id: "jira-interleaved-complete",
+    at: "04:30:08 AM",
+    tone: "info",
+    label: "tool",
+    message: "SUMMARY: Tool completed; task still running: Reading Jira issue APP-1.",
+  },
+]);
+assertEqual(
+  interleavedJiraActivities.filter(({ title }) => title === "Reading Jira Ticket").length,
+  1,
+  "non-adjacent tool completion should reconcile the original business activity",
+);
+assertEqual(
+  interleavedJiraActivities.find(({ title }) => title === "Reading Jira Ticket")?.status,
+  "completed",
+  "non-adjacent tool completion should finalize the original activity",
+);
+assertEqual(
+  interleavedJiraActivities.filter(({ status }) => status === "running").length,
+  1,
+  "non-adjacent completion should preserve only the current running activity",
 );
 
 assertEqual(
@@ -332,6 +490,61 @@ assertEqual(
   applyAgentEventProjection(projectionSession, changingProjection, 120).progress,
   67,
   "one publication should expose the latest meaningful progress",
+);
+const terminalProjection = projectAgentTaskSessionEvent(
+  {
+    id: 200,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 200,
+    kind: "lifecycle",
+    payload: { state: "succeeded" },
+    progress: null,
+    created_at: 200,
+  },
+  "terminal-200",
+  "04:30:12 AM",
+);
+const duplicateTerminalProjection = mergeAgentEventProjection(
+  terminalProjection,
+  terminalProjection,
+);
+assertEqual(
+  duplicateTerminalProjection.logs.length,
+  1,
+  "replaying one durable event should not duplicate its activity log",
+);
+const terminalSession = applyAgentEventProjection(projectionSession, terminalProjection, 120);
+assertEqual(
+  applyAgentEventProjection(terminalSession, terminalProjection, 120) === terminalSession,
+  true,
+  "applying the same terminal projection twice should preserve session identity",
+);
+const staleRunningProjection = projectAgentTaskSessionEvent(
+  {
+    id: 199,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 199,
+    kind: "lifecycle",
+    payload: { state: "running" },
+    progress: null,
+    created_at: 199,
+  },
+  "stale-running-199",
+  "04:30:11 AM",
+);
+assertEqual(
+  mergeAgentEventProjection(terminalProjection, staleRunningProjection).taskSessionState,
+  "succeeded",
+  "terminal projection state should not regress during replay reconciliation",
+);
+assertEqual(
+  applyAgentEventProjection(terminalSession, staleRunningProjection, 120) === terminalSession,
+  true,
+  "terminal session state should reject stale active projections without publishing",
 );
 if (workspaceContextRevision("context a") === workspaceContextRevision("context b")) {
   throw new Error("workspace context revisions should change with context content");

@@ -75,17 +75,33 @@ export function mergeAgentEventProjection(
   current: AgentEventProjection,
   incoming: AgentEventProjection,
 ): AgentEventProjection {
+  if (
+    isTerminalTaskSessionState(current.taskSessionState) &&
+    incoming.taskSessionState !== current.taskSessionState
+  ) {
+    return current;
+  }
   const logs = [...current.logs];
+  const logIds = new Set(logs.map((log) => log.id));
   for (const log of incoming.logs) {
-    if (log.label === "progress" && logs.at(-1)?.label === "progress") logs[logs.length - 1] = log;
-    else logs.push(log);
+    if (logIds.has(log.id)) continue;
+    if (log.label === "progress" && logs.at(-1)?.label === "progress") {
+      logIds.delete(logs[logs.length - 1].id);
+      logs[logs.length - 1] = log;
+    } else {
+      logs.push(log);
+    }
+    logIds.add(log.id);
   }
   return {
     progress:
       incoming.progress === null
         ? current.progress
         : Math.max(current.progress ?? 0, incoming.progress),
-    taskSessionState: incoming.taskSessionState ?? current.taskSessionState,
+    taskSessionState: reconcileTaskSessionState(
+      current.taskSessionState,
+      incoming.taskSessionState,
+    ),
     logs,
   };
 }
@@ -95,15 +111,27 @@ export function applyAgentEventProjection(
   projection: AgentEventProjection,
   maxLogs: number,
 ): AgentRunSession {
+  const currentTaskSessionState = session.taskSessionState ?? null;
+  if (
+    isTerminalTaskSessionState(currentTaskSessionState) &&
+    projection.taskSessionState !== currentTaskSessionState
+  ) {
+    return session;
+  }
   const progress =
     projection.progress === null
       ? session.progress
       : Math.max(session.progress, Math.min(100, projection.progress));
-  const taskSessionState = projection.taskSessionState ?? session.taskSessionState;
+  const taskSessionState = reconcileTaskSessionState(
+    currentTaskSessionState,
+    projection.taskSessionState,
+  );
+  const existingLogIds = new Set(session.logs.map((log) => log.id));
+  const newLogs = projection.logs.filter((log) => !existingLogIds.has(log.id));
   if (
     progress === session.progress &&
     taskSessionState === session.taskSessionState &&
-    projection.logs.length === 0
+    newLogs.length === 0
   ) {
     return session;
   }
@@ -111,13 +139,24 @@ export function applyAgentEventProjection(
     ...session,
     progress,
     taskSessionState,
-    logs:
-      projection.logs.length === 0
-        ? session.logs
-        : capList([...session.logs, ...projection.logs], maxLogs),
+    logs: newLogs.length === 0 ? session.logs : capList([...session.logs, ...newLogs], maxLogs),
   };
 }
 
 export function emptyAgentEventProjection(): AgentEventProjection {
   return { progress: null, taskSessionState: null, logs: [] };
+}
+
+function reconcileTaskSessionState(
+  current: TaskSessionState | null,
+  incoming: TaskSessionState | null,
+): TaskSessionState | null {
+  if (incoming === null || isTerminalTaskSessionState(current)) return current;
+  return incoming;
+}
+
+function isTerminalTaskSessionState(state: TaskSessionState | null): boolean {
+  return (
+    state === "succeeded" || state === "failed" || state === "blocked" || state === "cancelled"
+  );
 }

@@ -34,23 +34,71 @@ const HIDDEN_PRESENTATION_LABELS = new Set(["board", "local", "model", "operator
 
 export function timelineActivities(logs: AgentRunLog[], limit = 10): TimelineActivity[] {
   const activities: TimelineActivity[] = [];
+  const seenLogIds = new Set<string>();
+  let terminalStatus: Extract<TimelineStatus, "completed" | "failed" | "cancelled"> | null = null;
   for (const log of logs) {
+    if (seenLogIds.has(log.id)) continue;
+    seenLogIds.add(log.id);
     const activity = timelineActivity(log);
     if (!activity.title) continue;
-    const previous = activities[activities.length - 1];
-    if (previous && previous.key === activity.key) {
-      previous.repeatCount += 1;
-      previous.log = log;
-      previous.title = activity.title;
-      previous.summary = activity.summary;
-      previous.status = activity.status;
-      previous.importance = activity.importance;
-      previous.sections = mergeSections(previous.sections, activity.sections);
+
+    const lifecycleState = lifecycleStateFromLog(log);
+    const incomingTerminalStatus = terminalActivityStatus(lifecycleState);
+    if (terminalStatus && !incomingTerminalStatus) continue;
+    const existingIndex = activities.findIndex((candidate) => candidate.key === activity.key);
+    const existing = existingIndex >= 0 ? activities[existingIndex] : null;
+
+    if (incomingTerminalStatus) {
+      terminalStatus = incomingTerminalStatus;
+      finalizeRunningActivities(activities, incomingTerminalStatus);
+    } else if (activity.status === "running") {
+      finalizeRunningActivities(
+        activities,
+        "completed",
+        existing?.status === "running" ? existing : null,
+      );
+    } else if (activity.status === "waiting") {
+      finalizeRunningActivities(activities, "completed");
+    } else if (activity.status === "failed") {
+      finalizeRunningActivities(activities, "failed");
+    } else if (activity.status === "cancelled") {
+      finalizeRunningActivities(activities, "cancelled");
+    }
+
+    if (existing) {
+      existing.repeatCount += 1;
+      existing.log = log;
+      existing.title = activity.title;
+      existing.summary = activity.summary;
+      existing.status = activity.status;
+      existing.importance = activity.importance;
+      existing.sections = mergeSections(existing.sections, activity.sections);
+      activities.splice(existingIndex, 1);
+      activities.push(existing);
       continue;
     }
     activities.push(activity);
   }
   return activities.slice(-limit).reverse();
+}
+
+function finalizeRunningActivities(
+  activities: TimelineActivity[],
+  status: Extract<TimelineStatus, "completed" | "failed" | "cancelled">,
+  except: TimelineActivity | null = null,
+): void {
+  for (const activity of activities) {
+    if (activity !== except && activity.status === "running") activity.status = status;
+  }
+}
+
+function terminalActivityStatus(
+  lifecycleState: string | null,
+): Extract<TimelineStatus, "completed" | "failed" | "cancelled"> | null {
+  if (lifecycleState === "succeeded") return "completed";
+  if (lifecycleState === "failed" || lifecycleState === "blocked") return "failed";
+  if (lifecycleState === "cancelled") return "cancelled";
+  return null;
 }
 
 export function timelineActivity(log: AgentRunLog): TimelineActivity {
@@ -211,7 +259,7 @@ function presentationForLog(
 
 function lifecyclePresentation(state: string): ReturnType<typeof activity> {
   if (state === "queued")
-    return activity("queued", "Queued", "Waiting for an available worker.", "waiting");
+    return activity("queued", "Queued", "Waiting for an available worker.", "running");
   if (state === "running")
     return activity("agent-started", "Agent Started", "Execution has started.", "running");
   if (state === "committing")
@@ -234,6 +282,8 @@ function lifecyclePresentation(state: string): ReturnType<typeof activity> {
     );
   if (state === "cancelled")
     return activity("cancelled", "Execution Cancelled", "The task was cancelled.", "cancelled");
+  if (state === "cancelling")
+    return activity("cancelling", "Cancelling Execution", "Stopping the active task.", "running");
   return activity("executing-task", "Executing Task", "The agent is currently working.", "running");
 }
 
@@ -252,6 +302,11 @@ function hiddenActivity(key: string): ReturnType<typeof activity> {
 
 function lifecycleStateFrom(summary: string): string | null {
   return summary.match(/entered\s+([a-z_]+)/i)?.[1]?.toLowerCase() ?? null;
+}
+
+function lifecycleStateFromLog(log: AgentRunLog): string | null {
+  if (log.label !== "lifecycle") return null;
+  return lifecycleStateFrom(log.message);
 }
 
 function toolOperation(summary: string): string {
