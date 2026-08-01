@@ -185,6 +185,7 @@
     if (activity.status === "failed") return "Failed";
     if (activity.status === "waiting") return "Waiting";
     if (activity.status === "running") return "Running";
+    if (activity.status === "cancelled") return "Cancelled";
     return "Recorded";
   }
 
@@ -402,13 +403,15 @@
 
   <section class="console-section activity-section" aria-label="Activity feed">
     <div class="section-heading static-heading">
-      <span>Latest activity</span><small>{logs.length} event{logs.length === 1 ? "" : "s"}</small>
+      <span>Activity Log</span><small
+        >{latestActivityItems.length} activit{latestActivityItems.length === 1 ? "y" : "ies"}</small
+      >
     </div>
-    <div class="activity-feed">
+    <div class="activity-feed" aria-live="polite">
       {#if latestActivityItems.length === 0}
         <div class="empty-activity">The Agent will show meaningful progress here as it works.</div>
       {:else}
-        {#each latestActivityItems as activity (activity.log.id)}
+        {#each latestActivityItems as activity (activity.id)}
           <article
             class="activity-item"
             class:error={activity.status === "failed"}
@@ -423,14 +426,15 @@
                 <button
                   class="activity-expand"
                   type="button"
-                  aria-label={expandedActivities[activity.log.id]
-                    ? "Hide activity details"
-                    : "Show activity details"}
-                  aria-expanded={expandedActivities[activity.log.id] ?? false}
-                  onclick={() => toggleActivity(activity.log.id)}
+                  aria-label={expandedActivities[activity.id]
+                    ? "Hide Technical Details"
+                    : "Show Technical Details"}
+                  aria-expanded={expandedActivities[activity.id] ?? false}
+                  title="Technical Details"
+                  onclick={() => toggleActivity(activity.id)}
                   ><ChevronDown
                     size={14}
-                    class={expandedActivities[activity.log.id] ? "rotated" : ""}
+                    class={expandedActivities[activity.id] ? "rotated" : ""}
                   /></button
                 >
               </div>
@@ -440,11 +444,13 @@
                   >{relativeTimeLabel(activity.log.at, timelineNow)}</time
                 >
                 <span>{statusText(activity)}</span>
-                {#if activity.repeatCount > 1}<span>{activity.repeatCount} similar updates</span
-                  >{/if}
               </div>
-              {#if expandedActivities[activity.log.id]}
+              {#if expandedActivities[activity.id]}
                 <div class="activity-details">
+                  <h3>Technical Details</h3>
+                  {#if activity.repeatCount > 1}<p>
+                      {activity.repeatCount} related runtime updates were grouped into this activity.
+                    </p>{/if}
                   {#each activity.sections as section (section.title)}
                     <section>
                       <h4>{section.title}</h4>
@@ -1065,6 +1071,20 @@
     border: 1px solid #2b2635;
     border-radius: 10px;
     background: rgba(13, 12, 18, 0.58);
+  }
+  .activity-details > h3,
+  .activity-details > p {
+    margin: 0;
+  }
+  .activity-details > h3 {
+    color: #c8bfd3;
+    font-size: 10px;
+    font-weight: 850;
+  }
+  .activity-details > p {
+    color: #81788c;
+    font-size: 10px;
+    line-height: 1.4;
   }
   .activity-details section {
     display: grid;

@@ -116,20 +116,39 @@ const contextActivity = timelineActivity({
     "- Sections: SUMMARY, EVIDENCE, DETAILS",
   ].join("\n"),
 });
-assertEqual(contextActivity.title, "Preparing execution context", "timeline should explain progress");
+assertEqual(contextActivity.title, "Preparing Task", "timeline should explain progress");
 assertEqual(
   contextActivity.summary,
-  "Workspace, task, evidence, and operator context were prepared for execution.",
+  "Gathering the information needed to begin.",
   "timeline summary should avoid raw runtime labels",
 );
 assertEqual(contextActivity.sections[0].title, "Evidence", "technical evidence should move into details");
 
 const collapsedActivities = timelineActivities([
-  { id: "log-2", at: "04:30:19 AM", tone: "info", label: "runtime", message: "SUMMARY: Agent runtime started." },
-  { id: "log-3", at: "04:30:20 AM", tone: "info", label: "runtime", message: "SUMMARY: Agent runtime started." },
+  {
+    id: "log-2",
+    at: "04:30:19 AM",
+    tone: "info",
+    label: "progress",
+    message:
+      "SUMMARY: Task Session progress: activity.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
+  {
+    id: "log-3",
+    at: "04:30:20 AM",
+    tone: "info",
+    label: "progress",
+    message:
+      "SUMMARY: Task Session progress: text_delta.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
 ]);
-assertEqual(collapsedActivities.length, 1, "repeated runtime updates should collapse");
+assertEqual(collapsedActivities.length, 1, "repeated progress updates should collapse");
 assertEqual(collapsedActivities[0].repeatCount, 2, "collapsed updates should retain count");
+assertEqual(
+  collapsedActivities[0].title,
+  "Executing Task",
+  "progress should describe the business activity",
+);
 assertEqual(
   timelineActivity({
     id: "log-4",
@@ -140,6 +159,113 @@ assertEqual(
   }).status,
   "completed",
   "completed tool activity should not appear as still running",
+);
+
+const lifecycleActivities = timelineActivities([
+  {
+    id: "queued",
+    at: "04:30:01 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered queued.",
+  },
+  {
+    id: "running",
+    at: "04:30:02 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered running.",
+  },
+  {
+    id: "progress",
+    at: "04:30:03 AM",
+    tone: "info",
+    label: "progress",
+    message: "SUMMARY: Task Session progress.\nDETAILS:\n- Progress phase: executing_runtime",
+  },
+  {
+    id: "committing",
+    at: "04:30:04 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered committing.",
+  },
+  {
+    id: "succeeded",
+    at: "04:30:05 AM",
+    tone: "info",
+    label: "lifecycle",
+    message: "SUMMARY: Task Session entered succeeded.",
+  },
+]);
+assertEqual(
+  lifecycleActivities.map(({ title }) => title),
+  ["Execution Completed", "Saving Results", "Executing Task", "Agent Started", "Queued"],
+  "lifecycle events should become concise user activities with the latest action first",
+);
+assertEqual(
+  lifecycleActivities.some(({ title, summary }) =>
+    /task session|runtime|lifecycle|projection/i.test(`${title} ${summary}`),
+  ),
+  false,
+  "collapsed activities should not expose runtime terminology",
+);
+
+const jiraActivities = timelineActivities([
+  {
+    id: "jira-start",
+    at: "04:30:06 AM",
+    tone: "info",
+    label: "tool",
+    message: "SUMMARY: Tool started: Reading Jira issue APP-1.\nEVIDENCE:\n- Assignment attempt: 2",
+  },
+  {
+    id: "jira-complete",
+    at: "04:30:07 AM",
+    tone: "info",
+    label: "tool",
+    message:
+      "SUMMARY: Tool completed; task still running: Reading Jira issue APP-1.\nEVIDENCE:\n- Event sequence: 7",
+  },
+]);
+assertEqual(jiraActivities.length, 1, "tool start and completion should update one activity");
+assertEqual(
+  jiraActivities[0].title,
+  "Reading Jira Ticket",
+  "tool context should become a business action",
+);
+assertEqual(
+  jiraActivities[0].status,
+  "completed",
+  "merged tool activity should use its latest status",
+);
+assertEqual(
+  jiraActivities[0].sections.some((section) =>
+    section.lines.some((line) => /Assignment attempt|Event sequence/.test(line)),
+  ),
+  true,
+  "technical metadata should remain available in expanded sections",
+);
+
+assertEqual(
+  timelineActivities([
+    {
+      id: "runtime",
+      at: "04:30:08 AM",
+      tone: "info",
+      label: "runtime",
+      message: "SUMMARY: Agent runtime started.",
+    },
+    {
+      id: "board",
+      at: "04:30:09 AM",
+      tone: "info",
+      label: "board",
+      message: "SUMMARY: Board updated.",
+    },
+  ]).length,
+  0,
+  "internal runtime and board synchronization events should not create activities",
 );
 if (workspaceContextRevision("context a") === workspaceContextRevision("context b")) {
   throw new Error("workspace context revisions should change with context content");
