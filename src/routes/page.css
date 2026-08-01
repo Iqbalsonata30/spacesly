@@ -4137,3 +4137,162 @@ dd a:hover {
     width: 100%;
   }
 }
+
+/* Premium light surfaces. Dark tokens and component styling remain unchanged. */
+:root[data-resolved-theme="light"] .stage {
+  background:
+    radial-gradient(circle at 12% 15%, rgba(165, 197, 255, 0.32), transparent 36%),
+    radial-gradient(circle at 88% 88%, rgba(242, 190, 238, 0.24), transparent 34%),
+    linear-gradient(135deg, #edf3fc 0%, #f7f9fd 52%, #f8f2fc 100%);
+}
+
+:root[data-resolved-theme="light"] .window {
+  background: transparent;
+}
+
+:root[data-resolved-theme="light"] .titlebar,
+:root[data-resolved-theme="light"] .statusbar {
+  border-color: rgba(91, 116, 160, 0.12);
+  background: rgba(255, 255, 255, 0.68);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(18px) saturate(125%);
+}
+
+:root[data-resolved-theme="light"] button,
+:root[data-resolved-theme="light"] input,
+:root[data-resolved-theme="light"] select,
+:root[data-resolved-theme="light"] textarea {
+  border-radius: 11px;
+}
+
+:root[data-resolved-theme="light"] input,
+:root[data-resolved-theme="light"] select,
+:root[data-resolved-theme="light"] textarea {
+  border-color: rgba(91, 116, 160, 0.2);
+  background: rgba(255, 255, 255, 0.78);
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+:root[data-resolved-theme="light"] input::placeholder,
+:root[data-resolved-theme="light"] textarea::placeholder {
+  color: var(--text-dim);
+}
+
+:root[data-resolved-theme="light"] input:focus,
+:root[data-resolved-theme="light"] select:focus,
+:root[data-resolved-theme="light"] textarea:focus,
+:root[data-resolved-theme="light"] input:focus-visible,
+:root[data-resolved-theme="light"] select:focus-visible,
+:root[data-resolved-theme="light"] textarea:focus-visible {
+  border-color: var(--focus-border);
+  background: rgba(255, 255, 255, 0.96);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+:root[data-resolved-theme="light"] .workspace-picker,
+:root[data-resolved-theme="light"] .mode-switch,
+:root[data-resolved-theme="light"] .worker-pill {
+  border-color: rgba(91, 116, 160, 0.16);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+:root[data-resolved-theme="light"] .sync-button,
+:root[data-resolved-theme="light"] .save-settings,
+:root[data-resolved-theme="light"] .new-skill-button,
+:root[data-resolved-theme="light"] .skill-save {
+  border-color: #4563bf;
+  background: #4563bf;
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(94, 127, 232, 0.18);
+}
+
+:root[data-resolved-theme="light"] .sync-button:hover:not(:disabled),
+:root[data-resolved-theme="light"] .save-settings:hover:not(:disabled),
+:root[data-resolved-theme="light"] .new-skill-button:hover:not(:disabled),
+:root[data-resolved-theme="light"] .skill-save:hover:not(:disabled) {
+  border-color: #3f59ae;
+  background: #3f59ae;
+  color: #fff;
+}
+
+:root[data-resolved-theme="light"] .sync-button:active:not(:disabled),
+:root[data-resolved-theme="light"] .save-settings:active:not(:disabled),
+:root[data-resolved-theme="light"] .new-skill-button:active:not(:disabled),
+:root[data-resolved-theme="light"] .skill-save:active:not(:disabled) {
+  border-color: #354b98;
+  background: #354b98;
+}
+
+:root[data-resolved-theme="light"] .settings-panel,
+:root[data-resolved-theme="light"] .skill-editor-dialog,
+:root[data-resolved-theme="light"] .detail-popover,
+:root[data-resolved-theme="light"] .confirm-panel,
+:root[data-resolved-theme="light"] .new-task-popover,
+:root[data-resolved-theme="light"] .agent-console {
+  border-color: rgba(91, 116, 160, 0.16);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: var(--shadow-dialog);
+  backdrop-filter: blur(20px) saturate(125%);
+}
+
+:root[data-resolved-theme="light"] .settings-card,
+:root[data-resolved-theme="light"] .lane,
+:root[data-resolved-theme="light"] .task-card,
+:root[data-resolved-theme="light"] .endpoint-card,
+:root[data-resolved-theme="light"] .source-card,
+:root[data-resolved-theme="light"] .inherited-card,
+:root[data-resolved-theme="light"] .theme-card,
+:root[data-resolved-theme="light"] .notification-card,
+:root[data-resolved-theme="light"] .state-panel,
+:root[data-resolved-theme="light"] .skill-library-list article {
+  border-color: rgba(91, 116, 160, 0.14);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow:
+    0 1px 2px rgba(40, 59, 97, 0.04),
+    0 10px 30px rgba(40, 59, 97, 0.06);
+}
+
+:root[data-resolved-theme="light"] .task-card:hover,
+:root[data-resolved-theme="light"] .skill-library-list article:hover,
+:root[data-resolved-theme="light"] .notification-card:hover {
+  border-color: rgba(94, 127, 232, 0.28);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 2px 4px rgba(40, 59, 97, 0.05),
+    0 14px 36px rgba(40, 59, 97, 0.09);
+}
+
+:root[data-resolved-theme="light"] .settings-nav {
+  border-color: rgba(91, 116, 160, 0.1);
+  background: rgba(248, 251, 255, 0.66);
+}
+
+:root[data-resolved-theme="light"] .settings-nav button {
+  border-radius: 11px;
+}
+
+:root[data-resolved-theme="light"] .settings-nav button:hover,
+:root[data-resolved-theme="light"] .settings-nav button.active,
+:root[data-resolved-theme="light"] .mode-switch button.active {
+  background: #e7edff;
+  color: var(--accent);
+}
+
+:root[data-resolved-theme="light"] .settings-nav button.active {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+:root[data-resolved-theme="light"] .lane-header,
+:root[data-resolved-theme="light"] .settings-card > header,
+:root[data-resolved-theme="light"] .agent-console header,
+:root[data-resolved-theme="light"] .agent-console footer {
+  border-color: rgba(91, 116, 160, 0.11);
+  background: rgba(248, 251, 255, 0.58);
+}

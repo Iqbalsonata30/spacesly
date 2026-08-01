@@ -81,12 +81,78 @@
   --shadow-dialog: 0 28px 80px color-mix(in srgb, #000 46%, transparent);
 }
 
+:root[data-resolved-theme="light"] {
+  --surface: rgba(245, 248, 253, 0.82);
+  --surface-raised: rgba(255, 255, 255, 0.78);
+  --surface-overlay: rgba(255, 255, 255, 0.92);
+  --surface-inset: rgba(248, 251, 255, 0.88);
+  --surface-hover: rgba(94, 127, 232, 0.08);
+  --surface-selected: #e7edff;
+  --border-subtle: rgba(91, 116, 160, 0.14);
+  --border-strong: rgba(91, 116, 160, 0.24);
+  --border-interactive: rgba(94, 127, 232, 0.42);
+  --focus-ring: rgba(94, 127, 232, 0.28);
+  --focus-border: #5e7fe8;
+  --selection-bg: rgba(94, 127, 232, 0.16);
+  --selection-border: rgba(94, 127, 232, 0.52);
+  --disabled-opacity: 0.54;
+  --success-bg: #e6f5ee;
+  --success-border: rgba(62, 152, 119, 0.3);
+  --warning: #bd8735;
+  --warning-bg: #fff2d8;
+  --warning-border: rgba(189, 135, 53, 0.3);
+  --danger-bg: #fcebed;
+  --danger-border: rgba(207, 96, 106, 0.3);
+  --info-bg: #e7f1fd;
+  --info-border: rgba(79, 128, 188, 0.3);
+  --progress-track: rgba(91, 116, 160, 0.12);
+  --dialog-bg: rgba(255, 255, 255, 0.94);
+  --menu-bg: rgba(255, 255, 255, 0.96);
+  --tooltip-bg: rgba(255, 255, 255, 0.96);
+  --shadow-popover: 0 1px 2px rgba(40, 59, 97, 0.05), 0 12px 36px rgba(40, 59, 97, 0.12);
+  --shadow-dialog: 0 2px 8px rgba(40, 59, 97, 0.06), 0 28px 80px rgba(40, 59, 97, 0.16);
+}
+
 body {
   margin: 0;
   background: var(--bg-base);
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-size: 14px;
+}
+
+:root[data-resolved-theme="light"] body {
+  background:
+    radial-gradient(circle at 12% 15%, rgba(165, 197, 255, 0.32), transparent 36%),
+    radial-gradient(circle at 88% 88%, rgba(242, 190, 238, 0.24), transparent 34%),
+    linear-gradient(135deg, #edf3fc 0%, #f7f9fd 52%, #f8f2fc 100%);
+  background-attachment: fixed;
+}
+
+:root[data-resolved-theme="light"] {
+  scrollbar-color: rgba(98, 115, 145, 0.42) transparent;
+  scrollbar-width: thin;
+}
+
+:root[data-resolved-theme="light"] ::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+:root[data-resolved-theme="light"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:root[data-resolved-theme="light"] ::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(98, 115, 145, 0.38);
+  background-clip: padding-box;
+}
+
+:root[data-resolved-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(75, 94, 126, 0.56);
+  background-clip: padding-box;
 }
 
 ::selection {
