@@ -85,6 +85,16 @@ pub struct ConversationMessageRecord {
     pub created_at: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationHistoryRecord {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub messages: Vec<ConversationMessageRecord>,
+}
+
 /// One durable user or agent message visible to the Chat model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChatConversationMessage {
@@ -723,6 +733,75 @@ impl ExecutionStore {
             );
         }
         Ok(conversations)
+    }
+
+    pub fn load_conversation_history(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationHistoryRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT conversation_id, workspace_id, title, created_at, updated_at
+                 FROM conversations WHERE workspace_id = ?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )
+            .map_err(|error| format!("Failed to prepare conversation history query: {error}"))?;
+        let conversations = statement
+            .query_map(params![workspace_id, limit.max(1) as u64], |row| {
+                Ok(ConversationRecord {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    title: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("Failed to query conversation history: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to decode conversation history: {error}"))?;
+
+        conversations
+            .into_iter()
+            .map(|conversation| {
+                let mut message_statement = connection
+                    .prepare(
+                        "SELECT message_id, conversation_id, sequence, role, text, created_at
+                         FROM conversation_messages
+                         WHERE conversation_id = ?1 ORDER BY sequence",
+                    )
+                    .map_err(|error| {
+                        format!("Failed to prepare conversation history messages: {error}")
+                    })?;
+                let messages = message_statement
+                    .query_map(params![conversation.id], |row| {
+                        Ok(ConversationMessageRecord {
+                            id: row.get(0)?,
+                            conversation_id: row.get(1)?,
+                            sequence: row.get(2)?,
+                            role: row.get(3)?,
+                            text: row.get(4)?,
+                            created_at: row.get(5)?,
+                        })
+                    })
+                    .map_err(|error| {
+                        format!("Failed to query conversation history messages: {error}")
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        format!("Failed to decode conversation history messages: {error}")
+                    })?;
+                Ok(ConversationHistoryRecord {
+                    id: conversation.id,
+                    workspace_id: conversation.workspace_id,
+                    title: conversation.title,
+                    created_at: conversation.created_at,
+                    updated_at: conversation.updated_at,
+                    messages,
+                })
+            })
+            .collect()
     }
 
     pub fn load_conversation_messages(
@@ -1830,6 +1909,31 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn conversation_history_batches_recent_conversations_and_messages() {
+        let store = test_store();
+        append(&store, "conversation-a", "a-user", "user", "A");
+        append(&store, "conversation-a", "a-agent", "agent", "A reply");
+        append(&store, "conversation-b", "b-user", "user", "B");
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET updated_at = CASE conversation_id
+                   WHEN 'conversation-a' THEN 1 ELSE 2 END",
+                [],
+            )
+            .unwrap();
+
+        let history = store.load_conversation_history("workspace-a", 1).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "conversation-b");
+        assert_eq!(history[0].messages.len(), 1);
+        assert_eq!(history[0].messages[0].text, "B");
     }
 
     #[test]

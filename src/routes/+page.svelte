@@ -157,7 +157,7 @@
     deleteGlobalEnvironmentVariable,
     deleteRecoverySnapshot,
     listDirectory,
-    listConversations,
+    loadConversationHistory,
     loadConversationMessages,
     listRecoverySnapshots,
     lspCloseDocument,
@@ -444,6 +444,7 @@
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
   let durableConversationWorkspaceId = $state<string | null>(null);
+  let durableConversationHydrationTimer: ReturnType<typeof setTimeout> | null = null;
   let filesStateHydrated = $state(false);
   let selectedServerId = $state(initialSettings.jira.serverId);
   let workspaceMode = $state<WorkspaceMode>(initialUiState.workspaceMode);
@@ -732,6 +733,7 @@
       document.removeEventListener("visibilitychange", visibilityChange);
       for (const unregister of unregisterEditorCommands) unregister();
       if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
+      if (durableConversationHydrationTimer) clearTimeout(durableConversationHydrationTimer);
       unlistenWindowClose?.();
       unlistenWindowClose = null;
       unlistenWorkspaceFileChanges?.();
@@ -758,7 +760,7 @@
 
   $effect(() => {
     if (!workspace || durableConversationWorkspaceId === workspace.id) return;
-    void hydrateDurableConversations(workspace.id);
+    scheduleDurableConversationHydration(workspace.id);
   });
 
   $effect(() => {
@@ -3859,12 +3861,22 @@
     }
   }
 
-  async function hydrateDurableConversations(workspaceId: string) {
+  function scheduleDurableConversationHydration(workspaceId: string, attempt = 0) {
+    if (durableConversationHydrationTimer) clearTimeout(durableConversationHydrationTimer);
+    durableConversationWorkspaceId = workspaceId;
+    const delay = attempt === 0 ? 300 : 1_000 * 2 ** (attempt - 1);
+    durableConversationHydrationTimer = setTimeout(() => {
+      durableConversationHydrationTimer = null;
+      if (workspace?.id !== workspaceId) return;
+      void hydrateDurableConversations(workspaceId, attempt);
+    }, delay);
+  }
+
+  async function hydrateDurableConversations(workspaceId: string, attempt: number) {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
     const hydrationStartedAt = Date.now();
-    durableConversationWorkspaceId = workspaceId;
     try {
-      const records = await listConversations(workspaceId);
+      const records = await loadConversationHistory(workspaceId, MAX_CHAT_SESSIONS + 1);
       if (records.length === 0) {
         await importConversations(
           workspaceId,
@@ -3887,7 +3899,6 @@
       }
       const hydrated = await Promise.all(
         retainedRecords.map(async (record) => {
-          const messages = await loadConversationMessages(workspaceId, record.id);
           const existing = workspaceChatSessions.find((session) => session.id === record.id);
           const fallback = existing ?? createWorkspaceChatSession([], record.title);
           return {
@@ -3896,7 +3907,7 @@
             title: record.title,
             createdAt: record.created_at,
             updatedAt: record.updated_at,
-            messages: messages.map(({ id, role, text }) => ({ id, role, text })),
+            messages: record.messages.map(({ id, role, text }) => ({ id, role, text })),
           } satisfies ChatSessionState;
         }),
       );
@@ -3910,11 +3921,13 @@
       saveUiState();
       void recoverRetainedChatTaskSessions(workspaceId, hydrationStartedAt);
     } catch (reason: unknown) {
-      durableConversationWorkspaceId = null;
-      appNotice = {
-        tone: "error",
-        message: reason instanceof Error ? reason.message : String(reason),
-      };
+      console.warn(
+        "Conversation history hydration failed; retaining local cached sessions.",
+        reason,
+      );
+      if (attempt < 2 && workspace?.id === workspaceId) {
+        scheduleDurableConversationHydration(workspaceId, attempt + 1);
+      }
     }
   }
 

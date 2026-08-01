@@ -19,6 +19,7 @@ export type {
   AiWorkerTask,
   AiWorkerTaskResult,
   ConversationMessageRecord,
+  ConversationHistoryRecord,
   ConversationRecord,
   ExecutionContract,
 } from "$lib/ipc/agent";
@@ -40,6 +41,7 @@ export {
   importConversations,
   pruneConversations,
   listConversations,
+  loadConversationHistory,
   loadConversationMessages,
 } from "$lib/ipc/agent";
 export type {

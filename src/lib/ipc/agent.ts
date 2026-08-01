@@ -244,10 +244,25 @@ export interface ConversationMessageRecord {
   created_at: number;
 }
 
+export interface ConversationHistoryRecord extends ConversationRecord {
+  messages: ConversationMessageRecord[];
+}
+
 export async function listConversations(workspaceId: string): Promise<ConversationRecord[]> {
   return invokeWithPolicy<ConversationRecord[]>(
     "list_conversations",
     { workspaceId },
+    IPC_POLICIES.fileRead,
+  );
+}
+
+export async function loadConversationHistory(
+  workspaceId: string,
+  limit: number,
+): Promise<ConversationHistoryRecord[]> {
+  return invokeWithPolicy<ConversationHistoryRecord[]>(
+    "load_conversation_history",
+    { workspaceId, limit },
     IPC_POLICIES.fileRead,
   );
 }

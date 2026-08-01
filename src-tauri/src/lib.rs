@@ -737,6 +737,20 @@ async fn list_conversations(
 }
 
 #[tauri::command]
+async fn load_conversation_history(
+    workspace_id: String,
+    limit: usize,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<Vec<infrastructure::execution_store::ConversationHistoryRecord>, String> {
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.load_conversation_history(&workspace_id, limit.min(50))
+    })
+    .await
+    .map_err(|error| format!("Conversation history task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn load_conversation_messages(
     workspace_id: String,
     conversation_id: String,
@@ -2683,6 +2697,7 @@ pub fn run() {
             cancel_ai_worker_task,
             cancel_ai_run,
             list_conversations,
+            load_conversation_history,
             load_conversation_messages,
             append_conversation_message,
             import_conversations,
