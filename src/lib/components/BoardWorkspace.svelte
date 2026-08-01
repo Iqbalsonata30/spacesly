@@ -250,7 +250,7 @@
 <style>
   .running-task-list {
     position: relative;
-    color: #aaa1c3;
+    color: var(--text-secondary);
     font-size: 12px;
   }
   .running-task-list summary {
@@ -265,10 +265,10 @@
     display: grid;
     width: 280px;
     padding: 8px;
-    border: 1px solid #2a2835;
+    border: 1px solid var(--border-strong);
     border-radius: 10px;
-    background: #111017;
-    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+    background: var(--menu-bg);
+    box-shadow: var(--shadow-popover);
   }
   .running-task-list button {
     display: flex;
@@ -277,12 +277,12 @@
     border: 0;
     padding: 8px;
     background: transparent;
-    color: #e8e2ef;
+    color: var(--text-bright);
     text-align: left;
   }
   .running-task-list button strong {
     flex: 0 0 auto;
-    color: #95b082;
+    color: var(--success);
     font-size: 10px;
   }
 </style>

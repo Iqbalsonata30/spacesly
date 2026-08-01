@@ -5,9 +5,8 @@
 
   let { children } = $props();
 
-  initTheme();
-
   onMount(() => {
+    const destroyThemeManager = initTheme();
     function suppress(e: ErrorEvent) {
       if (e.message?.startsWith("ResizeObserver loop")) {
         e.stopImmediatePropagation();
@@ -15,7 +14,10 @@
     }
 
     window.addEventListener("error", suppress);
-    return () => window.removeEventListener("error", suppress);
+    return () => {
+      destroyThemeManager();
+      window.removeEventListener("error", suppress);
+    };
   });
 </script>
 

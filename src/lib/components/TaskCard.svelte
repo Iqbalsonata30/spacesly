@@ -200,10 +200,10 @@
     contain: layout paint;
     content-visibility: auto;
     contain-intrinsic-size: 220px;
-    border: 1px solid #27252f;
+    border: 1px solid var(--border-subtle);
     border-radius: 8px;
     padding: 16px;
-    background: #1a1920;
+    background: var(--surface-raised);
     cursor: grab;
     color: inherit;
     font: inherit;
@@ -217,8 +217,8 @@
   }
 
   .task-card:hover {
-    border-color: #34313d;
-    background: #1d1b23;
+    border-color: var(--border-strong);
+    background: var(--surface-hover);
   }
 
   .task-card:active {
@@ -226,13 +226,13 @@
   }
 
   .task-card:focus-visible {
-    outline: 2px solid #91aec2;
+    outline: 2px solid var(--focus-border);
     outline-offset: 2px;
   }
 
   .task-card.selected {
-    border-color: #91aec2;
-    box-shadow: 0 0 0 2px rgba(145, 174, 194, 0.34);
+    border-color: var(--selection-border);
+    box-shadow: 0 0 0 2px var(--focus-ring);
   }
 
   .task-status {
@@ -240,7 +240,7 @@
     align-items: center;
     gap: 10px;
     margin-bottom: 8px;
-    color: #95b082;
+    color: var(--success);
     font-size: 13px;
     font-weight: 800;
     letter-spacing: 0.12em;
@@ -251,12 +251,12 @@
     width: 9px;
     height: 9px;
     border-radius: 999px;
-    background: #8daa7a;
+    background: var(--success);
   }
 
   .task-status em {
     margin-left: auto;
-    color: #aaa1c3;
+    color: var(--text-secondary);
     font-style: normal;
     letter-spacing: 0;
   }
@@ -266,18 +266,18 @@
     margin: -2px 0 10px;
     overflow: hidden;
     border-radius: 999px;
-    background: #302d38;
+    background: var(--progress-track);
   }
 
   .task-progress span {
     display: block;
     height: 100%;
-    background: #8daa7a;
+    background: var(--progress-fill);
   }
 
   h3 {
     margin: 0;
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: clamp(17px, 1.35vw, 21px);
     line-height: 1.2;
     overflow-wrap: anywhere;
@@ -287,7 +287,7 @@
     display: -webkit-box;
     margin: 12px 0 0;
     overflow: hidden;
-    color: #aaa1c3;
+    color: var(--text-secondary);
     font-size: 16px;
     line-height: 1.45;
     line-clamp: 3;
@@ -296,7 +296,7 @@
   }
 
   p a {
-    color: #b8d6e4;
+    color: var(--text-link);
     text-decoration: none;
   }
 
@@ -313,7 +313,7 @@
   }
 
   .ticket-link-label {
-    color: #b8d6e4;
+    color: var(--text-link);
     font-family: var(--font-mono);
     font-size: 13px;
   }
@@ -328,8 +328,8 @@
   .labels span {
     border-radius: 999px;
     padding: 3px 8px;
-    background: #24232d;
-    color: #8f88a8;
+    background: var(--surface-selected);
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 800;
   }
@@ -348,10 +348,10 @@
     min-width: 0;
     height: 36px;
     padding: 0 14px;
-    border: 1px solid #34313d;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: #22212a;
-    color: #77718a;
+    background: var(--surface-hover);
+    color: var(--text-dim);
     font-weight: 800;
     white-space: nowrap;
     transition:
@@ -366,30 +366,30 @@
   }
 
   .actions .queue.active {
-    border-color: rgba(149, 176, 130, 0.5);
-    background: rgba(52, 73, 46, 0.42);
-    color: #cce2bd;
+    border-color: var(--success-border);
+    background: var(--success-bg);
+    color: var(--success);
     cursor: default;
   }
 
   .actions .queue.blocked {
-    border-color: rgba(240, 176, 170, 0.32);
-    background: rgba(91, 42, 42, 0.22);
-    color: #f0b0aa;
+    border-color: var(--danger-border);
+    background: var(--danger-bg);
+    color: var(--danger);
     cursor: default;
   }
 
   .actions .start {
     cursor: pointer;
-    border-color: #52606a;
-    background: #252a31;
-    color: #b8d6e4;
+    border-color: var(--border-interactive);
+    background: var(--selection-bg);
+    color: var(--text-link);
   }
 
   .actions .start.retry {
-    border-color: rgba(240, 176, 170, 0.44);
-    background: rgba(91, 42, 42, 0.34);
-    color: #f0b0aa;
+    border-color: var(--danger-border);
+    background: var(--danger-bg);
+    color: var(--danger);
   }
 
   .actions .start[aria-disabled="true"] {
@@ -398,16 +398,16 @@
   }
 
   .actions .manual-done {
-    border-color: rgba(123, 198, 123, 0.42);
-    background: rgba(45, 83, 52, 0.28);
-    color: #a9dca9;
+    border-color: var(--success-border);
+    background: var(--success-bg);
+    color: var(--success);
     cursor: pointer;
   }
 
   .actions .delete {
-    border-color: rgba(240, 176, 170, 0.26);
-    background: rgba(91, 42, 42, 0.18);
-    color: #f0b0aa;
+    border-color: var(--danger-border);
+    background: color-mix(in srgb, var(--danger-bg) 72%, transparent);
+    color: var(--danger);
     cursor: pointer;
   }
 

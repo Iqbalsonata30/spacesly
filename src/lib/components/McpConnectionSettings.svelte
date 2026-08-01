@@ -306,14 +306,14 @@
   }
 
   .type-config {
-    border-top: 1px solid #2a2832;
+    border-top: 1px solid var(--border-subtle);
     padding-top: 14px;
   }
 
   .section-kicker,
   label span {
     margin: 0 0 6px;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.14em;
@@ -322,7 +322,7 @@
 
   h3 {
     margin: 0;
-    color: #f1edf5;
+    color: var(--text-bright);
   }
 
   label {
@@ -333,15 +333,11 @@
   input,
   select,
   textarea {
-    color-scheme: dark;
-    border: 1px solid #25232c;
+    border: 1px solid var(--border-subtle);
     border-radius: 9px;
     padding: 11px 12px;
-    background: linear-gradient(180deg, #0b0b10, #09090d);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.025),
-      0 1px 0 rgba(0, 0, 0, 0.38);
-    color: #cfc8dc;
+    background: var(--surface-inset);
+    color: var(--text-primary);
     font: inherit;
   }
 
@@ -349,17 +345,14 @@
     height: 42px;
     appearance: none;
     background-image:
-      linear-gradient(45deg, transparent 50%, #716a83 50%),
-      linear-gradient(135deg, #716a83 50%, transparent 50%),
-      linear-gradient(180deg, #0b0b10, #09090d);
+      linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+      linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
     background-position:
       calc(100% - 18px) 18px,
-      calc(100% - 13px) 18px,
-      0 0;
+      calc(100% - 13px) 18px;
     background-size:
       5px 5px,
-      5px 5px,
-      100% 100%;
+      5px 5px;
     background-repeat: no-repeat;
     padding-right: 34px;
   }
@@ -367,16 +360,14 @@
   input:focus,
   select:focus,
   textarea:focus {
-    border-color: rgba(184, 214, 228, 0.42);
-    box-shadow:
-      0 0 0 3px rgba(184, 214, 228, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    border-color: var(--focus-border);
+    box-shadow: 0 0 0 3px var(--focus-ring);
     outline: none;
   }
 
   input::placeholder,
   textarea::placeholder {
-    color: #4e485c;
+    color: var(--text-muted);
   }
 
   textarea {
@@ -394,17 +385,16 @@
   .inherited-card {
     display: grid;
     gap: 12px;
-    border: 1px solid rgba(184, 214, 228, 0.18);
+    border: 1px solid var(--info-border);
     border-radius: 14px;
     padding: 14px;
     background:
-      radial-gradient(circle at top right, rgba(184, 214, 228, 0.12), transparent 34%),
-      linear-gradient(135deg, rgba(37, 42, 49, 0.72), rgba(17, 16, 22, 0.74));
+      radial-gradient(circle at top right, var(--info-bg), transparent 34%), var(--surface-raised);
   }
 
   .inherited-card p {
     margin: 0;
-    color: #aaa1c3;
+    color: var(--text-secondary);
     font-size: 13px;
     line-height: 1.45;
   }
@@ -419,14 +409,14 @@
     display: grid;
     gap: 5px;
     min-width: 0;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-subtle);
     border-radius: 10px;
     padding: 10px;
-    background: rgba(9, 9, 13, 0.42);
+    background: var(--surface-inset);
   }
 
   .inherited-grid strong {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.14em;
@@ -435,7 +425,7 @@
 
   .inherited-grid code {
     overflow: hidden;
-    color: #b8d6e4;
+    color: var(--text-link);
     font-family: var(--font-mono);
     font-size: 12px;
     text-overflow: ellipsis;

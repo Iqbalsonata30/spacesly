@@ -84,10 +84,9 @@
     box-sizing: border-box;
     min-height: 48px;
     padding: 5px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-subtle);
     border-radius: 15px;
-    background: linear-gradient(180deg, var(--bg-titlebar), var(--bg-card));
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    background: linear-gradient(180deg, var(--surface-overlay), var(--surface-raised));
     overflow: hidden;
   }
 
@@ -96,8 +95,7 @@
     inset: 5px;
     width: calc((100% - 10px) / var(--segment-count));
     border-radius: 11px;
-    background: linear-gradient(180deg, #2a3038, #20262d);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    background: var(--surface-selected);
     transform: translateX(calc(var(--segment-index) * 100%));
     transition:
       transform 200ms ease,
@@ -132,20 +130,20 @@
   }
 
   button:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--surface-hover);
     color: var(--text-bright);
   }
 
   button.active {
     color: var(--text-bright);
-    background: rgba(255, 255, 255, 0.025);
+    background: var(--selection-bg);
   }
 
   button:focus-visible {
     outline: none;
     box-shadow:
-      inset 0 0 0 1px rgba(184, 214, 228, 0.25),
-      0 0 0 3px rgba(184, 214, 228, 0.18);
+      inset 0 0 0 1px var(--focus-border),
+      0 0 0 3px var(--focus-ring);
   }
 
   .segmented-label {
@@ -163,8 +161,8 @@
     height: 20px;
     padding: 0 7px;
     border-radius: 999px;
-    background: #22344a;
-    color: #b8d6e4;
+    background: var(--info-bg);
+    color: var(--info);
     font-size: 11px;
     font-weight: 900;
     line-height: 1;

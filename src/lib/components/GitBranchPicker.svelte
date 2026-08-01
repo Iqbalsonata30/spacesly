@@ -144,15 +144,14 @@
     box-sizing: border-box;
     min-height: 46px;
     padding: 0 12px 0 10px;
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border-strong);
     border-radius: 13px;
-    background: linear-gradient(180deg, #22212a, #1b1a21);
+    background: linear-gradient(180deg, var(--surface-overlay), var(--surface-raised));
     color: var(--text-bright);
     font: inherit;
     font-size: 12px;
     font-weight: 850;
     cursor: pointer;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     transition:
       border-color 180ms ease,
       background-color 180ms ease,
@@ -163,12 +162,10 @@
 
   .branch-button:hover:not(:disabled),
   .branch-button:focus-visible:not(:disabled) {
-    border-color: #52606a;
-    background: linear-gradient(180deg, #2a3038, #20262d);
-    color: #f1edf5;
-    box-shadow:
-      0 0 0 3px rgba(184, 214, 228, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    border-color: var(--focus-border);
+    background: var(--surface-hover);
+    color: var(--text-bright);
+    box-shadow: 0 0 0 3px var(--focus-ring);
   }
 
   .branch-button:active:not(:disabled) {
@@ -217,8 +214,8 @@
     width: 28px;
     height: 28px;
     border-radius: 9px;
-    background: rgba(31, 30, 39, 0.9);
-    color: var(--accent);
+    background: var(--surface-inset);
+    color: var(--text-link);
   }
 
   .branch-button-indicator {
@@ -241,7 +238,7 @@
     position: fixed;
     inset: 0;
     z-index: 15;
-    background: rgba(9, 9, 13, 0.32);
+    background: var(--overlay-bg);
     backdrop-filter: blur(2px);
   }
 
@@ -257,10 +254,10 @@
     box-sizing: border-box;
     max-height: min(520px, calc(100vh - 220px));
     overflow: hidden;
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border-strong);
     border-radius: 14px;
-    background: linear-gradient(180deg, var(--bg-titlebar), #17161c);
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
+    background: var(--dialog-bg);
+    box-shadow: var(--shadow-dialog);
   }
 
   .branch-picker header {
@@ -268,9 +265,9 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-subtle);
     padding: 12px 14px;
-    background: linear-gradient(180deg, var(--bg-titlebar), var(--bg-card));
+    background: linear-gradient(180deg, var(--surface-overlay), var(--surface-raised));
   }
 
   .branch-picker header > div {
@@ -304,9 +301,9 @@
     width: 32px;
     height: 32px;
     padding: 0;
-    border-color: var(--border-light);
-    background: var(--bg-card);
-    color: var(--accent);
+    border-color: var(--border-strong);
+    background: var(--surface-raised);
+    color: var(--text-link);
   }
 
   .branch-picker input {
@@ -315,9 +312,9 @@
     box-sizing: border-box;
     height: 42px;
     border: 0;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-subtle);
     padding: 0 14px;
-    background: #111016;
+    background: var(--surface-inset);
     color: var(--text-bright);
     font: inherit;
     outline: none;
@@ -327,11 +324,16 @@
     color: var(--text-dim);
   }
 
+  .branch-picker input:focus-visible {
+    border-color: var(--focus-border);
+    box-shadow: inset 0 0 0 2px var(--focus-border);
+  }
+
   .branch-picker-warning {
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-subtle);
     padding: 9px 14px;
-    background: rgba(240, 209, 137, 0.1);
-    color: #f0d189;
+    background: var(--warning-bg);
+    color: var(--warning);
     font-size: 12px;
     font-weight: 850;
   }
@@ -360,8 +362,8 @@
   .branch-picker-list button:hover:not(:disabled),
   .branch-picker-list button:focus-visible:not(:disabled),
   .branch-picker-list button.active {
-    border-color: #52606a;
-    background: #20262d;
+    border-color: var(--selection-border);
+    background: var(--surface-selected);
   }
 
   .branch-picker-list strong {

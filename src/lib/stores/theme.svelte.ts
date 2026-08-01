@@ -1,36 +1,128 @@
 import {
   themes,
   defaultThemeId,
-  type ThemeId,
-  type ThemeDefinition,
-  type TerminalColors,
   type EditorColors,
+  type TerminalColors,
+  type ThemeDefinition,
+  type ThemeId,
 } from "$lib/themes";
+import {
+  parseThemeMode,
+  resolveThemeMode,
+  type ResolvedTheme,
+  type ThemeMode,
+} from "$lib/themeMode";
+import { SvelteSet } from "svelte/reactivity";
 
-const STORAGE_KEY = "spacesly-theme";
+const THEME_STORAGE_KEY = "spacesly-theme";
 const MODE_STORAGE_KEY = "spacesly-color-mode";
 
-export type ColorMode = "dark" | "light" | "system";
+export type ThemeSnapshot = {
+  id: ThemeId;
+  mode: ThemeMode;
+  resolvedTheme: ResolvedTheme;
+  theme: ThemeDefinition;
+};
 
-// ── Reactive state ────────────────────────────────────────
+type ThemeListener = (snapshot: ThemeSnapshot) => void;
 
 let activeId = $state<ThemeId>(readStoredTheme());
-let colorMode = $state<ColorMode>(readStoredColorMode());
+let mode = $state<ThemeMode>(readStoredMode());
+let systemTheme = $state<ResolvedTheme>(browserSystemTheme());
+let resolvedTheme = $state<ResolvedTheme>("dark");
+let initializationCount = 0;
+let stopSystemListeners: (() => void) | null = null;
+let nativeThemeListenerActive = false;
+const listeners = new SvelteSet<ThemeListener>();
 
 function readStoredTheme(): ThemeId {
   if (typeof localStorage === "undefined") return defaultThemeId;
-  const stored = localStorage.getItem(STORAGE_KEY);
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
   return stored && stored in themes ? (stored as ThemeId) : defaultThemeId;
 }
 
-function readStoredColorMode(): ColorMode {
+function readStoredMode(): ThemeMode {
   if (typeof localStorage === "undefined") return "system";
-  const stored = localStorage.getItem(MODE_STORAGE_KEY);
-  if (stored === "dark" || stored === "light" || stored === "system") return stored;
-  return "system";
+  return parseThemeMode(localStorage.getItem(MODE_STORAGE_KEY));
 }
 
-// ── Public API ────────────────────────────────────────────
+function browserSystemTheme(): ResolvedTheme {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return "dark";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function snapshot(): ThemeSnapshot {
+  return { id: activeId, mode, resolvedTheme, theme: themes[activeId] };
+}
+
+function applyTheme(notify = true): void {
+  resolvedTheme = resolveThemeMode(mode, systemTheme);
+  const current = snapshot();
+
+  if (typeof document !== "undefined") {
+    const root = document.documentElement;
+    const variables = current.theme.css[resolvedTheme];
+    for (const [key, value] of Object.entries(variables)) {
+      root.style.setProperty(`--${key}`, value);
+    }
+    root.dataset.theme = activeId;
+    root.dataset.themeMode = mode;
+    root.dataset.resolvedTheme = resolvedTheme;
+    root.style.colorScheme = resolvedTheme;
+  }
+
+  if (notify) {
+    for (const listener of listeners) listener(current);
+  }
+}
+
+async function syncNativeThemePreference(): Promise<void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+  try {
+    const { setTheme } = await import("@tauri-apps/api/app");
+    await setTheme(mode === "system" ? null : mode);
+    if (mode === "system") {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const currentTheme = await getCurrentWindow().theme();
+      if (currentTheme) {
+        systemTheme = currentTheme;
+        applyTheme();
+      }
+    }
+  } catch (reason) {
+    console.warn("Unable to synchronize the native application theme", reason);
+  }
+}
+
+async function attachNativeThemeListener(disposed: () => boolean): Promise<() => void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return () => {};
+
+  try {
+    await syncNativeThemePreference();
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const appWindow = getCurrentWindow();
+    nativeThemeListenerActive = true;
+    const initialTheme = await appWindow.theme();
+    if (initialTheme && mode === "system" && !disposed()) {
+      systemTheme = initialTheme;
+      applyTheme();
+    }
+    const unlisten = await appWindow.onThemeChanged(({ payload }) => {
+      if (mode !== "system") return;
+      systemTheme = payload;
+      applyTheme();
+    });
+    if (disposed()) {
+      unlisten();
+      return () => {};
+    }
+    return unlisten;
+  } catch (reason) {
+    nativeThemeListenerActive = false;
+    console.warn("Unable to listen for native theme changes; using browser preference", reason);
+    return () => {};
+  }
+}
 
 export function getThemeId(): ThemeId {
   return activeId;
@@ -40,96 +132,79 @@ export function getTheme(): ThemeDefinition {
   return themes[activeId];
 }
 
-export function setTheme(id: ThemeId): void {
-  activeId = id;
-  localStorage.setItem(STORAGE_KEY, id);
-  applyCssVars();
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("spacesly-theme-change"));
-  }
+export function getThemeMode(): ThemeMode {
+  return mode;
 }
 
-export function getColorMode(): ColorMode {
-  return colorMode;
+export function getResolvedTheme(): ResolvedTheme {
+  return resolvedTheme;
 }
 
-export function setColorMode(mode: ColorMode): void {
-  colorMode = mode;
-  localStorage.setItem(MODE_STORAGE_KEY, mode);
-  applyCssVars();
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("spacesly-theme-change"));
-  }
+export function getThemeSnapshot(): ThemeSnapshot {
+  return snapshot();
 }
 
-/** Terminal colors for the current theme + color scheme */
 export function getTerminalTheme(): TerminalColors {
-  const t = themes[activeId];
-  return isDark() ? t.terminal.dark : t.terminal.light;
+  return themes[activeId].terminal[resolvedTheme];
 }
 
-/** Editor colors for the current theme + color scheme */
 export function getEditorColors(): EditorColors {
-  const t = themes[activeId];
-  return isDark() ? t.editor.dark : t.editor.light;
+  return themes[activeId].editor[resolvedTheme];
 }
 
-/** Light-mode editor colors (for CodeMirror light theme, always needed) */
-export function getEditorColorsLight(): EditorColors {
-  return themes[activeId].editor.light;
+export function setTheme(id: ThemeId): void {
+  if (!(id in themes) || id === activeId) return;
+  activeId = id;
+  if (typeof localStorage !== "undefined") localStorage.setItem(THEME_STORAGE_KEY, id);
+  applyTheme();
 }
 
-// ── CSS application ───────────────────────────────────────
-
-function isDark(): boolean {
-  if (colorMode === "dark") return true;
-  if (colorMode === "light") return false;
-  return typeof window === "undefined" || window.matchMedia("(prefers-color-scheme: dark)").matches;
+export function setThemeMode(nextMode: ThemeMode): void {
+  if (nextMode === mode) return;
+  mode = nextMode;
+  if (typeof localStorage !== "undefined") localStorage.setItem(MODE_STORAGE_KEY, nextMode);
+  applyTheme();
+  void syncNativeThemePreference();
 }
 
-const ANSI_KEY_MAP: Record<string, string> = {
-  black: "ansi-black",
-  red: "ansi-red",
-  green: "ansi-green",
-  yellow: "ansi-yellow",
-  blue: "ansi-blue",
-  magenta: "ansi-magenta",
-  cyan: "ansi-cyan",
-  white: "ansi-white",
-  brightBlack: "ansi-bright-black",
-  brightRed: "ansi-bright-red",
-  brightGreen: "ansi-bright-green",
-  brightYellow: "ansi-bright-yellow",
-  brightBlue: "ansi-bright-blue",
-  brightMagenta: "ansi-bright-magenta",
-  brightCyan: "ansi-bright-cyan",
-  brightWhite: "ansi-bright-white",
-};
-
-function applyCssVars(): void {
-  if (typeof document === "undefined") return;
-  const t = themes[activeId];
-  const dark = isDark();
-  const vars = dark ? t.css.dark : t.css.light;
-  const root = document.documentElement;
-  for (const [key, value] of Object.entries(vars)) {
-    root.style.setProperty(`--${key}`, value);
-  }
-  // Expose terminal ANSI colors as CSS custom properties
-  const term = dark ? t.terminal.dark : t.terminal.light;
-  for (const [key, cssName] of Object.entries(ANSI_KEY_MAP)) {
-    root.style.setProperty(`--${cssName}`, term[key as keyof TerminalColors]);
-  }
+export function onThemeChange(listener: ThemeListener): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }
 
-// ── Initialization ────────────────────────────────────────
+export function initTheme(): () => void {
+  initializationCount += 1;
+  applyTheme(false);
+  if (initializationCount > 1) return releaseThemeManager;
 
-export function initTheme(): void {
-  applyCssVars();
-  // Re-apply when system color scheme changes
-  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-    applyCssVars();
-    // Dispatch event so Terminal/CodeEditor can update
-    window.dispatchEvent(new CustomEvent("spacesly-theme-change"));
+  let disposed = false;
+  let unlistenNative = () => {};
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  const handleBrowserThemeChange = (event: MediaQueryListEvent) => {
+    if (mode !== "system" || nativeThemeListenerActive) return;
+    systemTheme = event.matches ? "dark" : "light";
+    applyTheme();
+  };
+  media.addEventListener("change", handleBrowserThemeChange);
+  void attachNativeThemeListener(() => disposed).then((unlisten) => {
+    unlistenNative = unlisten;
   });
+
+  stopSystemListeners = () => {
+    disposed = true;
+    nativeThemeListenerActive = false;
+    media.removeEventListener("change", handleBrowserThemeChange);
+    unlistenNative();
+  };
+  return releaseThemeManager;
 }
+
+function releaseThemeManager(): void {
+  initializationCount = Math.max(0, initializationCount - 1);
+  if (initializationCount !== 0) return;
+  stopSystemListeners?.();
+  stopSystemListeners = null;
+}
+
+// Apply the persisted preference during initial component evaluation to avoid a fixed-theme flash.
+applyTheme(false);

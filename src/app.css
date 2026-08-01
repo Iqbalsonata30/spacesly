@@ -1,119 +1,84 @@
 :root {
   color-scheme: light dark;
 
-  /* ── Backgrounds (darkest → lightest) ── */
-  --bg-sidebar: #0f0d0a;
-  --bg-base: #12110e;
-  --bg-titlebar: #1a1611;
-  --bg-card: #1a1814;
-  --bg-hover: #1e1b17;
-  --bg-active: #2a2520;
+  /* Native-color bootstrap. The Theme Manager replaces these before mount. */
+  --bg-sidebar: Canvas;
+  --bg-base: Canvas;
+  --bg-titlebar: Canvas;
+  --bg-card: Canvas;
+  --bg-hover: ButtonFace;
+  --bg-active: SelectedItem;
+  --border: ButtonBorder;
+  --border-light: GrayText;
+  --text-muted: GrayText;
+  --text-dim: GrayText;
+  --text-secondary: CanvasText;
+  --text-primary: CanvasText;
+  --text-bright: CanvasText;
+  --accent: LinkText;
+  --status-ok: LinkText;
+  --status-pr-open: LinkText;
+  --status-fail: LinkText;
+  --diff-add: LinkText;
+  --diff-add-bg: Canvas;
+  --diff-del: LinkText;
+  --diff-del-bg: Canvas;
+  --error: LinkText;
+  --error-bg: Canvas;
+  --toast-bg: Canvas;
+  --toast-border: ButtonBorder;
+  --overlay-bg: color-mix(in srgb, CanvasText 32%, transparent);
+  --input-inset-bg: Field;
+  --input-inset-focus: Field;
+  --btn-subtle-bg: ButtonFace;
+  --btn-subtle-hover: ButtonFace;
+  --pill-btn-hover: ButtonFace;
+  --code-inline-bg: Field;
+  --code-block-bg: Field;
+  --img-remove-bg: CanvasText;
+  --img-remove-hover: CanvasText;
+  --bg-dev: Canvas;
+  --border-dev: ButtonBorder;
 
-  /* ── Borders ── */
-  --border: #1e1b18;
-  --border-light: #3a3530;
-
-  /* ── Text ── */
-  --text-muted: #4a4540;
-  --text-dim: #6a6050;
-  --text-secondary: #8a7e6a;
-  --text-primary: #d4c5a9;
-  --text-bright: #e8dcc8;
-
-  /* ── Accent ── */
-  --accent: #c8a97e;
-  --status-ok: #7e9e6b;
-  --status-pr-open: #7e8ec8;
-  --status-fail: #b5564e;
-
-  /* ── Diff ── */
-  --diff-add: #7e9e6b;
-  --diff-add-bg: #1a2a1a;
-  --diff-del: #c87e7e;
-  --diff-del-bg: #2a1a1a;
-
-  /* ── Error ── */
-  --error: #ee8888;
-  --error-bg: #3a1a1a;
-
-  /* ── Overlays / glass ── */
-  --toast-bg: rgba(30, 27, 24, 0.78);
-  --toast-border: rgba(255, 255, 255, 0.06);
-  --overlay-bg: rgba(0, 0, 0, 0.5);
-  --input-inset-bg: rgba(0, 0, 0, 0.25);
-  --input-inset-focus: rgba(0, 0, 0, 0.3);
-  --btn-subtle-bg: rgba(255, 255, 255, 0.06);
-  --btn-subtle-hover: rgba(255, 255, 255, 0.1);
-  --pill-btn-hover: rgba(255, 255, 255, 0.08);
-  --code-inline-bg: rgba(255, 255, 255, 0.05);
-  --code-block-bg: rgba(0, 0, 0, 0.3);
-  --img-remove-bg: rgba(0, 0, 0, 0.65);
-  --img-remove-hover: rgba(0, 0, 0, 0.85);
-
-  /* ── Dev mode (title bar) ── */
-  --bg-dev: #191726;
-  --border-dev: #252238;
-
-  /* ── Type ── */
   --font-sans: "Space Grotesk", system-ui, sans-serif;
   --font-mono: "SF Mono", "Fira Code", monospace;
-}
 
-@media (prefers-color-scheme: light) {
-  :root {
-    /* Backgrounds (lightest → darkest, warm cream) */
-    --bg-sidebar: #f0ebe3;
-    --bg-base: #f7f4ef;
-    --bg-titlebar: #ebe5dc;
-    --bg-card: #eee9e0;
-    --bg-hover: #e5dfd4;
-    --bg-active: #dbd4c7;
-
-    /* Borders */
-    --border: #dbd4c7;
-    --border-light: #c8bfb0;
-
-    /* Text (darkest → lightest) */
-    --text-muted: #b5ab9a;
-    --text-dim: #907f6d;
-    --text-secondary: #6a5d4e;
-    --text-primary: #33302a;
-    --text-bright: #1a1714;
-
-    /* Accent — darkened for contrast on light bg */
-    --accent: #9a7a48;
-    --status-ok: #4e7a3a;
-    --status-pr-open: #4e6a9e;
-    --status-fail: #b54545;
-
-    /* Diff */
-    --diff-add: #4e7a3a;
-    --diff-add-bg: #e4f0dc;
-    --diff-del: #b54545;
-    --diff-del-bg: #f5e2e2;
-
-    /* Error */
-    --error: #c04040;
-    --error-bg: #f5e2e2;
-
-    /* Overlays / glass */
-    --toast-bg: rgba(255, 252, 248, 0.82);
-    --toast-border: rgba(0, 0, 0, 0.06);
-    --overlay-bg: rgba(0, 0, 0, 0.25);
-    --input-inset-bg: rgba(0, 0, 0, 0.04);
-    --input-inset-focus: rgba(0, 0, 0, 0.07);
-    --btn-subtle-bg: rgba(0, 0, 0, 0.04);
-    --btn-subtle-hover: rgba(0, 0, 0, 0.08);
-    --pill-btn-hover: rgba(0, 0, 0, 0.06);
-    --code-inline-bg: rgba(0, 0, 0, 0.04);
-    --code-block-bg: rgba(0, 0, 0, 0.06);
-    --img-remove-bg: rgba(0, 0, 0, 0.55);
-    --img-remove-hover: rgba(0, 0, 0, 0.75);
-
-    /* Dev mode */
-    --bg-dev: #e8e4f0;
-    --border-dev: #cbc4d8;
-  }
+  /* Semantic component tokens derive from the active palette. */
+  --surface: var(--bg-base);
+  --surface-raised: var(--bg-card);
+  --surface-overlay: color-mix(in srgb, var(--bg-card) 94%, var(--text-bright) 6%);
+  --surface-inset: var(--input-inset-bg);
+  --surface-hover: var(--bg-hover);
+  --surface-selected: var(--bg-active);
+  --border-subtle: var(--border);
+  --border-strong: var(--border-light);
+  --border-interactive: color-mix(in srgb, var(--accent) 42%, var(--border-light));
+  --text-link: var(--accent);
+  --focus-ring: color-mix(in srgb, var(--accent) 34%, transparent);
+  --focus-border: color-mix(in srgb, var(--accent) 72%, var(--border-light));
+  --selection-bg: color-mix(in srgb, var(--accent) 24%, transparent);
+  --selection-border: color-mix(in srgb, var(--accent) 60%, var(--border-light));
+  --disabled-opacity: 0.48;
+  --success: var(--status-ok);
+  --success-bg: color-mix(in srgb, var(--status-ok) 14%, var(--bg-card));
+  --success-border: color-mix(in srgb, var(--status-ok) 45%, var(--border));
+  --warning: color-mix(in srgb, var(--accent) 74%, #d99a35);
+  --warning-bg: color-mix(in srgb, var(--warning) 13%, var(--bg-card));
+  --warning-border: color-mix(in srgb, var(--warning) 44%, var(--border));
+  --danger: var(--error);
+  --danger-bg: var(--error-bg);
+  --danger-border: color-mix(in srgb, var(--error) 46%, var(--border));
+  --info: var(--status-pr-open);
+  --info-bg: color-mix(in srgb, var(--status-pr-open) 14%, var(--bg-card));
+  --info-border: color-mix(in srgb, var(--status-pr-open) 44%, var(--border));
+  --progress-track: color-mix(in srgb, var(--bg-base) 72%, var(--border-light));
+  --progress-fill: var(--accent);
+  --dialog-bg: var(--surface-overlay);
+  --menu-bg: var(--surface-overlay);
+  --tooltip-bg: var(--surface-overlay);
+  --code-text: var(--text-primary);
+  --shadow-popover: 0 18px 50px color-mix(in srgb, #000 38%, transparent);
+  --shadow-dialog: 0 28px 80px color-mix(in srgb, #000 46%, transparent);
 }
 
 body {
@@ -122,4 +87,14 @@ body {
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-size: 14px;
+}
+
+::selection {
+  background: var(--selection-bg);
+  color: var(--text-bright);
+}
+
+:where(button, input, select, textarea):disabled {
+  cursor: not-allowed;
+  opacity: var(--disabled-opacity);
 }

@@ -607,9 +607,13 @@
     box-sizing: border-box;
     overflow: hidden;
     container-type: inline-size;
-    border: 1px solid #272530;
+    border: 1px solid var(--border-subtle);
     border-radius: 14px;
-    background: linear-gradient(180deg, #121118, #101017);
+    background: linear-gradient(
+      180deg,
+      var(--surface),
+      color-mix(in srgb, var(--surface) 96%, var(--border-strong))
+    );
   }
 
   .source-header {
@@ -618,9 +622,9 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     align-items: start;
-    border-bottom: 1px solid #25232d;
+    border-bottom: 1px solid var(--border-subtle);
     padding: 14px;
-    background: linear-gradient(180deg, #1c1b21, #17161c);
+    background: linear-gradient(180deg, var(--surface-overlay), var(--surface-raised));
   }
 
   .source-header-copy {
@@ -633,7 +637,7 @@
   }
   .source-header-copy p,
   .card-label-row span {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.14em;
@@ -642,7 +646,7 @@
   .source-header-copy h2 {
     margin-top: 6px;
     overflow: hidden;
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 13px;
     font-weight: 900;
     text-overflow: ellipsis;
@@ -659,7 +663,7 @@
   .card-label-row small,
   .commit-helper span,
   .empty-state span {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 800;
   }
@@ -670,9 +674,9 @@
     box-sizing: border-box;
     overflow: hidden;
     padding: 0 9px;
-    border: 1px solid #2f2d37;
+    border: 1px solid var(--border-subtle);
     border-radius: 999px;
-    background: rgba(31, 30, 39, 0.8);
+    background: color-mix(in srgb, var(--surface-hover) 80%, transparent);
     line-height: 22px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -695,9 +699,9 @@
   .branch-menu-actions button,
   .row-action,
   .context-menu button {
-    border: 1px solid #33313d;
-    background: #1c1b23;
-    color: #e9e4ef;
+    border: 1px solid var(--border-strong);
+    background: var(--surface-hover);
+    color: var(--text-primary);
   }
   .branch-menu-button {
     display: grid;
@@ -727,20 +731,20 @@
     white-space: nowrap;
   }
   .branch-menu-button-copy small {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 10px;
     font-weight: 900;
     text-transform: uppercase;
   }
   .branch-menu-button-copy strong {
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 12px;
   }
   .branch-menu-button-icon,
   .branch-menu-button-indicator {
     display: inline-flex;
     flex: 0 0 auto;
-    color: #9d8cff;
+    color: var(--accent);
   }
   .branch-menu {
     position: absolute;
@@ -750,11 +754,11 @@
     width: 100%;
     min-width: 0;
     box-sizing: border-box;
-    border: 1px solid #34313e;
+    border: 1px solid var(--border-strong);
     border-radius: 14px;
     padding: 12px;
-    background: #181720;
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+    background: var(--menu-bg);
+    box-shadow: var(--shadow-popover);
   }
   .branch-menu-copy p,
   .branch-menu-copy strong,
@@ -767,7 +771,7 @@
     overflow: hidden;
   }
   .branch-menu-copy p {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 10px;
     font-weight: 900;
     letter-spacing: 0.14em;
@@ -776,14 +780,14 @@
   .branch-menu-copy strong {
     margin-top: 5px;
     overflow: hidden;
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 13px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .branch-menu-copy span {
     margin-top: 4px;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     overflow-wrap: anywhere;
   }
@@ -792,17 +796,17 @@
     min-width: 0;
     gap: 6px;
     margin-top: 12px;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     text-transform: uppercase;
   }
   .branch-menu select,
   .commit-box textarea {
-    border: 1px solid #2f2d37;
+    border: 1px solid var(--border-strong);
     border-radius: 12px;
-    background: #111018;
-    color: #f1edf5;
+    background: var(--surface-inset);
+    color: var(--text-bright);
   }
   .branch-menu select {
     width: 100%;
@@ -839,10 +843,10 @@
   }
   .git-error,
   .commit-validation {
-    border: 1px solid rgba(216, 122, 122, 0.35);
+    border: 1px solid var(--danger-border);
     border-radius: 12px;
-    background: rgba(216, 122, 122, 0.1);
-    color: #efaaaa;
+    background: var(--danger-bg);
+    color: var(--danger);
     font-size: 12px;
     font-weight: 800;
   }
@@ -873,9 +877,9 @@
     min-height: max-content;
     box-sizing: border-box;
     overflow: hidden;
-    border: 1px solid #272530;
+    border: 1px solid var(--border-subtle);
     border-radius: 14px;
-    background: #15141c;
+    background: var(--surface-raised);
   }
   .card-label-row {
     display: flex;
@@ -883,7 +887,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 12px;
-    border-bottom: 1px solid #24222d;
+    border-bottom: 1px solid var(--border-subtle);
   }
   .card-label-row > div {
     flex: 1 1 auto;
@@ -893,7 +897,7 @@
   .card-label-row h3 {
     margin: 4px 0 0;
     overflow: hidden;
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 13px;
     font-weight: 900;
     text-overflow: ellipsis;
@@ -905,7 +909,7 @@
     min-width: max-content;
   }
   .card-label-row strong {
-    color: #c7b8ff;
+    color: var(--accent);
     font-size: 12px;
   }
   .source-toolbar {
@@ -939,9 +943,13 @@
   }
   .commit-button {
     margin: 0 12px;
-    background: linear-gradient(135deg, #7d5cff, #4c7dff);
+    background: linear-gradient(
+      135deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 68%, var(--info))
+    );
     border-color: transparent;
-    color: #fff;
+    color: var(--surface);
   }
   .changes-list {
     display: grid;
@@ -975,11 +983,11 @@
     width: 24px;
     height: 24px;
     border-radius: 8px;
-    color: #cfc7e8;
+    color: var(--text-primary);
   }
   .row-action:not(:disabled):hover {
-    border-color: #7d5cff;
-    color: #fff;
+    border-color: var(--focus-border);
+    color: var(--text-bright);
   }
   .empty-state {
     display: grid;
@@ -987,7 +995,7 @@
     gap: 8px;
     min-height: 112px;
     padding: 18px;
-    color: #f1edf5;
+    color: var(--text-bright);
     text-align: center;
   }
   .empty-state strong {
@@ -1000,8 +1008,8 @@
     overflow-wrap: anywhere;
   }
   .empty-state.clean .empty-icon {
-    color: #7bc67b;
-    border-color: rgba(123, 198, 123, 0.35);
+    color: var(--success);
+    border-color: var(--success-border);
   }
   .empty-icon {
     display: inline-flex;
@@ -1009,13 +1017,13 @@
     height: 36px;
     align-items: center;
     justify-content: center;
-    border: 1px solid #312f3b;
+    border: 1px solid var(--border-strong);
     border-radius: 12px;
-    color: #9d8cff;
-    background: #1b1a22;
+    color: var(--accent);
+    background: var(--surface-hover);
   }
   :global(.row-icon) {
-    color: #9d8cff;
+    color: var(--accent);
   }
   .context-menu {
     position: fixed;
@@ -1023,14 +1031,14 @@
     display: grid;
     min-width: 160px;
     overflow: hidden;
-    border: 1px solid #34313e;
+    border: 1px solid var(--border-strong);
     border-radius: 12px;
-    background: #181720;
-    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
+    background: var(--menu-bg);
+    box-shadow: var(--shadow-popover);
   }
   .context-menu button {
     border: 0;
-    border-bottom: 1px solid #24222d;
+    border-bottom: 1px solid var(--border-subtle);
     border-radius: 0;
     padding: 10px 12px;
     text-align: left;
@@ -1041,7 +1049,7 @@
     border-bottom: 0;
   }
   .context-menu button:not(:disabled):hover {
-    background: #242331;
+    background: var(--surface-hover);
   }
 
   @container (min-width: 390px) {

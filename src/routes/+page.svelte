@@ -125,6 +125,14 @@
   } from "$lib/workspaceChatRuns";
   import { createSourceControlStore } from "$lib/sourceControlStore.svelte";
   import {
+    getResolvedTheme,
+    getTerminalTheme,
+    getThemeMode,
+    onThemeChange,
+    setThemeMode,
+  } from "$lib/stores/theme.svelte";
+  import type { ThemeMode } from "$lib/themeMode";
+  import {
     createPromptTaskEnvelope,
     ensureOpenCodePromptProfile,
     executePromptTaskSession,
@@ -390,6 +398,15 @@
     "theme",
   ] as const;
   type SettingsTab = (typeof settingsTabOrder)[number];
+  const themeModeOptions: Array<{ mode: ThemeMode; label: string; description: string }> = [
+    {
+      mode: "system",
+      label: "System",
+      description: "Automatically follows your operating system appearance.",
+    },
+    { mode: "light", label: "Light", description: "Always use the light theme." },
+    { mode: "dark", label: "Dark", description: "Always use the dark theme." },
+  ];
 
   type BoardDisplayColumn = BoardProjection["columns"][number] & {
     totalCardCount: number;
@@ -662,6 +679,9 @@
 
   onMount(() => {
     let disposed = false;
+    const unregisterThemeChanges = onThemeChange(() => {
+      if (workspaceTerminal) workspaceTerminal.options.theme = getTerminalTheme();
+    });
     // Launch cache hydration and the fallback workspace load in parallel.
     // If the cached workspace arrives first it sets `workspace`; the default
     // projection then sees the guard `if (workspace ...)` and aborts.
@@ -747,6 +767,7 @@
       window.removeEventListener("keydown", editorKeydown);
       document.removeEventListener("visibilitychange", visibilityChange);
       for (const unregister of unregisterEditorCommands) unregister();
+      unregisterThemeChanges();
       if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
       if (durableConversationHydrationTimer) clearTimeout(durableConversationHydrationTimer);
       for (const pending of pendingAgentEventProjections.values()) clearTimeout(pending.timer);
@@ -4259,19 +4280,7 @@
       scrollback: 3_000,
       fontFamily: "'SF Mono', 'Fira Code', 'Menlo', monospace",
       fontSize: 13,
-      theme: {
-        background: "#09090d",
-        foreground: "#d7d0e2",
-        cursor: "#b8d6e4",
-        black: "#111016",
-        red: "#f0b0aa",
-        green: "#b9d6aa",
-        yellow: "#e7d38f",
-        blue: "#b8d6e4",
-        magenta: "#d0b8e8",
-        cyan: "#a8dce8",
-        white: "#f1edf5",
-      },
+      theme: getTerminalTheme(),
     });
     workspaceFitAddon = new FitAddon();
     workspaceTerminal.loadAddon(workspaceFitAddon);
@@ -8641,14 +8650,36 @@
                   id="theme-settings"
                   eyebrow="Theme"
                   title="Appearance"
-                  description="Review the active visual theme used throughout the Spacesly desktop workspace."
+                  description="Choose how Spacesly follows your desktop appearance. Changes apply immediately."
                 >
-                  <SettingsCard title="Active theme" tone="subtle">
-                    <div class="theme-card">
-                      <strong>Dark command center</strong>
+                  <SettingsCard title="Appearance" tone="subtle">
+                    <fieldset class="theme-options">
+                      <legend>Theme mode</legend>
+                      {#each themeModeOptions as option (option.mode)}
+                        <label class:active={getThemeMode() === option.mode} class="theme-option">
+                          <input
+                            type="radio"
+                            name="theme-mode"
+                            value={option.mode}
+                            checked={getThemeMode() === option.mode}
+                            onchange={() => setThemeMode(option.mode)}
+                          />
+                          <span class="theme-option-copy">
+                            <strong>{option.label}</strong>
+                            <span>{option.description}</span>
+                          </span>
+                          {#if option.mode === "system" && getThemeMode() === "system"}
+                            <span class="theme-resolved">Using {getResolvedTheme()}</span>
+                          {/if}
+                        </label>
+                      {/each}
+                    </fieldset>
+                    <div class="theme-card" aria-live="polite">
+                      <strong
+                        >{getResolvedTheme() === "dark" ? "Dark" : "Light"} appearance active</strong
+                      >
                       <span
-                        >The current Spacesly theme keeps editor, terminal, board, and Settings
-                        surfaces visually consistent.</span
+                        >Editor, terminal, board, dialogs, and controls use the same resolved theme.</span
                       >
                     </div>
                   </SettingsCard>
@@ -8668,33 +8699,36 @@
                 </details>
               {/if}
 
-              <SettingsActionBar>
-                {#if settingsTab === "mcp"}
-                  <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
-                    Remove
-                  </button>
+              {#if settingsTab !== "theme"}
+                <SettingsActionBar>
+                  {#if settingsTab === "mcp"}
+                    <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
+                      Remove
+                    </button>
+                    <button
+                      type="button"
+                      onclick={disconnectSelectedMcpServer}
+                      disabled={!selectedServer}
+                    >
+                      Disconnect
+                    </button>
+                    <button
+                      type="button"
+                      onclick={testSelectedMcpConnection}
+                      disabled={!selectedServer || testingConnection}
+                    >
+                      {testingConnection ? "Testing..." : "Test connection"}
+                    </button>
+                  {/if}
                   <button
+                    class="save-settings"
                     type="button"
-                    onclick={disconnectSelectedMcpServer}
-                    disabled={!selectedServer}
+                    onclick={persistSettings}
+                    disabled={settingsSaving}
+                    >{settingsSaving ? "Saving..." : "Save settings"}</button
                   >
-                    Disconnect
-                  </button>
-                  <button
-                    type="button"
-                    onclick={testSelectedMcpConnection}
-                    disabled={!selectedServer || testingConnection}
-                  >
-                    {testingConnection ? "Testing..." : "Test connection"}
-                  </button>
-                {/if}
-                <button
-                  class="save-settings"
-                  type="button"
-                  onclick={persistSettings}
-                  disabled={settingsSaving}>{settingsSaving ? "Saving..." : "Save settings"}</button
-                >
-              </SettingsActionBar>
+                </SettingsActionBar>
+              {/if}
             </form>
           </div>
         </div>

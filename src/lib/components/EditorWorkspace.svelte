@@ -510,6 +510,7 @@
   .outline-tree button:focus-visible {
     outline: none;
     background: var(--bg-hover);
+    box-shadow: inset 0 0 0 2px var(--focus-border);
   }
 
   .outline-tree button span {
@@ -574,6 +575,7 @@
   .editor-references > div button:focus-visible {
     outline: none;
     background: var(--bg-hover);
+    box-shadow: inset 0 0 0 2px var(--focus-border);
   }
 
   .editor-references span {

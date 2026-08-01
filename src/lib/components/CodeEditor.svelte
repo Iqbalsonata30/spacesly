@@ -17,6 +17,7 @@
   import type { EditorCommandId } from "$lib/editorCommands";
   import type { LspDiagnostic } from "$lib/ipc";
   import type { LspCompletionResult, LspTextEdit } from "$lib/ipc";
+  import { getEditorColors, getResolvedTheme, onThemeChange } from "$lib/stores/theme.svelte";
   import {
     completionType,
     lspRangeToOffsets,
@@ -28,6 +29,7 @@
     basicSetup: Extension;
     EditorState: typeof import("@codemirror/state").EditorState;
     StateEffect: typeof import("@codemirror/state").StateEffect;
+    Compartment: typeof import("@codemirror/state").Compartment;
     EditorView: typeof import("@codemirror/view").EditorView;
     keymap: typeof import("@codemirror/view").keymap;
     hoverTooltip: typeof import("@codemirror/view").hoverTooltip;
@@ -78,6 +80,11 @@
   let focusWhenReady = false;
   let dispatchOrigin: EditorTransactionOrigin = "user";
   let diagnosticsRuntime: Pick<Runtime, "setDiagnostics"> | null = null;
+  let themeCompartment: import("@codemirror/state").Compartment | null = null;
+  let themeRuntime: Pick<
+    Runtime,
+    "EditorView" | "HighlightStyle" | "syntaxHighlighting" | "tags"
+  > | null = null;
 
   $effect(() => {
     applyDiagnostics(diagnostics);
@@ -85,6 +92,12 @@
 
   onMount(() => {
     let cancelled = false;
+    const unregisterThemeChanges = onThemeChange(() => {
+      if (!view || !themeCompartment || !themeRuntime) return;
+      view.dispatch({
+        effects: themeCompartment.reconfigure(editorThemeExtensions(themeRuntime)),
+      });
+    });
 
     fallbackValue = documentValue(session);
 
@@ -97,6 +110,7 @@
             basicSetup,
             EditorState,
             StateEffect,
+            Compartment,
             EditorView,
             keymap,
             hoverTooltip,
@@ -113,6 +127,8 @@
           language,
         ] = await Promise.all([loadRuntime(), loadLanguage(session.path)]);
         if (cancelled || !host) return;
+        themeCompartment = new Compartment();
+        themeRuntime = { EditorView, HighlightStyle, syntaxHighlighting, tags };
 
         const extensions = [
           basicSetup,
@@ -196,7 +212,7 @@
               },
             ],
           }),
-          softDraculaHighlight({ HighlightStyle, syntaxHighlighting, tags }),
+          themeCompartment.of(editorThemeExtensions(themeRuntime)),
           keymap.of([
             indentWithTab,
             {
@@ -268,7 +284,6 @@
             if (previousDirty !== session.dirty) onDirtyChange(session.dirty);
             onChange(session.revision);
           }),
-          editorTheme(EditorView),
         ];
         const state = session.state
           ? session.state.update({ effects: StateEffect.reconfigure.of(extensions) }).state
@@ -306,6 +321,9 @@
       view?.destroy();
       view = null;
       diagnosticsRuntime = null;
+      themeCompartment = null;
+      themeRuntime = null;
+      unregisterThemeChanges();
       onReady(null);
     };
   });
@@ -440,6 +458,7 @@
         basicSetup: codemirror.basicSetup,
         EditorState: state.EditorState,
         StateEffect: state.StateEffect,
+        Compartment: state.Compartment,
         EditorView: view.EditorView,
         keymap: view.keymap,
         hoverTooltip: view.hoverTooltip,
@@ -457,38 +476,45 @@
     return runtimePromise;
   }
 
-  function softDraculaHighlight(
+  function editorHighlight(
     runtime: Pick<Runtime, "HighlightStyle" | "syntaxHighlighting" | "tags">,
   ): Extension {
     const { HighlightStyle, syntaxHighlighting, tags } = runtime;
+    const colors = getEditorColors();
 
     return syntaxHighlighting(
       HighlightStyle.define([
-        { tag: tags.keyword, color: "#b89adf" },
-        { tag: [tags.atom, tags.bool, tags.null], color: "#c9a7e8" },
-        { tag: [tags.string, tags.special(tags.string)], color: "#9dbb83" },
-        { tag: [tags.number, tags.integer, tags.float], color: "#d8a789" },
+        { tag: tags.keyword, color: colors.keyword },
+        { tag: [tags.atom, tags.bool, tags.null], color: colors.number },
+        { tag: [tags.string, tags.special(tags.string)], color: colors.string },
+        { tag: [tags.number, tags.integer, tags.float], color: colors.number },
         {
           tag: [tags.comment, tags.lineComment, tags.blockComment],
-          color: "#6f7386",
+          color: colors.comment,
           fontStyle: "italic",
         },
-        { tag: tags.docComment, color: "#858aa0", fontStyle: "italic" },
-        { tag: tags.variableName, color: "#d8d2e4" },
-        { tag: tags.definition(tags.variableName), color: "#e2ddee" },
-        { tag: tags.function(tags.variableName), color: "#8db9d6" },
-        { tag: [tags.propertyName, tags.attributeName], color: "#91c3d0" },
-        { tag: [tags.className, tags.typeName, tags.namespace], color: "#d9c58d" },
+        { tag: tags.docComment, color: colors.docComment, fontStyle: "italic" },
+        { tag: tags.variableName, color: colors.variable },
+        { tag: tags.definition(tags.variableName), color: colors.text },
+        { tag: tags.function(tags.variableName), color: colors.link },
+        { tag: [tags.propertyName, tags.attributeName], color: colors.property },
+        { tag: [tags.className, tags.typeName, tags.namespace], color: colors.keyword },
         {
           tag: [tags.operator, tags.compareOperator, tags.logicOperator, tags.arithmeticOperator],
-          color: "#aaa4bb",
+          color: colors.operator,
         },
-        { tag: [tags.punctuation, tags.separator, tags.bracket], color: "#8f89a0" },
-        { tag: tags.link, color: "#8db9d6", textDecoration: "underline" },
-        { tag: tags.heading, color: "#b89adf", fontWeight: "700" },
-        { tag: tags.invalid, color: "#e58a8a", backgroundColor: "rgba(229, 138, 138, 0.12)" },
+        { tag: [tags.punctuation, tags.separator, tags.bracket], color: colors.textSecondary },
+        { tag: tags.link, color: colors.link, textDecoration: "underline" },
+        { tag: tags.heading, color: colors.keyword, fontWeight: "700" },
+        { tag: tags.invalid, color: "var(--error)", backgroundColor: "var(--error-bg)" },
       ]),
     );
+  }
+
+  function editorThemeExtensions(
+    runtime: Pick<Runtime, "EditorView" | "HighlightStyle" | "syntaxHighlighting" | "tags">,
+  ): Extension[] {
+    return [editorHighlight(runtime), editorTheme(runtime.EditorView)];
   }
 
   function applyDiagnostics(values: LspDiagnostic[]) {
@@ -525,46 +551,47 @@
   }
 
   function editorTheme(EditorView: Runtime["EditorView"]): Extension {
+    const colors = getEditorColors();
     return EditorView.theme(
       {
         "&": {
           height: "100%",
-          backgroundColor: "#191820",
-          color: "#d8d2e4",
+          backgroundColor: colors.bg,
+          color: colors.text,
           fontSize: "13px",
         },
         ".cm-scroller": { fontFamily: "var(--font-mono)", lineHeight: "1.55" },
         ".cm-content": { padding: "18px 0" },
         ".cm-line": { padding: "0 20px" },
         ".cm-gutters": {
-          backgroundColor: "#15141b",
-          borderRight: "1px solid #282631",
-          color: "#706a84",
+          backgroundColor: colors.bgCard,
+          borderRight: `1px solid ${colors.borderColor}`,
+          color: colors.textMuted,
         },
-        ".cm-activeLine": { backgroundColor: "rgba(80, 74, 96, 0.22)" },
+        ".cm-activeLine": { backgroundColor: `rgba(${colors.accentRgba}, 0.09)` },
         ".cm-activeLineGutter": {
-          backgroundColor: "rgba(80, 74, 96, 0.28)",
-          color: "#a99bd6",
+          backgroundColor: `rgba(${colors.accentRgba}, 0.14)`,
+          color: colors.keyword,
         },
         ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
-          backgroundColor: "rgba(153, 131, 196, 0.26)",
+          backgroundColor: `rgba(${colors.accentRgba}, 0.24)`,
         },
         "&.cm-focused": { outline: "none" },
         ".cm-panels-bottom": {
-          borderTop: "1px solid #282631",
-          backgroundColor: "#111016",
-          color: "#a99bd6",
+          borderTop: `1px solid ${colors.borderColor}`,
+          backgroundColor: colors.bgCard,
+          color: colors.keyword,
           fontFamily: "var(--font-mono)",
           fontSize: "11px",
           fontWeight: "800",
         },
         ".cm-vim-panel input": {
           backgroundColor: "transparent",
-          color: "#d8d2e4",
+          color: colors.text,
           font: "inherit",
         },
       },
-      { dark: true },
+      { dark: getResolvedTheme() === "dark" },
     );
   }
 
@@ -631,7 +658,7 @@
     height: 100%;
     min-height: 0;
     overflow: hidden;
-    background: #191820;
+    background: var(--bg-base);
   }
 
   .code-editor-host {
@@ -650,7 +677,7 @@
     display: grid;
     height: 100%;
     place-items: center;
-    color: #b89adf;
+    color: var(--accent);
     font-family: var(--font-mono);
     font-size: 12px;
     font-weight: 800;
@@ -662,8 +689,8 @@
     border: 0;
     padding: 18px 20px;
     resize: none;
-    background: #191820;
-    color: #d8d2e4;
+    background: var(--bg-base);
+    color: var(--text-primary);
     font-family: var(--font-mono);
     font-size: 13px;
     line-height: 1.55;
@@ -672,15 +699,19 @@
     white-space: pre;
   }
 
+  .code-editor-fallback:focus-visible {
+    box-shadow: inset 0 0 0 2px var(--focus-border);
+  }
+
   :global(.cm-tooltip .cm-lsp-hover) {
     max-width: min(620px, 70vw);
     max-height: 320px;
     overflow: auto;
     padding: 10px 12px;
     white-space: pre-wrap;
-    color: #e6e0ee;
-    background: #17151d;
-    border: 1px solid #3a3448;
+    color: var(--text-bright);
+    background: var(--tooltip-bg);
+    border: 1px solid var(--border-light);
     border-radius: 6px;
     font-family: var(--font-mono);
     font-size: 12px;

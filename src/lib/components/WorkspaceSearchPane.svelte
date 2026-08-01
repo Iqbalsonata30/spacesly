@@ -171,16 +171,16 @@
     flex: 1;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid #272530;
+    border: 1px solid var(--border-strong);
     border-radius: 12px;
     color: var(--text-primary);
-    background: #101017;
+    background: var(--surface);
   }
 
   .workspace-search-pane > header {
     padding: 12px 14px;
-    border-bottom: 1px solid #25232d;
-    background: #1c1b21;
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface-raised);
   }
 
   .workspace-search-pane > header p,
@@ -189,7 +189,7 @@
   }
 
   .workspace-search-pane > header p {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.14em;
@@ -197,7 +197,7 @@
   }
 
   .workspace-search-pane > header h2 {
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 16px;
   }
 
@@ -205,7 +205,7 @@
     display: flex;
     gap: 6px;
     padding: 10px;
-    border-bottom: 1px solid var(--border-light);
+    border-bottom: 1px solid var(--border-strong);
   }
 
   label {
@@ -214,10 +214,15 @@
     flex: 1;
     align-items: center;
     gap: 7px;
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
     padding: 0 8px;
-    background: var(--bg-base);
+    background: var(--surface-inset);
+  }
+
+  label:focus-within {
+    border-color: var(--focus-border);
+    box-shadow: 0 0 0 3px var(--focus-ring);
   }
 
   input {
@@ -232,41 +237,41 @@
 
   .search-controls button {
     width: 36px;
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
     color: var(--text-secondary);
-    background: var(--bg-base);
+    background: var(--surface-raised);
     font-family: var(--font-mono);
     cursor: pointer;
   }
 
   .search-controls button.active {
-    border-color: var(--accent);
+    border-color: var(--selection-border);
     color: var(--text-bright);
-    background: var(--bg-active);
+    background: var(--surface-selected);
   }
 
   .replace-controls {
     display: flex;
     gap: 6px;
     padding: 0 10px 10px;
-    border-bottom: 1px solid var(--border-light);
+    border-bottom: 1px solid var(--border-strong);
   }
 
   .replace-controls input {
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
     padding: 8px;
-    background: var(--bg-base);
+    background: var(--surface-inset);
   }
 
   .replace-controls button,
   .replace-preview header button {
-    border: 1px solid var(--accent);
+    border: 1px solid var(--border-interactive);
     border-radius: 6px;
     padding: 0 10px;
-    color: var(--bg-base);
-    background: var(--accent);
+    color: var(--surface);
+    background: var(--text-link);
     font-weight: 750;
     cursor: pointer;
   }
@@ -279,13 +284,13 @@
 
   .search-status {
     padding: 7px 11px;
-    border-bottom: 1px solid var(--border-light);
+    border-bottom: 1px solid var(--border-strong);
     color: var(--text-muted);
     font-size: 10px;
   }
 
   .search-status .error {
-    color: var(--error);
+    color: var(--danger);
   }
 
   .search-results {
@@ -302,7 +307,7 @@
     min-width: 0;
     gap: 3px;
     border: 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--border-light) 55%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
     padding: 8px 42px 8px 11px;
     color: var(--text-primary);
     background: transparent;
@@ -313,7 +318,8 @@
   .search-results button:hover,
   .search-results button:focus-visible {
     outline: none;
-    background: var(--bg-hover);
+    background: var(--surface-hover);
+    box-shadow: inset 0 0 0 2px var(--focus-border);
   }
 
   .result-path,
@@ -355,8 +361,8 @@
     display: grid;
     max-height: 48%;
     overflow: hidden;
-    border-top: 1px solid var(--border-light);
-    background: var(--bg-card);
+    border-top: 1px solid var(--border-strong);
+    background: var(--surface-raised);
   }
 
   .replace-preview > header {
@@ -377,7 +383,7 @@
   .replace-preview .error {
     margin: 0;
     padding: 7px 10px;
-    color: var(--error);
+    color: var(--danger);
     font-size: 10px;
   }
 
@@ -390,7 +396,7 @@
     display: grid;
     gap: 3px;
     padding: 8px 10px;
-    border-top: 1px solid var(--border-light);
+    border-top: 1px solid var(--border-strong);
     font-size: 10px;
   }
 

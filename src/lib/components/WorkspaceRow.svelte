@@ -94,7 +94,7 @@
     border-radius: 0;
     padding: 10px 12px 10px calc(12px + (var(--row-depth) * 16px));
     background: transparent;
-    color: #f1edf5;
+    color: var(--text-bright);
     text-align: left;
   }
 
@@ -104,14 +104,14 @@
     inset-inline: 0;
     inset-block-end: 0;
     height: 1px;
-    background: #1f1e27;
+    background: var(--border-subtle);
     pointer-events: none;
   }
 
   .workspace-row:hover:not(:disabled),
   .workspace-row:focus-visible:not(:disabled),
   .workspace-row.active {
-    background: #20262d;
+    background: var(--surface-selected);
   }
 
   .workspace-row:disabled {
@@ -130,7 +130,7 @@
   .workspace-row-status {
     flex: 0 0 auto;
     min-width: 18px;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 900;
     letter-spacing: 0.12em;
@@ -139,15 +139,15 @@
   }
 
   .workspace-row-status.modified {
-    color: #f0b05f;
+    color: var(--warning);
   }
 
   .workspace-row-status.added {
-    color: #7bc67b;
+    color: var(--diff-add);
   }
 
   .workspace-row-status.deleted {
-    color: #d87a7a;
+    color: var(--diff-del);
   }
 
   .workspace-row-label {

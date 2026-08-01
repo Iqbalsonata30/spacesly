@@ -379,9 +379,9 @@
   .workspace-chat-proposal {
     margin: 0 14px 10px;
     padding: 12px;
-    border: 1px solid rgba(216, 167, 137, 0.38);
+    border: 1px solid var(--warning-border);
     border-radius: 10px;
-    background: rgba(216, 167, 137, 0.08);
+    background: var(--warning-bg);
   }
 
   .workspace-chat-proposal header,
@@ -427,10 +427,14 @@
     max-height: min(72vh, 560px);
     overflow: hidden;
     padding: 14px;
-    border: 1px solid #2a2835;
+    border: 1px solid var(--border-strong);
     border-radius: 16px;
-    background: linear-gradient(180deg, rgba(23, 22, 30, 0.98), rgba(16, 15, 22, 0.98));
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--menu-bg) 98%, transparent),
+      color-mix(in srgb, var(--surface) 98%, transparent)
+    );
+    box-shadow: var(--shadow-dialog);
     backdrop-filter: blur(12px);
   }
 
@@ -447,7 +451,7 @@
 
   .workspace-chat-session-menu > header p {
     margin: 0;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 800;
     letter-spacing: 0.12em;
@@ -458,13 +462,13 @@
   .workspace-chat-session-menu > header span {
     display: block;
     margin-top: 4px;
-    color: #e8e2ef;
+    color: var(--text-bright);
     font-size: 13px;
     line-height: 1.35;
   }
 
   .workspace-chat-session-menu > header span {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 11px;
     font-weight: 700;
     white-space: nowrap;
@@ -476,7 +480,7 @@
   }
 
   .workspace-chat-session-search span {
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 10px;
     font-weight: 800;
     letter-spacing: 0.12em;
@@ -486,11 +490,11 @@
   .workspace-chat-session-search input {
     width: 100%;
     min-width: 0;
-    border: 1px solid #2c2a36;
+    border: 1px solid var(--border-strong);
     border-radius: 12px;
     padding: 10px 12px;
-    background: #0f0e15;
-    color: #f1edf5;
+    background: var(--surface-inset);
+    color: var(--text-bright);
     font: inherit;
     outline: none;
     transition:
@@ -500,13 +504,13 @@
   }
 
   .workspace-chat-session-search input::placeholder {
-    color: #6f6884;
+    color: var(--text-dim);
   }
 
   .workspace-chat-session-search input:focus {
-    border-color: #6f63c9;
-    background: #12111a;
-    box-shadow: 0 0 0 3px rgba(111, 99, 201, 0.18);
+    border-color: var(--focus-border);
+    background: var(--surface);
+    box-shadow: 0 0 0 3px var(--focus-ring);
   }
 
   .workspace-chat-session-list {
@@ -525,20 +529,20 @@
     display: grid;
     gap: 4px;
     padding: 16px;
-    border: 1px dashed #2f2b3b;
+    border: 1px dashed var(--border-strong);
     border-radius: 14px;
-    background: rgba(255, 255, 255, 0.02);
+    background: color-mix(in srgb, var(--surface-raised) 96%, var(--text-bright) 4%);
   }
 
   .workspace-chat-session-empty strong {
-    color: #f1edf5;
+    color: var(--text-bright);
     font-size: 13px;
     font-weight: 700;
   }
 
   .workspace-chat-session-empty p {
     margin: 0;
-    color: #8f88a8;
+    color: var(--text-secondary);
     font-size: 12px;
     line-height: 1.45;
   }
@@ -550,10 +554,10 @@
     gap: 14px;
     min-width: 0;
     padding: 12px 13px;
-    border: 1px solid #262432;
+    border: 1px solid var(--border-subtle);
     border-radius: 14px;
-    background: #111017;
-    color: #e8e2ef;
+    background: var(--surface);
+    color: var(--text-bright);
     text-align: left;
     transition:
       border-color 120ms ease,
@@ -564,13 +568,13 @@
 
   .workspace-chat-session-list button:hover,
   .workspace-chat-session-list button.selected {
-    border-color: #6f63c9;
-    background: rgba(111, 99, 201, 0.18);
-    box-shadow: 0 0 0 1px rgba(111, 99, 201, 0.18);
+    border-color: var(--selection-border);
+    background: var(--selection-bg);
+    box-shadow: 0 0 0 1px var(--focus-ring);
   }
 
   .workspace-chat-session-list button.active {
-    border-color: rgba(111, 99, 201, 0.9);
+    border-color: var(--focus-border);
   }
 
   .workspace-chat-session-list button.selected {
@@ -600,19 +604,19 @@
   }
 
   .workspace-chat-session-meta em.run-status {
-    background: rgba(149, 176, 130, 0.16);
-    color: #cce2bd;
+    background: var(--success-bg);
+    color: var(--success);
   }
 
   .workspace-chat-session-meta em.run-status.failed,
   .workspace-chat-session-meta em.run-status.cancelling {
-    background: rgba(240, 176, 170, 0.14);
-    color: #f0b0aa;
+    background: var(--danger-bg);
+    color: var(--danger);
   }
 
   .workspace-chat-session-main span,
   .workspace-chat-session-meta span {
-    color: #a79fc0;
+    color: var(--text-secondary);
   }
 
   .workspace-chat-session-meta {
@@ -623,8 +627,8 @@
   .workspace-chat-session-meta em {
     padding: 2px 8px;
     border-radius: 999px;
-    background: rgba(111, 99, 201, 0.18);
-    color: #d6d0ff;
+    background: var(--info-bg);
+    color: var(--info);
     font-style: normal;
     font-weight: 800;
     letter-spacing: 0.08em;
