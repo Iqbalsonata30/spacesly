@@ -38,6 +38,13 @@ import {
 } from "../src/lib/uiState";
 import { formatJiraExecutionComment } from "../src/lib/jiraComment";
 import { timelineActivity, timelineActivities } from "../src/lib/agentTimeline";
+import {
+  applyAgentEventProjection,
+  emptyAgentEventProjection,
+  mergeAgentEventProjection,
+  projectAgentTaskSessionEvent,
+} from "../src/lib/agentEventProjection";
+import { createAgentRunSession } from "../src/lib/agentRun";
 import { relativeTimeLabel } from "../src/lib/relativeTime";
 import { defaultSettings, loadSettings, parseEnvText, saveSettings } from "../src/lib/settings";
 
@@ -266,6 +273,65 @@ assertEqual(
   ]).length,
   0,
   "internal runtime and board synchronization events should not create activities",
+);
+
+const projectionSession = createAgentRunSession(
+  "card-1", "Projection", "running", 55, "", null, [], [], null, [], null,
+);
+let pendingProjection = emptyAgentEventProjection();
+for (let sequence = 1; sequence <= 120; sequence += 1) {
+  pendingProjection = mergeAgentEventProjection(
+    pendingProjection,
+    projectAgentTaskSessionEvent(
+      {
+        id: sequence,
+        session_id: 1,
+        attempt_id: 1,
+        fencing_token: 1,
+        sequence,
+        kind: "runtime",
+        payload: { type: "text_delta", text: "token" },
+        progress: { phase: "executing_runtime", completed: 1, total: null },
+        created_at: sequence,
+      },
+      `delta-${sequence}`,
+      "04:30:10 AM",
+    ),
+  );
+}
+assertEqual(pendingProjection.logs.length, 0, "text deltas should not create presentation logs");
+assertEqual(pendingProjection.progress, 55, "repeated deltas should retain one latest progress value");
+assertEqual(
+  applyAgentEventProjection(projectionSession, pendingProjection, 120) === projectionSession,
+  true,
+  "unchanged progress should preserve session identity and avoid reactive publication",
+);
+let changingProjection = emptyAgentEventProjection();
+for (const [sequence, completed] of [10, 50, 90].entries()) {
+  changingProjection = mergeAgentEventProjection(
+    changingProjection,
+    projectAgentTaskSessionEvent(
+      {
+        id: sequence + 1,
+        session_id: 1,
+        attempt_id: 1,
+        fencing_token: 1,
+        sequence: sequence + 1,
+        kind: "progress",
+        payload: {},
+        progress: { phase: "executing_runtime", completed, total: 100 },
+        created_at: sequence + 1,
+      },
+      `progress-${sequence}`,
+      "04:30:11 AM",
+    ),
+  );
+}
+assertEqual(changingProjection.logs.length, 1, "same-frame progress logs should coalesce");
+assertEqual(
+  applyAgentEventProjection(projectionSession, changingProjection, 120).progress,
+  67,
+  "one publication should expose the latest meaningful progress",
 );
 if (workspaceContextRevision("context a") === workspaceContextRevision("context b")) {
   throw new Error("workspace context revisions should change with context content");

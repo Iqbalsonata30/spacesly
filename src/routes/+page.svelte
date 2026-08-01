@@ -60,6 +60,13 @@
     withCompletionMetadata,
   } from "$lib/boardWorkflow";
   import {
+    applyAgentEventProjection,
+    emptyAgentEventProjection,
+    mergeAgentEventProjection,
+    projectAgentTaskSessionEvent,
+    type AgentEventProjection,
+  } from "$lib/agentEventProjection";
+  import {
     agentSessionReplay,
     agentTaskCardProjection,
     agentWorkflowCheckpoint,
@@ -76,6 +83,7 @@
     type AgentRunLog,
     type AgentRunSession,
     type AgentRunStatus,
+    type AgentTaskCardProjection,
     type AgentSessionEvent,
     type ExecutionRun,
   } from "$lib/agentRun";
@@ -460,6 +468,13 @@
   let agentConsoleCardId = $state<string | null>(null);
   let agentTerminalInput = $state("");
   let agentRunSessions = $state<Record<string, AgentRunSession>>({});
+  let agentTaskCardProjections = $state<Record<string, AgentTaskCardProjection | null>>({});
+  // Runtime events accumulate outside Svelte state and publish one business snapshot per frame.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const pendingAgentEventProjections = new Map<
+    string,
+    { projection: AgentEventProjection; timer: ReturnType<typeof setTimeout> }
+  >();
   const cancellingAgentCardIds = new SvelteSet<string>();
   let latestAgentSessionId = $state<string | null>(null);
   let workspaceShellWorkdir = $state(initialUiState.workspaceShellWorkdir);
@@ -734,6 +749,8 @@
       for (const unregister of unregisterEditorCommands) unregister();
       if (workspaceFileChangeTimer) clearTimeout(workspaceFileChangeTimer);
       if (durableConversationHydrationTimer) clearTimeout(durableConversationHydrationTimer);
+      for (const pending of pendingAgentEventProjections.values()) clearTimeout(pending.timer);
+      pendingAgentEventProjections.clear();
       unlistenWindowClose?.();
       unlistenWindowClose = null;
       unlistenWorkspaceFileChanges?.();
@@ -1017,14 +1034,6 @@
   );
   let selectedCardAgentSession = $derived<AgentRunSession | null>(
     selectedCardId ? (agentRunSessions[selectedCardId] ?? null) : null,
-  );
-  let agentTaskCardProjections = $derived(
-    Object.fromEntries(
-      Object.entries(agentRunSessions).map(([cardId, session]) => [
-        cardId,
-        agentTaskCardProjection(session),
-      ]),
-    ),
   );
   let runningAgentTaskSessions = $derived(runningAgentSessions(agentRunSessions));
   let activeEditorFile = $derived.by((): OpenEditorFile | null => {
@@ -1328,7 +1337,7 @@
             : run.status === "blocked" || run.status === "failed"
               ? "blocked"
               : "running";
-        agentRunSessions[cardId] = createAgentRunSession(
+        const session = createAgentRunSession(
           cardId,
           ticketTitle,
           recoveredStatus,
@@ -1365,12 +1374,15 @@
           retainedTaskSession?.state ?? null,
           checkpoint,
         );
+        agentRunSessions[cardId] = session;
+        updateAgentTaskCardProjection(cardId, session);
         if (retainedTaskSession) {
           void watchRecoveredAgentTask(cardId, retainedTaskSession.id);
         }
         latestAgentSessionId = cardId;
       }
       agentRunSessions = retainAgentSessions(agentRunSessions);
+      retainAgentTaskCardProjections(agentRunSessions);
     } catch (reason) {
       appNotice = {
         tone: "error",
@@ -5521,6 +5533,7 @@
     if (selectedCardId === cardId) selectedCardId = null;
     const { [cardId]: _removed, ...remainingSessions } = agentRunSessions;
     agentRunSessions = remainingSessions;
+    delete agentTaskCardProjections[cardId];
     if (latestAgentSessionId === cardId) {
       latestAgentSessionId =
         Object.values(remainingSessions).sort(
@@ -5631,6 +5644,8 @@
       continuation ? (previousSession?.conversationId ?? null) : null,
     );
     agentRunSessions = retainAgentSessions({ ...agentRunSessions, [card.id]: session });
+    updateAgentTaskCardProjection(card.id, session);
+    retainAgentTaskCardProjections(agentRunSessions);
     latestAgentSessionId = card.id;
     appendStructuredAgentLogForCard(
       card.id,
@@ -5673,14 +5688,36 @@
     if (!session) return;
 
     const nextSession = transform(session);
+    if (nextSession === session) return;
     latestAgentSessionId = cardId;
     agentRunSessions[cardId] = nextSession;
+    updateAgentTaskCardProjection(cardId, nextSession);
     if (
       session.status === "running" &&
       nextSession.status !== "running" &&
       Object.keys(agentRunSessions).length > MAX_RETAINED_AGENT_SESSIONS
     ) {
       agentRunSessions = retainAgentSessions(agentRunSessions);
+      retainAgentTaskCardProjections(agentRunSessions);
+    }
+  }
+
+  function updateAgentTaskCardProjection(cardId: string, session: AgentRunSession) {
+    const next = agentTaskCardProjection(session);
+    const current = agentTaskCardProjections[cardId];
+    if (
+      current?.status === next?.status &&
+      current?.progress === next?.progress &&
+      current?.running === next?.running
+    ) {
+      return;
+    }
+    agentTaskCardProjections[cardId] = next;
+  }
+
+  function retainAgentTaskCardProjections(sessions: Record<string, AgentRunSession>) {
+    for (const cardId of Object.keys(agentTaskCardProjections)) {
+      if (!(cardId in sessions)) delete agentTaskCardProjections[cardId];
     }
   }
 
@@ -5868,10 +5905,10 @@
   }
 
   function setAgentProgressForCard(cardId: string, value: number) {
-    updateAgentSessionForCard(cardId, (session) => ({
-      ...session,
-      progress: Math.max(session.progress, Math.min(100, value)),
-    }));
+    updateAgentSessionForCard(cardId, (session) => {
+      const progress = Math.max(session.progress, Math.min(100, value));
+      return progress === session.progress ? session : { ...session, progress };
+    });
   }
 
   function appendAgentLogForCard(
@@ -5928,74 +5965,37 @@
   }
 
   function projectTaskSessionEvent(cardId: string, event: TaskSessionEvent) {
-    const payload =
-      typeof event.payload === "object" && event.payload !== null && !Array.isArray(event.payload)
-        ? (event.payload as Record<string, unknown>)
-        : {};
-    const eventType = typeof payload.type === "string" ? payload.type : event.kind;
-    const eventProgress = event.progress
-      ? event.progress.total && event.progress.total > 0
-        ? 35 + Math.round((event.progress.completed / event.progress.total) * 35)
-        : 55
-      : null;
-    if (event.kind === "runtime" && eventType === "text_delta") {
-      if (eventProgress !== null) setAgentProgressForCard(cardId, eventProgress);
+    const projected = projectAgentTaskSessionEvent(
+      event,
+      `run-${Date.now().toString(36)}-${event.sequence}`,
+      new Date().toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }),
+    );
+    const pending = pendingAgentEventProjections.get(cardId);
+    if (pending) {
+      pending.projection = mergeAgentEventProjection(pending.projection, projected);
       return;
     }
-
-    let tone: AgentRunLog["tone"] = "info";
-    let summary = `Task Session ${event.kind}: ${eventType}.`;
-    let taskSessionState: AgentRunSession["taskSessionState"] | undefined;
-    if (event.kind === "lifecycle" && typeof payload.state === "string") {
-      taskSessionState = payload.state as NonNullable<AgentRunSession["taskSessionState"]>;
-      tone = payload.state === "failed" || payload.state === "blocked" ? "error" : "info";
-      summary = `Task Session entered ${payload.state}.`;
-    } else if (event.kind === "tool") {
-      const context =
-        typeof payload.display_context === "object" && payload.display_context !== null
-          ? (payload.display_context as Record<string, unknown>)
-          : {};
-      const label = typeof context.label === "string" ? context.label : payload.tool_name;
-      const failed = payload.type === "tool_completed" && payload.success === false;
-      tone = failed ? "error" : "info";
-      summary = `${payload.type === "tool_completed" ? (failed ? "Tool failed" : "Tool completed; task still running") : "Tool started"}: ${String(label ?? "Agent tool")}.`;
-    } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
-      summary = "Agent result staged for authoritative Task Session commit.";
+    if (
+      projected.progress === null &&
+      projected.taskSessionState === null &&
+      projected.logs.length === 0
+    ) {
+      return;
     }
-    const message = [
-      `STATUS: ${tone === "error" ? "Blocked" : "Running"}`,
-      `SUMMARY: ${summary}`,
-      "EVIDENCE:",
-      `- Task Session event sequence: ${event.sequence}`,
-      `- Assignment attempt: ${event.attempt_id ?? "unassigned"}`,
-      "DETAILS:",
-      ...(event.progress ? [`- Progress phase: ${event.progress.phase}`] : []),
-    ].join("\n");
-    updateAgentSessionForCard(cardId, (session) => ({
-      ...session,
-      progress:
-        eventProgress === null
-          ? session.progress
-          : Math.max(session.progress, Math.min(100, eventProgress)),
-      taskSessionState: taskSessionState ?? session.taskSessionState,
-      logs: capList(
-        [
-          ...session.logs,
-          {
-            id: `run-${Date.now().toString(36)}-${session.logs.length}`,
-            at: new Date().toLocaleTimeString(undefined, {
-              hour: "2-digit",
-              minute: "2-digit",
-              second: "2-digit",
-            }),
-            tone,
-            label: event.kind,
-            message,
-          },
-        ],
-        MAX_AGENT_LOGS,
-      ),
-    }));
+    const entry = {
+      projection: mergeAgentEventProjection(emptyAgentEventProjection(), projected),
+      timer: setTimeout(() => {
+        pendingAgentEventProjections.delete(cardId);
+        updateAgentSessionForCard(cardId, (session) =>
+          applyAgentEventProjection(session, entry.projection, MAX_AGENT_LOGS),
+        );
+      }, 16),
+    };
+    pendingAgentEventProjections.set(cardId, entry);
   }
 
   function buildAgentContextExport(config: AiWorkerConfig, contract: ExecutionContract): string {
