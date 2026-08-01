@@ -8358,7 +8358,7 @@
                                 class="edit-skill-button"
                                 type="button"
                                 onclick={() =>
-                                  (skillEditor = { skill: structuredClone(skill), isNew: false })}
+                                  (skillEditor = { skill: $state.snapshot(skill), isNew: false })}
                                 >Edit configuration</button
                               >
                             </div>

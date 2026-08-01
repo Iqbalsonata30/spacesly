@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "bun tests/themes.ts && bun tests/agentSkills.ts && bun tests/editorDocument.ts && bun tests/taskSessions.ts",
+    "test:ui": "playwright test",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
@@ -47,6 +48,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.62.1",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.69.3",
     "@sveltejs/vite-plugin-svelte": "^7.2.0",

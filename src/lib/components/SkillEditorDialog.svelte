@@ -20,7 +20,7 @@
   };
 
   let { skill, skills, isNew, onSave, onCancel }: Props = $props();
-  let form = $state(untrack(() => structuredClone(skill)));
+  let form = $state(untrack(() => structuredClone($state.snapshot(skill))));
   let error = $state<string | null>(null);
   let nameInput: HTMLInputElement | null = $state(null);
   let dialogElement: HTMLFormElement | null = $state(null);
