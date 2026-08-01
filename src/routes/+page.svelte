@@ -7,6 +7,7 @@
   import NewTaskPopover from "$lib/components/NewTaskPopover.svelte";
   import NotificationStack from "$lib/components/NotificationStack.svelte";
   import SegmentedControl from "$lib/components/SegmentedControl.svelte";
+  import SkillEditorDialog from "$lib/components/SkillEditorDialog.svelte";
   import SettingsActionBar from "$lib/components/settings/SettingsActionBar.svelte";
   import SettingsCard from "$lib/components/settings/SettingsCard.svelte";
   import SettingsHelperText from "$lib/components/settings/SettingsHelperText.svelte";
@@ -170,6 +171,7 @@
     getWorkspace,
     importConversations,
     listGlobalEnvironmentVariables,
+    listAgentRuntimeProfiles,
     deleteGlobalEnvironmentVariable,
     deleteRecoverySnapshot,
     listDirectory,
@@ -258,6 +260,19 @@
   } from "$lib/ipc";
   import { lspConfigForPath } from "$lib/lspConfig";
   import { shouldPollLspDiagnostics } from "$lib/lspEditor";
+  import {
+    categoryLabel,
+    createAgentSkill,
+    duplicateAgentSkill,
+    resolveAgentSkillSnapshot,
+    skillCategories,
+    skillMatchesSearch,
+    triggerLabel,
+    validateAgentSkillCatalog,
+    type AgentSkill,
+    type SkillCategory,
+    type SkillTrigger,
+  } from "$lib/agentSkills";
   import {
     createMcpServer,
     loadLegacySettingsSecrets,
@@ -464,6 +479,15 @@
   };
   let globalEnvironmentVariables = $state<GlobalEnvironmentDraft[]>([]);
   let globalEnvironmentSearch = $state("");
+  let skillSearch = $state("");
+  let skillCategoryFilter = $state<SkillCategory | "all">("all");
+  let skillTriggerFilter = $state<SkillTrigger | "all">("all");
+  let skillStatusFilter = $state<"all" | "enabled" | "disabled">("all");
+  let skillEditor = $state<{ skill: AgentSkill; isNew: boolean } | null>(null);
+  const manuallyQueuedSkillIds = new SvelteSet<string>();
+  let pendingManualSkillReservation = Promise.resolve();
+  const pendingManualSkillReservationRunIds = new SvelteSet<string>();
+  const cancelledManualSkillReservationRunIds = new SvelteSet<string>();
   let globalEnvironmentHydrated = $state(false);
   let globalEnvironmentLoading = $state(false);
   let workspaceCacheHydrated = $state(false);
@@ -550,7 +574,6 @@
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
   let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
-  let agentSkillsTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRuns = $state<WorkspaceChatRuns>({});
   // Stream buffers stay non-reactive so token arrival cannot invalidate the UI more than once per frame.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -976,6 +999,17 @@
   });
 
   let activeBoard = $derived<BoardProjection | null>(workspace?.projects[0]?.boards[0] ?? null);
+  let visibleAgentSkills = $derived.by(() =>
+    settings.aiWorker.skills.filter((skill) => {
+      const enabled = skill.enabled && skill.trigger !== "disabled";
+      return (
+        skillMatchesSearch(skill, skillSearch) &&
+        (skillCategoryFilter === "all" || skill.category === skillCategoryFilter) &&
+        (skillTriggerFilter === "all" || skill.trigger === skillTriggerFilter) &&
+        (skillStatusFilter === "all" || (skillStatusFilter === "enabled" ? enabled : !enabled))
+      );
+    }),
+  );
   let workspaceChatRequestContextValue = $derived.by(() => {
     const context = workspaceAgentContext(activeBoard);
     return { context, revision: workspaceContextRevision(context) };
@@ -3378,6 +3412,7 @@
   }
 
   function closeSettings() {
+    skillEditor = null;
     settingsOpen = false;
     const opener = settingsOpener;
     settingsOpener = null;
@@ -3852,7 +3887,7 @@
       opencode_workdir: effectiveSettings.aiWorker.opencodeWorkdir.trim() || null,
       opencode_auto_approve: false,
       agent_rules: effectiveSettings.aiWorker.agentRules,
-      agent_skills: effectiveSettings.aiWorker.agentSkills,
+      agent_skills: "",
       temperature: effectiveSettings.aiWorker.temperature,
       mcp_servers: effectiveSettings.mcpServers.flatMap((server) => {
         const command = [server.command.trim(), ...server.args].filter(Boolean);
@@ -5389,6 +5424,11 @@
       settingsError = "Jira tool name is required.";
       return;
     }
+    const skillError = validateAgentSkillCatalog(nextSettings.aiWorker.skills);
+    if (skillError) {
+      settingsError = skillError;
+      return;
+    }
 
     settingsSaving = true;
     try {
@@ -5422,16 +5462,14 @@
 
   function settingsWithInstructionDrafts(): AppSettings {
     const agentRules = agentRulesTextarea?.value;
-    const agentSkills = agentSkillsTextarea?.value;
 
-    if (agentRules === undefined && agentSkills === undefined) return settings;
+    if (agentRules === undefined) return settings;
 
     return {
       ...settings,
       aiWorker: {
         ...settings.aiWorker,
         agentRules: agentRules ?? settings.aiWorker.agentRules,
-        agentSkills: agentSkills ?? settings.aiWorker.agentSkills,
       },
     };
   }
@@ -5448,12 +5486,80 @@
     };
   }
 
-  function commitAgentSkillsDraft() {
-    if (!agentSkillsTextarea) return;
-    settings = {
-      ...settings,
-      aiWorker: { ...settings.aiWorker, agentSkills: agentSkillsTextarea.value },
-    };
+  function saveAgentSkill(skill: AgentSkill): string | null {
+    const exists = settings.aiWorker.skills.some((candidate) => candidate.id === skill.id);
+    const skills = exists
+      ? settings.aiWorker.skills.map((candidate) => (candidate.id === skill.id ? skill : candidate))
+      : [...settings.aiWorker.skills, skill];
+    const error = persistAgentSkillCatalog(skills);
+    if (error) return error;
+    if (!skill.enabled || skill.trigger !== "manual") manuallyQueuedSkillIds.delete(skill.id);
+    skillEditor = null;
+    return null;
+  }
+
+  function removeAgentSkill(skill: AgentSkill) {
+    if (!window.confirm(`Delete “${skill.name}”? This cannot be undone.`)) return;
+    const error = persistAgentSkillCatalog(
+      settings.aiWorker.skills.filter((candidate) => candidate.id !== skill.id),
+      true,
+    );
+    if (!error) manuallyQueuedSkillIds.delete(skill.id);
+  }
+
+  function setAgentSkillEnabled(skill: AgentSkill, enabled: boolean) {
+    const updated_at = new Date().toISOString();
+    const error = persistAgentSkillCatalog(
+      settings.aiWorker.skills.map((candidate) =>
+        candidate.id === skill.id
+          ? {
+              ...candidate,
+              enabled,
+              trigger:
+                enabled && candidate.trigger === "disabled" ? "contextual" : candidate.trigger,
+              updated_at,
+            }
+          : candidate,
+      ),
+    );
+    if (!error && !enabled) manuallyQueuedSkillIds.delete(skill.id);
+  }
+
+  async function acquireManualSkillReservation(): Promise<() => void> {
+    const previousReservation = pendingManualSkillReservation;
+    let releaseReservation = () => {};
+    pendingManualSkillReservation = new Promise<void>((resolve) => {
+      releaseReservation = resolve;
+    });
+    await previousReservation;
+    return releaseReservation;
+  }
+
+  function persistAgentSkillCatalog(
+    skills: AgentSkill[],
+    allowInvalidReduction = false,
+  ): string | null {
+    const error = validateAgentSkillCatalog(skills);
+    const repairingInvalidCatalog =
+      allowInvalidReduction && skills.length < settings.aiWorker.skills.length;
+    if (error && !repairingInvalidCatalog) {
+      settingsError = error;
+      return error;
+    }
+    try {
+      const persisted = loadSettings();
+      saveSettings({
+        ...persisted,
+        aiWorker: { ...persisted.aiWorker, skills },
+      });
+    } catch (reason) {
+      const message = `Skills could not be saved: ${reason instanceof Error ? reason.message : String(reason)}`;
+      settingsError = message;
+      return message;
+    }
+    settings = { ...settings, aiWorker: { ...settings.aiWorker, skills } };
+    settingsError = error;
+    return null;
   }
 
   function updateActiveBoard(transform: (board: BoardProjection) => BoardProjection): boolean {
@@ -6181,6 +6287,7 @@
         contract_id: `contract-${runId}`,
         version: previousRun.contract.version + 1,
         runtime_inputs: {
+          ...previousRun.contract.runtime_inputs,
           operator_notes: operatorNotes,
           previous_output: previousOutput,
         },
@@ -6355,11 +6462,16 @@
       }));
     }
     const legacyRunId = runningWorkerRunIds[cardId];
-    const cancelled = await (session.taskSessionId != null
-      ? cancelTaskSession(session.taskSessionId).catch(() => false)
-      : legacyRunId
-        ? cancelAiWorkerTask(legacyRunId).catch(() => false)
-        : Promise.resolve(false));
+    const awaitingSkillReservation =
+      legacyRunId != null && pendingManualSkillReservationRunIds.has(legacyRunId);
+    if (awaitingSkillReservation) cancelledManualSkillReservationRunIds.add(legacyRunId);
+    const cancelled = awaitingSkillReservation
+      ? true
+      : await (session.taskSessionId != null
+          ? cancelTaskSession(session.taskSessionId).catch(() => false)
+          : legacyRunId
+            ? cancelAiWorkerTask(legacyRunId).catch(() => false)
+            : Promise.resolve(false));
     cancellingAgentCardIds.delete(cardId);
     if (!cancelled && session.taskSessionId != null) {
       updateAgentSessionForCard(cardId, (current) => ({
@@ -6810,6 +6922,29 @@
     }
   }
 
+  async function retainedAgentSkillSnapshot(session: AgentRunSession): Promise<string> {
+    if (!session.taskSessionId) {
+      throw new Error(
+        "Cannot continue safely because the original Skill snapshot has no retained Task Session.",
+      );
+    }
+    try {
+      const snapshot = await getTaskSession(session.taskSessionId);
+      if (!snapshot) throw new Error("retained Task Session was not found");
+      const envelope = agentEnvelopeFromSnapshot(snapshot);
+      if (!envelope) throw new Error("retained Task Session envelope was invalid");
+      const profiles = await listAgentRuntimeProfiles();
+      const profile = profiles.find((candidate) => candidate.id === envelope.runtime_profile_id);
+      if (!profile) throw new Error("retained Agent runtime profile was not found");
+      return profile.agent_skills;
+    } catch (reason) {
+      throw new Error(
+        `Cannot continue safely because the original Skill snapshot is unavailable: ${reason instanceof Error ? reason.message : String(reason)}`,
+        { cause: reason },
+      );
+    }
+  }
+
   async function startWorkerForCard(cardId: string, backlogAlreadyApproved = false) {
     const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
     if (
@@ -6912,8 +7047,19 @@
         : null;
     let backendExecutionStarted = false;
     let jiraTransitionCompleted = !issueKey;
+    let reservedManualSkillIds: string[] = [];
+    let manualSkillReservationCommitted = false;
+    let releaseManualSkillReservation: (() => void) | null = null;
+    let retainedLegacySkillSnapshot: string | null = null;
 
     try {
+      if (
+        isContinuation &&
+        existingSession &&
+        existingSession.executionRun?.contract.runtime_inputs.selected_skills_snapshot === undefined
+      ) {
+        retainedLegacySkillSnapshot = await retainedAgentSkillSnapshot(existingSession);
+      }
       beginAgentRun(card, isContinuation, null);
       const runtimeLabel =
         config.runtime === "opencode"
@@ -7048,6 +7194,49 @@
                   executionRepositoryContext(config, executionGitInfo, workspaceRoot),
                 ),
               );
+      if (
+        executionRun.contract.runtime_inputs.selected_skills_snapshot === undefined &&
+        isContinuation &&
+        existingSession
+      ) {
+        if (retainedLegacySkillSnapshot === null) {
+          throw new Error("Cannot continue safely because the original Skill snapshot is missing.");
+        }
+        executionRun = {
+          ...executionRun,
+          contract: {
+            ...executionRun.contract,
+            runtime_inputs: {
+              ...executionRun.contract.runtime_inputs,
+              selected_skill_ids: [],
+              selected_skills_snapshot: retainedLegacySkillSnapshot,
+            },
+          },
+        };
+      }
+      pendingManualSkillReservationRunIds.add(runId);
+      releaseManualSkillReservation = await acquireManualSkillReservation();
+      pendingManualSkillReservationRunIds.delete(runId);
+      if (cancelledManualSkillReservationRunIds.delete(runId)) {
+        throw new Error("Agent run was cancelled before submission.");
+      }
+      const skillSnapshot = resolveAgentSkillSnapshot(
+        settings.aiWorker.skills,
+        executionRun.contract,
+        [...manuallyQueuedSkillIds],
+      );
+      config.agent_skills = skillSnapshot.snapshot;
+      executionRun = { ...executionRun, contract: skillSnapshot.contract };
+      const consumedManualSkillIds = skillSnapshot.reused
+        ? []
+        : skillSnapshot.selectedSkillIds.filter((skillId) => manuallyQueuedSkillIds.has(skillId));
+      reservedManualSkillIds = consumedManualSkillIds;
+      for (const skillId of reservedManualSkillIds) manuallyQueuedSkillIds.delete(skillId);
+      const commitManualSkillReservation = () => {
+        manualSkillReservationCommitted = true;
+        releaseManualSkillReservation?.();
+        releaseManualSkillReservation = null;
+      };
       setAgentRunOutputForCard(cardId, buildAgentContextExport(config, executionRun.contract));
       setAgentProgressForCard(cardId, 55);
       if (issueKey && !jiraTransitionCompleted) {
@@ -7101,6 +7290,7 @@
             }));
             const execution = await executeAgentTaskSession(ticketLabel(card), prepared, {
               onSubmitted: (session) => {
+                commitManualSkillReservation();
                 updateAgentSessionForCard(cardId, (current) => ({
                   ...current,
                   taskSessionId: session.id,
@@ -7123,6 +7313,7 @@
                 if (event.run_id !== runId || event.sequence <= lastAgentEventSequence) return;
                 lastAgentEventSequence = event.sequence;
                 if (event.type === "run_started") {
+                  commitManualSkillReservation();
                   appendStructuredAgentLogForCard(
                     cardId,
                     "info",
@@ -7189,6 +7380,7 @@
                 }
               },
             );
+            commitManualSkillReservation();
           }
         } catch (reason) {
           if (
@@ -7495,6 +7687,15 @@
       );
       appNotice = { tone: "error", message };
     } finally {
+      pendingManualSkillReservationRunIds.delete(runId);
+      cancelledManualSkillReservationRunIds.delete(runId);
+      if (!manualSkillReservationCommitted) {
+        for (const skillId of reservedManualSkillIds) {
+          const skill = settings.aiWorker.skills.find((candidate) => candidate.id === skillId);
+          if (skill?.enabled && skill.trigger === "manual") manuallyQueuedSkillIds.add(skillId);
+        }
+      }
+      releaseManualSkillReservation?.();
       clearActiveAgentRun(
         useTaskSession || typeof localStorage === "undefined" ? undefined : localStorage,
         cardId,
@@ -8076,42 +8277,164 @@
                   id="skills-settings"
                   eyebrow="Agent playbooks"
                   title="Skills"
-                  description="Describe reusable work patterns that the Agent applies only when they match a task."
-                  badge="Contextual"
+                  description="Manage reusable procedures that are selected before an Agent task begins."
+                  badge={`${settings.aiWorker.skills.filter((skill) => skill.enabled && skill.trigger !== "disabled").length} enabled`}
                 >
-                  <SettingsCard title="Examples" tone="subtle">
-                    <div class="skill-template-grid" aria-label="Skill examples">
-                      <div>
-                        <strong>Bamboo diagnostics</strong>
-                        <span
-                          >Check builds, fetch logs, identify the failing job, summarize evidence.</span
-                        >
-                      </div>
-                      <div>
-                        <strong>OCP troubleshooting</strong>
-                        <span
-                          >Inspect pods, events, logs, and resource usage before proposing fixes.</span
-                        >
-                      </div>
-                    </div>
-                  </SettingsCard>
                   <SettingsCard
-                    title="Reusable skills"
-                    description="Name each skill, then list its ordered investigation or execution steps."
+                    title="Skill library"
+                    description="Automatic skills always apply. Contextual skills load only when their category matches the immutable task context."
                   >
-                    <SettingsLabel text="Skill definitions" forId="agent-skills-input">
-                      <SettingsInput wide>
-                        <textarea
-                          id="agent-skills-input"
-                          bind:this={agentSkillsTextarea}
-                          class="agent-instruction-field"
-                          rows="12"
-                          spellcheck="false"
-                          placeholder="Skill: Bamboo diagnostics&#10;Check latest build status, fetch logs, identify failing job, summarize evidence.&#10;&#10;Skill: OCP troubleshooting&#10;Check pod status, recent events, logs, and resource usage before guessing."
-                          value={settings.aiWorker.agentSkills}
-                          onblur={commitAgentSkillsDraft}></textarea>
-                      </SettingsInput>
-                    </SettingsLabel>
+                    <div class="skill-library-toolbar">
+                      <label class="skill-search">
+                        <span>Search</span>
+                        <input
+                          value={skillSearch}
+                          placeholder="Name, description, category, status, or trigger"
+                          oninput={(event) => (skillSearch = event.currentTarget.value)}
+                        />
+                      </label>
+                      <button
+                        class="new-skill-button"
+                        type="button"
+                        onclick={() => (skillEditor = { skill: createAgentSkill(), isNew: true })}
+                        >＋ New Skill</button
+                      >
+                    </div>
+                    <div class="skill-filters" aria-label="Skill filters">
+                      <label>
+                        <span>Category</span>
+                        <select
+                          value={skillCategoryFilter}
+                          onchange={(event) =>
+                            (skillCategoryFilter = event.currentTarget.value as
+                              SkillCategory | "all")}
+                        >
+                          <option value="all">All categories</option>
+                          {#each skillCategories as category (category)}
+                            <option value={category}>{categoryLabel(category)}</option>
+                          {/each}
+                        </select>
+                      </label>
+                      <label>
+                        <span>Activation</span>
+                        <select
+                          value={skillTriggerFilter}
+                          onchange={(event) =>
+                            (skillTriggerFilter = event.currentTarget.value as
+                              SkillTrigger | "all")}
+                        >
+                          <option value="all">All activation types</option>
+                          <option value="automatic">Automatic</option>
+                          <option value="contextual">Contextual</option>
+                          <option value="manual">Manual only</option>
+                          <option value="disabled">Disabled</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>Status</span>
+                        <select
+                          value={skillStatusFilter}
+                          onchange={(event) =>
+                            (skillStatusFilter = event.currentTarget
+                              .value as typeof skillStatusFilter)}
+                        >
+                          <option value="all">All statuses</option>
+                          <option value="enabled">Enabled</option>
+                          <option value="disabled">Disabled</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    {#if visibleAgentSkills.length > 0}
+                      <div class="skill-library-list">
+                        {#each visibleAgentSkills as skill (skill.id)}
+                          <article class:disabled={!skill.enabled || skill.trigger === "disabled"}>
+                            <div class="skill-card-heading">
+                              <div>
+                                <h5>{skill.name}</h5>
+                                <p>{skill.description}</p>
+                              </div>
+                              <button
+                                class="edit-skill-button"
+                                type="button"
+                                onclick={() =>
+                                  (skillEditor = { skill: structuredClone(skill), isNew: false })}
+                                >Edit configuration</button
+                              >
+                            </div>
+                            <div class="skill-card-metadata">
+                              <strong
+                                class:disabled={!skill.enabled || skill.trigger === "disabled"}
+                                >{skill.enabled && skill.trigger !== "disabled"
+                                  ? "Enabled"
+                                  : "Disabled"}</strong
+                              >
+                              <span>{triggerLabel(skill.trigger)}</span>
+                              <span>{categoryLabel(skill.category, skill.custom_category)}</span>
+                              <span>Priority {skill.priority}</span>
+                              {#if manuallyQueuedSkillIds.has(skill.id)}
+                                <span class="manual-queued">Queued for next run</span>
+                              {/if}
+                            </div>
+                            <div class="skill-card-actions">
+                              <button
+                                type="button"
+                                onclick={() =>
+                                  (skillEditor = {
+                                    skill: duplicateAgentSkill(skill),
+                                    isNew: true,
+                                  })}>Duplicate</button
+                              >
+                              {#if skill.enabled && skill.trigger === "manual"}
+                                <button
+                                  class:active={manuallyQueuedSkillIds.has(skill.id)}
+                                  type="button"
+                                  onclick={() => {
+                                    if (manuallyQueuedSkillIds.has(skill.id)) {
+                                      manuallyQueuedSkillIds.delete(skill.id);
+                                    } else {
+                                      manuallyQueuedSkillIds.add(skill.id);
+                                    }
+                                  }}
+                                  >{manuallyQueuedSkillIds.has(skill.id)
+                                    ? "Remove from next run"
+                                    : "Use next run"}</button
+                                >
+                              {/if}
+                              <button
+                                type="button"
+                                onclick={() =>
+                                  setAgentSkillEnabled(
+                                    skill,
+                                    !(skill.enabled && skill.trigger !== "disabled"),
+                                  )}
+                                >{skill.enabled && skill.trigger !== "disabled"
+                                  ? "Disable"
+                                  : "Enable"}</button
+                              >
+                              <button
+                                class="danger"
+                                type="button"
+                                onclick={() => removeAgentSkill(skill)}>Delete</button
+                              >
+                            </div>
+                          </article>
+                        {/each}
+                      </div>
+                    {:else}
+                      <div class="skill-library-empty">
+                        <strong
+                          >{settings.aiWorker.skills.length
+                            ? "No skills match"
+                            : "No skills yet"}</strong
+                        >
+                        <span
+                          >{settings.aiWorker.skills.length
+                            ? "Adjust search or filters to see more skills."
+                            : "Create a reusable procedure for Agent tasks."}</span
+                        >
+                      </div>
+                    {/if}
                   </SettingsCard>
                 </SettingsPage>
               {/if}
@@ -8699,7 +9022,7 @@
                 </details>
               {/if}
 
-              {#if settingsTab !== "theme"}
+              {#if settingsTab !== "theme" && settingsTab !== "skills"}
                 <SettingsActionBar>
                   {#if settingsTab === "mcp"}
                     <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
@@ -8733,6 +9056,18 @@
           </div>
         </div>
       </section>
+    {/if}
+
+    {#if skillEditor}
+      {#key `${skillEditor.skill.id}:${skillEditor.isNew}`}
+        <SkillEditorDialog
+          skill={skillEditor.skill}
+          skills={settings.aiWorker.skills}
+          isNew={skillEditor.isNew}
+          onSave={saveAgentSkill}
+          onCancel={() => (skillEditor = null)}
+        />
+      {/key}
     {/if}
 
     {#if error}

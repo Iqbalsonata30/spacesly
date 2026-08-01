@@ -1,4 +1,10 @@
 import { aiProviders, defaultModelForProvider, providerById } from "$lib/aiModels";
+import {
+  defaultAgentSkills,
+  migrateLegacyAgentSkills,
+  normalizeAgentSkills,
+  type AgentSkill,
+} from "$lib/agentSkills";
 import { normalizeOpencodeModel } from "$lib/opencodeModels";
 
 export interface McpServerSettings {
@@ -135,7 +141,7 @@ export interface AiWorkerSettings {
   opencodeWorkdir: string;
   opencodeAutoApprove: boolean;
   agentRules: string;
-  agentSkills: string;
+  skills: AgentSkill[];
   temperature: number;
 }
 
@@ -190,16 +196,7 @@ export const defaultSettings: AppSettings = {
       "- If a task requires shell/file/network access that is unavailable, report BLOCKED instead of pretending completion.",
       "- Do not modify credentials, secrets, or environment files unless the user explicitly asks.",
     ].join("\n"),
-    agentSkills: [
-      "Skill: Production task execution",
-      "Use concrete evidence. For file changes, verify with shell commands or file reads. For Jira tasks, summarize exact status/comment actions.",
-      "",
-      "Skill: Operational troubleshooting",
-      "Prefer checking logs, events, build output, and recent changes before guessing. Report blockers with next evidence needed.",
-      "",
-      "Skill: Architecture compliance",
-      "Keep domain independent from UI/Tauri/provider details. Treat every model provider and external service as replaceable infrastructure.",
-    ].join("\n"),
+    skills: defaultAgentSkills(),
     temperature: 0.2,
   },
 };
@@ -373,7 +370,7 @@ export function parseEnvText(value: string): Record<string, string> {
   );
 }
 
-function normalizeSettings(value: unknown): AppSettings {
+export function normalizeSettings(value: unknown): AppSettings {
   const fallback = cloneDefaultSettings();
   if (!value || typeof value !== "object") return fallback;
 
@@ -385,6 +382,13 @@ function normalizeSettings(value: unknown): AppSettings {
   const aiModelId = normalizeModelId(candidate.aiWorker, aiProviderId);
   const aiModelIds = normalizeAiModelIds(candidate.aiWorker, aiProviderId, aiModelId);
   const aiApiKeys = normalizeAiApiKeys(candidate.aiWorker, aiProviderId);
+  const legacyAiWorker = candidate.aiWorker as
+    (Partial<AiWorkerSettings> & { agentSkills?: unknown }) | undefined;
+  const skills = Array.isArray(candidate.aiWorker?.skills)
+    ? normalizeAgentSkills(candidate.aiWorker.skills)
+    : legacyAiWorker && "agentSkills" in legacyAiWorker
+      ? migrateLegacyAgentSkills(String(legacyAiWorker.agentSkills ?? ""))
+      : fallback.aiWorker.skills;
 
   return {
     mcpServers,
@@ -407,7 +411,7 @@ function normalizeSettings(value: unknown): AppSettings {
       ),
       opencodeAutoApprove: candidate.aiWorker?.opencodeAutoApprove === true,
       agentRules: String(candidate.aiWorker?.agentRules ?? fallback.aiWorker.agentRules),
-      agentSkills: String(candidate.aiWorker?.agentSkills ?? fallback.aiWorker.agentSkills),
+      skills,
       temperature: boundedFloat(
         candidate.aiWorker?.temperature,
         fallback.aiWorker.temperature,

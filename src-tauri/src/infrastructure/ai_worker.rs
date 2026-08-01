@@ -1003,7 +1003,7 @@ fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
 
     if include_skills && !skills.is_empty() {
         sections.push(format!(
-            "User-defined Agent skills/playbooks. Before acting, identify any skill that matches the task, then follow that skill as the required procedure for the matching work. If no skill applies, say so briefly in DETAILS. If a skill cannot be followed because tools/access are missing, return STATUS: BLOCKED:\n{skills}"
+            "Preselected Agent skills/playbooks for this task. Follow each included skill as the required procedure for its matching work. Selection was completed before execution; do not load or infer other skills. If a selected skill cannot be followed because tools/access are missing, return the blocked outcome required by this runtime's response schema:\n{skills}"
         ));
     }
 
@@ -1022,7 +1022,14 @@ fn execution_contract_context(task: &AiWorkerTask) -> String {
     let Some(contract) = task.execution_contract.as_ref() else {
         return "No Execution Contract was provided by Spacesly.".to_string();
     };
-    serde_json::to_string_pretty(contract).unwrap_or_else(|_| contract.to_string())
+    let mut prompt_contract = contract.clone();
+    if let Some(runtime_inputs) = prompt_contract
+        .get_mut("runtime_inputs")
+        .and_then(Value::as_object_mut)
+    {
+        runtime_inputs.remove("selected_skills_snapshot");
+    }
+    serde_json::to_string_pretty(&prompt_contract).unwrap_or_else(|_| prompt_contract.to_string())
 }
 
 fn contract_value(task: &AiWorkerTask, path: &[&str]) -> Option<String> {
@@ -3414,6 +3421,26 @@ mod tests {
 
         assert!(context.contains("required procedure"));
         assert!(context.contains("Skill: Deploy safely"));
+    }
+
+    #[test]
+    fn execution_contract_prompt_omits_retained_skill_snapshot() {
+        let task = AiWorkerTask {
+            execution_contract: Some(serde_json::json!({
+                "contract_id": "contract-1",
+                "runtime_inputs": {
+                    "operator_notes": null,
+                    "selected_skill_ids": ["deploy"],
+                    "selected_skills_snapshot": "Skill: Deploy safely\nSecret duplicate body"
+                }
+            })),
+            session_key: None,
+        };
+
+        let prompt = execution_contract_context(&task);
+        assert!(prompt.contains("selected_skill_ids"));
+        assert!(!prompt.contains("selected_skills_snapshot"));
+        assert!(!prompt.contains("Secret duplicate body"));
     }
 
     #[test]

@@ -79,6 +79,8 @@ export interface ExecutionContract {
   runtime_inputs: {
     operator_notes: string | null;
     previous_output: string | null;
+    selected_skill_ids?: string[];
+    selected_skills_snapshot?: string;
   };
 }
 
