@@ -1,16 +1,5 @@
 <script lang="ts">
-  import {
-    ArrowDownToLine,
-    ArrowUpFromLine,
-    CheckCircle2,
-    ChevronDown,
-    FileText,
-    GitMerge,
-    Loader2,
-    Minus,
-    Plus,
-    RefreshCw,
-  } from "lucide-svelte";
+  import { ChevronDown, Loader2, Minus, Plus } from "lucide-svelte";
   import GitBranchPicker from "$lib/components/GitBranchPicker.svelte";
   import WorkspaceRow from "$lib/components/WorkspaceRow.svelte";
   import type { GitChangedFile, GitWorkspaceInfo } from "$lib/ipc/git";
@@ -292,14 +281,15 @@
             actionsMenuOpen = !actionsMenuOpen;
           }}
         >
-          <span class="branch-menu-button-icon"><GitMerge size={14} /></span>
           <span class="branch-menu-button-copy">
             <small>Target branch</small>
             <strong title={mergeBranch || branchChoices[0] || "Choose branch"}
               >{mergeBranch || branchChoices[0] || "Choose branch"}</strong
             >
           </span>
-          <span class="branch-menu-button-indicator"><ChevronDown size={14} /></span>
+          <span class="branch-menu-button-indicator"
+            ><ChevronDown size={14} aria-hidden="true" /></span
+          >
         </button>
         {#if actionsMenuOpen}
           <div
@@ -335,7 +325,7 @@
               <button
                 type="button"
                 disabled={mergeDisabled}
-                onclick={() => void runMergeOrRebase("merge")}><GitMerge size={14} /> Merge</button
+                onclick={() => void runMergeOrRebase("merge")}>Merge</button
               >
               <button
                 type="button"
@@ -366,26 +356,23 @@
         <button
           type="button"
           disabled={stageAllDisabled}
-          onclick={() => void runAction("stage-all", onStageAll)}
-          ><Plus size={14} /> Stage All</button
+          onclick={() => void runAction("stage-all", onStageAll)}>Stage All</button
         >
         <button
           type="button"
           disabled={unstageAllDisabled}
-          onclick={() => void runAction("unstage-all", onUnstageAll)}
-          ><Minus size={14} /> Unstage All</button
+          onclick={() => void runAction("unstage-all", onUnstageAll)}>Unstage All</button
         >
         <button type="button" disabled={syncDisabled} onclick={() => void runAction("pull", onPull)}
-          ><ArrowDownToLine size={14} /> {actionLabel("pull")}</button
+          >{actionLabel("pull")}</button
         >
         <button type="button" disabled={pushDisabled} onclick={() => void runAction("push", onPush)}
-          ><ArrowUpFromLine size={14} /> {actionLabel("push")}</button
+          >{actionLabel("push")}</button
         >
         <button
           type="button"
           disabled={refreshDisabled}
-          onclick={() => void runAction("refresh", onRefresh)}
-          ><RefreshCw size={14} /> {actionLabel("refresh")}</button
+          onclick={() => void runAction("refresh", onRefresh)}>{actionLabel("refresh")}</button
         >
       </div>
     </section>
@@ -434,7 +421,7 @@
         disabled={commitDisabled}
         onclick={() => void commit()}
       >
-        {#if actionBusy === "commit"}<Loader2 size={15} />{/if}
+        {#if actionBusy === "commit"}<Loader2 class="spin" size={16} aria-hidden="true" />{/if}
         {actionBusy === "commit"
           ? "Committing..."
           : stagedCount > 0
@@ -459,7 +446,6 @@
       {#if stagedFiles.length > 0}
         <div class="changes-list">
           {#each stagedFiles as file (fileLabel(file))}
-            {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
             <div
               role="presentation"
               oncontextmenu={(event) => openContextMenu("staged", file, event)}
@@ -470,18 +456,18 @@
                   title={fileLabel(file)}
                   status={statusLabel(file.status)}
                   statusTone={statusTone(file.status)}
-                  leading={rowLeading}
                   onClick={() => onOpenFile(file.path)}
                 />
                 <button
                   class="row-action"
                   type="button"
-                  title="Unstage file"
+                  aria-label={`Unstage ${file.path}`}
+                  title={`Unstage ${file.path}`}
                   disabled={actionBusy !== null}
                   onclick={(event) => {
                     event.stopPropagation();
                     void runAction("unstage", () => onUnstageFile(file.path));
-                  }}><Minus size={13} /></button
+                  }}><Minus size={14} aria-hidden="true" /></button
                 >
               </div>
             </div>
@@ -489,9 +475,8 @@
         </div>
       {:else}
         <div class="empty-state">
-          <div class="empty-icon"><FileText size={18} /></div>
           <strong>No staged changes</strong><span
-            >Use + on a file or Stage All to prepare a commit.</span
+            >Use Stage on a file or Stage All to prepare a commit.</span
           >
         </div>
       {/if}
@@ -515,7 +500,6 @@
       {#if unstagedFiles.length > 0}
         <div class="changes-list">
           {#each unstagedFiles as file (fileLabel(file))}
-            {#snippet rowLeading()}<FileText size={14} class="row-icon" />{/snippet}
             <div
               role="presentation"
               oncontextmenu={(event) => openContextMenu("unstaged", file, event)}
@@ -526,18 +510,18 @@
                   title={fileLabel(file)}
                   status={statusLabel(file.status)}
                   statusTone={statusTone(file.status)}
-                  leading={rowLeading}
                   onClick={() => onOpenFile(file.path)}
                 />
                 <button
                   class="row-action"
                   type="button"
-                  title="Stage file"
+                  aria-label={`Stage ${file.path}`}
+                  title={`Stage ${file.path}`}
                   disabled={actionBusy !== null}
                   onclick={(event) => {
                     event.stopPropagation();
                     void runAction("stage", () => onStageFile(file.path));
-                  }}><Plus size={13} /></button
+                  }}><Plus size={14} aria-hidden="true" /></button
                 >
               </div>
             </div>
@@ -545,14 +529,12 @@
         </div>
       {:else if repoClean}
         <div class="empty-state clean">
-          <div class="empty-icon"><CheckCircle2 size={18} /></div>
           <strong>Working tree clean</strong><span
             >No modified, added, deleted, renamed, or untracked files.</span
           >
         </div>
       {:else}
         <div class="empty-state">
-          <div class="empty-icon"><FileText size={18} /></div>
           <strong>No unstaged changes</strong><span>All current changes are staged for commit.</span
           >
         </div>
@@ -705,7 +687,7 @@
   }
   .branch-menu-button {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 9px;
     align-items: center;
     width: 100%;
@@ -740,7 +722,6 @@
     color: var(--text-bright);
     font-size: 12px;
   }
-  .branch-menu-button-icon,
   .branch-menu-button-indicator {
     display: inline-flex;
     flex: 0 0 auto;
@@ -980,8 +961,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: 32px;
+    height: 32px;
     border-radius: 8px;
     color: var(--text-primary);
   }
@@ -1006,24 +987,6 @@
   .commit-validation,
   .commit-helper {
     overflow-wrap: anywhere;
-  }
-  .empty-state.clean .empty-icon {
-    color: var(--success);
-    border-color: var(--success-border);
-  }
-  .empty-icon {
-    display: inline-flex;
-    width: 36px;
-    height: 36px;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--border-strong);
-    border-radius: 12px;
-    color: var(--accent);
-    background: var(--surface-hover);
-  }
-  :global(.row-icon) {
-    color: var(--accent);
   }
   .context-menu {
     position: fixed;
@@ -1050,6 +1013,22 @@
   }
   .context-menu button:not(:disabled):hover {
     background: var(--surface-hover);
+  }
+
+  :global(.spin) {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :global(.spin) {
+      animation: none;
+    }
   }
 
   @container (min-width: 390px) {

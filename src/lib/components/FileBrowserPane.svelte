@@ -4,9 +4,9 @@
     ChevronsLeft,
     File as FileIcon,
     FilePlus2,
-    FileSearch,
     Folder,
     FolderOpen,
+    ListCollapse,
     Loader2,
     RefreshCw,
   } from "lucide-svelte";
@@ -200,7 +200,7 @@
       onclick={onToggleSidebar}
       aria-label="Hide sidebar"
     >
-      <ChevronsLeft size={15} />
+      <ChevronsLeft size={16} aria-hidden="true" />
     </button>
   </header>
 
@@ -212,7 +212,7 @@
       aria-label="Open folder (Ctrl+Shift+O)"
       title="Open folder (Ctrl+Shift+O)"
     >
-      <FolderOpen size={15} />
+      <FolderOpen size={16} aria-hidden="true" />
     </button>
     <button
       type="button"
@@ -221,7 +221,7 @@
       aria-label="Open file"
       title="Open file (Ctrl+O)"
     >
-      <FileSearch size={15} />
+      <FileIcon size={16} aria-hidden="true" />
     </button>
     <button
       type="button"
@@ -230,7 +230,7 @@
       aria-label="New file"
       title="New file"
     >
-      <FilePlus2 size={15} />
+      <FilePlus2 size={16} aria-hidden="true" />
     </button>
     <button
       type="button"
@@ -239,7 +239,7 @@
       aria-label="Refresh"
       title="Refresh root"
     >
-      <RefreshCw size={15} />
+      <RefreshCw size={16} aria-hidden="true" />
     </button>
     <button
       type="button"
@@ -248,7 +248,7 @@
       aria-label="Collapse all"
       title="Collapse all"
     >
-      <ChevronsLeft size={15} />
+      <ListCollapse size={16} aria-hidden="true" />
     </button>
   </div>
 
@@ -275,14 +275,19 @@
       {#snippet rowLeading()}
         {#if row.entry.is_dir}
           {#if disclosure === "loading"}
-            <Loader2 size={14} class="row-icon" style="animation: spin 1s linear infinite;" />
+            <Loader2
+              size={14}
+              class="row-icon"
+              aria-hidden="true"
+              style="animation: spin 1s linear infinite;"
+            />
           {:else if disclosure === "expanded"}
-            <FolderOpen size={14} class="row-icon" />
+            <FolderOpen size={14} class="row-icon" aria-hidden="true" />
           {:else}
-            <Folder size={14} class="row-icon" />
+            <Folder size={14} class="row-icon" aria-hidden="true" />
           {/if}
         {:else}
-          <FileIcon size={14} class="row-icon" />
+          <FileIcon size={14} class="row-icon" aria-hidden="true" />
         {/if}
       {/snippet}
       <WorkspaceRow

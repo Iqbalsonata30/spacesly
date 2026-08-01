@@ -388,8 +388,7 @@
     border: 1px solid var(--info-border);
     border-radius: 14px;
     padding: 14px;
-    background:
-      radial-gradient(circle at top right, var(--info-bg), transparent 34%), var(--surface-raised);
+    background: var(--surface-raised);
   }
 
   .inherited-card p {

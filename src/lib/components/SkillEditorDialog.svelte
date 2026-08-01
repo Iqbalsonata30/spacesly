@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
+  import { X } from "lucide-svelte";
   import {
     categoryLabel,
     skillCategories,
@@ -99,7 +100,9 @@
         <p>Agent Skill</p>
         <h3 id="skill-editor-title">{isNew ? "Create skill" : `Edit ${skill.name}`}</h3>
       </div>
-      <button type="button" aria-label="Close skill editor" onclick={onCancel}>×</button>
+      <button type="button" aria-label="Close skill editor" onclick={onCancel}
+        ><X size={16} aria-hidden="true" /></button
+      >
     </header>
 
     <div class="skill-editor-fields">

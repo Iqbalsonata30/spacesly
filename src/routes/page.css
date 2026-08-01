@@ -83,10 +83,6 @@ button:active:not(:disabled) {
   font-size: 18px;
 }
 
-.workspace-picker span {
-  color: var(--text-secondary);
-}
-
 .mode-switch {
   display: flex;
   align-items: center;
@@ -139,24 +135,22 @@ button:active:not(:disabled) {
   white-space: nowrap;
 }
 
-.worker-pill span,
-.worker-status span {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--danger);
-  box-shadow: 0 0 0 3px var(--danger-bg);
+.worker-pill .worker-state {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.worker-pill > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .worker-pill.connected,
-.worker-status span.connected + strong {
+.worker-pill.connected .worker-state {
   color: var(--success);
-}
-
-.worker-pill.connected span,
-.worker-status span.connected {
-  background: var(--success);
-  box-shadow: 0 0 0 3px var(--success-bg);
 }
 
 .sync-button {
@@ -276,8 +270,6 @@ button:active:not(:disabled) {
   border-radius: 12px;
   background: linear-gradient(180deg, var(--surface-overlay), var(--surface));
   color: var(--accent);
-  font-size: 24px;
-  font-weight: 950;
 }
 
 .file-browser-pane,
@@ -837,27 +829,9 @@ button:active:not(:disabled) {
   font-size: 10px;
 }
 
-.agent-console-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--text-secondary);
-  box-shadow: 0 0 0 4px var(--surface-selected);
-}
-
-.agent-console-dot.running {
-  background: var(--info);
-  box-shadow: 0 0 0 4px var(--info-bg);
-}
-
-.agent-console-dot.completed {
-  background: var(--success);
-  box-shadow: 0 0 0 4px var(--success-bg);
-}
-
-.agent-console-dot.blocked {
-  background: var(--danger);
-  box-shadow: 0 0 0 4px var(--danger-bg);
+.agent-console-launch small {
+  color: var(--text-secondary);
+  font-size: 10px;
 }
 
 .resize-toolbar div {
@@ -2469,10 +2443,6 @@ button:active:not(:disabled) {
   text-transform: uppercase;
 }
 
-.caret {
-  color: var(--text-muted);
-}
-
 .count {
   min-width: 28px;
   border-radius: 7px;
@@ -2532,18 +2502,11 @@ button:active:not(:disabled) {
   align-items: center;
   gap: 10px;
   margin-bottom: 8px;
-  color: var(--success);
+  color: var(--text-secondary);
   font-size: 13px;
   font-weight: 800;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-}
-
-.task-status span {
-  width: 9px;
-  height: 9px;
-  border-radius: 999px;
-  background: var(--success);
 }
 
 .task-status.waiting {

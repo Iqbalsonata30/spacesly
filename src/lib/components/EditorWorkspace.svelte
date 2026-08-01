@@ -4,6 +4,15 @@
   import type { AiEditProposal } from "$lib/aiEdit";
   import type { CodeEditorHandle, DocumentSession } from "$lib/editorDocument";
   import type { EditorCommandId } from "$lib/editorCommands";
+  import {
+    AlertTriangle,
+    ArrowLeft,
+    ArrowRight,
+    ChevronDown,
+    ChevronRight,
+    RefreshCw,
+    X,
+  } from "lucide-svelte";
   import type {
     LspCodeAction,
     LspCompletionResult,
@@ -190,14 +199,16 @@
         disabled={!canNavigateBack}
         aria-label="Navigate back"
         title="Back (Alt+Left)"
-        onclick={() => onExecuteCommand("editor.navigateBack")}>←</button
+        onclick={() => onExecuteCommand("editor.navigateBack")}
+        ><ArrowLeft size={16} aria-hidden="true" /></button
       >
       <button
         type="button"
         disabled={!canNavigateForward}
         aria-label="Navigate forward"
         title="Forward (Alt+Right)"
-        onclick={() => onExecuteCommand("editor.navigateForward")}>→</button
+        onclick={() => onExecuteCommand("editor.navigateForward")}
+        ><ArrowRight size={16} aria-hidden="true" /></button
       >
     </nav>
   </header>
@@ -222,13 +233,17 @@
             onkeydown={(event) => onTabKeydown(event, index, file.path)}
           >
             <span>{file.name}</span>
-            <small>{file.externalConflict ? "!" : file.dirty ? "•" : ""}</small>
+            {#if file.externalConflict}
+              <AlertTriangle size={14} aria-hidden="true" />
+            {:else if file.dirty}
+              <span class="dirty-indicator" aria-hidden="true"></span>
+            {/if}
           </button>
           <button
             type="button"
             tabindex="-1"
             aria-label={`Close ${file.name}`}
-            onclick={() => onCloseEditorTab(file.path)}>×</button
+            onclick={() => onCloseEditorTab(file.path)}><X size={16} aria-hidden="true" /></button
           >
         </div>
       {/each}
@@ -243,7 +258,13 @@
           aria-expanded={outlineOpen}
           onclick={() => (outlineOpen = !outlineOpen)}
         >
-          <span>{outlineOpen ? "▾" : "▸"} Outline</span>
+          <span>
+            {#if outlineOpen}<ChevronDown size={14} aria-hidden="true" />{:else}<ChevronRight
+                size={14}
+                aria-hidden="true"
+              />{/if}
+            Outline
+          </span>
           <small>{lspSymbolsLoading ? "loading" : `${lspSymbols.length} symbols`}</small>
         </button>
         <button
@@ -251,7 +272,7 @@
           class="outline-refresh"
           disabled={lspSymbolsLoading}
           aria-label="Refresh document outline"
-          onclick={onRefreshLspSymbols}>↻</button
+          onclick={onRefreshLspSymbols}><RefreshCw size={14} aria-hidden="true" /></button
         >
       </div>
       {#if outlineOpen}
@@ -280,7 +301,8 @@
             ? "Finding references"
             : `${lspReferences.length} references`}</strong
         >
-        <button type="button" aria-label="Close references" onclick={onCloseLspReferences}>×</button
+        <button type="button" aria-label="Close references" onclick={onCloseLspReferences}
+          ><X size={16} aria-hidden="true" /></button
         >
       </header>
       {#if !lspReferencesLoading}
@@ -468,6 +490,20 @@
     padding: 7px 12px;
     font-size: 11px;
     font-weight: 750;
+  }
+
+  .outline-toggle > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .dirty-indicator {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--warning);
   }
 
   .outline-toggle small,

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { X } from "lucide-svelte";
+
   type Props = {
     title: string;
     description: string;
@@ -13,7 +15,9 @@
 </script>
 
 <aside class="new-task-popover" aria-label="Create new task">
-  <button class="close-detail" type="button" aria-label="Close" onclick={onClose}>×</button>
+  <button class="close-detail" type="button" aria-label="Close" onclick={onClose}
+    ><X size={16} aria-hidden="true" /></button
+  >
   <div>
     <p class="section-kicker">New Task</p>
     <h3>Create Agent work</h3>

@@ -116,8 +116,8 @@
         type="button"
         onclick={onOpenAgentConsole}
       >
-        <span class={`agent-console-dot ${agentRunStatus}`}></span>
         <span>Open Agent Console</span>
+        <small>{agentRunStatus}</small>
         <strong>{agentRunProgress}%</strong>
       </button>
     {/if}
@@ -152,7 +152,6 @@
       >
         <header class="lane-header">
           <div>
-            <span class="caret">⌄</span>
             <h2>{column.name}</h2>
             <span class="count"
               >{column.intent === "done" && column.hiddenDoneCardCount > 0
@@ -239,7 +238,7 @@
 
         {#if column.intent === "backlog"}
           <footer class="lane-footer">
-            <button type="button" onclick={onOpenNewTask}>＋ New task</button>
+            <button type="button" onclick={onOpenNewTask}>New task</button>
           </footer>
         {/if}
       </section>

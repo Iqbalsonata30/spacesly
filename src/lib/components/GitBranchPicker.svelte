@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { ChevronDown, GitBranch } from "lucide-svelte";
+  import { ChevronDown, GitBranch, X } from "lucide-svelte";
   import type { GitWorkspaceInfo } from "$lib/ipc";
 
   type Props = {
@@ -62,7 +62,7 @@
       onclick={openPicker}
     >
       <span class="branch-button-icon">
-        <GitBranch size={14} />
+        <GitBranch size={14} aria-hidden="true" />
       </span>
       <span class="branch-button-copy">
         <small>{switching ? "Switching branch" : "Current branch"}</small>
@@ -71,7 +71,7 @@
         >
       </span>
       <span class="branch-button-indicator">
-        <ChevronDown size={14} class="open" />
+        <ChevronDown size={14} class={open ? "open" : ""} aria-hidden="true" />
       </span>
     </button>
 
@@ -90,7 +90,7 @@
             <h3>{gitInfo.current_branch ?? "Detached HEAD"}</h3>
           </div>
           <button type="button" onclick={() => (open = false)} aria-label="Close branch picker"
-            >×</button
+            ><X size={16} aria-hidden="true" /></button
           >
         </header>
         <input

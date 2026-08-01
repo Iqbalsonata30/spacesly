@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Replace, Search } from "lucide-svelte";
+  import { Replace } from "lucide-svelte";
   import type { WorkspaceReplacePreviewResponse, WorkspaceSearchResult } from "$lib/ipc";
 
   type Props = {
@@ -63,7 +63,6 @@
 
   <div class="search-controls">
     <label>
-      <Search size={14} aria-hidden="true" />
       <input
         bind:this={searchInput}
         value={query}
@@ -76,6 +75,7 @@
       type="button"
       class:active={caseSensitive}
       aria-pressed={caseSensitive}
+      aria-label="Match case"
       title="Match case"
       onclick={() => onCaseSensitiveChange(!caseSensitive)}>Aa</button
     >

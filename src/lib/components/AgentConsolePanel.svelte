@@ -1,16 +1,5 @@
 <script lang="ts">
-  import {
-    AlertCircle,
-    Check,
-    ChevronDown,
-    Circle,
-    Clock3,
-    ExternalLink,
-    FileCode2,
-    Loader2,
-    Wrench,
-    X,
-  } from "lucide-svelte";
+  import { AlertCircle, Check, ChevronDown, Circle, Loader2, X } from "lucide-svelte";
   import type { AiWorkerTaskResult } from "$lib/ipc";
   import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
@@ -235,7 +224,6 @@
 <aside class="agent-console-v2" aria-label="Agent workspace" {style}>
   <header class="agent-hero">
     <div class="hero-topline">
-      <span class={`status-orb ${runStatus}`}><span></span></span>
       <span class="eyebrow">Agent workspace</span>
       {#if isWorking && runCardId}
         <button
@@ -246,7 +234,7 @@
         >
       {/if}
       <button class="close-button" type="button" aria-label="Close Agent console" onclick={onClose}
-        ><X size={16} /></button
+        ><X size={16} aria-hidden="true" /></button
       >
     </div>
     <div class="hero-copy">
@@ -266,19 +254,15 @@
       </div>
       <div class="progress-track"><span style={`transform: scaleX(${progress / 100})`}></span></div>
       <div class="activity-now">
-        <span class="pulse-dot"></span><strong>{userActivity.title}</strong><span
-          >{userActivity.detail}</span
-        >
+        <strong>{userActivity.title}</strong><span>{userActivity.detail}</span>
       </div>
     </div>
     {#if runCardId}
       <div class="hero-actions">
         <button type="button" class="quiet-button" onclick={() => onOpenCard(runCardId)}
-          ><ExternalLink size={14} /> Open task</button
+          >Open task</button
         >
-        {#if isComplete}<span class="completion-note"
-            ><Check size={14} /> Verified result available</span
-          >{/if}
+        {#if isComplete}<span class="completion-note">Verified result available</span>{/if}
       </div>
     {/if}
   </header>
@@ -292,10 +276,12 @@
       <button
         class="section-heading attention-heading"
         type="button"
+        aria-expanded={attentionOpen}
         onclick={() => (attentionOpen = !attentionOpen)}
       >
-        <span><AlertCircle size={15} /> Needs your attention</span><ChevronDown
-          size={15}
+        <span><AlertCircle size={16} aria-hidden="true" /> Needs your attention</span><ChevronDown
+          size={16}
+          aria-hidden="true"
           class={attentionOpen ? "" : "rotated"}
         />
       </button>
@@ -335,7 +321,8 @@
             class="timeline-item"
           >
             <div class="timeline-rail">
-              <span class={`timeline-icon ${stepRun?.status ?? "pending"}`}><Icon size={13} /></span
+              <span class={`timeline-icon ${stepRun?.status ?? "pending"}`}
+                ><Icon size={14} aria-hidden="true" /></span
               >{#if index < executionRun.contract.workflow.length - 1}<span class="timeline-line"
                 ></span>{/if}
             </div>
@@ -361,11 +348,6 @@
         >
       </div>
       <div class="result-summary">
-        <span class={`result-mark ${isComplete ? "success" : isBlocked ? "danger" : "neutral"}`}
-          >{#if isComplete}<Check size={16} />{:else if isBlocked}<AlertCircle
-              size={16}
-            />{:else}<Clock3 size={16} />{/if}</span
-        >
         <div>
           <strong
             >{result?.summary ??
@@ -384,12 +366,11 @@
         <div class="result-grid">
           {#each resultItems.slice(0, 6) as item, index (item + index)}
             <div class="result-item">
-              <FileCode2 size={14} />
               <div><span>{resultLabel(item)}</span><strong>{cleanLine(item)}</strong></div>
             </div>
           {/each}
           {#if warnings.length > 0}<div class="result-item warning">
-              <AlertCircle size={14} />
+              <AlertCircle size={16} aria-hidden="true" />
               <div>
                 <span>Warnings</span><strong
                   >{warnings.length} item{warnings.length === 1 ? "" : "s"} need review</strong
@@ -419,7 +400,7 @@
             class:waiting={activity.status === "waiting"}
             class:minor={activity.importance === "minor"}
           >
-            <span class="activity-marker" aria-label={statusText(activity)}><span></span></span>
+            <span class="activity-marker" aria-hidden="true"><span></span></span>
             <div class="activity-copy">
               <div class="activity-heading">
                 <strong>{activity.title}</strong>
@@ -434,6 +415,7 @@
                   onclick={() => toggleActivity(activity.id)}
                   ><ChevronDown
                     size={14}
+                    aria-hidden="true"
                     class={expandedActivities[activity.id] ? "rotated" : ""}
                   /></button
                 >
@@ -471,9 +453,14 @@
   </section>
 
   <section class="technical-drawer" class:open={technicalOpen} aria-label="Technical console">
-    <button class="technical-toggle" type="button" onclick={() => (technicalOpen = !technicalOpen)}
-      ><span><Wrench size={14} /> Technical console</span><ChevronDown
-        size={15}
+    <button
+      class="technical-toggle"
+      type="button"
+      aria-expanded={technicalOpen}
+      onclick={() => (technicalOpen = !technicalOpen)}
+      ><span>Technical console</span><ChevronDown
+        size={16}
+        aria-hidden="true"
         class={technicalOpen ? "rotated" : ""}
       /></button
     >
@@ -558,36 +545,6 @@
     font-weight: 900;
     letter-spacing: 0.13em;
     text-transform: uppercase;
-  }
-  .status-orb {
-    display: inline-flex;
-    width: 9px;
-    height: 9px;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-    background: var(--text-dim);
-  }
-  .status-orb span {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--text-primary);
-  }
-  .status-orb.running {
-    background: var(--accent);
-    box-shadow: 0 0 0 5px var(--focus-ring);
-  }
-  .status-orb.running span {
-    background: var(--surface);
-    animation: agent-pulse 1.8s ease-in-out infinite;
-  }
-  .status-orb.completed {
-    background: var(--success);
-  }
-  .status-orb.blocked,
-  .status-orb.timeout {
-    background: var(--danger);
   }
   .close-button {
     display: inline-flex;
@@ -677,12 +634,6 @@
   }
   .activity-now strong {
     color: var(--text-bright);
-  }
-  .pulse-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--progress-fill);
   }
   .hero-actions {
     gap: 12px;
@@ -864,25 +815,6 @@
   .result-summary {
     gap: 10px;
     padding: 13px;
-  }
-  .result-mark {
-    display: inline-flex;
-    flex: 0 0 auto;
-    width: 31px;
-    height: 31px;
-    align-items: center;
-    justify-content: center;
-    border-radius: 10px;
-    background: var(--info-bg);
-    color: var(--info);
-  }
-  .result-mark.success {
-    background: var(--success-bg);
-    color: var(--success);
-  }
-  .result-mark.danger {
-    background: var(--danger-bg);
-    color: var(--danger);
   }
   .result-summary strong {
     color: var(--text-bright);
@@ -1211,16 +1143,5 @@
   }
   .rotated {
     transform: rotate(-180deg);
-  }
-  @keyframes agent-pulse {
-    0%,
-    100% {
-      opacity: 0.45;
-      transform: scale(0.8);
-    }
-    50% {
-      opacity: 1;
-      transform: scale(1.15);
-    }
   }
 </style>

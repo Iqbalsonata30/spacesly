@@ -94,7 +94,6 @@
   ondragend={onDragEnd}
 >
   <div class="task-status">
-    <span></span>
     <strong>{agentTask?.status ?? executionLabel}</strong>
     {#if agentTask}<em>{agentTask.progress}%</em>{/if}
   </div>
@@ -240,18 +239,11 @@
     align-items: center;
     gap: 10px;
     margin-bottom: 8px;
-    color: var(--success);
+    color: var(--text-secondary);
     font-size: 13px;
     font-weight: 800;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-  }
-
-  .task-status span {
-    width: 9px;
-    height: 9px;
-    border-radius: 999px;
-    background: var(--success);
   }
 
   .task-status em {

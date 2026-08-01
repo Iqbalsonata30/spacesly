@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
+  import { PanelLeftOpen, X } from "lucide-svelte";
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
@@ -7725,7 +7726,6 @@
     <header class="titlebar">
       <div class="workspace-picker">
         <strong>{workspace?.projects[0]?.name.toLowerCase() ?? "spacesly"}</strong>
-        <span>⌄</span>
       </div>
 
       <button class="icon-button" type="button" aria-label="Settings" onclick={() => openSettings()}
@@ -7760,8 +7760,8 @@
         title={workerStatusLabel}
         onclick={() => openSettings("agent")}
       >
-        <span></span>
-        {selectedAgentLabel}
+        <span class="worker-state">{workerConnected ? "Connected" : "Not tested"}</span>
+        <strong>{selectedAgentLabel}</strong>
       </button>
 
       <button class="sync-button" type="button" disabled={syncing} onclick={syncJira}>
@@ -7796,7 +7796,9 @@
               <p>Settings</p>
               <h2 id="settings-title">{settingsTitle}</h2>
             </div>
-            <button type="button" aria-label="Close settings" onclick={closeSettings}>×</button>
+            <button type="button" aria-label="Close settings" onclick={closeSettings}
+              ><X size={16} aria-hidden="true" /></button
+            >
           </header>
 
           <div class:mcp={settingsTab === "mcp"} class="settings-grid">
@@ -7929,7 +7931,7 @@
                     <em>{mcpConnectionDetail(server.id)}</em>
                   </button>
                 {/each}
-                <button class="add-server" type="button" onclick={addMcpServer}>＋ Add MCP</button>
+                <button class="add-server" type="button" onclick={addMcpServer}>Add MCP</button>
               </aside>
             {/if}
 
@@ -7970,7 +7972,7 @@
                   >
                     <SettingsCard tone="subtle">
                       <button type="button" class="add-server" onclick={addMcpServer}
-                        >＋ Add MCP connection</button
+                        >Add MCP connection</button
                       >
                     </SettingsCard>
                   </SettingsPage>
@@ -8215,7 +8217,6 @@
 
                   <SettingsCard title="Connection status" tone="subtle">
                     <div class="worker-status">
-                      <span class:connected={workerConnected}></span>
                       <strong>{workerStatusLabel}</strong>
                     </div>
                     {#snippet actions()}
@@ -8297,7 +8298,7 @@
                         class="new-skill-button"
                         type="button"
                         onclick={() => (skillEditor = { skill: createAgentSkill(), isNew: true })}
-                        >＋ New Skill</button
+                        >New Skill</button
                       >
                     </div>
                     <div class="skill-filters" aria-label="Skill filters">
@@ -8469,7 +8470,7 @@
                         onclick={addGlobalEnvironmentVariable}
                         disabled={globalEnvironmentLoading}
                       >
-                        + Add Variable
+                        Add Variable
                       </button>
                     </SettingsRow>
 
@@ -9181,7 +9182,8 @@
                   <button
                     type="button"
                     aria-label="Close Agent console"
-                    onclick={() => (agentConsoleOpen = false)}>×</button
+                    onclick={() => (agentConsoleOpen = false)}
+                    ><X size={16} aria-hidden="true" /></button
                   >
                 </header>
                 <div class="console-progress" aria-label="Agent run progress">
@@ -9216,10 +9218,9 @@
               class="close-detail"
               type="button"
               aria-label="Close"
-              onclick={() => (selectedCardId = null)}>×</button
+              onclick={() => (selectedCardId = null)}><X size={16} aria-hidden="true" /></button
             >
             <div class="task-status waiting">
-              <span></span>
               <strong>{executionLabel(selectedCard.execution)}</strong>
             </div>
             <h3>{selectedCard.title}</h3>
@@ -9438,7 +9439,7 @@
               onclick={toggleFileSidebar}
               aria-label="Show file browser"
             >
-              &gt;
+              <PanelLeftOpen size={16} aria-hidden="true" />
             </button>
           {:else}
             <div class="grid-resize-handle file-resize-handle">
@@ -9623,7 +9624,8 @@
             <button
               type="button"
               aria-label="Close confirmation"
-              onclick={() => resolveBacklogStartConfirmation(false)}>×</button
+              onclick={() => resolveBacklogStartConfirmation(false)}
+              ><X size={16} aria-hidden="true" /></button
             >
           </header>
           <div class="confirm-body">
@@ -9665,7 +9667,8 @@
             <button
               type="button"
               aria-label="Close confirmation"
-              onclick={() => void confirmManualDone(false)}>×</button
+              onclick={() => void confirmManualDone(false)}
+              ><X size={16} aria-hidden="true" /></button
             >
           </header>
           <div class="confirm-body">

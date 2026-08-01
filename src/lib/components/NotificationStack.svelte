@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { X } from "lucide-svelte";
+
   type AppNotice = {
     tone: "info" | "success" | "error";
     message: string;
@@ -27,7 +29,9 @@
           >
           <span>{notice.message}</span>
         </div>
-        <button type="button" aria-label="Dismiss notification" onclick={onDismissNotice}>×</button>
+        <button type="button" aria-label="Dismiss notification" onclick={onDismissNotice}
+          ><X size={16} aria-hidden="true" /></button
+        >
       </div>
     {:else if syncError}
       <div class="notification-card sync-error" role="status">
