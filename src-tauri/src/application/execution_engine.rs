@@ -499,11 +499,12 @@ fn default_completion_projector() -> Arc<dyn CompletionProjector> {
     }
 }
 
+type MockExecutorFn =
+    Arc<dyn Fn(&TaskExecutionContext) -> Result<(), TaskExecutionError> + Send + Sync + 'static>;
+
 /// Configurable mock executor used while the real Agent Runtime remains out of scope.
 pub struct MockTaskExecutor {
-    execution: Arc<
-        dyn Fn(&TaskExecutionContext) -> Result<(), TaskExecutionError> + Send + Sync + 'static,
-    >,
+    execution: MockExecutorFn,
 }
 
 impl MockTaskExecutor {
@@ -1020,12 +1021,14 @@ struct TaskAssignment {
     event_sink: TaskEventSink,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WorkerCommand {
     Execute(TaskAssignment),
     Shutdown,
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum WorkerOutcome {
     Succeeded(TaskExecutionOutput),
     Failed(String),
@@ -1048,11 +1051,13 @@ struct Scheduler {
     next_lease_renewal: Instant,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ProjectionCommand {
     Project(StagedCompletion),
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_scheduler(
     receiver: mpsc::Receiver<SchedulerMessage>,
     sender: mpsc::Sender<SchedulerMessage>,

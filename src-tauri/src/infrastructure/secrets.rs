@@ -317,6 +317,7 @@ impl AppSecretsStore {
     }
 }
 
+#[cfg(test)]
 fn replace_mcp_connector(
     secrets: &mut AppSecrets,
     server_id: &str,
@@ -450,7 +451,7 @@ mod tests {
         );
         assert!(store.ai_api_key("missing").unwrap().is_empty());
         assert!(store.redacted_snapshot().unwrap().ai_api_keys.is_empty());
-        assert_eq!(store.ai_provider_statuses().unwrap()["openai"], true);
+        assert!(store.ai_provider_statuses().unwrap()["openai"]);
         assert_eq!(
             store.mcp_environment_statuses().unwrap()["jira"],
             vec!["JIRA_TOKEN"]

@@ -329,11 +329,11 @@ fn validate_snapshot(snapshot: &RecoverySnapshotInput) -> Result<(), String> {
     {
         return Err("Recovery snapshot path is invalid.".to_string());
     }
-    if snapshot.content.as_bytes().len() > MAX_RECOVERY_CONTENT_BYTES {
+    if snapshot.content.len() > MAX_RECOVERY_CONTENT_BYTES {
         return Err(format!(
             "Recovery snapshot for {} is too large ({} bytes, limit {}).",
             snapshot.path,
-            snapshot.content.as_bytes().len(),
+            snapshot.content.len(),
             MAX_RECOVERY_CONTENT_BYTES
         ));
     }

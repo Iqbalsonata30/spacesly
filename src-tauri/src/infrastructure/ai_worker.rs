@@ -510,7 +510,7 @@ pub fn chat_ai_worker(
     mut config: AiWorkerConfig,
     request: AiWorkerChatRequest,
     cancellation: Arc<AtomicBool>,
-    mut on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
+    mut on_event: Option<AiWorkerEventCallback>,
 ) -> Result<AiWorkerChatResult, String> {
     let message = request.message.trim();
     if message.is_empty() {
@@ -571,7 +571,7 @@ pub fn chat_ai_worker(
                 .to_string()
         };
         let prompt = context.opencode_chat_prompt(
-            &session_context,
+            session_context,
             &workspace_context,
             message,
             session.is_some(),
@@ -1118,7 +1118,7 @@ fn execute_opencode_task(
     config: AiWorkerConfig,
     task: AiWorkerTask,
     cancellation: Arc<AtomicBool>,
-    mut on_event: Option<Box<dyn FnMut(AiWorkerStreamEvent) -> Result<(), String> + Send>>,
+    mut on_event: Option<AiWorkerEventCallback>,
 ) -> Result<AiWorkerTaskResult, String> {
     validate_opencode_config(&config)?;
     require_execution_contract(&task)?;

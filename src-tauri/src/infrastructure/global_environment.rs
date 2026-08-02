@@ -175,6 +175,7 @@ pub fn inject_global_environment(command: &mut Command) {
     }
 }
 
+#[allow(dead_code)]
 pub fn inject_global_environment_pty(command: &mut CommandBuilder) {
     if let Ok(store) = GlobalEnvironmentStore::global() {
         if let Ok(values) = store.enabled_values() {

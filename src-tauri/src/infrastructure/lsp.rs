@@ -141,10 +141,12 @@ pub struct LspRegistry {
     servers: Arc<Mutex<HashMap<String, Arc<LspClient>>>>,
 }
 
+type LspPending = Arc<Mutex<HashMap<u64, mpsc::SyncSender<Result<Value, String>>>>>;
+
 struct LspClient {
     child: Mutex<Child>,
     writer: Arc<Mutex<std::process::ChildStdin>>,
-    pending: Arc<Mutex<HashMap<u64, mpsc::SyncSender<Result<Value, String>>>>>,
+    pending: LspPending,
     diagnostics: Arc<Mutex<HashMap<String, LspDiagnosticReport>>>,
     opened_documents: Arc<Mutex<HashMap<String, OpenDocument>>>,
     stderr: Arc<Mutex<String>>,
@@ -731,7 +733,7 @@ fn send_message(
 fn start_reader(
     stdout: std::process::ChildStdout,
     writer: Arc<Mutex<std::process::ChildStdin>>,
-    pending: Arc<Mutex<HashMap<u64, mpsc::SyncSender<Result<Value, String>>>>>,
+    pending: LspPending,
     diagnostics: Arc<Mutex<HashMap<String, LspDiagnosticReport>>>,
     opened_documents: Arc<Mutex<HashMap<String, OpenDocument>>>,
     root_uri: String,
@@ -857,10 +859,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
         .map_err(|error| format!("LSP server returned invalid JSON: {error}"))
 }
 
-fn fail_pending(
-    pending: &Arc<Mutex<HashMap<u64, mpsc::SyncSender<Result<Value, String>>>>>,
-    error: &str,
-) {
+fn fail_pending(pending: &LspPending, error: &str) {
     if let Ok(mut pending) = pending.lock() {
         for (_, sender) in pending.drain() {
             let _ = sender.send(Err(error.to_string()));

@@ -409,9 +409,11 @@ mod tests {
         executions: Arc<AtomicUsize>,
     }
 
+    type IsolationObservation = Arc<Mutex<Vec<(String, u64, u64, u64)>>>;
+
     struct IsolationRunner {
         barrier: Arc<Barrier>,
-        seen: Arc<Mutex<Vec<(String, u64, u64, u64)>>>,
+        seen: IsolationObservation,
         active: Arc<AtomicUsize>,
         maximum: Arc<AtomicUsize>,
         origin: Instant,

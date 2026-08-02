@@ -194,6 +194,7 @@ pub fn read_file_at_root(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_file(
     root: &WorkspaceRoot,
     workspace_id: String,
@@ -218,6 +219,7 @@ pub fn write_file(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_file_authorized(
     root: &WorkspaceRoot,
     workspace_id: String,
@@ -320,7 +322,7 @@ fn decode_text(bytes: &[u8]) -> Result<(String, TextEncoding), String> {
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("UTF-16 file has an incomplete code unit.".to_string());
     }
     let units = bytes
@@ -380,7 +382,7 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     atomic_write_revalidated(path, content, None)
 }
 
-#[allow(unused_variables)]
+#[allow(unused_variables, clippy::needless_return)]
 fn atomic_write_workspace(
     path: &Path,
     content: &[u8],

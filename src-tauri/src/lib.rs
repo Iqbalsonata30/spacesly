@@ -468,6 +468,7 @@ fn begin_ai_run(kind: AiRunKind, ai_runs: State<'_, AiRunRegistry>) -> Result<Ai
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn execute_ai_worker_task(
     run_id: String,
     mut config: AiWorkerConfig,
@@ -821,6 +822,7 @@ async fn prune_conversations(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn chat_ai_worker(
     mut config: AiWorkerConfig,
     mut request: AiWorkerChatRequest,
@@ -1522,6 +1524,7 @@ async fn apply_workspace_replace(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn write_file(
     workspace_id: String,
     relative_path: String,
@@ -2406,6 +2409,7 @@ async fn lsp_code_actions(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         bind_backend_provider_profile, file_ipc_error, mcp_ipc_error, tool_failure_error,

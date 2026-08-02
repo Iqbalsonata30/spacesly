@@ -29,6 +29,7 @@ impl FilesService {
         read_file_at_root(&self.root, workspace_id, relative_path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_file(
         &self,
         workspace_id: String,

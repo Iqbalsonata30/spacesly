@@ -1387,11 +1387,12 @@ fn load_run(connection: &Connection, run_id: &str) -> Result<Option<ExecutionRun
     }))
 }
 
+type StepLeaseRow = (Option<String>, Option<u64>, Option<String>, Option<String>);
+
 fn load_step_leases(
     transaction: &Transaction<'_>,
     run_id: &str,
-) -> Result<BTreeMap<String, (Option<String>, Option<u64>, Option<String>, Option<String>)>, String>
-{
+) -> Result<BTreeMap<String, StepLeaseRow>, String> {
     let mut statement = transaction
         .prepare(
             "SELECT step_id, lease_owner, lease_expires_at, result_json,
