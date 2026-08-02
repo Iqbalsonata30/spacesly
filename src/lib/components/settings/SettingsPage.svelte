@@ -7,6 +7,7 @@
     title,
     description,
     badge,
+    status,
     children,
   }: {
     id: string;
@@ -14,6 +15,7 @@
     title: string;
     description: string;
     badge?: string;
+    status?: Snippet;
     children: Snippet;
   } = $props();
 </script>
@@ -25,7 +27,9 @@
       <h3>{title}</h3>
       <p>{description}</p>
     </div>
-    {#if badge}<strong class="settings-page-badge">{badge}</strong>{/if}
+    {#if status}{@render status()}{:else if badge}<strong class="settings-page-badge"
+        >{badge}</strong
+      >{/if}
   </header>
   <div class="settings-page-body">{@render children()}</div>
 </div>

@@ -5,13 +5,14 @@
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
+  import AgentRulesSettings from "$lib/components/AgentRulesSettings.svelte";
   import NewTaskPopover from "$lib/components/NewTaskPopover.svelte";
   import NotificationStack from "$lib/components/NotificationStack.svelte";
   import SegmentedControl from "$lib/components/SegmentedControl.svelte";
   import SkillEditorDialog from "$lib/components/SkillEditorDialog.svelte";
+  import UnsavedChangesDialog from "$lib/components/UnsavedChangesDialog.svelte";
   import SettingsActionBar from "$lib/components/settings/SettingsActionBar.svelte";
   import SettingsCard from "$lib/components/settings/SettingsCard.svelte";
-  import SettingsHelperText from "$lib/components/settings/SettingsHelperText.svelte";
   import SettingsInput from "$lib/components/settings/SettingsInput.svelte";
   import SettingsLabel from "$lib/components/settings/SettingsLabel.svelte";
   import SettingsPage from "$lib/components/settings/SettingsPage.svelte";
@@ -276,6 +277,7 @@
   } from "$lib/agentSkills";
   import {
     createMcpServer,
+    defaultSettings,
     loadLegacySettingsSecrets,
     loadSettings,
     saveSettings,
@@ -467,6 +469,15 @@
   let settingsError = $state<string | null>(null);
   let settingsSaving = $state(false);
   let settings = $state<AppSettings>(initialSettings);
+  let agentRulesDraft = $state(initialSettings.aiWorker.agentRules);
+  let agentRulesSaved = $state(initialSettings.aiWorker.agentRules);
+  let agentRulesSaving = $state(false);
+  let agentRulesSaveError = $state<string | null>(null);
+  let agentRulesSaveMessage = $state<string | null>(null);
+  let pendingSettingsAction = $state<null | { kind: "close" } | { kind: "tab"; tab: SettingsTab }>(
+    null,
+  );
+  let agentRulesDirty = $derived(agentRulesDraft !== agentRulesSaved);
   let appSecrets = $state<AppSecrets>(initialAppSecrets);
   let aiProviderSecrets = $state<Record<string, boolean>>({});
   let mcpEnvironmentSecrets = $state<Record<string, string[]>>({});
@@ -574,7 +585,6 @@
   > | null = null;
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
-  let agentRulesTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatRuns = $state<WorkspaceChatRuns>({});
   // Stream buffers stay non-reactive so token arrival cannot invalidate the UI more than once per frame.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -715,7 +725,8 @@
     void hydrateCachedWorkspace();
     void loadDefaultWorkspaceProjection();
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (allowWindowClose || !openEditorFiles.some((file) => file.dirty)) return;
+      if (allowWindowClose || (!openEditorFiles.some((file) => file.dirty) && !agentRulesDirty))
+        return;
       event.preventDefault();
       event.returnValue = true;
     };
@@ -762,9 +773,19 @@
           const appWindow = getCurrentWindow();
           const unlisten = await appWindow.onCloseRequested(async (event) => {
             if (allowWindowClose) return;
-            if (!openEditorFiles.some((file) => file.dirty)) return;
+            const hasDirtyEditors = openEditorFiles.some((file) => file.dirty);
+            if (!hasDirtyEditors && !agentRulesDirty) return;
             event.preventDefault();
-            if (!(await resolveDirtyEditors(openEditorFiles, "closing Spacesly"))) return;
+            if (
+              agentRulesDirty &&
+              !window.confirm("Discard unsaved Agent Rules and close Spacesly?")
+            )
+              return;
+            if (
+              hasDirtyEditors &&
+              !(await resolveDirtyEditors(openEditorFiles, "closing Spacesly"))
+            )
+              return;
             recoverySyncDisabled = true;
             try {
               await clearCurrentRecoverySnapshots();
@@ -3404,6 +3425,8 @@
 
   function openSettings(tab?: SettingsTab) {
     if (tab) settingsTab = tab;
+    agentRulesSaveError = null;
+    agentRulesSaveMessage = null;
     settingsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     settingsOpen = true;
     void tick().then(() => {
@@ -3413,6 +3436,14 @@
   }
 
   function closeSettings() {
+    if (settingsTab === "rules" && agentRulesDirty) {
+      pendingSettingsAction = { kind: "close" };
+      return;
+    }
+    closeSettingsImmediately();
+  }
+
+  function closeSettingsImmediately() {
     skillEditor = null;
     settingsOpen = false;
     const opener = settingsOpener;
@@ -3420,10 +3451,36 @@
     void tick().then(() => opener?.focus());
   }
 
-  function switchSettingsTab(tab: SettingsTab) {
-    if (settingsTab === tab) return;
+  function switchSettingsTab(tab: SettingsTab): boolean {
+    if (settingsTab === tab) return true;
+    if (settingsTab === "rules" && agentRulesDirty) {
+      pendingSettingsAction = { kind: "tab", tab };
+      return false;
+    }
     settingsTab = tab;
     void tick().then(() => settingsForm?.scrollTo({ top: 0 }));
+    return true;
+  }
+
+  function keepEditingAgentRules() {
+    pendingSettingsAction = null;
+    void tick().then(() => document.getElementById("agent-rules-input")?.focus());
+  }
+
+  function discardAgentRulesChanges() {
+    const action = pendingSettingsAction;
+    agentRulesDraft = agentRulesSaved;
+    agentRulesSaveError = null;
+    pendingSettingsAction = null;
+    if (action?.kind === "close") {
+      closeSettingsImmediately();
+    } else if (action?.kind === "tab") {
+      settingsTab = action.tab;
+      void tick().then(() => {
+        settingsForm?.scrollTo({ top: 0 });
+        document.getElementById(`${action.tab}-settings-tab`)?.focus();
+      });
+    }
   }
 
   function handleSettingsTabKeydown(event: KeyboardEvent, tab: SettingsTab) {
@@ -3436,11 +3493,21 @@
     else return;
     event.preventDefault();
     const target = settingsTabOrder[(next + settingsTabOrder.length) % settingsTabOrder.length];
-    switchSettingsTab(target);
-    void tick().then(() => document.getElementById(`${target}-settings-tab`)?.focus());
+    if (switchSettingsTab(target)) {
+      void tick().then(() => document.getElementById(`${target}-settings-tab`)?.focus());
+    }
   }
 
   function handleSettingsDialogKeydown(event: KeyboardEvent) {
+    if (
+      settingsTab === "rules" &&
+      (event.ctrlKey || event.metaKey) &&
+      event.key.toLowerCase() === "s"
+    ) {
+      event.preventDefault();
+      if (agentRulesDirty && !agentRulesSaving) void persistAgentRules();
+      return;
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       closeSettings();
@@ -5440,9 +5507,50 @@
     } finally {
       settingsSaving = false;
     }
-    closeSettings();
+    agentRulesSaved = nextSettings.aiWorker.agentRules;
+    agentRulesDraft = agentRulesSaved;
+    closeSettingsImmediately();
     settingsError = null;
     syncError = null;
+  }
+
+  function updateAgentRulesDraft(value: string) {
+    agentRulesDraft = value;
+    agentRulesSaveError = null;
+    agentRulesSaveMessage = null;
+  }
+
+  function revertAgentRules() {
+    agentRulesDraft = agentRulesSaved;
+    agentRulesSaveError = null;
+    agentRulesSaveMessage = null;
+    void tick().then(() => document.getElementById("agent-rules-input")?.focus());
+  }
+
+  async function persistAgentRules() {
+    if (agentRulesSaving || !agentRulesDirty) return;
+    agentRulesSaving = true;
+    agentRulesSaveError = null;
+    agentRulesSaveMessage = null;
+    await tick();
+    try {
+      const persisted = loadSettings();
+      const nextSettings = {
+        ...persisted,
+        aiWorker: { ...persisted.aiWorker, agentRules: agentRulesDraft },
+      };
+      saveSettings(nextSettings);
+      settings = {
+        ...settings,
+        aiWorker: { ...settings.aiWorker, agentRules: agentRulesDraft },
+      };
+      agentRulesSaved = agentRulesDraft;
+      agentRulesSaveMessage = "Agent Rules saved";
+    } catch (reason) {
+      agentRulesSaveError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      agentRulesSaving = false;
+    }
   }
 
   function applyJqlPreset(preset: "assigned" | "unassigned_todo" | "unresolved") {
@@ -5462,28 +5570,12 @@
   }
 
   function settingsWithInstructionDrafts(): AppSettings {
-    const agentRules = agentRulesTextarea?.value;
-
-    if (agentRules === undefined) return settings;
-
     return {
       ...settings,
       aiWorker: {
         ...settings.aiWorker,
-        agentRules: agentRules ?? settings.aiWorker.agentRules,
+        agentRules: agentRulesDraft,
       },
-    };
-  }
-
-  function commitInstructionDrafts() {
-    settings = settingsWithInstructionDrafts();
-  }
-
-  function commitAgentRulesDraft() {
-    if (!agentRulesTextarea) return;
-    settings = {
-      ...settings,
-      aiWorker: { ...settings.aiWorker, agentRules: agentRulesTextarea.value },
     };
   }
 
@@ -8237,39 +8329,29 @@
                 <SettingsPage
                   id="rules-settings"
                   eyebrow="Agent governance"
-                  title="Rules"
-                  description="Define concise guardrails that are applied before task and chat instructions."
-                  badge="Always on"
+                  title="Agent Rules"
+                  description="Define global instructions applied before task-specific prompts."
                 >
-                  <SettingsCard title="Rule behavior" tone="subtle">
-                    <div class="guidance-metrics" aria-label="Rules behavior">
-                      <div><strong>Priority</strong><span>Higher than task text</span></div>
-                      <div><strong>Scope</strong><span>All Agent actions</span></div>
-                      <div><strong>Format</strong><span>One rule per line</span></div>
+                  {#snippet status()}
+                    <div
+                      class="agent-rules-applied-status"
+                      title="These rules are included before task-specific instructions."
+                    >
+                      <strong>Applied to every run</strong>
+                      <span>Included before task instructions</span>
                     </div>
-                  </SettingsCard>
-                  <SettingsCard
-                    title="Operating rules"
-                    description="Keep each rule direct, enforceable, and limited to one behavior."
-                  >
-                    <SettingsLabel text="Rules applied to every run" forId="agent-rules-input">
-                      <SettingsInput wide>
-                        <textarea
-                          id="agent-rules-input"
-                          bind:this={agentRulesTextarea}
-                          class="agent-instruction-field"
-                          rows="10"
-                          spellcheck="false"
-                          placeholder="Never mark a task done unless it was actually executed and verified.&#10;Do not touch secrets unless explicitly requested.&#10;Block instead of guessing when tools or access are missing."
-                          value={settings.aiWorker.agentRules}
-                          onblur={commitAgentRulesDraft}></textarea>
-                      </SettingsInput>
-                    </SettingsLabel>
-                    <SettingsHelperText>
-                      Use direct verbs such as verify, block, ask, avoid, and require. Avoid vague
-                      preferences that cannot be checked.
-                    </SettingsHelperText>
-                  </SettingsCard>
+                  {/snippet}
+                  <AgentRulesSettings
+                    draft={agentRulesDraft}
+                    saved={agentRulesSaved}
+                    defaultRules={defaultSettings.aiWorker.agentRules}
+                    saving={agentRulesSaving}
+                    saveError={agentRulesSaveError}
+                    saveMessage={agentRulesSaveMessage}
+                    onDraftChange={updateAgentRulesDraft}
+                    onSave={() => void persistAgentRules()}
+                    onRevert={revertAgentRules}
+                  />
                 </SettingsPage>
               {/if}
 
@@ -9023,7 +9105,7 @@
                 </details>
               {/if}
 
-              {#if settingsTab !== "theme" && settingsTab !== "skills"}
+              {#if settingsTab !== "theme" && settingsTab !== "skills" && settingsTab !== "rules"}
                 <SettingsActionBar>
                   {#if settingsTab === "mcp"}
                     <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
@@ -9069,6 +9151,13 @@
           onCancel={() => (skillEditor = null)}
         />
       {/key}
+    {/if}
+
+    {#if pendingSettingsAction}
+      <UnsavedChangesDialog
+        onKeepEditing={keepEditingAgentRules}
+        onDiscard={discardAgentRulesChanges}
+      />
     {/if}
 
     {#if error}

@@ -1292,6 +1292,10 @@ button:active:not(:disabled) {
   text-align: left;
 }
 
+.settings-nav button:hover {
+  background: var(--surface-hover);
+}
+
 .settings-nav button.active {
   border-color: var(--selection-border);
   background: var(--surface-selected);
@@ -3639,6 +3643,30 @@ dd a:hover {
 .settings-page {
   width: min(100%, 840px);
   margin: 0 auto;
+}
+
+#rules-settings-panel {
+  width: 100%;
+  max-width: 1040px;
+}
+
+.agent-rules-applied-status {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 3px;
+  border-left: 2px solid var(--accent);
+  padding-left: 12px;
+  text-align: left;
+}
+
+.agent-rules-applied-status strong {
+  color: var(--text-bright);
+  font-size: 11px;
+}
+
+.agent-rules-applied-status span {
+  color: var(--text-secondary);
+  font-size: 10px;
 }
 
 .settings-page-header {
