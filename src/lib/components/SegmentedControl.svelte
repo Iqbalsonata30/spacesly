@@ -100,7 +100,6 @@
     transition:
       transform 200ms ease,
       background-color 200ms ease,
-      box-shadow 200ms ease,
       opacity 200ms ease;
     pointer-events: none;
   }
@@ -123,10 +122,9 @@
     font-weight: 850;
     letter-spacing: 0.01em;
     transition:
-      color 180ms ease,
-      background-color 180ms ease,
-      box-shadow 180ms ease,
-      transform 180ms ease;
+      color 60ms ease,
+      background-color 60ms ease,
+      transform 60ms ease;
   }
 
   button:hover:not(:disabled) {

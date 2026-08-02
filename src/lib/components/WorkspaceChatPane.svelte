@@ -498,9 +498,8 @@
     font: inherit;
     outline: none;
     transition:
-      border-color 120ms ease,
-      box-shadow 120ms ease,
-      background 120ms ease;
+      border-color 60ms ease,
+      background 60ms ease;
   }
 
   .workspace-chat-session-search input::placeholder {
@@ -560,10 +559,9 @@
     color: var(--text-bright);
     text-align: left;
     transition:
-      border-color 120ms ease,
-      background 120ms ease,
-      transform 120ms ease,
-      box-shadow 120ms ease;
+      border-color 60ms ease,
+      background 60ms ease,
+      transform 60ms ease;
   }
 
   .workspace-chat-session-list button:hover,

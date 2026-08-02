@@ -153,11 +153,10 @@
     font-weight: 850;
     cursor: pointer;
     transition:
-      border-color 180ms ease,
-      background-color 180ms ease,
-      color 180ms ease,
-      box-shadow 180ms ease,
-      transform 180ms ease;
+      border-color 60ms ease,
+      background-color 60ms ease,
+      color 60ms ease,
+      transform 60ms ease;
   }
 
   .branch-button:hover:not(:disabled),

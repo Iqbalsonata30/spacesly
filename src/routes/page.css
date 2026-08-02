@@ -40,11 +40,10 @@ button {
   cursor: pointer;
   font: inherit;
   transition:
-    border-color 120ms ease,
-    background 120ms ease,
-    color 120ms ease,
-    box-shadow 120ms ease,
-    transform 120ms ease;
+    border-color 60ms ease,
+    background 60ms ease,
+    color 60ms ease,
+    transform 60ms ease;
 }
 
 button:hover:not(:disabled),
@@ -1702,9 +1701,9 @@ button:active:not(:disabled) {
   padding: 14px;
   background: var(--surface-raised);
   transition:
-    border-color 120ms ease,
-    background 120ms ease,
-    opacity 120ms ease;
+    border-color 60ms ease,
+    background 60ms ease,
+    opacity 60ms ease;
 }
 
 .skill-library-list article:hover {
@@ -1940,10 +1939,9 @@ button:active:not(:disabled) {
   color: var(--text-primary);
   cursor: pointer;
   transition:
-    border-color 120ms ease,
-    background 120ms ease,
-    box-shadow 120ms ease,
-    transform 120ms ease;
+    border-color 60ms ease,
+    background 60ms ease,
+    transform 60ms ease;
 }
 
 .theme-option:hover {
@@ -4162,9 +4160,8 @@ dd a:hover {
   border-color: rgba(91, 116, 160, 0.2);
   background: rgba(255, 255, 255, 0.78);
   transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    box-shadow 150ms ease;
+    border-color 60ms ease,
+    background-color 60ms ease;
 }
 
 :root[data-resolved-theme="light"] input::placeholder,

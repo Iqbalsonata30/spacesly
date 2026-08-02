@@ -209,10 +209,9 @@
     text-align: left;
     user-select: none;
     transition:
-      border-color 160ms ease,
-      box-shadow 160ms ease,
-      background 160ms ease,
-      transform 160ms ease;
+      border-color 60ms ease,
+      background 60ms ease,
+      transform 60ms ease;
   }
 
   .task-card:hover {
@@ -347,10 +346,10 @@
     font-weight: 800;
     white-space: nowrap;
     transition:
-      border-color 140ms ease,
-      background 140ms ease,
-      color 140ms ease,
-      opacity 140ms ease;
+      border-color 60ms ease,
+      background 60ms ease,
+      color 60ms ease,
+      opacity 60ms ease;
   }
 
   .actions .queue {
