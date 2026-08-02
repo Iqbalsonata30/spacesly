@@ -5473,6 +5473,7 @@
     if (!selectedServer) return;
 
     const serverId = selectedServer.id;
+    const nextKind = ("kind" in values ? values.kind : selectedServer.kind) ?? selectedServer.kind;
     if ("env" in values) mcpEnvEditedServerIds.add(serverId);
     invalidateMcpConnection(serverId);
     settings = {
@@ -5480,6 +5481,7 @@
       mcpServers: settings.mcpServers.map((server) =>
         server.id === serverId ? { ...server, ...values } : server,
       ),
+      jira: nextKind === "jira" ? { ...settings.jira, serverId } : settings.jira,
     };
   }
 
@@ -8701,30 +8703,11 @@
                 >
                   <SettingsCard
                     title="Connection"
-                    description="Choose the Jira MCP runtime and verify the shared connection."
+                    description="Verify the shared Jira MCP connection."
                   >
-                    <label>
-                      <span>Jira MCP Runtime</span>
-                      <select
-                        value={settings.jira.serverId}
-                        oninput={(event) => {
-                          selectedServerId = event.currentTarget.value;
-                          settings = {
-                            ...settings,
-                            jira: { ...settings.jira, serverId: event.currentTarget.value },
-                          };
-                        }}
-                      >
-                        {#each settings.mcpServers as server (server.id)}
-                          <option value={server.id}
-                            >{server.name || "Unnamed MCP"} ({server.kind})</option
-                          >
-                        {/each}
-                      </select>
-                    </label>
                     <p class="field-help">
-                      Only the MCP command lives in the MCP tab. Its Jira identity is inherited from
-                      this page so credentials do not drift.
+                      The Jira MCP connection (command, args, credentials) is managed in the MCP
+                      Connections tab.
                     </p>
                     {#snippet actions()}
                       <button
