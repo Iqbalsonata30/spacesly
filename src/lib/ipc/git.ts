@@ -48,7 +48,10 @@ export async function getWorkspaceGitStatus(workspaceId?: string): Promise<GitSt
   );
 }
 
-export async function stageWorkspaceGitFile(path: string, workspaceId?: string): Promise<GitStatus> {
+export async function stageWorkspaceGitFile(
+  path: string,
+  workspaceId?: string,
+): Promise<GitStatus> {
   return invokeWithPolicy<GitStatus>(
     "stage_workspace_git_file",
     { workspaceId, path },
@@ -118,7 +121,10 @@ export async function gitPull(workspaceId?: string): Promise<GitWorkspaceInfo> {
   );
 }
 
-export async function gitMergeBranch(branch: string, workspaceId?: string): Promise<GitWorkspaceInfo> {
+export async function gitMergeBranch(
+  branch: string,
+  workspaceId?: string,
+): Promise<GitWorkspaceInfo> {
   return invokeWithPolicy<GitWorkspaceInfo>(
     "merge_workspace_git_branch",
     { workspaceId, branch },

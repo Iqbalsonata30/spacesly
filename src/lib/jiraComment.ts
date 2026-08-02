@@ -35,16 +35,10 @@ export function formatJiraExecutionComment(input: JiraExecutionCommentInput): st
         : "The requested work could not be completed.";
   const summary = `${outcome} ${cleanLine(result.summary, 500)}`.trim();
   const changes = unique(
-    result.details
-      .filter(isHumanFacingEvidence)
-      .map(humanFacingChange)
-      .filter(Boolean),
+    result.details.filter(isHumanFacingEvidence).map(humanFacingChange).filter(Boolean),
   ).slice(0, 5);
   const verification = unique(
-    result.evidence
-      .filter(isHumanFacingEvidence)
-      .map(humanFacingVerification)
-      .filter(Boolean),
+    result.evidence.filter(isHumanFacingEvidence).map(humanFacingVerification).filter(Boolean),
   ).slice(0, 5);
   const actions = unique(
     result.next
@@ -82,9 +76,7 @@ export function formatJiraExecutionComment(input: JiraExecutionCommentInput): st
       ? [
           "",
           "*Execution details*",
-          ...result.details
-            .filter(isHumanFacingEvidence)
-            .map((line) => `* ${wikiText(line, 900)}`),
+          ...result.details.filter(isHumanFacingEvidence).map((line) => `* ${wikiText(line, 900)}`),
         ]
       : []),
   ];
@@ -112,9 +104,7 @@ export function formatJiraExecutionComment(input: JiraExecutionCommentInput): st
     "",
     "h3. Required Action",
     "",
-    ...(actions.length > 0
-      ? actions.map((line) => `* ${wikiText(line, 500)}`)
-      : ["None."]),
+    ...(actions.length > 0 ? actions.map((line) => `* ${wikiText(line, 500)}`) : ["None."]),
     "",
     "{expand:title=Technical Evidence}",
     ...technicalEvidence,
@@ -128,7 +118,8 @@ function humanFacingChange(value: string): string {
     return `Application configuration was updated. ${line}`;
   }
   if (/(deploy|rollout|release)/i.test(line)) return `Deployment changes were applied. ${line}`;
-  if (/(commit|push|branch|repository)/i.test(line)) return "Repository changes were committed and synchronized.";
+  if (/(commit|push|branch|repository)/i.test(line))
+    return "Repository changes were committed and synchronized.";
   if (/(database|migration|schema)/i.test(line)) return `Database changes were applied. ${line}`;
   return line;
 }

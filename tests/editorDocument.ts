@@ -105,9 +105,21 @@ assertEqual(
 );
 
 const timestampNow = new Date(2026, 0, 1, 4, 30, 18).getTime();
-assertEqual(relativeTimeLabel("04:30:18 AM", timestampNow), "Just now", "fresh activity should be relative");
-assertEqual(relativeTimeLabel("04:29:58 AM", timestampNow), "20 sec ago", "recent activity should show seconds");
-assertEqual(relativeTimeLabel("04:25:18 AM", timestampNow), "5 min ago", "older activity should show minutes");
+assertEqual(
+  relativeTimeLabel("04:30:18 AM", timestampNow),
+  "Just now",
+  "fresh activity should be relative",
+);
+assertEqual(
+  relativeTimeLabel("04:29:58 AM", timestampNow),
+  "20 sec ago",
+  "recent activity should show seconds",
+);
+assertEqual(
+  relativeTimeLabel("04:25:18 AM", timestampNow),
+  "5 min ago",
+  "older activity should show minutes",
+);
 
 const contextActivity = timelineActivity({
   id: "log-1",
@@ -129,7 +141,11 @@ assertEqual(
   "Gathering the information needed to begin.",
   "timeline summary should avoid raw runtime labels",
 );
-assertEqual(contextActivity.sections[0].title, "Evidence", "technical evidence should move into details");
+assertEqual(
+  contextActivity.sections[0].title,
+  "Evidence",
+  "technical evidence should move into details",
+);
 
 const collapsedActivities = timelineActivities([
   {
@@ -434,7 +450,17 @@ assertEqual(
 );
 
 const projectionSession = createAgentRunSession(
-  "card-1", "Projection", "running", 55, "", null, [], [], null, [], null,
+  "card-1",
+  "Projection",
+  "running",
+  55,
+  "",
+  null,
+  [],
+  [],
+  null,
+  [],
+  null,
 );
 let pendingProjection = emptyAgentEventProjection();
 for (let sequence = 1; sequence <= 120; sequence += 1) {
@@ -458,7 +484,11 @@ for (let sequence = 1; sequence <= 120; sequence += 1) {
   );
 }
 assertEqual(pendingProjection.logs.length, 0, "text deltas should not create presentation logs");
-assertEqual(pendingProjection.progress, 55, "repeated deltas should retain one latest progress value");
+assertEqual(
+  pendingProjection.progress,
+  55,
+  "repeated deltas should retain one latest progress value",
+);
 assertEqual(
   applyAgentEventProjection(projectionSession, pendingProjection, 120) === projectionSession,
   true,
@@ -845,7 +875,7 @@ assertEqual(
 );
 
 const chatSessions = Array.from({ length: 7 }, (_, index) => {
-  const session = createWorkspaceChatSession([] , `Chat ${index + 1}`);
+  const session = createWorkspaceChatSession([], `Chat ${index + 1}`);
   return { ...session, id: `session-${index + 1}`, updatedAt: index + 1 };
 });
 const chatStorage = {
@@ -865,7 +895,13 @@ assertEqual(
 
 const emptySession = createWorkspaceChatSession([], "Empty");
 const fullSession = createWorkspaceChatSession(
-  [{ id: "full-message", role: "user", text: "Full session history" } satisfies WorkspaceChatMessage],
+  [
+    {
+      id: "full-message",
+      role: "user",
+      text: "Full session history",
+    } satisfies WorkspaceChatMessage,
+  ],
   "Full",
 );
 fullSession.id = "session-full";
@@ -893,10 +929,7 @@ const jiraComment = formatJiraExecutionComment({
       "contract_id=contract-123 current_step=worker.execute",
       "Automated checks passed",
     ],
-    details: [
-      "Added BG_MAPPING_SERVICE to the required ConfigMaps",
-      "worker.execute completed",
-    ],
+    details: ["Added BG_MAPPING_SERVICE to the required ConfigMaps", "worker.execute completed"],
     next: [],
     completion_status: "completed",
     blocked_reason: null,
@@ -913,7 +946,9 @@ assertEqual(
     jiraComment.indexOf("h3. What Changed"),
     jiraComment.indexOf("h3. Verification"),
     jiraComment.indexOf("h3. Required Action"),
-  ].every((index, position, values) => index >= 0 && (position === 0 || index > values[position - 1])),
+  ].every(
+    (index, position, values) => index >= 0 && (position === 0 || index > values[position - 1]),
+  ),
   true,
   "Jira execution comments should use outcome-first section ordering",
 );
@@ -921,7 +956,8 @@ assertEqual(
   {
     success: jiraComment.includes("✅ Success"),
     none: jiraComment.includes("None."),
-    hidesInternalState: !jiraComment.includes("contract-123") && !jiraComment.includes("worker.execute"),
+    hidesInternalState:
+      !jiraComment.includes("contract-123") && !jiraComment.includes("worker.execute"),
     technicalEvidence: jiraComment.includes("Technical Evidence"),
   },
   { success: true, none: true, hidesInternalState: true, technicalEvidence: true },

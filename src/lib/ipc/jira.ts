@@ -95,11 +95,7 @@ export async function testMcpServerConnection(
 }
 
 export async function disconnectMcpServer(config: JiraMcpServerConfig): Promise<boolean> {
-  return invokeWithPolicy<boolean>(
-    "disconnect_mcp_server",
-    { config },
-    IPC_POLICIES.jiraMutation,
-  );
+  return invokeWithPolicy<boolean>("disconnect_mcp_server", { config }, IPC_POLICIES.jiraMutation);
 }
 
 export async function syncJiraWorkspace(config: JiraMcpConfig): Promise<WorkspaceProjection> {

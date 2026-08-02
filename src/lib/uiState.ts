@@ -158,7 +158,7 @@ export function loadUiState(
       ? parsed.workspaceChatSessions.filter(isWorkspaceChatSession)
       : [];
     const sessions = dedupeChatSessions(
-        sessionEntries.length > 0
+      sessionEntries.length > 0
         ? sessionEntries
         : legacySession
           ? [
@@ -217,9 +217,7 @@ export function loadUiState(
   }
 }
 
-function dedupeChatSessions(
-  sessions: WorkspaceChatSession[],
-): WorkspaceChatSession[] {
+function dedupeChatSessions(sessions: WorkspaceChatSession[]): WorkspaceChatSession[] {
   const merged = new Map<string, WorkspaceChatSession>();
   for (const session of sessions) {
     merged.set(session.id, {

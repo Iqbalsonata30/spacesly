@@ -346,7 +346,7 @@ pub(crate) fn emit_runtime_event(
                 }),
                 failure,
             )
-        },
+        }
         AiWorkerStreamEvent::UsageUpdated {
             input_tokens,
             output_tokens,
@@ -863,8 +863,7 @@ mod tests {
         let terminal = events
             .iter()
             .find(|event| {
-                event.kind == TaskSessionEventKind::Lifecycle
-                    && event.payload["state"] == "failed"
+                event.kind == TaskSessionEventKind::Lifecycle && event.payload["state"] == "failed"
             })
             .expect("terminal lifecycle event");
         assert_eq!(completed.attempt_id, terminal.attempt_id);

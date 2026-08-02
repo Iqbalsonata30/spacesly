@@ -2408,8 +2408,8 @@ async fn lsp_code_actions(
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_backend_provider_profile, file_ipc_error, mcp_ipc_error,
-        tool_failure_error, validate_renderer_conversation_role,
+        bind_backend_provider_profile, file_ipc_error, mcp_ipc_error, tool_failure_error,
+        validate_renderer_conversation_role,
     };
     use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerStreamEvent};
     use crate::infrastructure::execution_store::ConversationMessageInput;

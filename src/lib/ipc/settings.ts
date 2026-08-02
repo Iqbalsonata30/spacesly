@@ -67,11 +67,7 @@ export async function saveMcpEnvironmentSecret(
 }
 
 export async function removeMcpConnector(serverId: string): Promise<void> {
-  return invokeWithPolicy<void>(
-    "remove_mcp_connector",
-    { serverId },
-    IPC_POLICIES.secret,
-  );
+  return invokeWithPolicy<void>("remove_mcp_connector", { serverId }, IPC_POLICIES.secret);
 }
 
 export async function saveJiraConnectionProfile(profile: {
@@ -81,11 +77,7 @@ export async function saveJiraConnectionProfile(profile: {
   command: string;
   args: string[];
 }): Promise<void> {
-  return invokeWithPolicy<void>(
-    "save_jira_connection_profile",
-    { profile },
-    IPC_POLICIES.secret,
-  );
+  return invokeWithPolicy<void>("save_jira_connection_profile", { profile }, IPC_POLICIES.secret);
 }
 
 export async function jiraSecretStatuses(): Promise<Record<string, boolean>> {
@@ -100,11 +92,7 @@ export async function saveJiraSecret(
   secretType: "api_token" | "personal_access_token" | "password",
   value: string | null,
 ): Promise<void> {
-  return invokeWithPolicy<void>(
-    "save_jira_secret",
-    { secretType, value },
-    IPC_POLICIES.secret,
-  );
+  return invokeWithPolicy<void>("save_jira_secret", { secretType, value }, IPC_POLICIES.secret);
 }
 
 export async function listGlobalEnvironmentVariables(): Promise<GlobalEnvironmentVariable[]> {
@@ -126,11 +114,7 @@ export async function saveGlobalEnvironmentVariable(
 }
 
 export async function deleteGlobalEnvironmentVariable(id: string): Promise<void> {
-  return invokeWithPolicy<void>(
-    "delete_global_environment_variable",
-    { id },
-    IPC_POLICIES.secret,
-  );
+  return invokeWithPolicy<void>("delete_global_environment_variable", { id }, IPC_POLICIES.secret);
 }
 
 export async function revealGlobalEnvironmentVariable(id: string): Promise<string> {

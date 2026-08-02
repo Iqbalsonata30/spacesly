@@ -19,7 +19,9 @@
     "format:check": "prettier . --check"
   },
   "overrides": {
-    "cookie": "0.7.0"
+    "brace-expansion": "^5.0.8",
+    "cookie": "0.7.0",
+    "postcss": "^8.5.18"
   },
   "license": "MIT",
   "dependencies": {
