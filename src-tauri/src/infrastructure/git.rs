@@ -390,17 +390,30 @@ pub fn rebase_workspace_git_branch(
 }
 
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
-    let output = git_output(path, ["rev-parse", "--show-toplevel"]);
-    match output {
-        Some(output) => {
-            let root = output.trim();
-            if root.is_empty() {
-                Ok(None)
+    let mut command = Command::new("git");
+    inject_global_environment(&mut command);
+    let output = command
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "git executable was not found on PATH while inspecting {}.",
+                    path.display()
+                )
             } else {
-                Ok(Some(PathBuf::from(root)))
+                format!("Failed to run git: {error}.")
             }
-        }
-        None => Ok(None),
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(root)))
     }
 }
 
