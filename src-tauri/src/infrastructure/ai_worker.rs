@@ -1767,7 +1767,8 @@ fn git_head(config: &AiWorkerConfig) -> Option<String> {
 }
 
 fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<String> {
-    let mut command = Command::new("git");
+    let git = super::git::git_executable().ok()?;
+    let mut command = Command::new(git);
     inject_global_environment(&mut command);
     command.args(args);
     command.current_dir(opencode_workdir(config)?);
@@ -1780,7 +1781,8 @@ fn git_output<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Optio
 }
 
 fn git_status<const N: usize>(config: &AiWorkerConfig, args: [&str; N]) -> Option<bool> {
-    let mut command = Command::new("git");
+    let git = super::git::git_executable().ok()?;
+    let mut command = Command::new(git);
     inject_global_environment(&mut command);
     command.args(args);
     command.current_dir(opencode_workdir(config)?);

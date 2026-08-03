@@ -28,6 +28,65 @@ struct GitStatusCacheState {
 
 static GIT_STATUS_CACHE: OnceLock<GitStatusCache> = OnceLock::new();
 
+static GIT_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Resolves the git executable once, searching the process PATH first and then
+/// common installation locations (including the Nix profile) so the tool works
+/// even when launched outside an interactive shell.
+pub(crate) fn git_executable() -> Result<&'static PathBuf, String> {
+    let resolved = GIT_EXECUTABLE.get_or_init(resolve_git_executable);
+    resolved.as_ref().ok_or_else(|| {
+        "git executable was not found on PATH or common installation locations. Install git or make it available to the application.".to_string()
+    })
+}
+
+fn resolve_git_executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("git");
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".nix-profile").join("bin").join("git"));
+        candidates.push(home.join(".local").join("bin").join("git"));
+    }
+    if let Some(user) = std::env::var_os("USER") {
+        candidates.push(
+            PathBuf::from("/nix/var/nix/profiles/per-user")
+                .join(user)
+                .join("bin")
+                .join("git"),
+        );
+    }
+    candidates.push(PathBuf::from("/nix/var/nix/profiles/default/bin/git"));
+    candidates.push(PathBuf::from("/usr/local/bin/git"));
+    candidates.push(PathBuf::from("/usr/bin/git"));
+    candidates.push(PathBuf::from("/bin/git"));
+    candidates.into_iter().find(|path| is_executable_file(path))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct GitWorkspaceInfo {
     pub is_git_repo: bool,
@@ -148,7 +207,7 @@ pub fn checkout_workspace_git_branch(
     };
     let branch = validated_branch_name(&repo_root, &branch)?;
 
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let status = command
         .args(["switch", "--", branch.as_str()])
@@ -207,7 +266,7 @@ fn git_status_for_repo(repo_root: &Path) -> Result<GitStatus, String> {
 }
 
 fn load_git_status(repo_root: &Path) -> Result<GitStatus, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let output = command
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
@@ -390,22 +449,13 @@ pub fn rebase_workspace_git_branch(
 }
 
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "git executable was not found on PATH while inspecting {}.",
-                    path.display()
-                )
-            } else {
-                format!("Failed to run git: {error}.")
-            }
-        })?;
+        .map_err(|error| format!("Failed to run git: {error}."))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -418,7 +468,8 @@ fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
-    let mut command = Command::new("git");
+    let git = git_executable().ok()?;
+    let mut command = Command::new(git);
     inject_global_environment(&mut command);
     let output = command.args(args).current_dir(cwd).output().ok()?;
     if !output.status.success() {
@@ -429,7 +480,7 @@ fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
 }
 
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let output = command
         .args(args)
@@ -446,7 +497,7 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<(), String> {
 }
 
 fn run_git_dynamic(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let output = command
         .args(args)
@@ -481,7 +532,7 @@ fn validated_branch_name(repo_root: &Path, branch: &str) -> Result<String, Strin
         return Err("Branch name is not a canonical Git ref.".to_string());
     }
     let full_ref = format!("refs/heads/{branch}");
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let valid = command
         .args(["check-ref-format", full_ref.as_str()])
@@ -585,6 +636,12 @@ mod tests {
             validated_branch_name(repo.path(), "feature/safe-branch").unwrap(),
             "feature/safe-branch"
         );
+    }
+
+    #[test]
+    fn git_executable_resolves_to_a_real_binary() {
+        let git = super::git_executable().expect("git should resolve");
+        assert!(is_executable_file(git), "resolved git is not executable");
     }
 
     #[test]
