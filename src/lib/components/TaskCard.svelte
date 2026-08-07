@@ -20,6 +20,7 @@
     onSelect,
     onQueue,
     onStartAgent,
+    onRetryFresh,
     onMarkDone,
     onDelete,
     onDragStart,
@@ -40,6 +41,7 @@
     onSelect: () => void;
     onQueue: () => void;
     onStartAgent: () => void;
+    onRetryFresh: () => void;
     onMarkDone: () => void;
     onDelete: () => void;
     onDragStart: (event: DragEvent) => void;
@@ -80,6 +82,11 @@
   function markDone(event: MouseEvent | KeyboardEvent): void {
     event.stopPropagation();
     if (isBlocked) onMarkDone();
+  }
+
+  function retryFresh(event: MouseEvent | KeyboardEvent): void {
+    event.stopPropagation();
+    if (canStartAgent && isBlocked) onRetryFresh();
   }
 </script>
 
@@ -146,7 +153,6 @@
       >
       <span
         class="start"
-        class:retry={isBlocked}
         aria-disabled={!canStartAgent}
         role="button"
         tabindex="0"
@@ -159,6 +165,19 @@
         }}>{actionLabel}</span
       >
       {#if isBlocked}
+        <span
+          class="retry-fresh"
+          aria-disabled={!canStartAgent}
+          role="button"
+          tabindex="0"
+          onclick={retryFresh}
+          onkeydown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              retryFresh(event);
+            }
+          }}>Retry Fresh</span
+        >
         <span
           class="manual-done"
           role="button"
@@ -377,13 +396,14 @@
     color: var(--text-link);
   }
 
-  .actions .start.retry {
-    border-color: var(--danger-border);
-    background: var(--danger-bg);
-    color: var(--danger);
+  .actions .retry-fresh {
+    cursor: pointer;
+    background: var(--surface-raised);
+    color: var(--text-secondary);
   }
 
-  .actions .start[aria-disabled="true"] {
+  .actions .start[aria-disabled="true"],
+  .actions .retry-fresh[aria-disabled="true"] {
     cursor: not-allowed;
     opacity: 0.55;
   }

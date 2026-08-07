@@ -747,6 +747,35 @@ impl SchedulerStore {
         capabilities: &[String],
         grant_source: &str,
     ) -> Result<TaskSessionSnapshot, String> {
+        self.resume_session(
+            id,
+            request,
+            capabilities,
+            grant_source,
+            true,
+            "resumed_after_approval",
+        )
+    }
+
+    pub(crate) fn continue_interrupted_session(
+        &self,
+        id: TaskSessionId,
+        request: &TaskRequest,
+        capabilities: &[String],
+        grant_source: &str,
+    ) -> Result<TaskSessionSnapshot, String> {
+        self.resume_session(id, request, capabilities, grant_source, false, "continued")
+    }
+
+    fn resume_session(
+        &self,
+        id: TaskSessionId,
+        request: &TaskRequest,
+        capabilities: &[String],
+        grant_source: &str,
+        approval_resume: bool,
+        action: &str,
+    ) -> Result<TaskSessionSnapshot, String> {
         let now = now_millis();
         let capabilities = validate_capability_grants(capabilities, grant_source)?;
         let ownership = request_ownership(request);
@@ -775,17 +804,26 @@ impl SchedulerStore {
                 .optional()
                 .map_err(|error| format!("Failed to inspect Task Session resume: {error}"))?
                 .ok_or_else(|| format!("Task Session {} was not found.", id.0))?;
-        if state != "blocked"
-            || error
-                .as_deref()
-                .is_none_or(|error| !error.contains("[approval_required]"))
-        {
-            return Err(
-                "Only a Task Session blocked on an approval request may be resumed.".to_string(),
-            );
+        let approval_required = error
+            .as_deref()
+            .is_some_and(|error| error.contains("[approval_required]"));
+        if approval_resume {
+            if state != "blocked" || !approval_required {
+                return Err(
+                    "Only a Task Session blocked on an approval request may be resumed through approval."
+                        .to_string(),
+                );
+            }
+        } else if !matches!(state.as_str(), "blocked" | "failed") || approval_required {
+            return Err(if approval_required {
+                "This Task Session requires structured UI approval before it may continue."
+            } else {
+                "Only an interrupted blocked or failed Task Session may continue."
+            }
+            .to_string());
         }
         let opencode_session_id = opencode_session_id.ok_or_else(|| {
-            "The blocked Task Session has no durable OpenCode session identity; refusing to silently create a replacement session."
+            "The interrupted Task Session has no durable OpenCode session identity; use Retry Fresh instead of silently creating a replacement session."
                 .to_string()
         })?;
         if workspace_id != ownership.workspace_id
@@ -806,19 +844,20 @@ impl SchedulerStore {
                         lease_expires_at = NULL, completed_at = NULL, error = NULL,
                         progress_phase = 'queued', progress_completed = 0,
                         progress_total = NULL
-                  WHERE session_id = ?1 AND state = 'blocked'",
+                  WHERE session_id = ?1 AND state = ?6",
                 params![
                     to_i64(id.0)?,
                     to_i64(enqueue_sequence)?,
                     request.label,
                     request.payload,
                     ownership.execution_run_id,
+                    state,
                 ],
             )
-            .map_err(|error| format!("Failed to requeue approved Task Session: {error}"))?;
+            .map_err(|error| format!("Failed to requeue continued Task Session: {error}"))?;
         if updated != 1 {
             return Err(
-                "Task Session approval resume raced with another lifecycle transition.".to_string(),
+                "Task Session continuation raced with another lifecycle transition.".to_string(),
             );
         }
         transaction
@@ -852,7 +891,7 @@ impl SchedulerStore {
                 kind: TaskSessionEventKind::Lifecycle,
                 payload: json!({
                     "state": "queued",
-                    "action": "resumed_after_approval",
+                    "action": action,
                     "task_session_id": id.0,
                     "opencode_session_id": opencode_session_id,
                 }),
@@ -866,7 +905,7 @@ impl SchedulerStore {
         )?;
         transaction
             .commit()
-            .map_err(|error| format!("Failed to commit Task Session approval resume: {error}"))?;
+            .map_err(|error| format!("Failed to commit Task Session continuation: {error}"))?;
         drop(connection);
         self.get_session(id)?
             .ok_or_else(|| "Resumed Task Session was not found.".to_string())
@@ -4149,6 +4188,115 @@ mod tests {
             event.payload["action"] == json!("terminal")
                 && event.payload["opencode_session_id"] == json!("opencode-session-x")
         }));
+    }
+
+    #[test]
+    fn generic_continuation_reuses_interrupted_session_but_cannot_bypass_approval() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("blocked", "conversation-blocked", "subject-blocked");
+        let session = store.enqueue(&request).expect("task enqueued");
+        let first = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("task claim")
+            .expect("assignment");
+        store
+            .bind_opencode_session(first.fence, "opencode-session-blocked")
+            .expect("session identity bound");
+        store
+            .resolve_assignment(
+                first.fence,
+                DurableOutcome::Blocked("operator input required".to_string()),
+            )
+            .expect("task blocked");
+
+        let continued_request =
+            owned_agent_request("continued", "conversation-blocked", "subject-blocked");
+        let continued = store
+            .continue_interrupted_session(session.id, &continued_request, &[], "test_continuation")
+            .expect("task continued");
+        assert_eq!(continued.id, session.id);
+        assert_eq!(
+            continued.opencode_session_id.as_deref(),
+            Some("opencode-session-blocked")
+        );
+        let second = store
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("continued claim")
+            .expect("continued assignment");
+        assert_eq!(second.fence.attempt, 2);
+        assert_eq!(
+            store
+                .assignment_opencode_session(second.fence)
+                .expect("continued identity"),
+            Some("opencode-session-blocked".to_string())
+        );
+
+        store
+            .resolve_assignment(
+                second.fence,
+                DurableOutcome::Blocked("[approval_required] restart".to_string()),
+            )
+            .expect("approval pause");
+        assert!(store
+            .continue_interrupted_session(session.id, &continued_request, &[], "test_continuation",)
+            .expect_err("generic continuation must not bypass approval")
+            .contains("structured UI approval"));
+    }
+
+    #[test]
+    fn continuation_without_a_durable_opencode_session_requires_retry_fresh() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("missing", "conversation-missing", "subject-missing");
+        let session = store.enqueue(&request).expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("task claim")
+            .expect("assignment");
+        store
+            .resolve_assignment(
+                assignment.fence,
+                DurableOutcome::Failed("runtime failed before session creation".to_string()),
+            )
+            .expect("task failed");
+        assert!(store
+            .continue_interrupted_session(session.id, &request, &[], "test_continuation")
+            .expect_err("missing identity must not silently create a session")
+            .contains("Retry Fresh"));
+    }
+
+    #[test]
+    fn failed_task_with_a_durable_opencode_session_can_continue() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("failed", "conversation-failed", "subject-failed");
+        let session = store.enqueue(&request).expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("task claim")
+            .expect("assignment");
+        store
+            .bind_opencode_session(assignment.fence, "opencode-session-failed")
+            .expect("session identity bound");
+        store
+            .resolve_assignment(
+                assignment.fence,
+                DurableOutcome::Failed("recoverable provider interruption".to_string()),
+            )
+            .expect("task failed");
+
+        let continued_request =
+            owned_agent_request("continued-failure", "conversation-failed", "subject-failed");
+        let continued = store
+            .continue_interrupted_session(session.id, &continued_request, &[], "test_continuation")
+            .expect("failed task continued");
+        assert_eq!(continued.id, session.id);
+        assert_eq!(continued.state, TaskSessionState::Queued);
+        assert_eq!(
+            continued.opencode_session_id.as_deref(),
+            Some("opencode-session-failed")
+        );
     }
 
     #[test]

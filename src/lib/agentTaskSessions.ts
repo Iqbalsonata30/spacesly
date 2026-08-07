@@ -3,6 +3,7 @@ import { appendConversationMessage } from "$lib/ipc/agent";
 import type { GitWorkspaceInfo } from "$lib/ipc/git";
 import {
   cancelTaskSession,
+  continueInterruptedTaskSession,
   digestAgentExecutionContract,
   getTaskSession,
   getTaskSessionResult,
@@ -81,6 +82,7 @@ export type AgentTaskSessionDependencies = {
   saveProfile: typeof saveImmutableAgentRuntimeProfile;
   submit: typeof submitTaskSession;
   resume: typeof resumeTaskSessionAfterApproval;
+  continueInterrupted: typeof continueInterruptedTaskSession;
   watch: typeof onTaskSessionUpdated;
 };
 
@@ -129,6 +131,7 @@ const defaultDependencies: AgentTaskSessionDependencies = {
   saveProfile: saveImmutableAgentRuntimeProfile,
   submit: submitTaskSession,
   resume: resumeTaskSessionAfterApproval,
+  continueInterrupted: continueInterruptedTaskSession,
   watch: onTaskSessionUpdated,
 };
 
@@ -381,6 +384,30 @@ export async function resumeAgentTaskSession(
   );
   if (resumed.id !== sessionId) {
     throw new Error("Scheduler replaced the Task Session during approval resume.");
+  }
+  options.onSubmitted?.(resumed);
+  return waitForAgentTaskSession(sessionId, { ...options, dependencies: deps });
+}
+
+/** Continues the same interrupted Task Session and Task Session-owned OpenCode session. */
+export async function continueAgentTaskSession(
+  sessionId: number,
+  label: string,
+  prepared: PreparedAgentTaskSession,
+  options: ExecuteAgentTaskSessionOptions = {},
+): Promise<AgentTaskSessionExecution> {
+  const deps = { ...defaultDependencies, ...options.dependencies };
+  const resumed = await deps.continueInterrupted(
+    sessionId,
+    label,
+    prepared.envelope,
+    prepared.grantedCapabilities,
+  );
+  if (resumed.id !== sessionId) {
+    throw new Error("Scheduler replaced the Task Session during continuation.");
+  }
+  if (!resumed.opencode_session_id) {
+    throw new Error("Continued Task Session lost its durable OpenCode session identity.");
   }
   options.onSubmitted?.(resumed);
   return waitForAgentTaskSession(sessionId, { ...options, dependencies: deps });

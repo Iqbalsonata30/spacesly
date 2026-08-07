@@ -833,6 +833,41 @@ impl ExecutionEngine {
         receive(response)?
     }
 
+    /// Continues the same interrupted Task Session and its durable OpenCode session.
+    pub fn continue_interrupted_session(
+        &self,
+        id: TaskSessionId,
+        label: impl Into<String>,
+        envelope: &TaskSessionEnvelope,
+        capabilities: Vec<String>,
+    ) -> Result<TaskSessionSnapshot, ExecutionEngineError> {
+        let label = label.into();
+        if label.trim().is_empty() {
+            return Err(ExecutionEngineError::InvalidRequest(
+                "Task label is required.".to_string(),
+            ));
+        }
+        let requested = &envelope.session().requested_capabilities;
+        if let Some(capability) = capabilities
+            .iter()
+            .find(|capability| !requested.contains(capability))
+        {
+            return Err(ExecutionEngineError::InvalidRequest(format!(
+                "Task capability '{capability}' was not requested by the continued envelope."
+            )));
+        }
+        let request = TaskRequest::from_envelope(label, envelope)
+            .map_err(ExecutionEngineError::InvalidRequest)?;
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::ContinueInterrupted {
+            id,
+            request,
+            capabilities,
+            reply,
+        })?;
+        receive(response)?
+    }
+
     /// Subscribes to best-effort post-commit wake-ups; durable replay remains authoritative.
     pub fn subscribe_updates(&self) -> mpsc::Receiver<TaskSessionUpdate> {
         self.notifier.subscribe()
@@ -1023,6 +1058,12 @@ enum SchedulerCommand {
         reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
     },
     ResumeAfterApproval {
+        id: TaskSessionId,
+        request: TaskRequest,
+        capabilities: Vec<String>,
+        reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
+    },
+    ContinueInterrupted {
         id: TaskSessionId,
         request: TaskRequest,
         capabilities: Vec<String>,
@@ -1220,6 +1261,26 @@ fn run_scheduler(
                             &request,
                             &capabilities,
                             "renderer_user_approval",
+                        )
+                        .map_err(ExecutionEngineError::Persistence);
+                    if let Ok(snapshot) = &result {
+                        scheduler.publish(snapshot);
+                    }
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::ContinueInterrupted {
+                    id,
+                    request,
+                    capabilities,
+                    reply,
+                }) => {
+                    let result = scheduler
+                        .store
+                        .continue_interrupted_session(
+                            id,
+                            &request,
+                            &capabilities,
+                            "renderer_user_continuation",
                         )
                         .map_err(ExecutionEngineError::Persistence);
                     if let Ok(snapshot) = &result {

@@ -148,6 +148,7 @@
     AgentTaskSessionTimeoutError,
     agentEnvelopeFromSnapshot,
     executionRepositoryContext,
+    continueAgentTaskSession,
     executeAgentTaskSession,
     prepareAgentTaskSession,
     resumeAgentTaskSession,
@@ -7191,7 +7192,11 @@
     }
   }
 
-  async function startWorkerForCard(cardId: string, backlogAlreadyApproved = false) {
+  async function startWorkerForCard(
+    cardId: string,
+    backlogAlreadyApproved = false,
+    executionMode: "continue" | "fresh" = "continue",
+  ) {
     const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
     if (
       runningWorkerCardIds.has(cardId) ||
@@ -7530,6 +7535,29 @@
         try {
           backendExecutionStarted = true;
           if (useTaskSession) {
+            const approvalResumeSessionId =
+              executionMode === "continue" &&
+              isContinuation &&
+              existingSession?.pendingApproval?.status === "approving"
+                ? (existingSession.taskSessionId ?? null)
+                : null;
+            const continuationSessionId =
+              executionMode === "continue" && isContinuation && !approvalResumeSessionId
+                ? (existingSession?.taskSessionId ?? null)
+                : null;
+            if (continuationSessionId) {
+              const retained = await getTaskSession(continuationSessionId);
+              if (!retained || !["blocked", "failed"].includes(retained.state)) {
+                throw new Error(
+                  "The retained Task Session is not interrupted and cannot be continued. Use Retry Fresh for a new execution.",
+                );
+              }
+              if (!retained.opencode_session_id) {
+                throw new Error(
+                  "The retained Task Session has no resumable OpenCode session. Use Retry Fresh explicitly.",
+                );
+              }
+            }
             const prepared = await prepareAgentTaskSession(
               config,
               cardId,
@@ -7554,10 +7582,6 @@
               },
               onEvent: (event: TaskSessionEvent) => projectTaskSessionEvent(cardId, event),
             };
-            const approvalResumeSessionId =
-              isContinuation && existingSession?.pendingApproval?.status === "approving"
-                ? (existingSession.taskSessionId ?? null)
-                : null;
             const execution = approvalResumeSessionId
               ? await resumeAgentTaskSession(
                   approvalResumeSessionId,
@@ -7565,6 +7589,13 @@
                   prepared,
                   taskSessionOptions,
                 )
+              : continuationSessionId
+                ? await continueAgentTaskSession(
+                    continuationSessionId,
+                    ticketLabel(card),
+                    prepared,
+                    taskSessionOptions,
+                  )
               : await executeAgentTaskSession(ticketLabel(card), prepared, taskSessionOptions);
             result = execution.result;
           } else {
@@ -7573,7 +7604,8 @@
               config,
               {
                 execution_contract: executionRun.contract,
-                session_key: `task:${cardId}`,
+                session_key:
+                  executionMode === "fresh" ? `task:${cardId}:fresh:${runId}` : `task:${cardId}`,
               },
               (event) => {
                 if (event.run_id !== runId || event.sequence <= lastAgentEventSequence) return;
@@ -9425,6 +9457,7 @@
             onSelectCard={selectCard}
             onQueueCard={queueCard}
             onStartAgent={(cardId) => void startWorkerForCard(cardId)}
+            onRetryFresh={(cardId) => void startWorkerForCard(cardId, false, "fresh")}
             onMarkDone={requestManualDoneConfirmation}
             onDeleteCard={removeCard}
             onDragStartCard={(cardId) => {
@@ -9598,6 +9631,16 @@
                       runningWorkerCardIds.has(selectedCard.id),
                       Boolean(operatorNotesForCard(selectedCard.id)),
                     )}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canStartAgent(
+                      selectedCard,
+                      runningWorkerCardIds.has(selectedCard.id),
+                    )}
+                    onclick={() => void startWorkerForCard(selectedCard.id, false, "fresh")}
+                  >
+                    Retry Fresh
                   </button>
                 {/if}
                 {#if selectedCardAgentSession}

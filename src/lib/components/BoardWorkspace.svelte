@@ -30,6 +30,7 @@
     onSelectCard: (card: CardProjection) => void;
     onQueueCard: (cardId: string) => void;
     onStartAgent: (cardId: string) => void;
+    onRetryFresh: (cardId: string) => void;
     onMarkDone: (cardId: string) => void;
     onDeleteCard: (cardId: string) => void;
     onDragStartCard: (cardId: string) => void;
@@ -67,6 +68,7 @@
     onSelectCard,
     onQueueCard,
     onStartAgent,
+    onRetryFresh,
     onMarkDone,
     onDeleteCard,
     onDragStartCard,
@@ -204,6 +206,7 @@
               onSelect={() => onSelectCard(card)}
               onQueue={() => onQueueCard(card.id)}
               onStartAgent={() => onStartAgent(card.id)}
+              onRetryFresh={() => onRetryFresh(card.id)}
               onMarkDone={() => onMarkDone(card.id)}
               onDelete={() => onDeleteCard(card.id)}
               onDragStart={() => onDragStartCard(card.id)}

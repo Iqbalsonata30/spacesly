@@ -2226,6 +2226,35 @@ async fn resume_task_session_after_approval(
 }
 
 #[tauri::command]
+async fn continue_interrupted_task_session(
+    session_id: u64,
+    label: String,
+    envelope: TaskSessionEnvelope,
+    granted_capabilities: Vec<String>,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<TaskSessionSnapshot, String> {
+    match &envelope {
+        TaskSessionEnvelope::V1(session) => session.validate_agent_runtime_ownership()?,
+        TaskSessionEnvelope::V2(_) => {
+            return Err("Continuation requires an Agent Task Session envelope.".to_string())
+        }
+    }
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .continue_interrupted_session(
+                TaskSessionId(session_id),
+                label,
+                &envelope,
+                granted_capabilities,
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Continue Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
 fn digest_task_session_prompt_input(input: TaskSessionInputV2) -> Result<String, String> {
     prompt_input_digest(&input)
 }
@@ -3113,6 +3142,7 @@ pub fn run() {
             save_immutable_agent_runtime_profile,
             submit_task_session,
             resume_task_session_after_approval,
+            continue_interrupted_task_session,
             digest_task_session_prompt_input,
             digest_agent_execution_contract,
             cancel_task_session,

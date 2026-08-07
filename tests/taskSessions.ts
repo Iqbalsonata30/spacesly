@@ -11,6 +11,7 @@ import {
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
   executionRepositoryContext,
+  continueAgentTaskSession,
   executeAgentTaskSession,
   planAgentTaskConnectors,
   prepareAgentTaskSession,
@@ -636,6 +637,31 @@ assertEqual(
   },
   { requestedId: 42, returnedId: 42, opencodeSessionId: "opencode-session-x" },
   "approval continuation should wait on the same durable Task Session identity",
+);
+
+let continuedTaskSessionId: number | null = null;
+const continuedExecution = await continueAgentTaskSession(43, "continue", prepared, {
+  dependencies: {
+    ...independentDependencies,
+    continueInterrupted: async (sessionId) => {
+      continuedTaskSessionId = sessionId;
+      return {
+        ...terminalSnapshot(sessionId),
+        state: "queued",
+        attempt_id: null,
+        last_event_sequence: 0,
+      };
+    },
+  },
+});
+assertEqual(
+  {
+    requestedId: continuedTaskSessionId,
+    returnedId: continuedExecution.session.id,
+    opencodeSessionId: continuedExecution.session.opencode_session_id,
+  },
+  { requestedId: 43, returnedId: 43, opencodeSessionId: "opencode-session-x" },
+  "generic continuation should retain both Task Session and OpenCode session identity",
 );
 
 let timeoutCancelledSession: number | null = null;

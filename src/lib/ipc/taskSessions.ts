@@ -316,6 +316,20 @@ export function resumeTaskSessionAfterApproval(
   );
 }
 
+/** Continues the same interrupted Agent Task Session and durable OpenCode session. */
+export function continueInterruptedTaskSession(
+  sessionId: number,
+  label: string,
+  envelope: TaskSessionEnvelope,
+  grantedCapabilities: string[],
+): Promise<TaskSessionSnapshot> {
+  return invokeWithPolicy(
+    "continue_interrupted_task_session",
+    { sessionId, label, envelope, grantedCapabilities },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
 /** Returns the backend-canonical integrity digest for immutable Chat/Edit prompt input. */
 export function digestTaskSessionPromptInput(input: TaskSessionInputV2): Promise<string> {
   return invokeWithPolicy(

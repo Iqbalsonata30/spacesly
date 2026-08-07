@@ -471,6 +471,11 @@ mod tests {
         seen_session_ids: Mutex<Vec<Option<String>>>,
     }
 
+    struct BlockedThenCompleteRunner {
+        executions: AtomicUsize,
+        seen_session_ids: Mutex<Vec<Option<String>>>,
+    }
+
     struct ToolFailureRunner;
 
     impl AgentRuntimeRunner for ToolFailureRunner {
@@ -559,6 +564,43 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
+            })
+        }
+    }
+
+    impl AgentRuntimeRunner for BlockedThenCompleteRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            self.seen_session_ids
+                .lock()
+                .expect("seen sessions lock")
+                .push(task.opencode_session_id.clone());
+            on_event(AiWorkerStreamEvent::OpenCodeSession {
+                session_id: "opencode-session-continued".to_string(),
+                action: if execution == 0 { "created" } else { "resumed" }.to_string(),
+            })?;
+            Ok(AiWorkerTaskResult {
+                summary: if execution == 0 {
+                    "operator input required"
+                } else {
+                    "continued successfully"
+                }
+                .to_string(),
+                evidence: Vec::new(),
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: if execution == 0 {
+                    AiWorkerCompletionStatus::Blocked
+                } else {
+                    AiWorkerCompletionStatus::Completed
+                },
+                blocked_reason: (execution == 0).then(|| "operator input required".to_string()),
             })
         }
     }
@@ -996,6 +1038,66 @@ mod tests {
             .filter(|event| event.payload["action"] == json!("created"))
             .count();
         assert_eq!(created_count, 1);
+    }
+
+    #[test]
+    fn generic_continuation_resumes_the_same_opencode_session_end_to_end() {
+        let directory = tempdir().expect("temp directory");
+        let runner = Arc::new(BlockedThenCompleteRunner {
+            executions: AtomicUsize::new(0),
+            seen_session_ids: Mutex::new(Vec::new()),
+        });
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            runner.clone(),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let envelope = test_envelope();
+        let session = engine
+            .submit_envelope_with_grants(
+                "blocked-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let blocked = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task blocks");
+        assert_eq!(blocked.state, TaskSessionState::Blocked);
+
+        let continued = engine
+            .continue_interrupted_session(
+                session.id,
+                "continued-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+            )
+            .expect("task continued");
+        assert_eq!(continued.id, session.id);
+        assert_eq!(
+            continued.opencode_session_id.as_deref(),
+            Some("opencode-session-continued")
+        );
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("continued task completes");
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(
+            runner
+                .seen_session_ids
+                .lock()
+                .expect("seen sessions lock")
+                .as_slice(),
+            &[None, Some("opencode-session-continued".to_string())]
+        );
     }
 
     #[test]

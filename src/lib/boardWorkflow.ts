@@ -177,9 +177,9 @@ export function canStartAgent(card: CardProjection, running: boolean): boolean {
 export function agentActionLabel(
   card: CardProjection,
   running: boolean,
-  hasOperatorNotes: boolean,
+  _hasOperatorNotes: boolean,
 ): string {
   if (running || card.execution === "running") return "Running";
-  if (isBlocked(card.execution)) return hasOperatorNotes ? "↻ Continue Agent" : "↻ Retry Agent";
+  if (isBlocked(card.execution)) return "↻ Continue Agent";
   return "▷ Start";
 }
