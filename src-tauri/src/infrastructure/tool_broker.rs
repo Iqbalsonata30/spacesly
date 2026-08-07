@@ -310,6 +310,8 @@ impl ToolBroker {
                 "execute",
                 "link",
                 "move",
+                "patch",
+                "apply",
                 "restart",
                 "run",
                 "scale",
@@ -468,6 +470,22 @@ mod tests {
         assert_eq!(
             ToolBroker::risk_for_tool("custom_action"),
             ToolRisk::Unknown
+        );
+        assert_eq!(
+            ToolBroker::risk_for_tool("kubernetes_resources_list"),
+            ToolRisk::Read
+        );
+        assert_eq!(
+            ToolBroker::risk_for_tool("kubernetes_resources_create"),
+            ToolRisk::Mutation
+        );
+        assert_eq!(
+            ToolBroker::risk_for_tool("kubernetes_resources_patch"),
+            ToolRisk::Mutation
+        );
+        assert_eq!(
+            ToolBroker::risk_for_tool("kubernetes_resources_delete"),
+            ToolRisk::Destructive
         );
     }
 

@@ -1,12 +1,20 @@
 use serde_json::{json, Value};
 
-use super::client::OcpClient;
+use super::client::{DiscoveredResource, KubernetesPatchType, OcpClient};
 use super::errors::{OcpError, OcpResult};
 
 pub const MAX_LIST_ITEMS: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OcpTool {
+    KubernetesResourcesList,
+    KubernetesResourcesGet,
+    KubernetesResourcesCreate,
+    KubernetesResourcesUpdate,
+    KubernetesResourcesPatch,
+    KubernetesResourcesDelete,
+    KubernetesEventsList,
+    KubernetesNamespacesList,
     GetNamespaces,
     GetNodes,
     GetPods,
@@ -27,6 +35,14 @@ pub enum OcpTool {
 impl OcpTool {
     pub fn all() -> &'static [OcpTool] {
         &[
+            Self::KubernetesResourcesList,
+            Self::KubernetesResourcesGet,
+            Self::KubernetesResourcesCreate,
+            Self::KubernetesResourcesUpdate,
+            Self::KubernetesResourcesPatch,
+            Self::KubernetesResourcesDelete,
+            Self::KubernetesEventsList,
+            Self::KubernetesNamespacesList,
             Self::GetNamespaces,
             Self::GetNodes,
             Self::GetPods,
@@ -54,6 +70,14 @@ impl OcpTool {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::KubernetesResourcesList => "kubernetes_resources_list",
+            Self::KubernetesResourcesGet => "kubernetes_resources_get",
+            Self::KubernetesResourcesCreate => "kubernetes_resources_create",
+            Self::KubernetesResourcesUpdate => "kubernetes_resources_update",
+            Self::KubernetesResourcesPatch => "kubernetes_resources_patch",
+            Self::KubernetesResourcesDelete => "kubernetes_resources_delete",
+            Self::KubernetesEventsList => "kubernetes_events_list",
+            Self::KubernetesNamespacesList => "kubernetes_namespaces_list",
             Self::GetNamespaces => "ocp_get_namespaces",
             Self::GetNodes => "ocp_get_nodes",
             Self::GetPods => "ocp_get_pods",
@@ -75,7 +99,13 @@ impl OcpTool {
     pub fn is_mutation(self) -> bool {
         matches!(
             self,
-            Self::RestartDeployment | Self::ScaleDeployment | Self::DeleteManagedPod
+            Self::KubernetesResourcesCreate
+                | Self::KubernetesResourcesUpdate
+                | Self::KubernetesResourcesPatch
+                | Self::KubernetesResourcesDelete
+                | Self::RestartDeployment
+                | Self::ScaleDeployment
+                | Self::DeleteManagedPod
         )
     }
 
@@ -88,7 +118,102 @@ impl OcpTool {
             "type": "string",
             "description": "Resource name."
         });
+        let api_version_prop = json!({
+            "type": "string",
+            "description": "Kubernetes apiVersion, for example v1, apps/v1, or example.io/v1alpha1."
+        });
+        let kind_prop = json!({
+            "type": "string",
+            "description": "Kubernetes Kind. Supply either kind or resource."
+        });
+        let resource_prop = json!({
+            "type": "string",
+            "description": "Discovered plural, singular, or short resource name. Supply either resource or kind."
+        });
+        let generic_identity = || {
+            json!({
+                "api_version": api_version_prop,
+                "kind": kind_prop,
+                "resource": resource_prop,
+                "namespace": {
+                    "type": "string",
+                    "description": "Required for namespaced resources and forbidden for cluster-scoped resources."
+                }
+            })
+        };
         let properties = match self {
+            Self::KubernetesResourcesList => {
+                let mut properties = generic_identity();
+                properties["label_selector"] = json!({ "type": "string" });
+                properties["field_selector"] = json!({ "type": "string" });
+                properties["limit"] = json!({ "type": "integer", "minimum": 1, "maximum": 200 });
+                properties["continue"] = json!({
+                    "type": "string",
+                    "description": "Opaque Kubernetes list continuation token from a previous response."
+                });
+                properties
+            }
+            Self::KubernetesResourcesGet | Self::KubernetesResourcesDelete => {
+                let mut properties = generic_identity();
+                properties["name"] = name_prop;
+                if self == Self::KubernetesResourcesDelete {
+                    properties["propagation_policy"] = json!({
+                        "type": "string",
+                        "enum": ["Foreground", "Background", "Orphan"]
+                    });
+                    properties["grace_period_seconds"] =
+                        json!({ "type": "integer", "minimum": 0, "maximum": 86400 });
+                    properties["dry_run"] = json!({ "type": "boolean" });
+                }
+                properties
+            }
+            Self::KubernetesResourcesCreate | Self::KubernetesResourcesUpdate => json!({
+                "manifest": {
+                    "type": "object",
+                    "description": "Complete structured Kubernetes object including apiVersion, kind, metadata.name, and metadata.namespace when namespaced. Update also requires metadata.resourceVersion."
+                }
+            }),
+            Self::KubernetesResourcesPatch => {
+                let mut properties = generic_identity();
+                properties["name"] = name_prop;
+                properties["patch"] = json!({
+                    "description": "Structured merge/apply object or RFC 6902 JSON Patch array."
+                });
+                properties["patch_type"] = json!({
+                    "type": "string",
+                    "enum": ["merge", "json", "server_apply"],
+                    "description": "merge uses JSON Merge Patch; json uses RFC 6902; server_apply uses Kubernetes server-side apply."
+                });
+                properties["field_manager"] = json!({
+                    "type": "string",
+                    "description": "Required for server_apply."
+                });
+                properties["force"] = json!({
+                    "type": "boolean",
+                    "description": "Only applies to server_apply; request ownership takeover on conflicts."
+                });
+                properties
+            }
+            Self::KubernetesEventsList => json!({
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace to query. Omit to list events across all namespaces."
+                },
+                "involved_object_name": { "type": "string" },
+                "involved_object_kind": { "type": "string" },
+                "reason": { "type": "string" },
+                "type": { "type": "string", "enum": ["Normal", "Warning"] },
+                "field_selector": { "type": "string" },
+                "label_selector": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                "continue": { "type": "string" }
+            }),
+            Self::KubernetesNamespacesList => json!({
+                "label_selector": { "type": "string" },
+                "field_selector": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                "continue": { "type": "string" }
+            }),
             Self::GetNamespaces | Self::GetNodes => json!({}),
             Self::GetPods
             | Self::GetDeployments
@@ -143,19 +268,71 @@ impl OcpTool {
                 }
             }),
         };
+        let mut input_schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": self.required_properties(),
+            "additionalProperties": false
+        });
+        if matches!(
+            self,
+            Self::KubernetesResourcesList
+                | Self::KubernetesResourcesGet
+                | Self::KubernetesResourcesPatch
+                | Self::KubernetesResourcesDelete
+        ) {
+            input_schema["oneOf"] = json!([
+                { "required": ["kind"] },
+                { "required": ["resource"] }
+            ]);
+        }
         json!({
             "name": self.as_str(),
             "description": self.description(),
-            "inputSchema": {
-                "type": "object",
-                "properties": properties,
-                "additionalProperties": false
-            }
+            "inputSchema": input_schema
         })
+    }
+
+    fn required_properties(self) -> Vec<&'static str> {
+        match self {
+            Self::KubernetesResourcesList => vec!["api_version"],
+            Self::KubernetesResourcesGet | Self::KubernetesResourcesDelete => {
+                vec!["api_version", "name"]
+            }
+            Self::KubernetesResourcesCreate | Self::KubernetesResourcesUpdate => vec!["manifest"],
+            Self::KubernetesResourcesPatch => {
+                vec!["api_version", "name", "patch", "patch_type"]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn description(self) -> &'static str {
         match self {
+            Self::KubernetesResourcesList => {
+                "List arbitrary discovered Kubernetes resources with selectors and pagination."
+            }
+            Self::KubernetesResourcesGet => {
+                "Get one arbitrary discovered Kubernetes resource as a structured object."
+            }
+            Self::KubernetesResourcesCreate => {
+                "Create a structured Kubernetes manifest. Requires explicit operator approval in Spacesly."
+            }
+            Self::KubernetesResourcesUpdate => {
+                "Replace a Kubernetes resource using an explicit resourceVersion. Requires explicit operator approval in Spacesly."
+            }
+            Self::KubernetesResourcesPatch => {
+                "Patch a Kubernetes resource using merge patch, RFC 6902 JSON Patch, or server-side apply. Requires explicit operator approval in Spacesly."
+            }
+            Self::KubernetesResourcesDelete => {
+                "Delete an arbitrary Kubernetes resource with explicit delete options. Destructive and requires explicit operator approval in Spacesly."
+            }
+            Self::KubernetesEventsList => {
+                "List normalized Kubernetes events in one namespace or across all namespaces with server-side filters where supported."
+            }
+            Self::KubernetesNamespacesList => {
+                "List namespaces with phase, labels, annotations, and creation timestamp."
+            }
             Self::GetNamespaces => "List namespaces visible to the configured cluster identity.",
             Self::GetNodes => "List cluster nodes and their status.",
             Self::GetPods => "List pods in a namespace with their status.",
@@ -197,6 +374,14 @@ pub fn execute_tool(client: &OcpClient, name: &str, arguments: &Value) -> OcpRes
         ));
     }
     match tool {
+        OcpTool::KubernetesResourcesList => generic_resource_list(client, arguments),
+        OcpTool::KubernetesResourcesGet => generic_resource_get(client, arguments),
+        OcpTool::KubernetesResourcesCreate => generic_resource_create(client, arguments),
+        OcpTool::KubernetesResourcesUpdate => generic_resource_update(client, arguments),
+        OcpTool::KubernetesResourcesPatch => generic_resource_patch(client, arguments),
+        OcpTool::KubernetesResourcesDelete => generic_resource_delete(client, arguments),
+        OcpTool::KubernetesEventsList => kubernetes_events_list(client, arguments),
+        OcpTool::KubernetesNamespacesList => kubernetes_namespaces_list(client, arguments),
         OcpTool::GetNamespaces => {
             let items = client.get_namespaces()?;
             Ok(json!({ "kind": "NamespaceList", "items": items }))
@@ -374,6 +559,605 @@ pub fn execute_tool(client: &OcpClient, name: &str, arguments: &Value) -> OcpRes
             }))
         }
     }
+}
+
+fn generic_resource_list(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let resource = resolve_resource(client, arguments)?;
+    let namespace = resource_namespace(&resource, arguments)?;
+    let query = list_query(arguments, 100)?;
+    let result = client.list_resource(&resource, namespace.as_deref(), &query)?;
+    Ok(resource_response(
+        "list",
+        &resource,
+        namespace.as_deref(),
+        "result",
+        result,
+    ))
+}
+
+fn generic_resource_get(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let resource = resolve_resource(client, arguments)?;
+    let namespace = resource_namespace(&resource, arguments)?;
+    let name = required_resource_name(arguments, "name")?;
+    let object = client.get_resource(&resource, namespace.as_deref(), &name)?;
+    Ok(resource_response(
+        "get",
+        &resource,
+        namespace.as_deref(),
+        "object",
+        object,
+    ))
+}
+
+fn generic_resource_create(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let manifest = required_manifest(arguments)?;
+    let (resource, namespace, _name) = validate_manifest_identity(client, manifest, false)?;
+    let object = client.create_resource(&resource, namespace.as_deref(), manifest)?;
+    Ok(resource_response(
+        "create",
+        &resource,
+        namespace.as_deref(),
+        "object",
+        object,
+    ))
+}
+
+fn generic_resource_update(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let manifest = required_manifest(arguments)?;
+    let (resource, namespace, name) = validate_manifest_identity(client, manifest, true)?;
+    let object = client.update_resource(&resource, namespace.as_deref(), &name, manifest)?;
+    Ok(resource_response(
+        "update",
+        &resource,
+        namespace.as_deref(),
+        "object",
+        object,
+    ))
+}
+
+fn generic_resource_patch(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let resource = resolve_resource(client, arguments)?;
+    let namespace = resource_namespace(&resource, arguments)?;
+    let name = required_resource_name(arguments, "name")?;
+    let patch = arguments.get("patch").ok_or_else(|| {
+        OcpError::invalid_manifest("patch_required", "Structured patch content is required.")
+    })?;
+    let patch_type = match required_raw_string(arguments, "patch_type")?.as_str() {
+        "merge" => {
+            if !patch.is_object() {
+                return Err(OcpError::invalid_manifest(
+                    "merge_patch_invalid",
+                    "JSON Merge Patch content must be an object.",
+                ));
+            }
+            KubernetesPatchType::Merge
+        }
+        "json" => {
+            validate_json_patch(patch)?;
+            KubernetesPatchType::Json
+        }
+        "server_apply" => {
+            validate_apply_patch_identity(patch, &resource, namespace.as_deref(), &name)?;
+            KubernetesPatchType::ServerApply
+        }
+        value => {
+            return Err(OcpError::invalid_manifest(
+                "patch_type_invalid",
+                format!("Unsupported patch_type '{value}'. Use merge, json, or server_apply."),
+            ))
+        }
+    };
+    let field_manager = optional_query_string(arguments, "field_manager")?;
+    let force = arguments
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if patch_type != KubernetesPatchType::ServerApply && (field_manager.is_some() || force) {
+        return Err(OcpError::invalid_manifest(
+            "patch_options_invalid",
+            "field_manager and force are only valid for server_apply.",
+        ));
+    }
+    let object = client.patch_resource(
+        &resource,
+        namespace.as_deref(),
+        &name,
+        patch,
+        patch_type,
+        field_manager.as_deref(),
+        force,
+    )?;
+    Ok(resource_response(
+        "patch",
+        &resource,
+        namespace.as_deref(),
+        "object",
+        object,
+    ))
+}
+
+fn generic_resource_delete(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let resource = resolve_resource(client, arguments)?;
+    let namespace = resource_namespace(&resource, arguments)?;
+    let name = required_resource_name(arguments, "name")?;
+    let mut options = json!({ "apiVersion": "v1", "kind": "DeleteOptions" });
+    if let Some(policy) = optional_query_string(arguments, "propagation_policy")? {
+        if !matches!(policy.as_str(), "Foreground" | "Background" | "Orphan") {
+            return Err(OcpError::config(
+                "delete_options_invalid",
+                "propagation_policy must be Foreground, Background, or Orphan.",
+            ));
+        }
+        options["propagationPolicy"] = json!(policy);
+    }
+    if let Some(seconds) = arguments
+        .get("grace_period_seconds")
+        .and_then(Value::as_u64)
+    {
+        if seconds > 86_400 {
+            return Err(OcpError::config(
+                "delete_options_invalid",
+                "grace_period_seconds must not exceed 86400.",
+            ));
+        }
+        options["gracePeriodSeconds"] = json!(seconds);
+    }
+    if arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        options["dryRun"] = json!(["All"]);
+    }
+    let result = client.delete_resource(&resource, namespace.as_deref(), &name, &options)?;
+    Ok(resource_response(
+        "delete",
+        &resource,
+        namespace.as_deref(),
+        "result",
+        result,
+    ))
+}
+
+fn kubernetes_namespaces_list(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let resource = client.discover_resource("v1", "Namespace")?;
+    let query = list_query(arguments, 100)?;
+    let result = client.list_resource(&resource, None, &query)?;
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            json!({
+                "name": item.pointer("/metadata/name"),
+                "phase": item.pointer("/status/phase"),
+                "labels": item.pointer("/metadata/labels").cloned().unwrap_or_else(|| json!({})),
+                "annotations": item.pointer("/metadata/annotations").cloned().unwrap_or_else(|| json!({})),
+                "creation_timestamp": item.pointer("/metadata/creationTimestamp")
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "api_version": "v1",
+        "kind": "NamespaceList",
+        "count": items.len(),
+        "metadata": result.get("metadata").cloned().unwrap_or_else(|| json!({})),
+        "items": items
+    }))
+}
+
+fn kubernetes_events_list(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let (resource, modern) = match client.discover_resource("events.k8s.io/v1", "Event") {
+        Ok(resource) => (resource, true),
+        Err(error)
+            if error.code == "api_version_not_found" || error.code == "api_resource_not_found" =>
+        {
+            (client.discover_resource("v1", "Event")?, false)
+        }
+        Err(error) => return Err(error),
+    };
+    let namespace = optional_resource_namespace(arguments)?;
+    if let Some(namespace) = namespace.as_deref() {
+        validate_identifier(namespace, "namespace")?;
+    }
+    let mut selectors = optional_query_string(arguments, "field_selector")?
+        .map(|value| vec![value])
+        .unwrap_or_default();
+    let object_name = optional_query_string(arguments, "involved_object_name")?;
+    let object_kind = optional_query_string(arguments, "involved_object_kind")?;
+    let reason = optional_query_string(arguments, "reason")?;
+    let event_type = optional_query_string(arguments, "type")?;
+    for (field, value) in [
+        (
+            if modern {
+                "regarding.name"
+            } else {
+                "involvedObject.name"
+            },
+            object_name,
+        ),
+        (
+            if modern {
+                "regarding.kind"
+            } else {
+                "involvedObject.kind"
+            },
+            object_kind,
+        ),
+        ("reason", reason),
+        ("type", event_type),
+    ] {
+        if let Some(value) = value {
+            selectors.push(format!("{field}={value}"));
+        }
+    }
+    let mut query = list_query(arguments, 100)?;
+    query.retain(|(key, _)| *key != "fieldSelector");
+    if !selectors.is_empty() {
+        query.push(("fieldSelector", selectors.join(",")));
+    }
+    let result = if namespace.is_some() {
+        client.list_resource(&resource, namespace.as_deref(), &query)?
+    } else {
+        client.list_resource_all_namespaces(&resource, &query)?
+    };
+    let mut items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| normalize_event(item, modern))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| event_timestamp(right).cmp(event_timestamp(left)));
+    Ok(json!({
+        "api_version": resource.api_version,
+        "kind": "EventList",
+        "namespace": namespace,
+        "count": items.len(),
+        "metadata": result.get("metadata").cloned().unwrap_or_else(|| json!({})),
+        "items": items
+    }))
+}
+
+fn resolve_resource(client: &OcpClient, arguments: &Value) -> OcpResult<DiscoveredResource> {
+    let api_version = required_raw_string(arguments, "api_version")?;
+    let kind = optional_query_string(arguments, "kind")?;
+    let resource = optional_query_string(arguments, "resource")?;
+    let identity = match (kind.as_deref(), resource.as_deref()) {
+        (Some(kind), None) => kind,
+        (None, Some(resource)) => resource,
+        (Some(_), Some(_)) => {
+            return Err(OcpError::config(
+                "resource_identity_ambiguous",
+                "Supply either kind or resource, not both.",
+            ))
+        }
+        (None, None) => {
+            return Err(OcpError::config(
+                "resource_identity_required",
+                "Kubernetes resource kind or resource is required.",
+            ))
+        }
+    };
+    client.discover_resource(&api_version, identity)
+}
+
+fn resource_namespace(
+    resource: &DiscoveredResource,
+    arguments: &Value,
+) -> OcpResult<Option<String>> {
+    let namespace = optional_resource_namespace(arguments)?;
+    if resource.namespaced && namespace.is_none() {
+        return Err(OcpError::config(
+            "namespace_required",
+            format!(
+                "Namespace is required for namespaced Kubernetes resource '{}'.",
+                resource.qualified_name()
+            ),
+        ));
+    }
+    if !resource.namespaced && namespace.is_some() {
+        return Err(OcpError::config(
+            "namespace_not_allowed",
+            format!(
+                "Kubernetes resource '{}' is cluster-scoped; omit namespace.",
+                resource.qualified_name()
+            ),
+        ));
+    }
+    if let Some(namespace) = namespace.as_deref() {
+        validate_identifier(namespace, "namespace")?;
+    }
+    Ok(namespace)
+}
+
+fn validate_manifest_identity(
+    client: &OcpClient,
+    manifest: &Value,
+    require_resource_version: bool,
+) -> OcpResult<(DiscoveredResource, Option<String>, String)> {
+    let api_version = manifest
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OcpError::invalid_manifest("api_version_required", "Manifest apiVersion is required.")
+        })?;
+    let kind = manifest
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| OcpError::invalid_manifest("kind_required", "Manifest kind is required."))?;
+    let name = manifest
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OcpError::invalid_manifest(
+                "name_required",
+                "Manifest metadata.name is required; Spacesly does not infer it.",
+            )
+        })?
+        .to_string();
+    validate_identifier(&name, "metadata.name")?;
+    let resource = client.discover_resource(api_version, kind)?;
+    let namespace = manifest
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if resource.namespaced && namespace.is_none() {
+        return Err(OcpError::invalid_manifest(
+            "namespace_required",
+            format!(
+                "Manifest metadata.namespace is required for namespaced resource '{}'.",
+                resource.qualified_name()
+            ),
+        ));
+    }
+    if !resource.namespaced && namespace.is_some() {
+        return Err(OcpError::invalid_manifest(
+            "namespace_not_allowed",
+            format!(
+                "Manifest metadata.namespace must be omitted for cluster-scoped resource '{}'.",
+                resource.qualified_name()
+            ),
+        ));
+    }
+    if let Some(namespace) = namespace.as_deref() {
+        validate_identifier(namespace, "metadata.namespace")?;
+    }
+    if require_resource_version
+        && manifest
+            .pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(OcpError::invalid_manifest(
+            "resource_version_required",
+            "Update requires metadata.resourceVersion from a current GET to prevent lost updates.",
+        ));
+    }
+    Ok((resource, namespace, name))
+}
+
+fn required_manifest(arguments: &Value) -> OcpResult<&Value> {
+    arguments
+        .get("manifest")
+        .filter(|manifest| manifest.is_object())
+        .ok_or_else(|| {
+            OcpError::invalid_manifest(
+                "manifest_required",
+                "A structured Kubernetes manifest object is required.",
+            )
+        })
+}
+
+fn validate_json_patch(patch: &Value) -> OcpResult<()> {
+    let operations = patch.as_array().ok_or_else(|| {
+        OcpError::invalid_manifest(
+            "json_patch_invalid",
+            "RFC 6902 JSON Patch content must be an array.",
+        )
+    })?;
+    if operations.is_empty() {
+        return Err(OcpError::invalid_manifest(
+            "json_patch_empty",
+            "RFC 6902 JSON Patch must contain at least one operation.",
+        ));
+    }
+    for operation in operations {
+        let op = operation.get("op").and_then(Value::as_str);
+        let path = operation.get("path").and_then(Value::as_str);
+        if !matches!(
+            op,
+            Some("add" | "remove" | "replace" | "move" | "copy" | "test")
+        ) || path.is_none_or(|path| !path.starts_with('/'))
+        {
+            return Err(OcpError::invalid_manifest(
+                "json_patch_invalid",
+                "Each RFC 6902 operation requires a supported op and an absolute JSON Pointer path.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_apply_patch_identity(
+    patch: &Value,
+    resource: &DiscoveredResource,
+    namespace: Option<&str>,
+    name: &str,
+) -> OcpResult<()> {
+    if !patch.is_object()
+        || patch.get("apiVersion").and_then(Value::as_str) != Some(resource.api_version.as_str())
+        || patch.get("kind").and_then(Value::as_str) != Some(resource.kind.as_str())
+        || patch.pointer("/metadata/name").and_then(Value::as_str) != Some(name)
+        || patch.pointer("/metadata/namespace").and_then(Value::as_str) != namespace
+    {
+        return Err(OcpError::invalid_manifest(
+            "apply_identity_mismatch",
+            "Server-side apply content must include apiVersion, kind, metadata.name, and metadata.namespace matching the requested resource identity.",
+        ));
+    }
+    Ok(())
+}
+
+fn resource_response(
+    operation: &str,
+    resource: &DiscoveredResource,
+    namespace: Option<&str>,
+    result_key: &str,
+    result: Value,
+) -> Value {
+    let mut response = json!({
+        "operation": operation,
+        "resource": {
+            "api_version": resource.api_version,
+            "kind": resource.kind,
+            "name": resource.name,
+            "namespaced": resource.namespaced,
+            "namespace": namespace
+        }
+    });
+    response[result_key] = result;
+    response
+}
+
+fn list_query(arguments: &Value, default_limit: u32) -> OcpResult<Vec<(&'static str, String)>> {
+    let mut query = Vec::new();
+    if let Some(selector) = optional_query_string(arguments, "label_selector")? {
+        query.push(("labelSelector", selector));
+    }
+    if let Some(selector) = optional_query_string(arguments, "field_selector")? {
+        query.push(("fieldSelector", selector));
+    }
+    let limit = optional_u32(arguments, "limit").unwrap_or(default_limit);
+    if limit == 0 || limit as usize > MAX_LIST_ITEMS {
+        return Err(OcpError::config(
+            "limit_invalid",
+            format!("Kubernetes list limit must be between 1 and {MAX_LIST_ITEMS}."),
+        ));
+    }
+    query.push(("limit", limit.to_string()));
+    if let Some(token) = optional_query_string(arguments, "continue")? {
+        query.push(("continue", token));
+    }
+    Ok(query)
+}
+
+fn optional_resource_namespace(arguments: &Value) -> OcpResult<Option<String>> {
+    optional_query_string(arguments, "namespace")
+}
+
+fn optional_query_string(arguments: &Value, key: &str) -> OcpResult<Option<String>> {
+    let value = arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if value
+        .as_deref()
+        .is_some_and(|value| value.len() > 2048 || value.chars().any(char::is_control))
+    {
+        return Err(OcpError::config(
+            "invalid_arguments",
+            format!("Kubernetes tool argument '{key}' is invalid or too long."),
+        ));
+    }
+    Ok(value)
+}
+
+fn required_raw_string(arguments: &Value, key: &str) -> OcpResult<String> {
+    optional_query_string(arguments, key)?.ok_or_else(|| {
+        OcpError::config(
+            "invalid_arguments",
+            format!("Kubernetes tool argument '{key}' is required."),
+        )
+    })
+}
+
+fn required_resource_name(arguments: &Value, key: &str) -> OcpResult<String> {
+    let value = required_raw_string(arguments, key)?;
+    validate_identifier(&value, key)?;
+    Ok(value)
+}
+
+fn normalize_event(event: &Value, modern: bool) -> Value {
+    let regarding = if modern {
+        event.get("regarding")
+    } else {
+        event.get("involvedObject")
+    };
+    let source = if modern {
+        event
+            .get("reportingController")
+            .or_else(|| event.pointer("/deprecatedSource/component"))
+    } else {
+        event
+            .get("reportingComponent")
+            .or_else(|| event.pointer("/source/component"))
+    };
+    let first_timestamp = if modern {
+        event
+            .get("eventTime")
+            .filter(|value| !value.is_null())
+            .or_else(|| event.get("deprecatedFirstTimestamp"))
+            .or_else(|| event.pointer("/series/lastObservedTime"))
+            .or_else(|| event.pointer("/metadata/creationTimestamp"))
+    } else {
+        event
+            .get("firstTimestamp")
+            .or_else(|| event.get("eventTime"))
+            .or_else(|| event.pointer("/metadata/creationTimestamp"))
+    };
+    let last_timestamp = if modern {
+        event
+            .pointer("/series/lastObservedTime")
+            .or_else(|| event.get("eventTime"))
+            .filter(|value| !value.is_null())
+            .or_else(|| event.get("deprecatedLastTimestamp"))
+            .or_else(|| event.pointer("/metadata/creationTimestamp"))
+    } else {
+        event
+            .get("lastTimestamp")
+            .or_else(|| event.get("eventTime"))
+            .or_else(|| event.pointer("/metadata/creationTimestamp"))
+    };
+    json!({
+        "namespace": event.pointer("/metadata/namespace"),
+        "type": event.get("type"),
+        "reason": event.get("reason"),
+        "message": if modern { event.get("note") } else { event.get("message") },
+        "involved_object": {
+            "api_version": regarding.and_then(|value| value.get("apiVersion")),
+            "kind": regarding.and_then(|value| value.get("kind")),
+            "namespace": regarding.and_then(|value| value.get("namespace")),
+            "name": regarding.and_then(|value| value.get("name")),
+            "uid": regarding.and_then(|value| value.get("uid"))
+        },
+        "reporting_controller": source,
+        "count": if modern {
+            event.pointer("/series/count").or_else(|| event.get("deprecatedCount"))
+        } else {
+            event.get("count").or_else(|| event.pointer("/series/count"))
+        },
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp
+    })
+}
+
+fn event_timestamp(event: &Value) -> &str {
+    event
+        .get("last_timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 trait WithLimit {
@@ -556,9 +1340,9 @@ fn validate_identifier(value: &str, field: &str) -> OcpResult<()> {
     if value.len() > 253
         || value.starts_with('-')
         || value.ends_with('-')
-        || value
-            .chars()
-            .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.')))
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | ':'))
+        })
     {
         return Err(OcpError::config(
             "invalid_arguments",
@@ -571,6 +1355,136 @@ fn validate_identifier(value: &str, field: &str) -> OcpResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::ocp::client::OcpTimeouts;
+    use crate::infrastructure::ocp::config::{ClientCredentials, ResolvedCluster};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    struct MockKubeServer {
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl MockKubeServer {
+        fn finish(self) -> Vec<String> {
+            self.handle.join().expect("mock Kubernetes server joins");
+            Arc::try_unwrap(self.requests)
+                .expect("request log has one owner")
+                .into_inner()
+                .expect("request log lock")
+        }
+    }
+
+    fn mock_client(responses: Vec<(u16, Value)>) -> (OcpClient, MockKubeServer) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = requests.clone();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("mock request accepted");
+                let request = read_http_request(&mut stream);
+                request_log.lock().expect("request log lock").push(request);
+                let body = serde_json::to_string(&body).expect("mock body encoded");
+                let reason = match status {
+                    200 => "OK",
+                    201 => "Created",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    409 => "Conflict",
+                    422 => "Unprocessable Entity",
+                    _ => "Response",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("mock response written");
+            }
+        });
+        let cluster = ResolvedCluster {
+            server: format!("http://{address}"),
+            ca: None,
+            insecure_skip_tls_verify: false,
+            credentials: ClientCredentials::default(),
+            default_namespace: Some("default".to_string()),
+        };
+        let client = OcpClient::build(&cluster, OcpTimeouts::default()).expect("test client");
+        (client, MockKubeServer { requests, handle })
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_len = None;
+        loop {
+            let count = stream.read(&mut buffer).expect("mock request read");
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if expected_len.is_none() {
+                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_len = Some(header_end + 4 + content_length);
+                }
+            }
+            if expected_len.is_some_and(|expected| bytes.len() >= expected) {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("request is UTF-8")
+    }
+
+    fn core_discovery() -> Value {
+        json!({
+            "groupVersion": "v1",
+            "resources": [
+                {"name":"pods","singularName":"pod","namespaced":true,"kind":"Pod","verbs":["get","list","create","update","patch","delete"],"shortNames":["po"]},
+                {"name":"nodes","singularName":"node","namespaced":false,"kind":"Node","verbs":["get","list"]},
+                {"name":"configmaps","singularName":"configmap","namespaced":true,"kind":"ConfigMap","verbs":["get","list","create","update","patch","delete"],"shortNames":["cm"]},
+                {"name":"namespaces","singularName":"namespace","namespaced":false,"kind":"Namespace","verbs":["get","list"]},
+                {"name":"events","singularName":"event","namespaced":true,"kind":"Event","verbs":["get","list"]}
+            ]
+        })
+    }
+
+    fn modern_event_discovery() -> Value {
+        json!({
+            "groupVersion": "events.k8s.io/v1",
+            "resources": [
+                {"name":"events","singularName":"event","namespaced":true,"kind":"Event","verbs":["get","list"]}
+            ]
+        })
+    }
+
+    fn status_error(code: u16, reason: &str, message: &str, kind: &str) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": message,
+            "reason": reason,
+            "details": { "kind": kind },
+            "code": code
+        })
+    }
 
     #[test]
     fn every_registered_tool_parses_round_trip() {
@@ -598,6 +1512,10 @@ mod tests {
         assert_eq!(
             mutations,
             vec![
+                "kubernetes_resources_create",
+                "kubernetes_resources_update",
+                "kubernetes_resources_patch",
+                "kubernetes_resources_delete",
                 "ocp_restart_deployment",
                 "ocp_scale_deployment",
                 "ocp_delete_managed_pod"
@@ -627,6 +1545,7 @@ mod tests {
     #[test]
     fn rejects_invalid_namespace_identifiers() {
         assert!(validate_identifier("team-a", "namespace").is_ok());
+        assert!(validate_identifier("system:node", "name").is_ok());
         assert!(validate_identifier("../../etc", "namespace").is_err());
         assert!(validate_identifier("-bad", "namespace").is_err());
     }
@@ -653,5 +1572,375 @@ mod tests {
         assert_eq!(summary["phase"], json!("Running"));
         assert_eq!(summary["image"], json!("nginx:1.25"));
         assert_eq!(summary["node"], json!("node-1"));
+    }
+
+    #[test]
+    fn generic_crud_preserves_scope_payloads_and_discovery_cache() {
+        let (client, server) = mock_client(vec![
+            (200, core_discovery()),
+            (
+                200,
+                json!({"kind":"PodList","metadata":{"continue":"next"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"team-a"}}]}),
+            ),
+            (
+                200,
+                json!({"kind":"NodeList","items":[{"apiVersion":"v1","kind":"Node","metadata":{"name":"minikube"}}]}),
+            ),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"team-a"},"spec":{},"status":{"phase":"Running"}}),
+            ),
+            (
+                201,
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"team-a","resourceVersion":"1"},"data":{"A":"1"}}),
+            ),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"team-a","resourceVersion":"2"},"data":{"A":"2"}}),
+            ),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"team-a","resourceVersion":"3"},"data":{"A":"3"}}),
+            ),
+            (200, json!({"kind":"Status","status":"Success"})),
+        ]);
+
+        let listed = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","kind":"Pod","namespace":"team-a","label_selector":"app=web","limit":20}),
+        )
+        .unwrap();
+        assert_eq!(listed["result"]["items"][0]["metadata"]["name"], "web");
+        assert_eq!(listed["result"]["metadata"]["continue"], "next");
+
+        let nodes = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","resource":"nodes"}),
+        )
+        .unwrap();
+        assert_eq!(nodes["resource"]["namespaced"], false);
+
+        let pod = execute_tool(
+            &client,
+            "kubernetes_resources_get",
+            &json!({"api_version":"v1","resource":"po","namespace":"team-a","name":"web"}),
+        )
+        .unwrap();
+        assert_eq!(pod["object"]["status"]["phase"], "Running");
+
+        let created = execute_tool(
+            &client,
+            "kubernetes_resources_create",
+            &json!({"manifest":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"team-a"},"data":{"A":"1"}}}),
+        )
+        .unwrap();
+        assert_eq!(created["object"]["metadata"]["resourceVersion"], "1");
+
+        let updated = execute_tool(
+            &client,
+            "kubernetes_resources_update",
+            &json!({"manifest":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"team-a","resourceVersion":"1"},"data":{"A":"2"}}}),
+        )
+        .unwrap();
+        assert_eq!(updated["object"]["metadata"]["resourceVersion"], "2");
+
+        let patched = execute_tool(
+            &client,
+            "kubernetes_resources_patch",
+            &json!({"api_version":"v1","kind":"ConfigMap","namespace":"team-a","name":"settings","patch_type":"merge","patch":{"data":{"A":"3"}}}),
+        )
+        .unwrap();
+        assert_eq!(patched["object"]["data"]["A"], "3");
+
+        let deleted = execute_tool(
+            &client,
+            "kubernetes_resources_delete",
+            &json!({"api_version":"v1","kind":"ConfigMap","namespace":"team-a","name":"settings","propagation_policy":"Background"}),
+        )
+        .unwrap();
+        assert_eq!(deleted["result"]["status"], "Success");
+
+        let requests = server.finish();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /api/v1 HTTP/1.1"))
+                .count(),
+            1
+        );
+        assert!(requests[1].starts_with("GET /api/v1/namespaces/team-a/pods?"));
+        assert!(requests[1].contains("labelSelector=app%3Dweb"));
+        assert!(requests[2].starts_with("GET /api/v1/nodes?"));
+        assert!(requests[3].starts_with("GET /api/v1/namespaces/team-a/pods/web HTTP/1.1"));
+        assert!(requests[4].starts_with("POST /api/v1/namespaces/team-a/configmaps HTTP/1.1"));
+        assert!(
+            requests[5].starts_with("PUT /api/v1/namespaces/team-a/configmaps/settings HTTP/1.1")
+        );
+        assert!(
+            requests[6].starts_with("PATCH /api/v1/namespaces/team-a/configmaps/settings HTTP/1.1")
+        );
+        assert!(requests[6]
+            .to_ascii_lowercase()
+            .contains("content-type: application/merge-patch+json"));
+        assert!(requests[7]
+            .starts_with("DELETE /api/v1/namespaces/team-a/configmaps/settings HTTP/1.1"));
+        assert!(requests[7].contains("\"propagationPolicy\":\"Background\""));
+    }
+
+    #[test]
+    fn generic_resources_validate_scope_kind_and_update_concurrency() {
+        let (client, server) = mock_client(vec![(200, core_discovery())]);
+        let missing_namespace = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","kind":"Pod"}),
+        )
+        .unwrap_err();
+        assert_eq!(missing_namespace.code, "namespace_required");
+
+        let cluster_namespace = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","kind":"Node","namespace":"default"}),
+        )
+        .unwrap_err();
+        assert_eq!(cluster_namespace.code, "namespace_not_allowed");
+
+        let unknown = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","kind":"Mystery"}),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.code, "api_resource_not_found");
+
+        let stale_update = execute_tool(
+            &client,
+            "kubernetes_resources_update",
+            &json!({"manifest":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"default"}}}),
+        )
+        .unwrap_err();
+        assert_eq!(stale_update.code, "resource_version_required");
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn generic_resources_preserve_forbidden_and_conflict_diagnostics() {
+        let (client, server) = mock_client(vec![
+            (200, core_discovery()),
+            (
+                403,
+                status_error(403, "Forbidden", "pods is forbidden", "pods"),
+            ),
+            (
+                409,
+                status_error(
+                    409,
+                    "Conflict",
+                    "the object has been modified",
+                    "configmaps",
+                ),
+            ),
+        ]);
+        let forbidden = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"v1","kind":"Pod","namespace":"locked"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            forbidden.kind,
+            crate::infrastructure::ocp::errors::OcpErrorKind::Forbidden
+        );
+        assert!(forbidden.message.contains("verb 'list'"));
+        assert!(forbidden.message.contains("'pods'"));
+        assert!(forbidden.message.contains("namespace 'locked'"));
+
+        let conflict = execute_tool(
+            &client,
+            "kubernetes_resources_update",
+            &json!({"manifest":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"locked","resourceVersion":"old"}}}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict.kind,
+            crate::infrastructure::ocp::errors::OcpErrorKind::Conflict
+        );
+        assert_eq!(conflict.code, "resource_version_conflict");
+        assert!(conflict.message.contains("current resourceVersion"));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn namespace_listing_returns_operational_metadata() {
+        let (client, server) = mock_client(vec![
+            (200, core_discovery()),
+            (
+                200,
+                json!({"kind":"NamespaceList","metadata":{"continue":"more"},"items":[{"metadata":{"name":"team-a","labels":{"env":"test"},"annotations":{"owner":"platform"},"creationTimestamp":"2026-08-01T00:00:00Z"},"status":{"phase":"Active"}}]}),
+            ),
+        ]);
+        let result = execute_tool(
+            &client,
+            "kubernetes_namespaces_list",
+            &json!({"label_selector":"env=test","limit":10}),
+        )
+        .unwrap();
+        assert_eq!(result["items"][0]["name"], "team-a");
+        assert_eq!(result["items"][0]["phase"], "Active");
+        assert_eq!(result["items"][0]["labels"]["env"], "test");
+        assert_eq!(result["metadata"]["continue"], "more");
+        let requests = server.finish();
+        assert!(requests[1].starts_with("GET /api/v1/namespaces?"));
+    }
+
+    #[test]
+    fn events_use_modern_api_namespace_and_all_namespace_filters() {
+        let event = json!({
+            "apiVersion":"events.k8s.io/v1","kind":"Event",
+            "metadata":{"namespace":"team-a","creationTimestamp":"2026-08-08T01:00:00Z"},
+            "type":"Warning","reason":"BackOff","note":"container is restarting",
+            "regarding":{"apiVersion":"v1","kind":"Pod","namespace":"team-a","name":"web-1","uid":"u1"},
+            "reportingController":"kubelet","eventTime":null,
+            "deprecatedFirstTimestamp":"2026-08-08T02:00:00Z",
+            "deprecatedLastTimestamp":"2026-08-08T03:00:00Z",
+            "deprecatedCount":4
+        });
+        let (client, server) = mock_client(vec![
+            (200, modern_event_discovery()),
+            (200, json!({"kind":"EventList","items":[event.clone()]})),
+            (200, json!({"kind":"EventList","items":[event]})),
+        ]);
+        let namespaced = execute_tool(
+            &client,
+            "kubernetes_events_list",
+            &json!({"namespace":"team-a","involved_object_name":"web-1","involved_object_kind":"Pod","reason":"BackOff","type":"Warning","limit":25}),
+        )
+        .unwrap();
+        assert_eq!(namespaced["items"][0]["message"], "container is restarting");
+        assert_eq!(namespaced["items"][0]["reporting_controller"], "kubelet");
+        assert_eq!(namespaced["items"][0]["count"], 4);
+        assert_eq!(
+            namespaced["items"][0]["first_timestamp"],
+            "2026-08-08T02:00:00Z"
+        );
+        assert_eq!(
+            namespaced["items"][0]["last_timestamp"],
+            "2026-08-08T03:00:00Z"
+        );
+
+        let all = execute_tool(&client, "kubernetes_events_list", &json!({"limit":25})).unwrap();
+        assert_eq!(all["count"], 1);
+        let requests = server.finish();
+        assert!(requests[1].starts_with("GET /apis/events.k8s.io/v1/namespaces/team-a/events?"));
+        assert!(requests[1].contains("fieldSelector="));
+        assert!(requests[1].contains("regarding.name%3Dweb-1"));
+        assert!(requests[2].starts_with("GET /apis/events.k8s.io/v1/events?"));
+    }
+
+    #[test]
+    fn events_fall_back_to_core_v1_and_custom_resources_are_generic() {
+        let widget_discovery = json!({
+            "groupVersion":"example.io/v1",
+            "resources":[{"name":"widgets","singularName":"widget","namespaced":true,"kind":"Widget","verbs":["get","list","create","update","patch","delete"],"shortNames":["wd"]}]
+        });
+        let (client, server) = mock_client(vec![
+            (
+                404,
+                status_error(
+                    404,
+                    "NotFound",
+                    "the server could not find the requested resource",
+                    "events",
+                ),
+            ),
+            (200, core_discovery()),
+            (
+                200,
+                json!({"kind":"EventList","items":[{"metadata":{"namespace":"team-a","creationTimestamp":"2026-08-08T01:00:00Z"},"type":"Normal","reason":"Scheduled","message":"assigned","involvedObject":{"kind":"Pod","name":"web"},"source":{"component":"scheduler"},"count":1,"lastTimestamp":"2026-08-08T02:00:00Z"}]}),
+            ),
+            (200, widget_discovery),
+            (
+                200,
+                json!({"apiVersion":"example.io/v1","kind":"WidgetList","items":[{"apiVersion":"example.io/v1","kind":"Widget","metadata":{"name":"sample","namespace":"team-a"},"spec":{"size":2}}]}),
+            ),
+        ]);
+        let events = execute_tool(
+            &client,
+            "kubernetes_events_list",
+            &json!({"namespace":"team-a","involved_object_name":"web"}),
+        )
+        .unwrap();
+        assert_eq!(events["api_version"], "v1");
+        assert_eq!(events["items"][0]["reporting_controller"], "scheduler");
+
+        let widgets = execute_tool(
+            &client,
+            "kubernetes_resources_list",
+            &json!({"api_version":"example.io/v1","resource":"wd","namespace":"team-a"}),
+        )
+        .unwrap();
+        assert_eq!(widgets["result"]["items"][0]["kind"], "Widget");
+        let requests = server.finish();
+        assert!(requests[0].starts_with("GET /apis/events.k8s.io/v1 HTTP/1.1"));
+        assert!(requests[2].contains("involvedObject.name%3Dweb"));
+        assert!(requests[3].starts_with("GET /apis/example.io/v1 HTTP/1.1"));
+        assert!(requests[4].starts_with("GET /apis/example.io/v1/namespaces/team-a/widgets?"));
+    }
+
+    #[test]
+    fn patch_validation_distinguishes_json_merge_and_server_apply() {
+        assert!(
+            validate_json_patch(&json!([{"op":"replace","path":"/data/A","value":"2"}])).is_ok()
+        );
+        assert!(validate_json_patch(&json!({"data":{"A":"2"}})).is_err());
+        assert!(validate_json_patch(&json!([{"op":"replace","path":"relative"}])).is_err());
+    }
+
+    #[test]
+    fn patch_types_use_distinct_kubernetes_protocol_semantics() {
+        let (client, server) = mock_client(vec![
+            (200, core_discovery()),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"default"}}),
+            ),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"default"}}),
+            ),
+        ]);
+        execute_tool(
+            &client,
+            "kubernetes_resources_patch",
+            &json!({
+                "api_version":"v1","kind":"ConfigMap","namespace":"default","name":"settings",
+                "patch_type":"json","patch":[{"op":"replace","path":"/data/A","value":"2"}]
+            }),
+        )
+        .unwrap();
+        execute_tool(
+            &client,
+            "kubernetes_resources_patch",
+            &json!({
+                "api_version":"v1","kind":"ConfigMap","namespace":"default","name":"settings",
+                "patch_type":"server_apply","field_manager":"spacesly","force":true,
+                "patch":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"default"},"data":{"A":"3"}}
+            }),
+        )
+        .unwrap();
+        let requests = server.finish();
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("content-type: application/json-patch+json"));
+        assert!(requests[1].contains("\"op\":\"replace\""));
+        assert!(requests[2].starts_with(
+            "PATCH /api/v1/namespaces/default/configmaps/settings?fieldManager=spacesly&force=true"
+        ));
+        assert!(requests[2]
+            .to_ascii_lowercase()
+            .contains("content-type: application/apply-patch+yaml"));
     }
 }

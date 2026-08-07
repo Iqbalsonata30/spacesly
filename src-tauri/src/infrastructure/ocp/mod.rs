@@ -417,7 +417,9 @@ pub fn contract_approved_mutation(contract: &Value) -> Option<ApprovedMutation> 
             }
             let operation = approval.get("operation")?.as_str()?.trim();
             let arguments_digest = approval.get("arguments_digest")?.as_str()?.trim();
-            if !operation.starts_with("ocp_") || arguments_digest.is_empty() {
+            if !(operation.starts_with("ocp_") || operation.starts_with("kubernetes_"))
+                || arguments_digest.is_empty()
+            {
                 return None;
             }
             Some(ApprovedMutation {
@@ -1393,6 +1395,16 @@ mod tests {
                 .count(),
             1
         );
+
+        let responses = serve_protocol(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"kubernetes_resources_delete\",\"arguments\":{\"api_version\":\"v1\",\"kind\":\"ConfigMap\",\"namespace\":\"default\",\"name\":\"temporary\"}}}\n",
+        );
+        let content = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let approval: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(approval["status"], json!("approval_required"));
+        assert_eq!(approval["operation"], json!("kubernetes_resources_delete"));
     }
 
     #[test]
@@ -1422,6 +1434,21 @@ mod tests {
             Some(ApprovedMutation {
                 operation: "ocp_restart_deployment".to_string(),
                 arguments_digest: "abc123".to_string(),
+            })
+        );
+        assert_eq!(
+            contract_approved_mutation(&json!({
+                "runtime_inputs": { "approvals": [{
+                    "operation": "kubernetes_resources_patch",
+                    "arguments_digest": "def456",
+                    "decision": "approved",
+                    "contract_version": 2
+                }] },
+                "version": 2
+            })),
+            Some(ApprovedMutation {
+                operation: "kubernetes_resources_patch".to_string(),
+                arguments_digest: "def456".to_string(),
             })
         );
         assert!(contract_approved_mutation(&json!({

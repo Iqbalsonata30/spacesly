@@ -23,6 +23,14 @@ pub enum OcpErrorKind {
     Auth,
     /// HTTP 403 — credentials are valid but RBAC denies the operation.
     Forbidden,
+    /// HTTP 404 — the requested API resource, namespace, or object does not exist.
+    NotFound,
+    /// HTTP 409 — optimistic concurrency or another Kubernetes conflict failed the operation.
+    Conflict,
+    /// Kubernetes API discovery could not resolve the requested API version or resource.
+    Discovery,
+    /// The submitted Kubernetes manifest or patch is structurally invalid.
+    InvalidManifest,
     /// Non-5xx HTTP error or unexpected API response shape.
     Api,
     /// MCP protocol-level error (malformed JSON-RPC, unexpected message, etc.).
@@ -43,6 +51,10 @@ impl OcpErrorKind {
             Self::DnsResolution => "dns_resolution",
             Self::Auth => "auth",
             Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Discovery => "discovery",
+            Self::InvalidManifest => "invalid_manifest",
             Self::Api => "api",
             Self::Protocol => "protocol",
             Self::Cancelled => "cancelled",
@@ -86,6 +98,22 @@ impl OcpError {
         Self::new(OcpErrorKind::Forbidden, code, message)
     }
 
+    pub fn not_found(code: &str, message: impl Into<String>) -> Self {
+        Self::new(OcpErrorKind::NotFound, code, message)
+    }
+
+    pub fn conflict(code: &str, message: impl Into<String>) -> Self {
+        Self::new(OcpErrorKind::Conflict, code, message)
+    }
+
+    pub fn discovery(code: &str, message: impl Into<String>) -> Self {
+        Self::new(OcpErrorKind::Discovery, code, message)
+    }
+
+    pub fn invalid_manifest(code: &str, message: impl Into<String>) -> Self {
+        Self::new(OcpErrorKind::InvalidManifest, code, message)
+    }
+
     pub fn api(code: &str, message: impl Into<String>) -> Self {
         Self::new(OcpErrorKind::Api, code, message)
     }
@@ -118,11 +146,8 @@ impl OcpError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
-            OcpErrorKind::Connect
-                | OcpErrorKind::Timeout
-                | OcpErrorKind::Api
-                | OcpErrorKind::DnsResolution
-        )
+            OcpErrorKind::Connect | OcpErrorKind::Timeout | OcpErrorKind::DnsResolution
+        ) || (self.kind == OcpErrorKind::Api && self.code == "server_error")
     }
 
     /// True when retrying will never succeed without a configuration change.
@@ -132,6 +157,10 @@ impl OcpError {
             OcpErrorKind::Config
                 | OcpErrorKind::Auth
                 | OcpErrorKind::Forbidden
+                | OcpErrorKind::NotFound
+                | OcpErrorKind::Conflict
+                | OcpErrorKind::Discovery
+                | OcpErrorKind::InvalidManifest
                 | OcpErrorKind::Tls
                 | OcpErrorKind::Protocol
         )
@@ -359,12 +388,31 @@ pub fn handle_api_status(status: reqwest::StatusCode, body: &str) -> OcpResult<(
             "rbac_denied",
             api_status_message(status, body, "The cluster denied access to this resource."),
         )),
-        404 => Err(OcpError::api(
-            "not_found",
+        404 => Err(OcpError::not_found(
+            if api_status_details_kind(body).as_deref() == Some("namespaces") {
+                "namespace_not_found"
+            } else {
+                "resource_not_found"
+            },
             api_status_message(
                 status,
                 body,
                 "The requested cluster resource was not found.",
+            ),
+        )),
+        409 => Err(OcpError::conflict(
+            "resource_version_conflict",
+            format!(
+                "{} Fetch the current resourceVersion and retry explicitly.",
+                api_status_message(status, body, "The resource changed since it was read.")
+            ),
+        )),
+        422 => Err(OcpError::invalid_manifest(
+            "manifest_rejected",
+            api_status_message(
+                status,
+                body,
+                "The Kubernetes API rejected the manifest or patch.",
             ),
         )),
         408 | 425 | 429 | 500 | 502 | 503 | 504 => Err(OcpError::api(
@@ -376,6 +424,11 @@ pub fn handle_api_status(status: reqwest::StatusCode, body: &str) -> OcpResult<(
             api_status_message(status, body, "The cluster API server returned an error."),
         )),
     }
+}
+
+fn api_status_details_kind(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.pointer("/details/kind")?.as_str().map(str::to_string)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -390,7 +443,7 @@ mod tests {
         assert!(transient.is_retryable());
         assert!(!transient.is_permanent());
         assert!(OcpError::timeout("stage_timeout", "slow").is_retryable());
-        assert!(OcpError::api("bad_gateway", "502").is_retryable());
+        assert!(OcpError::api("server_error", "502").is_retryable());
         assert!(OcpError::dns("dns_failed", "NXDOMAIN").is_retryable());
 
         let permanent = OcpError::auth("token_rejected", "unauthorized");
@@ -450,7 +503,19 @@ mod tests {
             handle_api_status(reqwest::StatusCode::NOT_FOUND, "{}")
                 .unwrap_err()
                 .kind,
-            OcpErrorKind::Api
+            OcpErrorKind::NotFound
+        );
+        assert_eq!(
+            handle_api_status(reqwest::StatusCode::CONFLICT, "{}")
+                .unwrap_err()
+                .kind,
+            OcpErrorKind::Conflict
+        );
+        assert_eq!(
+            handle_api_status(reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{}")
+                .unwrap_err()
+                .kind,
+            OcpErrorKind::InvalidManifest
         );
         assert_eq!(
             handle_api_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "{}")
