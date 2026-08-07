@@ -10,6 +10,7 @@ pub mod global_environment;
 pub mod jira_rest;
 pub mod lsp;
 pub mod mcp;
+pub mod ocp;
 pub mod provider_registry;
 pub mod pty;
 pub mod recovery_store;

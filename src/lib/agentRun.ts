@@ -35,7 +35,25 @@ export type AgentRunGitSnapshot = Pick<
 >;
 
 export type AgentSessionEventType =
-  "system" | "operator_note" | "approval" | "agent_output" | "blocker" | "error";
+  | "system"
+  | "operator_note"
+  | "approval"
+  | "decline"
+  | "agent_output"
+  | "blocker"
+  | "error";
+
+export type AgentApprovalRequest = {
+  id: string;
+  operation: string;
+  argumentsDigest: string;
+  risk: string;
+  label: string;
+  category: string;
+  target: string | null;
+  capability: string | null;
+  status: "pending" | "approving" | "declined";
+};
 
 export type AgentSessionEvent = {
   id: string;
@@ -85,6 +103,7 @@ export type AgentRunSession = {
   taskSessionState?: TaskSessionState | null;
   conversationId?: string | null;
   workflowCheckpoint?: AgentWorkflowCheckpoint | null;
+  pendingApproval?: AgentApprovalRequest | null;
 };
 
 const ACTIVE_AGENT_RUNS_KEY = "spacesly.agent.active-runs.v1";
@@ -202,6 +221,7 @@ export function createAgentRunSession(
     taskSessionState,
     conversationId,
     workflowCheckpoint,
+    pendingApproval: null,
   };
 }
 

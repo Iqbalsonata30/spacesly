@@ -16,5 +16,12 @@ fn main() {
         }
         return;
     }
+    if std::env::args().any(|argument| argument == "--spacesly-ocp-connector") {
+        if let Err(error) = spacesly_lib::run_ocp_connector() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     spacesly_lib::run()
 }

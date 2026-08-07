@@ -9,6 +9,7 @@ import {
   listTaskSessionEvents,
   onTaskSessionUpdated,
   saveImmutableAgentRuntimeProfile,
+  resumeTaskSessionAfterApproval,
   submitTaskSession,
   type AgentRuntimeProfile,
   type TaskSessionEnvelopeV1,
@@ -79,6 +80,7 @@ export type AgentTaskSessionDependencies = {
   listEvents: typeof listTaskSessionEvents;
   saveProfile: typeof saveImmutableAgentRuntimeProfile;
   submit: typeof submitTaskSession;
+  resume: typeof resumeTaskSessionAfterApproval;
   watch: typeof onTaskSessionUpdated;
 };
 
@@ -126,6 +128,7 @@ const defaultDependencies: AgentTaskSessionDependencies = {
   listEvents: listTaskSessionEvents,
   saveProfile: saveImmutableAgentRuntimeProfile,
   submit: submitTaskSession,
+  resume: resumeTaskSessionAfterApproval,
   watch: onTaskSessionUpdated,
 };
 
@@ -360,6 +363,27 @@ export async function executeAgentTaskSession(
   const submitted = await deps.submit(label, prepared.envelope, prepared.grantedCapabilities);
   options.onSubmitted?.(submitted);
   return waitForAgentTaskSession(submitted.id, { ...options, dependencies: deps });
+}
+
+/** Resumes the same durable Task Session and its Task Session-owned OpenCode session. */
+export async function resumeAgentTaskSession(
+  sessionId: number,
+  label: string,
+  prepared: PreparedAgentTaskSession,
+  options: ExecuteAgentTaskSessionOptions = {},
+): Promise<AgentTaskSessionExecution> {
+  const deps = { ...defaultDependencies, ...options.dependencies };
+  const resumed = await deps.resume(
+    sessionId,
+    label,
+    prepared.envelope,
+    prepared.grantedCapabilities,
+  );
+  if (resumed.id !== sessionId) {
+    throw new Error("Scheduler replaced the Task Session during approval resume.");
+  }
+  options.onSubmitted?.(resumed);
+  return waitForAgentTaskSession(sessionId, { ...options, dependencies: deps });
 }
 
 /** Replays one retained Agent Task Session without resubmitting it. */

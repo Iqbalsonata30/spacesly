@@ -166,6 +166,7 @@ export type TaskSessionSnapshot = {
   attempt: number;
   attempt_id: number | null;
   fencing_token: number;
+  opencode_session_id: string | null;
   lease_expires_at: number | null;
   progress: TaskProgress | null;
   last_event_sequence: number;
@@ -297,6 +298,20 @@ export function submitTaskSession(
   return invokeWithPolicy(
     "submit_task_session",
     { label, envelope, grantedCapabilities },
+    IPC_POLICIES.taskSessionMutation,
+  );
+}
+
+/** Requeues the same blocked Agent Task Session after structured UI approval. */
+export function resumeTaskSessionAfterApproval(
+  sessionId: number,
+  label: string,
+  envelope: TaskSessionEnvelope,
+  grantedCapabilities: string[],
+): Promise<TaskSessionSnapshot> {
+  return invokeWithPolicy(
+    "resume_task_session_after_approval",
+    { sessionId, label, envelope, grantedCapabilities },
     IPC_POLICIES.taskSessionMutation,
   );
 }

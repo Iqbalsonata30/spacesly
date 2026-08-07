@@ -1144,7 +1144,7 @@ button:active:not(:disabled) {
 }
 
 .settings-panel > header p,
-.settings-form label span {
+.settings-form label:not(.settings-label) > span:first-child {
   margin: 0 0 6px;
   color: var(--text-secondary);
   font-size: 12px;
@@ -1448,6 +1448,21 @@ button:active:not(:disabled) {
   font: inherit;
 }
 
+.settings-form input {
+  height: 42px;
+}
+
+.settings-form .field-mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0;
+}
+
+.settings-form input[type="checkbox"],
+.settings-form input[type="radio"] {
+  height: auto;
+}
+
 .settings-form select {
   appearance: none;
   background-image:
@@ -1517,7 +1532,7 @@ button:active:not(:disabled) {
 
 .field-help {
   margin: -6px 0 0;
-  color: var(--text-dim);
+  color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.4;
 }
@@ -3601,7 +3616,7 @@ dd a:hover {
 }
 
 .settings-form {
-  gap: 16px;
+  gap: 12px;
   padding: 20px;
   scroll-padding-bottom: 78px;
 }
@@ -3634,7 +3649,7 @@ dd a:hover {
 .settings-page,
 .settings-page-body {
   display: grid;
-  gap: 14px;
+  gap: 11px;
   min-width: 0;
 }
 
@@ -3826,10 +3841,10 @@ dd a:hover {
   gap: 8px;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .settings-label > span em {
@@ -3911,6 +3926,133 @@ dd a:hover {
   padding: 11px 20px;
   background: var(--dialog-bg);
   box-shadow: var(--shadow-popover);
+}
+
+.settings-action-bar .save-settings {
+  margin-left: auto;
+}
+
+.settings-action-bar .test-connection {
+  border-color: var(--border-interactive);
+  color: var(--text-link);
+}
+
+.mcp-destructive-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  border-left: 1px solid var(--border-subtle);
+  padding-left: 12px;
+}
+
+.mcp-destructive-actions .remove-connector {
+  border-color: transparent;
+  background: transparent;
+  color: var(--danger);
+}
+
+.connector-health {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 11px;
+  padding: 11px 13px;
+  background: var(--surface-inset);
+}
+
+.connector-health.connected {
+  border-color: var(--success-border);
+  background: color-mix(in srgb, var(--success-bg) 50%, var(--surface-raised));
+}
+
+.connector-health.error {
+  border-color: var(--danger-border);
+}
+
+.connector-health-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-dim);
+  font-weight: 900;
+}
+
+.connector-health.connected .connector-health-icon {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.connector-health.error .connector-health-icon {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.connector-health-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.connector-health-copy strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.connector-health-copy span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connector-tools {
+  position: relative;
+}
+
+.connector-tools summary {
+  cursor: pointer;
+  color: var(--text-link);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.connector-tools > div {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 9px);
+  z-index: 3;
+  display: flex;
+  width: min(400px, 70vw);
+  max-height: 180px;
+  flex-wrap: wrap;
+  gap: 5px;
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 10px;
+  background: var(--menu-bg);
+  box-shadow: var(--shadow-popover);
+}
+
+.connector-tools code {
+  border-radius: 5px;
+  padding: 3px 5px;
+  background: var(--code-inline-bg);
+  color: var(--code-text);
+  font-size: 10.5px;
+}
+
+.connector-health > .settings-validation {
+  grid-column: 1 / -1;
+  min-height: 0;
 }
 
 .settings-query-field {
@@ -4044,9 +4186,22 @@ dd a:hover {
     height: calc(100% - 32px);
     max-height: calc(100% - 32px);
   }
+}
 
+/* Keep the MCP nav/server-list rail only above the 980px stack breakpoint;
+   below it the grid collapses to a single column. This re-declares the
+   collapse AFTER the shared design-system base rule (.settings-grid.mcp at
+   line 3589) which would otherwise win by source order. */
+@media (min-width: 981px) and (max-width: 1180px) {
   .settings-grid.mcp {
     grid-template-columns: 196px 220px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .settings-grid,
+  .settings-grid.mcp {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -4081,6 +4236,24 @@ dd a:hover {
 
   .settings-page-header {
     flex-direction: column;
+  }
+
+  .connector-health {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+
+  .connector-tools {
+    grid-column: 2;
+  }
+
+  .settings-action-bar .save-settings {
+    width: 100%;
+    margin-left: 0;
+    order: -1;
+  }
+
+  .mcp-destructive-actions {
+    margin-left: auto;
   }
 
   .settings-row,

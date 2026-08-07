@@ -10,6 +10,10 @@ pub fn run_task_tools() -> Result<(), String> {
     infrastructure::task_tools::run_task_tools_from_env()
 }
 
+pub fn run_ocp_connector() -> Result<(), String> {
+    infrastructure::ocp::run_ocp_mcp_server()
+}
+
 use application::agent_task_executor::{
     execution_contract_digest, AgentTaskExecutor, AiWorkerRuntimeRunner,
 };
@@ -22,6 +26,7 @@ use application::prompt_task_executor::{
     prompt_input_digest, AiWorkerPromptRuntimeRunner, PromptTaskExecutor, TaskSessionExecutor,
 };
 use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
+use base64::Engine;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::task_session::{
@@ -59,6 +64,15 @@ use infrastructure::lsp::{
 use infrastructure::mcp::{
     close_all_mcp_sessions, close_mcp_session, JiraBoard, JiraConnectionStatus, JiraIssue,
     JiraMcpConfig, McpConnectionStatus, McpServerConfig,
+};
+use infrastructure::ocp::config::{default_connector_dir, ConfigStore};
+use infrastructure::ocp::{
+    build_ocp_spec, connector_status as ocp_connector_status_impl,
+    delete_connector as ocp_delete_connector_impl, effective_credentials, ocp_environment,
+    ocp_secret_status as ocp_secret_status_impl, ocp_worker_command, ocp_worker_server,
+    rotate_credentials as ocp_rotate_credentials_impl, run_preflight_connection,
+    save_draft as ocp_save_draft_impl, OcpConfigInput, OcpConfigSpec, OcpConnectorStatus, OcpError,
+    OcpSecretStatus, OcpStructuredError, OcpTimeoutPolicy, PreflightReport,
 };
 use infrastructure::provider_registry::profile as provider_profile;
 use infrastructure::pty::{
@@ -328,6 +342,65 @@ async fn test_mcp_server_connection(
     result.map_err(|error| mcp_ipc_error("MCP test failed", error))
 }
 
+#[tauri::command(rename_all = "snake_case")]
+async fn test_ocp_mcp_connection(
+    server_id: String,
+    scope_id: Option<String>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<McpConnectionStatus, String> {
+    let store = store.inner().clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let connector_dir = default_connector_dir().map_err(|error| error.to_string())?;
+        let config_store = ConfigStore::new(connector_dir.clone());
+        let spec = config_store
+            .load_draft()
+            .map_err(|error| error.to_string())?
+            .or_else(|| config_store.load_last_known_good().ok().flatten())
+            .ok_or_else(|| {
+                "OpenShift connector configuration was not found. Save the connector before testing it."
+                    .to_string()
+            })?;
+        let effective = effective_credentials(&connector_dir, None, None);
+        let environment = ocp_environment(
+            &spec,
+            effective.token.as_deref(),
+            effective.ca_data.as_deref(),
+        );
+        let worker = ocp_worker_server(&server_id, &environment)?;
+        let (executable, args) = worker
+            .command
+            .split_first()
+            .ok_or_else(|| "OpenShift connector command is empty.".to_string())?;
+
+        // Keep the canonical embedded command in the connector registry so Agent runs and
+        // future tests cannot fall back to a stale generic command from the settings model.
+        store.save_mcp_environment(
+            &server_id,
+            executable.clone(),
+            args.to_vec(),
+            Some(environment.clone()),
+        )?;
+
+        JiraService::new().test_mcp_connection(McpServerConfig {
+            command: executable.clone(),
+            args: args.to_vec(),
+            env: worker.environment,
+            scope_id,
+            secret_id: None,
+        })
+    });
+    let result = tokio::time::timeout(MCP_TEST_CONNECTION_TIMEOUT, task)
+        .await
+        .map_err(|_| {
+            mcp_ipc_error(
+                "OpenShift MCP test failed",
+                "request timed out after 60 seconds while testing the connector",
+            )
+        })?
+        .map_err(|error| mcp_ipc_error("OpenShift MCP test task failed", error))?;
+    result.map_err(|error| mcp_ipc_error("OpenShift MCP test failed", error))
+}
+
 #[tauri::command]
 async fn disconnect_mcp_server(
     mut config: McpServerConfig,
@@ -493,6 +566,8 @@ async fn execute_ai_worker_task(
     if submitted_contract != &persisted_run.contract {
         return Err("Execution contract does not match the persisted run.".to_string());
     }
+    let ocp_approval = infrastructure::ocp::contract_approved_mutation(&persisted_run.contract);
+    prepare_ocp_agent_servers(&mut config, ocp_approval.as_ref())?;
     ai_runs.require_capabilities(
         &run_id,
         &["workspace_read", "workspace_write", "shell", "git"],
@@ -1037,8 +1112,19 @@ fn emit_worker_stream_event(
     event: AiWorkerStreamEvent,
     audit_store: Option<&ExecutionStore>,
 ) {
+    if let AiWorkerStreamEvent::OpenCodeSession { session_id, action } = &event {
+        if let Some(store) = audit_store {
+            let payload = serde_json::json!({
+                "opencode_session_id": session_id,
+                "action": action,
+            });
+            let _ = store.record_ai_audit(Some(run_id), "opencode_session", &payload);
+        }
+        return;
+    }
     let sequence = sequence.fetch_add(1, Ordering::Relaxed);
     let runtime_event = match event {
+        AiWorkerStreamEvent::OpenCodeSession { .. } => unreachable!(),
         AiWorkerStreamEvent::TextDelta(delta) => AiRuntimeEvent::TextDelta {
             run_id: run_id.to_string(),
             sequence,
@@ -1326,6 +1412,32 @@ fn resolve_ai_secrets(
             .chain(profile.args)
             .collect();
         server.environment = secrets.mcp_environment(&server.secret_id)?;
+    }
+    Ok(())
+}
+
+fn prepare_ocp_agent_servers(
+    config: &mut AiWorkerConfig,
+    approval: Option<&infrastructure::ocp::ApprovedMutation>,
+) -> Result<(), String> {
+    for server in &mut config.mcp_servers {
+        if !infrastructure::ocp::is_ocp_connector_env(&server.environment) {
+            continue;
+        }
+        let original_name = server.name.clone();
+        let mut worker = ocp_worker_server(&server.secret_id, &server.environment)?;
+        worker.name = original_name;
+        if let Some(approval) = approval {
+            worker.environment.insert(
+                infrastructure::ocp::ENV_APPROVED_OPERATION.to_string(),
+                approval.operation.clone(),
+            );
+            worker.environment.insert(
+                infrastructure::ocp::ENV_APPROVED_ARGUMENTS_DIGEST.to_string(),
+                approval.arguments_digest.clone(),
+            );
+        }
+        *server = worker;
     }
     Ok(())
 }
@@ -1695,6 +1807,219 @@ async fn save_jira_connection_profile(
         .map_err(|error| format!("Save Jira profile task failed: {error}"))?
 }
 
+#[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+async fn ocp_preflight(
+    mode: String,
+    kubeconfig_path: Option<String>,
+    kubeconfig_context: Option<String>,
+    server: Option<String>,
+    token: Option<String>,
+    ca_data: Option<String>,
+    default_namespace: Option<String>,
+    timeout_policy: Option<OcpTimeoutPolicy>,
+) -> Result<PreflightReport, OcpStructuredError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let connector_dir = default_connector_dir()
+            .map_err(|error| OcpStructuredError::from_error(&error, Some("config")))?;
+        let effective = effective_credentials(&connector_dir, token.as_deref(), ca_data.as_deref());
+        let ca_bytes = effective.ca_data.as_deref().and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        });
+        let spec = build_ocp_spec(
+            &mode,
+            kubeconfig_path.as_deref(),
+            kubeconfig_context.as_deref(),
+            server.as_deref(),
+            default_namespace.as_deref(),
+            None,
+            None,
+            effective.token.as_deref().is_some(),
+            effective.ca_data.as_deref().is_some(),
+            timeout_policy.as_ref(),
+        )?;
+        run_preflight_connection(
+            &spec,
+            effective.token.as_deref(),
+            ca_bytes.as_deref(),
+            connector_dir,
+        )
+    })
+    .await
+    .map_err(|error| {
+        OcpStructuredError::from_error(
+            &OcpError::internal(format!("OCP preflight task failed: {error}")),
+            Some("internal"),
+        )
+    })?
+}
+
+#[tauri::command]
+fn ocp_connector_status() -> Result<OcpConnectorStatus, String> {
+    let connector_dir = default_connector_dir().map_err(|error| error.to_string())?;
+    Ok(ocp_connector_status_impl(connector_dir))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+async fn ocp_save_draft(
+    mode: String,
+    kubeconfig_path: Option<String>,
+    kubeconfig_context: Option<String>,
+    server: Option<String>,
+    default_namespace: Option<String>,
+    display_name: Option<String>,
+    environment_label: Option<String>,
+    token: Option<String>,
+    ca_pem_base64: Option<String>,
+    server_id: String,
+    timeout_policy: Option<OcpTimeoutPolicy>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<OcpConfigSpec, OcpStructuredError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connector_dir = default_connector_dir()
+            .map_err(|error| OcpStructuredError::from_error(&error, Some("config")))?;
+        let input = OcpConfigInput {
+            mode,
+            kubeconfig_path,
+            kubeconfig_context,
+            server,
+            default_namespace,
+            display_name,
+            environment_label,
+            token,
+            ca_pem_base64,
+            server_id: server_id.clone(),
+            timeout_policy,
+        };
+        if input.server_id != server_id {
+            return Err(OcpStructuredError::from_error(
+                &OcpError::internal("OCP server identifier did not match the input."),
+                Some("config"),
+            ));
+        }
+        let spec = ocp_save_draft_impl(&input, &connector_dir)?;
+        let effective = effective_credentials(
+            &connector_dir,
+            input.token.as_deref(),
+            input.ca_pem_base64.as_deref(),
+        );
+        let environment = ocp_environment(
+            &spec,
+            effective.token.as_deref(),
+            effective.ca_data.as_deref(),
+        );
+        let command = ocp_worker_command().map_err(|error| {
+            OcpStructuredError::from_error(&OcpError::internal(error), Some("internal"))
+        })?;
+        let (executable, args) = command.split_first().ok_or_else(|| {
+            OcpStructuredError::from_error(
+                &OcpError::internal("OCP connector command is empty."),
+                Some("internal"),
+            )
+        })?;
+        store
+            .save_mcp_environment(
+                &server_id,
+                executable.clone(),
+                args.to_vec(),
+                Some(environment),
+            )
+            .map_err(|error| {
+                OcpStructuredError::from_error(&OcpError::internal(error), Some("internal"))
+            })?;
+        Ok(spec)
+    })
+    .await
+    .map_err(|error| {
+        OcpStructuredError::from_error(
+            &OcpError::internal(format!("OCP save draft task failed: {error}")),
+            Some("internal"),
+        )
+    })?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn ocp_secret_status(server_id: String) -> Result<OcpSecretStatus, String> {
+    let _ = server_id;
+    let connector_dir = default_connector_dir().map_err(|error| error.to_string())?;
+    Ok(ocp_secret_status_impl(&connector_dir))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn ocp_delete_connector(
+    server_id: String,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connector_dir = default_connector_dir().map_err(|error| error.to_string())?;
+        ocp_delete_connector_impl(&connector_dir).map_err(|error| error.to_string())?;
+        store.remove_mcp_connector(&server_id)
+    })
+    .await
+    .map_err(|error| format!("OCP delete connector task failed: {error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::result_large_err)]
+async fn ocp_rotate_credentials(
+    server_id: String,
+    token: Option<String>,
+    ca_pem_base64: Option<String>,
+    store: State<'_, AppSecretsStore>,
+) -> Result<(), OcpStructuredError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connector_dir = default_connector_dir()
+            .map_err(|error| OcpStructuredError::from_error(&error, Some("config")))?;
+        let spec = ocp_rotate_credentials_impl(
+            &connector_dir,
+            token.as_deref(),
+            ca_pem_base64.as_deref(),
+        )?;
+        let effective =
+            effective_credentials(&connector_dir, token.as_deref(), ca_pem_base64.as_deref());
+        let environment = ocp_environment(
+            &spec,
+            effective.token.as_deref(),
+            effective.ca_data.as_deref(),
+        );
+        let command = ocp_worker_command().map_err(|error| {
+            OcpStructuredError::from_error(&OcpError::internal(error), Some("internal"))
+        })?;
+        let (executable, args) = command.split_first().ok_or_else(|| {
+            OcpStructuredError::from_error(
+                &OcpError::internal("OCP connector command is empty."),
+                Some("internal"),
+            )
+        })?;
+        store
+            .save_mcp_environment(
+                &server_id,
+                executable.clone(),
+                args.to_vec(),
+                Some(environment),
+            )
+            .map_err(|error| {
+                OcpStructuredError::from_error(&OcpError::internal(error), Some("internal"))
+            })?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        OcpStructuredError::from_error(
+            &OcpError::internal(format!("OCP rotate credentials task failed: {error}")),
+            Some("internal"),
+        )
+    })?
+}
+
 #[tauri::command]
 async fn save_ai_provider_secret(
     provider_id: String,
@@ -1869,6 +2194,35 @@ async fn submit_task_session(
     })
     .await
     .map_err(|error| format!("Submit Task Session task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn resume_task_session_after_approval(
+    session_id: u64,
+    label: String,
+    envelope: TaskSessionEnvelope,
+    granted_capabilities: Vec<String>,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<TaskSessionSnapshot, String> {
+    match &envelope {
+        TaskSessionEnvelope::V1(session) => session.validate_agent_runtime_ownership()?,
+        TaskSessionEnvelope::V2(_) => {
+            return Err("Approval resume requires an Agent Task Session envelope.".to_string())
+        }
+    }
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .resume_after_approval(
+                TaskSessionId(session_id),
+                label,
+                &envelope,
+                granted_capabilities,
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Resume Task Session task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2684,6 +3038,7 @@ pub fn run() {
             get_jira_boards,
             test_jira_mcp_connection,
             test_mcp_server_connection,
+            test_ocp_mcp_connection,
             disconnect_mcp_server,
             sync_jira_workspace,
             transition_jira_issue,
@@ -2732,6 +3087,12 @@ pub fn run() {
             save_jira_connection_profile,
             jira_secret_statuses,
             save_jira_secret,
+            ocp_preflight,
+            ocp_connector_status,
+            ocp_save_draft,
+            ocp_secret_status,
+            ocp_delete_connector,
+            ocp_rotate_credentials,
             list_global_environment_variables,
             save_global_environment_variable,
             delete_global_environment_variable,
@@ -2751,6 +3112,7 @@ pub fn run() {
             save_agent_runtime_profile,
             save_immutable_agent_runtime_profile,
             submit_task_session,
+            resume_task_session_after_approval,
             digest_task_session_prompt_input,
             digest_agent_execution_contract,
             cancel_task_session,

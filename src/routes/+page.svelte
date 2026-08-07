@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
-  import { PanelLeftOpen, X } from "lucide-svelte";
+  import { AlertTriangle, Check, Circle, PanelLeftOpen, X } from "lucide-svelte";
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
@@ -20,6 +20,7 @@
   import ValidationMessage from "$lib/components/settings/ValidationMessage.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
+  import { ocpTestMcpConnection } from "$lib/ipc/ocp";
   import {
     createRecoveredDocumentSession,
     createDocumentSession,
@@ -86,6 +87,7 @@
     type AgentRunLog,
     type AgentRunSession,
     type AgentRunStatus,
+    type AgentApprovalRequest,
     type AgentTaskCardProjection,
     type AgentSessionEvent,
     type ExecutionRun,
@@ -148,6 +150,7 @@
     executionRepositoryContext,
     executeAgentTaskSession,
     prepareAgentTaskSession,
+    resumeAgentTaskSession,
     waitForAgentTaskSession,
   } from "$lib/agentTaskSessions";
   import "./page.css";
@@ -577,6 +580,12 @@
   let mcpConnectionRuntime: Promise<
     typeof import("$lib/components/McpConnectionSettings.svelte")
   > | null = null;
+  let ocpConnectorModule = $state<
+    typeof import("$lib/components/OcpConnectorSettings.svelte") | null
+  >(null);
+  let ocpConnectorRuntime: Promise<
+    typeof import("$lib/components/OcpConnectorSettings.svelte")
+  > | null = null;
   let agentConsoleModule = $state<typeof import("$lib/components/AgentConsolePanel.svelte") | null>(
     null,
   );
@@ -870,6 +879,7 @@
   $effect(() => {
     if (settingsOpen && settingsTab === "mcp") {
       void loadMcpConnectionRuntime();
+      if (selectedServer?.kind === "ocp") void loadOcpConnectorRuntime();
     }
   });
 
@@ -1239,6 +1249,7 @@
   let visibleAgentTerminalLines = $derived(visibleAgentSession?.terminalLines ?? []);
   let visibleAgentRunTranscript = $derived(visibleAgentSession?.transcript ?? []);
   let visibleExecutionRun = $derived(visibleAgentSession?.executionRun ?? null);
+  let visibleAgentApproval = $derived(visibleAgentSession?.pendingApproval ?? null);
   let hasAgentConsoleSession = $derived(Boolean(visibleAgentSession));
   let latestAgentSession = $derived<AgentRunSession | null>(
     latestAgentSessionId ? (agentRunSessions[latestAgentSessionId] ?? null) : null,
@@ -4510,6 +4521,15 @@
     return mcpConnectionRuntime;
   }
 
+  function loadOcpConnectorRuntime() {
+    ocpConnectorRuntime ??= import("$lib/components/OcpConnectorSettings.svelte").then((module) => {
+      ocpConnectorModule = module;
+      return module;
+    });
+
+    return ocpConnectorRuntime;
+  }
+
   function loadAgentConsoleRuntime() {
     agentConsoleRuntime ??= import("$lib/components/AgentConsolePanel.svelte").then((module) => {
       agentConsoleModule = module;
@@ -5257,7 +5277,10 @@
     settingsError = null;
 
     try {
-      const status = await testMcpServerConnection(serverConfig);
+      const status =
+        selectedServer.kind === "ocp"
+          ? await ocpTestMcpConnection(serverId, workspace?.id ?? "workspace-personal")
+          : await testMcpServerConnection(serverConfig);
       rememberMcpTools(serverId, status.tools);
       connectionMessage = `MCP test passed. ${status.tool_count} tool${status.tool_count === 1 ? "" : "s"} available.`;
       rememberMcpConnection(serverId, {
@@ -5837,7 +5860,7 @@
             {
               id: `term-${Date.now().toString(36)}`,
               prompt: "system",
-              text: "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+              text: "Agent execution session opened. Use the input below for constraints or operator notes.",
             },
           ],
       continuation && previousSession ? previousSession.gitSnapshot : gitSnapshot,
@@ -5846,7 +5869,7 @@
         : [
             createAgentSessionEvent(
               "system",
-              "Agent execution session opened. Use the input below for approvals, constraints, or operator notes.",
+              "Agent execution session opened. Use the input below for constraints or operator notes.",
             ),
           ],
       continuation && previousSession ? (previousSession.executionRun ?? null) : null,
@@ -5870,7 +5893,7 @@
       ],
       [
         `Execution state: ${executionDetail(card.execution)}`,
-        `Terminal session opened for approvals, constraints, and operator notes.`,
+        `Terminal session opened for constraints and operator notes.`,
       ],
       ["Review the context export, then continue with the run."],
     );
@@ -6175,6 +6198,8 @@
   }
 
   function projectTaskSessionEvent(cardId: string, event: TaskSessionEvent) {
+    const approval = approvalRequestFromTaskSessionEvent(event);
+    if (approval) setPendingAgentApproval(cardId, approval);
     const projected = projectAgentTaskSessionEvent(
       event,
       `run-${Date.now().toString(36)}-${event.sequence}`,
@@ -6206,6 +6231,61 @@
       }, 16),
     };
     pendingAgentEventProjections.set(cardId, entry);
+  }
+
+  function approvalRequestFromTaskSessionEvent(
+    event: TaskSessionEvent,
+  ): AgentApprovalRequest | null {
+    if (event.kind !== "tool" || typeof event.payload !== "object" || !event.payload) return null;
+    const payload = event.payload as Record<string, unknown>;
+    if (
+      payload.type !== "tool_completed" ||
+      payload.success !== false ||
+      typeof payload.error !== "string" ||
+      !payload.error.includes("[approval_required]")
+    )
+      return null;
+    return approvalRequestFromToolDetails(payload, `task-${event.session_id}-${event.sequence}`);
+  }
+
+  function approvalRequestFromToolDetails(
+    payload: Record<string, unknown>,
+    fallbackId: string,
+  ): AgentApprovalRequest | null {
+    const operation = typeof payload.tool_name === "string" ? payload.tool_name : "";
+    const argumentsDigest =
+      typeof payload.arguments_digest === "string" ? payload.arguments_digest : "";
+    if (!operation || !argumentsDigest) return null;
+    const context =
+      typeof payload.display_context === "object" && payload.display_context
+        ? (payload.display_context as Record<string, unknown>)
+        : {};
+    return {
+      id: typeof payload.operation_id === "string" ? payload.operation_id : fallbackId,
+      operation,
+      argumentsDigest,
+      risk: typeof payload.risk === "string" ? payload.risk : "unknown",
+      label: typeof context.label === "string" ? context.label : operation,
+      category: typeof context.category === "string" ? context.category : "external",
+      target: typeof context.target === "string" ? context.target : null,
+      capability: typeof payload.capability === "string" ? payload.capability : null,
+      status: "pending",
+    };
+  }
+
+  function setPendingAgentApproval(cardId: string, approval: AgentApprovalRequest) {
+    updateAgentSessionForCard(cardId, (session) => {
+      if (
+        session.pendingApproval?.id === approval.id ||
+        (session.pendingApproval?.status === "pending" &&
+          session.pendingApproval.operation === approval.operation &&
+          session.pendingApproval.argumentsDigest === approval.argumentsDigest)
+      )
+        return session;
+      return { ...session, pendingApproval: approval };
+    });
+    agentConsoleCardId = cardId;
+    agentConsoleOpen = true;
   }
 
   function buildAgentContextExport(config: AiWorkerConfig, contract: ExecutionContract): string {
@@ -6371,6 +6451,7 @@
     previousRun: ExecutionRun,
     operatorNotes: string | null,
     previousOutput: string | null,
+    approval: AgentApprovalRequest | null = null,
   ): ExecutionRun {
     const workerStep = previousRun.step_runs["worker.execute"];
     const verifyStep = previousRun.step_runs["worker.verify"];
@@ -6385,6 +6466,18 @@
           ...previousRun.contract.runtime_inputs,
           operator_notes: operatorNotes,
           previous_output: previousOutput,
+          approvals: approval
+            ? [
+                ...(previousRun.contract.runtime_inputs.approvals ?? []),
+                {
+                  operation: approval.operation,
+                  arguments_digest: approval.argumentsDigest,
+                  decision: "approved",
+                  decided_at: new Date().toISOString(),
+                  contract_version: previousRun.contract.version + 1,
+                },
+              ]
+            : previousRun.contract.runtime_inputs.approvals,
         },
       },
       status: "pending",
@@ -6488,20 +6581,24 @@
   }
 
   function appendTerminalLineForCard(cardId: string, prompt: string, text: string) {
-    updateAgentSessionForCard(cardId, (session) => ({
-      ...session,
-      terminalLines: capList(
-        [
-          ...session.terminalLines,
-          {
-            id: `term-${Date.now().toString(36)}-${session.terminalLines.length}`,
-            prompt,
-            text,
-          },
-        ],
-        MAX_AGENT_TERMINAL_LINES,
-      ),
-    }));
+    updateAgentSessionForCard(cardId, (session) => {
+      const previous = session.terminalLines.at(-1);
+      if (previous?.prompt === prompt && previous.text === text) return session;
+      return {
+        ...session,
+        terminalLines: capList(
+          [
+            ...session.terminalLines,
+            {
+              id: `term-${Date.now().toString(36)}-${session.terminalLines.length}`,
+              prompt,
+              text,
+            },
+          ],
+          MAX_AGENT_TERMINAL_LINES,
+        ),
+      };
+    });
   }
 
   function submitAgentTerminalInput() {
@@ -6514,11 +6611,7 @@
     }
 
     appendTerminalLineForCard(cardId, "operator", input);
-    appendAgentSessionTranscriptForCard(
-      cardId,
-      isApprovalText(input) ? "approval" : "operator_note",
-      input,
-    );
+    appendAgentSessionTranscriptForCard(cardId, "operator_note", input);
     appendStructuredAgentLogForCard(
       cardId,
       "info",
@@ -6528,22 +6621,87 @@
       ["Operator note saved to the running session."],
       ["Continue the Agent with the updated guidance."],
     );
-    if (agentSessionForCard(cardId)?.status === "blocked" && isApprovalText(input)) {
+    agentTerminalInput = "";
+  }
+
+  async function approveAgentAction(cardId: string) {
+    const session = agentSessionForCard(cardId);
+    const approval = session?.pendingApproval;
+    const executionRun = session?.executionRun;
+    if (!session || !approval || approval.status !== "pending" || !executionRun) return;
+    if (session.status === "running") {
+      appNotice = { tone: "info", message: "Waiting for the Agent to pause safely." };
+      return;
+    }
+
+    updateAgentSessionForCard(cardId, (current) => ({
+      ...current,
+      pendingApproval: current.pendingApproval
+        ? { ...current.pendingApproval, status: "approving" }
+        : null,
+    }));
+    try {
+      appendAgentSessionTranscriptForCard(
+        cardId,
+        "approval",
+        `Approved ${approval.operation}${approval.target ? ` for ${approval.target}` : ""}.`,
+      );
       appendStructuredAgentLogForCard(
         cardId,
         "success",
         "approval",
-        "Operator approval recorded for this card session.",
-        ["Approval text detected in operator input."],
-        ["The blocked session can continue."],
-        ["Continue the Agent to finish remaining work."],
+        `Operator approved ${approval.label}.`,
+        [
+          `Operation: ${approval.operation}`,
+          `Risk: ${approval.risk}`,
+          ...(approval.target ? [`Target: ${approval.target}`] : []),
+        ],
+        ["Approval was recorded as structured execution authority for the next run only."],
+        ["Continue the Agent with the approved action."],
       );
+      await startWorkerForCard(cardId, true);
+    } catch (reason) {
+      updateAgentSessionForCard(cardId, (current) => ({
+        ...current,
+        pendingApproval: current.pendingApproval
+          ? { ...current.pendingApproval, status: "pending" }
+          : null,
+      }));
       appNotice = {
-        tone: "info",
-        message: "Approval recorded. Continue the Agent on this card when ready.",
+        tone: "error",
+        message: `Approval could not be recorded: ${reason instanceof Error ? reason.message : String(reason)}`,
       };
     }
-    agentTerminalInput = "";
+  }
+
+  function declineAgentAction(cardId: string) {
+    const approval = agentSessionForCard(cardId)?.pendingApproval;
+    if (!approval || approval.status !== "pending") return;
+    updateAgentSessionForCard(cardId, (session) => ({
+      ...session,
+      pendingApproval: session.pendingApproval
+        ? { ...session.pendingApproval, status: "declined" }
+        : null,
+    }));
+    appendAgentSessionTranscriptForCard(
+      cardId,
+      "decline",
+      `Declined ${approval.operation}${approval.target ? ` for ${approval.target}` : ""}.`,
+    );
+    appendStructuredAgentLogForCard(
+      cardId,
+      "info",
+      "approval",
+      `Operator declined ${approval.label}.`,
+      [
+        `Operation: ${approval.operation}`,
+        `Risk: ${approval.risk}`,
+        ...(approval.target ? [`Target: ${approval.target}`] : []),
+      ],
+      ["No execution authority was granted."],
+      ["Add different guidance if you want the Agent to take another approach."],
+    );
+    appNotice = { tone: "info", message: "Action declined. No change was authorized." };
   }
 
   async function cancelAgentRunForCard(cardId: string) {
@@ -6602,13 +6760,6 @@
         message: `Could not confirm cancellation for ${session.title}.`,
       };
     }
-  }
-
-  function isApprovalText(value: string): boolean {
-    const text = value.toLowerCase();
-    return (
-      text.includes("approve") || text.includes("approved") || text.includes("approval granted")
-    );
   }
 
   function operatorNotesForCard(cardId: string): string | null {
@@ -7276,7 +7427,15 @@
         resumeAuthoritativeResult && existingSession?.executionRun
           ? existingSession.executionRun
           : isContinuation && existingSession?.executionRun
-            ? resumeExecutionRun(runId, existingSession.executionRun, operatorNotes, previousOutput)
+            ? resumeExecutionRun(
+                runId,
+                existingSession.executionRun,
+                operatorNotes,
+                previousOutput,
+                existingSession.pendingApproval?.status === "approving"
+                  ? existingSession.pendingApproval
+                  : null,
+              )
             : createExecutionRun(
                 runId,
                 buildExecutionContract(
@@ -7383,8 +7542,8 @@
               ...session,
               conversationId: prepared.conversationId,
             }));
-            const execution = await executeAgentTaskSession(ticketLabel(card), prepared, {
-              onSubmitted: (session) => {
+            const taskSessionOptions = {
+              onSubmitted: (session: TaskSessionSnapshot) => {
                 commitManualSkillReservation();
                 updateAgentSessionForCard(cardId, (current) => ({
                   ...current,
@@ -7393,8 +7552,20 @@
                   conversationId: prepared.conversationId,
                 }));
               },
-              onEvent: (event) => projectTaskSessionEvent(cardId, event),
-            });
+              onEvent: (event: TaskSessionEvent) => projectTaskSessionEvent(cardId, event),
+            };
+            const approvalResumeSessionId =
+              isContinuation && existingSession?.pendingApproval?.status === "approving"
+                ? (existingSession.taskSessionId ?? null)
+                : null;
+            const execution = approvalResumeSessionId
+              ? await resumeAgentTaskSession(
+                  approvalResumeSessionId,
+                  ticketLabel(card),
+                  prepared,
+                  taskSessionOptions,
+                )
+              : await executeAgentTaskSession(ticketLabel(card), prepared, taskSessionOptions);
             result = execution.result;
           } else {
             result = await executeAiWorkerTask(
@@ -7444,6 +7615,19 @@
                     ["Wait for the runtime to report tool completion."],
                   );
                 } else if (event.type === "tool_completed") {
+                  if (!event.success && event.error?.includes("[approval_required]")) {
+                    const approval = approvalRequestFromToolDetails(
+                      {
+                        tool_name: event.tool_name,
+                        arguments_digest: event.arguments_digest,
+                        operation_id: event.operation_id,
+                        risk: event.risk,
+                        display_context: event.display_context,
+                      },
+                      event.operation_id,
+                    );
+                    if (approval) setPendingAgentApproval(cardId, approval);
+                  }
                   appendStructuredAgentLogForCard(
                     cardId,
                     event.success ? "info" : "error",
@@ -7459,6 +7643,17 @@
                     event.success ? [] : ["Review the tool failure evidence before continuing."],
                   );
                 } else if (event.type === "approval_required") {
+                  const approval = approvalRequestFromToolDetails(
+                    {
+                      tool_name: event.operation,
+                      arguments_digest: event.arguments_digest,
+                      operation_id: event.operation_id,
+                      risk: event.risk,
+                      capability: event.capability,
+                    },
+                    event.operation_id,
+                  );
+                  if (approval) setPendingAgentApproval(cardId, approval);
                   appendStructuredAgentLogForCard(
                     cardId,
                     "error",
@@ -7470,7 +7665,7 @@
                       `Risk: ${event.risk}`,
                     ],
                     ["The backend stopped the unapproved operation."],
-                    ["Grant the required capability and start a new execution run."],
+                    ["Review the requested action and choose Approve or Decline."],
                   );
                 }
               },
@@ -8010,11 +8205,12 @@
                         settings = { ...settings, jira: { ...settings.jira, serverId: server.id } };
                       }
                     }}
-                  >
-                    <strong>{server.name || "Unnamed MCP"}</strong>
-                    <span
-                      >{server.kind.toUpperCase()} · {server.command ||
-                        "No command configured"}</span
+                    >
+                      <strong>{server.name || "Unnamed MCP"}</strong>
+                      <span
+                      >{server.kind.toUpperCase()} · {server.kind === "ocp"
+                        ? "Embedded"
+                        : server.command || "No command configured"}</span
                     >
                     <small
                       class={`mcp-status ${mcpConnectionState(server.id)?.status ?? "unknown"}`}
@@ -8035,7 +8231,16 @@
               onsubmit={(event) => event.preventDefault()}
             >
               {#if settingsTab === "mcp"}
-                {#if selectedServer && mcpConnectionModule}
+                {#if selectedServer?.kind === "ocp" && ocpConnectorModule}
+                  {@const OcpConnectorSettings = ocpConnectorModule.default}
+                  <OcpConnectorSettings
+                    serverId={selectedServer.id}
+                    serverName={selectedServer.name}
+                    kind={selectedServer.kind}
+                    onUpdate={updateSelectedServer}
+                    onSaved={() => invalidateMcpConnection(selectedServer.id)}
+                  />
+                {:else if selectedServer && mcpConnectionModule}
                   {@const McpConnectionSettings = mcpConnectionModule.default}
                   <McpConnectionSettings
                     server={selectedServer}
@@ -9075,46 +9280,82 @@
                 </SettingsPage>
               {/if}
 
-              <ValidationMessage error={settingsError} success={connectionMessage} />
-
-              {#if settingsTab === "mcp" && selectedMcpTools.length > 0}
-                <details class="tool-list">
-                  <summary>Available MCP tools ({selectedMcpTools.length})</summary>
-                  <div>
-                    {#each selectedMcpTools as tool (tool)}
-                      <code>{tool}</code>
-                    {/each}
+              {#if settingsTab === "mcp" && selectedServer}
+                {@const connectorState = mcpConnectionState(selectedServer.id)}
+                <section
+                  class:connected={connectorState?.status === "connected"}
+                  class:error={connectorState?.status === "disconnected"}
+                  class="connector-health"
+                  aria-labelledby="connector-health-heading"
+                >
+                  <div class="connector-health-icon" aria-hidden="true">
+                    {#if connectorState?.status === "connected"}
+                      <Check size={14} strokeWidth={2.5} />
+                    {:else if connectorState?.status === "disconnected"}
+                      <AlertTriangle size={13} strokeWidth={2.2} />
+                    {:else}
+                      <Circle size={8} fill="currentColor" strokeWidth={0} />
+                    {/if}
                   </div>
-                </details>
+                  <div class="connector-health-copy">
+                    <strong id="connector-health-heading"
+                      >{mcpConnectionLabel(selectedServer.id)}</strong
+                    >
+                    <span>{mcpConnectionDetail(selectedServer.id)}</span>
+                  </div>
+                  {#if selectedMcpTools.length > 0}
+                    <details class="connector-tools">
+                      <summary
+                        >{selectedMcpTools.length} available tool{selectedMcpTools.length === 1
+                          ? ""
+                          : "s"}</summary
+                      >
+                      <div>
+                        {#each selectedMcpTools as tool (tool)}<code>{tool}</code>{/each}
+                      </div>
+                    </details>
+                  {/if}
+                  <ValidationMessage error={settingsError} success={connectionMessage} />
+                </section>
+              {:else}
+                <ValidationMessage error={settingsError} success={connectionMessage} />
               {/if}
 
               {#if settingsTab !== "theme" && settingsTab !== "skills" && settingsTab !== "rules"}
                 <SettingsActionBar>
                   {#if settingsTab === "mcp"}
-                    <button type="button" onclick={removeSelectedServer} disabled={!selectedServer}>
-                      Remove
-                    </button>
                     <button
-                      type="button"
-                      onclick={disconnectSelectedMcpServer}
-                      disabled={!selectedServer}
-                    >
-                      Disconnect
-                    </button>
-                    <button
+                      class="test-connection"
                       type="button"
                       onclick={testSelectedMcpConnection}
                       disabled={!selectedServer || testingConnection}
                     >
-                      {testingConnection ? "Testing..." : "Test connection"}
+                      {testingConnection ? "Testing…" : "Test connection"}
                     </button>
+                    <span class="mcp-destructive-actions">
+                      <button
+                        class="remove-connector"
+                        type="button"
+                        onclick={removeSelectedServer}
+                        disabled={!selectedServer}>Remove</button
+                      >
+                      <button
+                        type="button"
+                        onclick={disconnectSelectedMcpServer}
+                        disabled={!selectedServer}>Disconnect</button
+                      >
+                    </span>
                   {/if}
                   <button
                     class="save-settings"
                     type="button"
                     onclick={persistSettings}
                     disabled={settingsSaving}
-                    >{settingsSaving ? "Saving..." : "Save settings"}</button
+                    >{settingsSaving
+                      ? "Saving…"
+                      : settingsTab === "mcp"
+                        ? "Save changes"
+                        : "Save settings"}</button
                   >
                 </SettingsActionBar>
               {/if}
@@ -9236,12 +9477,15 @@
                 terminalLines={visibleAgentTerminalLines}
                 terminalInput={agentTerminalInput}
                 runCardId={agentConsoleCardId}
+                approval={visibleAgentApproval}
                 onClose={() => (agentConsoleOpen = false)}
                 onCancel={cancelAgentRunForCard}
                 onTerminalInputChange={(value) => (agentTerminalInput = value)}
                 onSubmitTerminalInput={submitAgentTerminalInput}
                 onOpenCard={(cardId) => (selectedCardId = cardId)}
                 onMarkBlockedDone={requestManualDoneConfirmation}
+                onApprove={(cardId) => void approveAgentAction(cardId)}
+                onDecline={declineAgentAction}
               />
             {:else}
               <aside class="agent-console" aria-label="Agent run console loading">

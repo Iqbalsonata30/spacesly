@@ -128,12 +128,13 @@ impl TaskExecutor for AgentTaskExecutor {
             .resolve(&envelope, &runtime_attempt_id)
             .map_err(TaskExecutionError::new)?;
         validate_resolved_task(&envelope, &resolved).map_err(TaskExecutionError::new)?;
+        resolved.task.opencode_session_id = context.opencode_session_id()?;
         if resolved.config.runtime != "opencode" {
             return Err(TaskExecutionError::new(
                 "Scheduler Agent execution requires the isolated fenced OpenCode runtime.",
             ));
         }
-        resolved.task.session_key = Some(runtime_attempt_id.clone());
+        resolved.task.session_key = Some(format!("task-session:{}", context.session_id().0));
         resolved.config.opencode_auto_approve = false;
         resolved.config.restrict_tools = false;
         resolved.config.fenced_tools_only = true;
@@ -176,6 +177,33 @@ impl TaskExecutor for AgentTaskExecutor {
             if !*open {
                 return Err("Agent runtime callback is closed.".to_string());
             }
+            if let AiWorkerStreamEvent::OpenCodeSession { session_id, .. } = &event {
+                reporter
+                    .bind_opencode_session(session_id)
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            if let AiWorkerStreamEvent::ToolCompleted {
+                tool_name,
+                success: false,
+                error: Some(error),
+                arguments_digest,
+                ..
+            } = &event
+            {
+                if error.contains("[approval_required]") {
+                    reporter
+                        .emit_event(
+                            TaskSessionEventKind::Runtime,
+                            json!({
+                                "type": "approval_requested",
+                                "operation": tool_name,
+                                "arguments_digest": arguments_digest,
+                            }),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
             emit_runtime_event(&reporter, event)
         });
         let result = self.runner.execute(
@@ -185,7 +213,13 @@ impl TaskExecutor for AgentTaskExecutor {
             callback,
         );
         drop(callback_guard);
-        let result = result.map_err(TaskExecutionError::new)?;
+        let result = result.map_err(|error| {
+            if error.contains("[approval_required]") {
+                TaskExecutionError::blocked(error)
+            } else {
+                TaskExecutionError::new(error)
+            }
+        })?;
         context.ensure_current()?;
         context.emit_event(
             TaskSessionEventKind::Runtime,
@@ -292,6 +326,15 @@ pub(crate) fn emit_runtime_event(
     event: AiWorkerStreamEvent,
 ) -> Result<(), String> {
     let (kind, payload, failure) = match event {
+        AiWorkerStreamEvent::OpenCodeSession { session_id, action } => (
+            TaskSessionEventKind::Runtime,
+            json!({
+                "type": "opencode_session",
+                "opencode_session_id": session_id,
+                "action": action,
+            }),
+            None,
+        ),
         AiWorkerStreamEvent::TextDelta(text) => (
             TaskSessionEventKind::Runtime,
             json!({ "type": "text_delta", "text": text }),
@@ -400,6 +443,7 @@ mod tests {
                 task: AiWorkerTask {
                     execution_contract: Some(json!({ "contract": "test" })),
                     session_key: None,
+                    opencode_session_id: None,
                 },
             })
         }
@@ -421,6 +465,11 @@ mod tests {
     }
 
     struct BlockedRunner;
+
+    struct ApprovalThenCompleteRunner {
+        executions: AtomicUsize,
+        seen_session_ids: Mutex<Vec<Option<String>>>,
+    }
 
     struct ToolFailureRunner;
 
@@ -468,6 +517,52 @@ mod tests {
         }
     }
 
+    impl AgentRuntimeRunner for ApprovalThenCompleteRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            self.seen_session_ids
+                .lock()
+                .expect("seen sessions lock")
+                .push(task.opencode_session_id.clone());
+            on_event(AiWorkerStreamEvent::OpenCodeSession {
+                session_id: "opencode-session-resume".to_string(),
+                action: if execution == 0 { "created" } else { "resumed" }.to_string(),
+            })?;
+            if execution == 0 {
+                let approval_error =
+                    "[approval_required] OpenShift restart requires explicit operator approval";
+                on_event(AiWorkerStreamEvent::ToolCompleted {
+                    tool_call_id: "call-approval".to_string(),
+                    tool_name: "ocp_restart_deployment".to_string(),
+                    success: false,
+                    error: Some(approval_error.to_string()),
+                    risk: "write".to_string(),
+                    arguments_digest: "approval-digest".to_string(),
+                    display_context: ToolDisplayContext {
+                        label: "Restart deployment".to_string(),
+                        category: "external".to_string(),
+                        target: Some("deployment/clbo".to_string()),
+                    },
+                })?;
+                return Err(approval_error.to_string());
+            }
+            Ok(AiWorkerTaskResult {
+                summary: "continued after approval".to_string(),
+                evidence: vec!["same OpenCode session".to_string()],
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AiWorkerCompletionStatus::Completed,
+                blocked_reason: None,
+            })
+        }
+    }
+
     struct DetachedCallbackRunner {
         callback: Arc<Mutex<Option<AiWorkerEventCallback>>>,
         panic_after_detach: bool,
@@ -509,13 +604,18 @@ mod tests {
             assert!(task
                 .session_key
                 .as_deref()
-                .is_some_and(|value| value.contains("-attempt-")));
+                .is_some_and(|value| value.starts_with("task-session:")));
+            assert!(task.opencode_session_id.is_none());
             let authority = config.mcp_servers[0]
                 .proxy_authority
                 .as_ref()
                 .expect("fenced proxy authority");
             assert_eq!(authority.connector_id, "jira");
             assert_eq!(authority.capability, "external_tools:jira");
+            on_event(AiWorkerStreamEvent::OpenCodeSession {
+                session_id: "opencode-session-fake".to_string(),
+                action: "created".to_string(),
+            })?;
             on_event(AiWorkerStreamEvent::TextDelta("working".to_string()))?;
             self.executions.fetch_add(1, Ordering::SeqCst);
             Ok(AiWorkerTaskResult {
@@ -630,6 +730,10 @@ mod tests {
             .wait_for_terminal(session.id, Duration::from_secs(5))
             .expect("task completes");
         assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(
+            completed.opencode_session_id.as_deref(),
+            Some("opencode-session-fake")
+        );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert_eq!(attempts.lock().expect("attempt lock").len(), 1);
         assert!(engine
@@ -828,6 +932,73 @@ mod tests {
     }
 
     #[test]
+    fn approval_continuation_resumes_the_same_opencode_session_end_to_end() {
+        let directory = tempdir().expect("temp directory");
+        let runner = Arc::new(ApprovalThenCompleteRunner {
+            executions: AtomicUsize::new(0),
+            seen_session_ids: Mutex::new(Vec::new()),
+        });
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            runner.clone(),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let envelope = test_envelope();
+        let session = engine
+            .submit_envelope_with_grants(
+                "approval-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let paused = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task pauses");
+        assert_eq!(paused.state, TaskSessionState::Blocked);
+        assert_eq!(
+            paused.opencode_session_id.as_deref(),
+            Some("opencode-session-resume")
+        );
+
+        let resumed = engine
+            .resume_after_approval(
+                session.id,
+                "approval-agent-resumed",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+            )
+            .expect("same task resumed");
+        assert_eq!(resumed.id, session.id);
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("resumed task completes");
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(
+            runner
+                .seen_session_ids
+                .lock()
+                .expect("seen sessions lock")
+                .as_slice(),
+            &[None, Some("opencode-session-resume".to_string())]
+        );
+        let created_count = engine
+            .events_after(session.id, 0)
+            .expect("events replayed")
+            .iter()
+            .filter(|event| event.payload["action"] == json!("created"))
+            .count();
+        assert_eq!(created_count, 1);
+    }
+
+    #[test]
     fn scheduler_agent_executor_terminalizes_failed_tool_with_original_cause() {
         let directory = tempdir().expect("temp directory");
         let executor = AgentTaskExecutor::new(
@@ -994,6 +1165,7 @@ mod tests {
             task: AiWorkerTask {
                 execution_contract: Some(json!({ "contract": "test" })),
                 session_key: None,
+                opencode_session_id: None,
             },
         };
         assert!(validate_resolved_task(&envelope, &resolved)

@@ -247,6 +247,7 @@ impl SchedulerStore {
                    attempt_count INTEGER NOT NULL DEFAULT 0,
                    active_attempt_id INTEGER,
                    fencing_token INTEGER NOT NULL DEFAULT 0,
+                   opencode_session_id TEXT,
                    lease_expires_at INTEGER,
                    progress_phase TEXT,
                    progress_completed INTEGER,
@@ -340,6 +341,12 @@ impl SchedulerStore {
             "scheduler_metadata",
             "instance_id",
             "instance_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_sessions",
+            "opencode_session_id",
+            "opencode_session_id TEXT",
         )?;
         ensure_column(
             &migration,
@@ -733,6 +740,138 @@ impl SchedulerStore {
             .ok_or_else(|| "Enqueued task session was not found.".to_string())
     }
 
+    pub(crate) fn resume_after_approval(
+        &self,
+        id: TaskSessionId,
+        request: &TaskRequest,
+        capabilities: &[String],
+        grant_source: &str,
+    ) -> Result<TaskSessionSnapshot, String> {
+        let now = now_millis();
+        let capabilities = validate_capability_grants(capabilities, grant_source)?;
+        let ownership = request_ownership(request);
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start Task Session resume: {error}"))?;
+        let (state, error, workspace_id, conversation_id, subject_id, opencode_session_id) =
+            transaction
+                .query_row(
+                    "SELECT state, error, workspace_id, conversation_id, subject_id,
+                            opencode_session_id
+                       FROM scheduler_task_sessions WHERE session_id = ?1",
+                    params![to_i64(id.0)?],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("Failed to inspect Task Session resume: {error}"))?
+                .ok_or_else(|| format!("Task Session {} was not found.", id.0))?;
+        if state != "blocked"
+            || error
+                .as_deref()
+                .is_none_or(|error| !error.contains("[approval_required]"))
+        {
+            return Err(
+                "Only a Task Session blocked on an approval request may be resumed.".to_string(),
+            );
+        }
+        let opencode_session_id = opencode_session_id.ok_or_else(|| {
+            "The blocked Task Session has no durable OpenCode session identity; refusing to silently create a replacement session."
+                .to_string()
+        })?;
+        if workspace_id != ownership.workspace_id
+            || conversation_id != ownership.conversation_id
+            || subject_id != ownership.subject_id
+        {
+            return Err(
+                "Resumed Task Session ownership does not match the original task.".to_string(),
+            );
+        }
+        let enqueue_sequence = next_sequence(&transaction, "next_enqueue_sequence")?;
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_task_sessions
+                    SET enqueue_sequence = ?2, label = ?3, payload = ?4,
+                        execution_run_id = ?5, state = 'queued', worker_id = NULL,
+                        dispatch_sequence = NULL, active_attempt_id = NULL,
+                        lease_expires_at = NULL, completed_at = NULL, error = NULL,
+                        progress_phase = 'queued', progress_completed = 0,
+                        progress_total = NULL
+                  WHERE session_id = ?1 AND state = 'blocked'",
+                params![
+                    to_i64(id.0)?,
+                    to_i64(enqueue_sequence)?,
+                    request.label,
+                    request.payload,
+                    ownership.execution_run_id,
+                ],
+            )
+            .map_err(|error| format!("Failed to requeue approved Task Session: {error}"))?;
+        if updated != 1 {
+            return Err(
+                "Task Session approval resume raced with another lifecycle transition.".to_string(),
+            );
+        }
+        transaction
+            .execute(
+                "DELETE FROM scheduler_task_grants WHERE session_id = ?1",
+                params![to_i64(id.0)?],
+            )
+            .map_err(|error| format!("Failed to replace resumed Task Session grants: {error}"))?;
+        for capability in capabilities {
+            transaction
+                .execute(
+                    "INSERT INTO scheduler_task_grants
+                       (session_id, capability, grant_source, granted_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![to_i64(id.0)?, capability, grant_source, to_i64(now)?],
+                )
+                .map_err(|error| format!("Failed to persist resumed capability grant: {error}"))?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM scheduler_task_completions WHERE session_id = ?1",
+                params![to_i64(id.0)?],
+            )
+            .map_err(|error| format!("Failed to clear blocked Task Session result: {error}"))?;
+        append_event_in_transaction(
+            &transaction,
+            id,
+            None,
+            0,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Lifecycle,
+                payload: json!({
+                    "state": "queued",
+                    "action": "resumed_after_approval",
+                    "task_session_id": id.0,
+                    "opencode_session_id": opencode_session_id,
+                }),
+                progress: Some(TaskProgress {
+                    phase: "queued".to_string(),
+                    completed: 0,
+                    total: None,
+                }),
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit Task Session approval resume: {error}"))?;
+        drop(connection);
+        self.get_session(id)?
+            .ok_or_else(|| "Resumed Task Session was not found.".to_string())
+    }
+
     pub(crate) fn get_session(
         &self,
         id: TaskSessionId,
@@ -937,6 +1076,105 @@ impl SchedulerStore {
 
     pub(crate) fn assignment_is_current(&self, fence: AssignmentFence) -> Result<bool, String> {
         self.assignment_is_current_at(fence, now_millis())
+    }
+
+    pub(crate) fn assignment_opencode_session(
+        &self,
+        fence: AssignmentFence,
+    ) -> Result<Option<String>, String> {
+        let now = now_millis();
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        if !assignment_is_current_on(&connection, fence, now)? {
+            return Err("OpenCode session lookup assignment fence is stale.".to_string());
+        }
+        connection
+            .query_row(
+                "SELECT opencode_session_id FROM scheduler_task_sessions WHERE session_id = ?1",
+                params![to_i64(fence.session_id.0)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to load Task Session OpenCode identity: {error}"))
+    }
+
+    pub(crate) fn bind_opencode_session(
+        &self,
+        fence: AssignmentFence,
+        opencode_session_id: &str,
+    ) -> Result<TaskSessionEvent, String> {
+        let opencode_session_id = opencode_session_id.trim();
+        if opencode_session_id.is_empty()
+            || opencode_session_id.len() > 256
+            || opencode_session_id.chars().any(char::is_control)
+        {
+            return Err("OpenCode session identity is invalid.".to_string());
+        }
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start OpenCode identity transaction: {error}"))?;
+        if !assignment_is_current_on(&transaction, fence, now)? {
+            return Err("OpenCode session binding assignment fence is stale.".to_string());
+        }
+        let (existing, worker_id) = transaction
+            .query_row(
+                "SELECT sessions.opencode_session_id, attempts.worker_id
+                   FROM scheduler_task_sessions sessions
+                   JOIN scheduler_task_attempts attempts
+                     ON attempts.attempt_id = sessions.active_attempt_id
+                  WHERE sessions.session_id = ?1",
+                params![to_i64(fence.session_id.0)?],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| {
+                format!("Failed to inspect Task Session OpenCode identity: {error}")
+            })?;
+        if existing
+            .as_deref()
+            .is_some_and(|existing| existing != opencode_session_id)
+        {
+            return Err(format!(
+                "Task Session {} already owns a different OpenCode session.",
+                fence.session_id.0
+            ));
+        }
+        if existing.is_none() {
+            transaction
+                .execute(
+                    "UPDATE scheduler_task_sessions SET opencode_session_id = ?2
+                      WHERE session_id = ?1 AND active_attempt_id = ?3 AND fencing_token = ?4",
+                    params![
+                        to_i64(fence.session_id.0)?,
+                        opencode_session_id,
+                        to_i64(fence.attempt_id)?,
+                        to_i64(fence.fencing_token)?
+                    ],
+                )
+                .map_err(|error| format!("Failed to persist OpenCode session identity: {error}"))?;
+        }
+        let event = append_event_in_transaction(
+            &transaction,
+            fence.session_id,
+            Some(fence.attempt_id),
+            fence.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Runtime,
+                payload: json!({
+                    "type": "opencode_session",
+                    "action": if existing.is_some() { "resumed" } else { "created" },
+                    "task_session_id": fence.session_id.0,
+                    "worker_id": from_i64(worker_id, "worker ID")?,
+                    "assignment_attempt": fence.attempt,
+                    "opencode_session_id": opencode_session_id,
+                }),
+                progress: None,
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit OpenCode session identity: {error}"))?;
+        Ok(event)
     }
 
     fn assignment_is_current_at(&self, fence: AssignmentFence, now: u64) -> Result<bool, String> {
@@ -1840,13 +2078,15 @@ const SESSION_COLUMNS: &str =
      COALESCE(active_attempt_id, (SELECT MAX(attempt_id) FROM scheduler_task_attempts
        WHERE scheduler_task_attempts.session_id = scheduler_task_sessions.session_id)),
      fencing_token, lease_expires_at, error, created_at, started_at,
-     completed_at, progress_phase, progress_completed, progress_total, next_event_sequence";
+     completed_at, progress_phase, progress_completed, progress_total, next_event_sequence,
+     opencode_session_id";
 const SESSION_SELECT_ALL: &str =
     "SELECT session_id, label, payload, state, worker_id, dispatch_sequence, attempt_count,
             COALESCE(active_attempt_id, (SELECT MAX(attempt_id) FROM scheduler_task_attempts
               WHERE scheduler_task_attempts.session_id = scheduler_task_sessions.session_id)),
             fencing_token, lease_expires_at, error, created_at, started_at,
-            completed_at, progress_phase, progress_completed, progress_total, next_event_sequence
+            completed_at, progress_phase, progress_completed, progress_total, next_event_sequence,
+            opencode_session_id
        FROM scheduler_task_sessions ORDER BY session_id";
 
 struct StoredSession {
@@ -1868,6 +2108,7 @@ struct StoredSession {
     progress_completed: Option<i64>,
     progress_total: Option<i64>,
     next_event_sequence: i64,
+    opencode_session_id: Option<String>,
 }
 
 struct StoredCompletion {
@@ -1920,6 +2161,19 @@ fn terminalize_assignment(
     error: Option<&str>,
     now: u64,
 ) -> Result<(), String> {
+    let opencode_session_id = transaction
+        .query_row(
+            "SELECT opencode_session_id FROM scheduler_task_sessions WHERE session_id = ?1",
+            params![to_i64(fence.session_id.0)?],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(|error| format!("Failed to load terminal OpenCode identity: {error}"))?;
+    let action =
+        if state == "blocked" && error.is_some_and(|error| error.contains("[approval_required]")) {
+            "paused"
+        } else {
+            "terminal"
+        };
     transaction
         .execute(
             "UPDATE scheduler_task_attempts
@@ -1951,7 +2205,13 @@ fn terminalize_assignment(
         fence.fencing_token,
         &TaskSessionEventInput {
             kind: TaskSessionEventKind::Lifecycle,
-            payload: json!({ "state": state, "error": error }),
+            payload: json!({
+                "state": state,
+                "error": error,
+                "action": action,
+                "task_session_id": fence.session_id.0,
+                "opencode_session_id": opencode_session_id,
+            }),
             progress: Some(TaskProgress {
                 phase: state.to_string(),
                 completed: 1,
@@ -1999,6 +2259,7 @@ impl StoredSession {
                 .map(|value| from_i64(value, "task attempt ID"))
                 .transpose()?,
             fencing_token: from_i64(self.fencing_token, "fencing token")?,
+            opencode_session_id: self.opencode_session_id,
             lease_expires_at: self
                 .lease_expires_at
                 .map(|value| from_i64(value, "lease expiry"))
@@ -2057,6 +2318,7 @@ fn stored_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSe
         progress_completed: row.get(15)?,
         progress_total: row.get(16)?,
         next_event_sequence: row.get(17)?,
+        opencode_session_id: row.get(18)?,
     })
 }
 
@@ -3767,6 +4029,166 @@ mod tests {
         assert!(store
             .assignment_is_current_at(current.fence, 1_053)
             .expect("current authority checked"));
+    }
+
+    #[test]
+    fn approval_resumes_the_same_durable_opencode_session_across_workers_and_reopen() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let initial = owned_agent_request("initial", "conversation-resume", "subject-resume");
+        let session = store.enqueue(&initial).expect("task enqueued");
+        let first = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("first claim")
+            .expect("first assignment");
+        let created = store
+            .bind_opencode_session(first.fence, "opencode-session-x")
+            .expect("OpenCode identity bound");
+        assert_eq!(created.payload["action"], json!("created"));
+        store
+            .resolve_assignment(
+                first.fence,
+                DurableOutcome::Blocked(
+                    "[approval_required] restart deployment needs approval".to_string(),
+                ),
+            )
+            .expect("approval pause persisted");
+
+        let second_request =
+            owned_agent_request("approved-once", "conversation-resume", "subject-resume");
+        let resumed = store
+            .resume_after_approval(session.id, &second_request, &[], "test_approval")
+            .expect("approval resumed");
+        assert_eq!(resumed.id, session.id);
+        assert_eq!(
+            resumed.opencode_session_id.as_deref(),
+            Some("opencode-session-x")
+        );
+        drop(store);
+
+        let reopened = SchedulerStore::open_at(path).expect("store reopens");
+        let second = reopened
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("second claim")
+            .expect("second assignment");
+        assert_eq!(second.fence.session_id, session.id);
+        assert_eq!(second.fence.attempt, 2);
+        assert_eq!(
+            reopened
+                .assignment_opencode_session(second.fence)
+                .expect("identity loaded")
+                .as_deref(),
+            Some("opencode-session-x")
+        );
+        assert!(reopened
+            .bind_opencode_session(first.fence, "opencode-session-x")
+            .is_err());
+        let resumed_event = reopened
+            .bind_opencode_session(second.fence, "opencode-session-x")
+            .expect("same identity resumed on another worker");
+        assert_eq!(resumed_event.payload["action"], json!("resumed"));
+        assert_eq!(resumed_event.payload["worker_id"], json!(3));
+        assert!(reopened
+            .bind_opencode_session(second.fence, "opencode-session-y")
+            .is_err());
+
+        reopened
+            .resolve_assignment(
+                second.fence,
+                DurableOutcome::Blocked("[approval_required] scale needs approval".to_string()),
+            )
+            .expect("second approval pause persisted");
+        let third_request =
+            owned_agent_request("approved-twice", "conversation-resume", "subject-resume");
+        reopened
+            .resume_after_approval(session.id, &third_request, &[], "test_approval")
+            .expect("second approval resumed");
+        let third = reopened
+            .claim_next(owner, 4, Duration::from_secs(5), 5)
+            .expect("third claim")
+            .expect("third assignment");
+        assert_eq!(third.fence.attempt, 3);
+        reopened
+            .bind_opencode_session(third.fence, "opencode-session-x")
+            .expect("identity resumed for the second approval cycle");
+        reopened
+            .resolve_assignment(
+                third.fence,
+                DurableOutcome::Succeeded(TaskExecutionOutput::None),
+            )
+            .expect("task completed");
+
+        let snapshot = reopened
+            .get_session(session.id)
+            .expect("session loaded")
+            .expect("session exists");
+        assert_eq!(snapshot.state, TaskSessionState::Succeeded);
+        assert_eq!(
+            snapshot.opencode_session_id.as_deref(),
+            Some("opencode-session-x")
+        );
+        let events = reopened
+            .events_after(session.id, 0)
+            .expect("events replayed");
+        let created_count = events
+            .iter()
+            .filter(|event| event.payload["action"] == json!("created"))
+            .count();
+        assert_eq!(created_count, 1);
+        assert!(events.iter().any(|event| {
+            event.payload["action"] == json!("paused")
+                && event.payload["opencode_session_id"] == json!("opencode-session-x")
+        }));
+        assert!(events.iter().any(|event| {
+            event.payload["action"] == json!("resumed_after_approval")
+                && event.payload["opencode_session_id"] == json!("opencode-session-x")
+        }));
+        assert!(events.iter().any(|event| {
+            event.payload["action"] == json!("terminal")
+                && event.payload["opencode_session_id"] == json!("opencode-session-x")
+        }));
+    }
+
+    #[test]
+    fn concurrent_task_sessions_keep_distinct_opencode_identities() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let task_a = store
+            .enqueue(&owned_agent_request("a", "conversation-a", "subject-a"))
+            .expect("task A enqueued");
+        let task_b = store
+            .enqueue(&owned_agent_request("b", "conversation-b", "subject-b"))
+            .expect("task B enqueued");
+        let assignment_a = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("task A claim")
+            .expect("task A assignment");
+        let assignment_b = store
+            .claim_next(owner, 2, Duration::from_secs(5), 5)
+            .expect("task B claim")
+            .expect("task B assignment");
+        assert_eq!(assignment_a.fence.session_id, task_a.id);
+        assert_eq!(assignment_b.fence.session_id, task_b.id);
+        store
+            .bind_opencode_session(assignment_a.fence, "opencode-session-a")
+            .expect("task A identity bound");
+        store
+            .bind_opencode_session(assignment_b.fence, "opencode-session-b")
+            .expect("task B identity bound");
+        assert_eq!(
+            store
+                .assignment_opencode_session(assignment_a.fence)
+                .expect("task A identity"),
+            Some("opencode-session-a".to_string())
+        );
+        assert_eq!(
+            store
+                .assignment_opencode_session(assignment_b.fence)
+                .expect("task B identity"),
+            Some("opencode-session-b".to_string())
+        );
     }
 
     fn test_agent_envelope() -> TaskSessionEnvelope {

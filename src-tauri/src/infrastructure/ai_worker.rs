@@ -274,6 +274,9 @@ pub struct AiWorkerTask {
     pub execution_contract: Option<Value>,
     #[serde(default)]
     pub session_key: Option<String>,
+    /// Durable OpenCode session identity owned by the Spacesly Task Session.
+    #[serde(default)]
+    pub opencode_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -347,6 +350,10 @@ pub struct AiWorkerChatResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AiWorkerStreamEvent {
+    OpenCodeSession {
+        session_id: String,
+        action: String,
+    },
     TextDelta(String),
     ToolStarted {
         tool_call_id: String,
@@ -1134,9 +1141,11 @@ fn execute_opencode_task(
             Err(error) => (None, Some(error)),
         }
     };
-    let session = server
-        .as_ref()
-        .and_then(|server| cached_opencode_session(server, task.session_key.as_deref()));
+    let session = task.opencode_session_id.clone().or_else(|| {
+        server
+            .as_ref()
+            .and_then(|server| cached_opencode_session(server, task.session_key.as_deref()))
+    });
     let mut command = opencode_command(&config);
     command.args([
         "run",
@@ -1158,6 +1167,8 @@ fn execute_opencode_task(
         .arg("--title")
         .arg(contract_title(&task))
         .arg(prompt);
+    let expected_session_id = session.clone();
+    let mut observed_session_id: Option<String> = None;
     let output = run_cancellable_jsonl_command(
         command,
         cancellation,
@@ -1165,6 +1176,28 @@ fn execute_opencode_task(
         AGENT_OUTPUT_LIMIT,
         "OpenCode Agent",
         |line| {
+            if let Some(line_session_id) = opencode_session_id_from_line(line) {
+                if let Some(expected) = expected_session_id.as_deref() {
+                    if line_session_id != expected {
+                        return Err(format!(
+                            "OpenCode resumed session '{line_session_id}' instead of Task Session-owned session '{expected}'."
+                        ));
+                    }
+                }
+                if observed_session_id.as_deref() != Some(line_session_id.as_str()) {
+                    if let Some(on_event) = on_event.as_mut() {
+                        on_event(AiWorkerStreamEvent::OpenCodeSession {
+                            session_id: line_session_id.clone(),
+                            action: if expected_session_id.is_some() {
+                                "resumed".to_string()
+                            } else {
+                                "created".to_string()
+                            },
+                        })?;
+                    }
+                    observed_session_id = Some(line_session_id);
+                }
+            }
             if let Some(event) = parse_opencode_stream_event(line) {
                 if let Some(on_event) = on_event.as_mut() {
                     on_event(event)?;
@@ -1189,6 +1222,14 @@ fn execute_opencode_task(
     }
 
     let response = parse_opencode_run_output(&stdout)?;
+    if let Some(expected) = expected_session_id.as_deref() {
+        if response.session_id != expected {
+            return Err(format!(
+                "OpenCode completed session '{}' instead of Task Session-owned session '{expected}'.",
+                response.session_id
+            ));
+        }
+    }
     if let Some(server) = server.as_ref() {
         remember_opencode_session(server, task.session_key.as_deref(), &response.session_id);
     }
@@ -2791,6 +2832,14 @@ fn parse_opencode_json_line(
     Some((session_id, text, error))
 }
 
+fn opencode_session_id_from_line(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("sessionID")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     let part = value.get("part")?;
@@ -2839,7 +2888,30 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let approval_required = part
+        .get("state")
+        .and_then(|state| state.get("output").or_else(|| state.get("result")))
+        .map(|output| match output {
+            Value::String(value) => value.clone(),
+            value => value.to_string(),
+        })
+        .filter(|output| {
+            output.contains("\"status\":\"approval_required\"")
+                || output.contains("\"status\": \"approval_required\"")
+        });
     match status {
+        "completed" if approval_required.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            success: false,
+            error: Some(format!(
+                "config[approval_required]: {}",
+                approval_required.unwrap_or_default()
+            )),
+            risk,
+            arguments_digest,
+            display_context,
+        }),
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
@@ -3437,6 +3509,7 @@ mod tests {
                 }
             })),
             session_key: None,
+            opencode_session_id: None,
         };
 
         let prompt = execution_contract_context(&task);
@@ -3568,6 +3641,7 @@ mod tests {
                 "runtime_inputs": { "operator_notes": null }
             })),
             session_key: None,
+            opencode_session_id: None,
         };
 
         let result = result_from_structured_response(
@@ -3601,6 +3675,7 @@ mod tests {
                 "runtime_inputs": { "operator_notes": "approval granted" }
             })),
             session_key: None,
+            opencode_session_id: None,
         };
 
         assert!(task_requires_env_update_commit(&task));
@@ -3612,6 +3687,7 @@ mod tests {
         let task = AiWorkerTask {
             execution_contract: None,
             session_key: None,
+            opencode_session_id: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));
@@ -3623,6 +3699,7 @@ mod tests {
         let task = AiWorkerTask {
             execution_contract: None,
             session_key: None,
+            opencode_session_id: None,
         };
 
         assert!(!task_requires_env_update_commit(&task));
@@ -3775,6 +3852,18 @@ mod tests {
         let failed = parse_opencode_stream_event(
             r#"{"part":{"type":"tool","callID":"call-2","tool":"jira_search","state":{"status":"error","error":"Connection refused while reading stdout."}}}"#,
         );
+
+        let approval = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"call-3","tool":"ocp_restart_deployment","state":{"status":"completed","input":{"name":"api","namespace":"prod"},"output":"{\"status\":\"approval_required\",\"operation\":\"ocp_restart_deployment\"}"}}}"#,
+        );
+        assert!(matches!(
+            approval,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: false,
+                error: Some(ref error),
+                ..
+            }) if error.contains("[approval_required]")
+        ));
         assert_eq!(
             failed,
             Some(AiWorkerStreamEvent::ToolCompleted {

@@ -5,6 +5,7 @@ node_modules
 /package
 /playwright-report
 /test-results
+/tests/responsiveness-artifacts
 .env
 .env.*
 !.env.example

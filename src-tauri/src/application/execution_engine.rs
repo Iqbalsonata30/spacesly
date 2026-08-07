@@ -269,6 +269,15 @@ impl TaskExecutionContext {
         )
     }
 
+    /// Loads the durable OpenCode identity owned by this Task Session under the
+    /// current assignment fence.
+    pub fn opencode_session_id(&self) -> Result<Option<String>, TaskExecutionError> {
+        self.event_sink
+            .store
+            .assignment_opencode_session(self.event_sink.fence)
+            .map_err(TaskExecutionError::new)
+    }
+
     /// Appends a structured event using this assignment's durable fencing token.
     pub fn emit_event(
         &self,
@@ -302,6 +311,22 @@ pub struct TaskEventReporter {
 }
 
 impl TaskEventReporter {
+    pub fn bind_opencode_session(
+        &self,
+        opencode_session_id: &str,
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        let event = self
+            .event_sink
+            .store
+            .bind_opencode_session(self.event_sink.fence, opencode_session_id)
+            .map_err(TaskExecutionError::new)?;
+        self.event_sink.notifier.publish(TaskSessionUpdate {
+            session_id: event.session_id,
+            latest_sequence: event.sequence,
+        });
+        Ok(event)
+    }
+
     pub fn emit_event(
         &self,
         kind: TaskSessionEventKind,
@@ -773,6 +798,41 @@ impl ExecutionEngine {
         receive(response)?
     }
 
+    /// Requeues the same blocked Task Session after an explicit UI approval.
+    pub fn resume_after_approval(
+        &self,
+        id: TaskSessionId,
+        label: impl Into<String>,
+        envelope: &TaskSessionEnvelope,
+        capabilities: Vec<String>,
+    ) -> Result<TaskSessionSnapshot, ExecutionEngineError> {
+        let label = label.into();
+        if label.trim().is_empty() {
+            return Err(ExecutionEngineError::InvalidRequest(
+                "Task label is required.".to_string(),
+            ));
+        }
+        let requested = &envelope.session().requested_capabilities;
+        if let Some(capability) = capabilities
+            .iter()
+            .find(|capability| !requested.contains(capability))
+        {
+            return Err(ExecutionEngineError::InvalidRequest(format!(
+                "Task capability '{capability}' was not requested by the resumed envelope."
+            )));
+        }
+        let request = TaskRequest::from_envelope(label, envelope)
+            .map_err(ExecutionEngineError::InvalidRequest)?;
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::ResumeAfterApproval {
+            id,
+            request,
+            capabilities,
+            reply,
+        })?;
+        receive(response)?
+    }
+
     /// Subscribes to best-effort post-commit wake-ups; durable replay remains authoritative.
     pub fn subscribe_updates(&self) -> mpsc::Receiver<TaskSessionUpdate> {
         self.notifier.subscribe()
@@ -962,6 +1022,12 @@ enum SchedulerCommand {
         grant_source: String,
         reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
     },
+    ResumeAfterApproval {
+        id: TaskSessionId,
+        request: TaskRequest,
+        capabilities: Vec<String>,
+        reply: mpsc::Sender<Result<TaskSessionSnapshot, ExecutionEngineError>>,
+    },
     Cancel {
         id: TaskSessionId,
         reply: mpsc::Sender<Result<bool, ExecutionEngineError>>,
@@ -1135,6 +1201,26 @@ fn run_scheduler(
                     let result = scheduler
                         .store
                         .enqueue_with_grants(&request, &capabilities, &grant_source)
+                        .map_err(ExecutionEngineError::Persistence);
+                    if let Ok(snapshot) = &result {
+                        scheduler.publish(snapshot);
+                    }
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::ResumeAfterApproval {
+                    id,
+                    request,
+                    capabilities,
+                    reply,
+                }) => {
+                    let result = scheduler
+                        .store
+                        .resume_after_approval(
+                            id,
+                            &request,
+                            &capabilities,
+                            "renderer_user_approval",
+                        )
                         .map_err(ExecutionEngineError::Persistence);
                     if let Ok(snapshot) = &result {
                         scheduler.publish(snapshot);

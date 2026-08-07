@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "bun tests/themes.ts && bun tests/icons.ts && bun tests/agentRules.ts && bun tests/agentSkills.ts && bun tests/editorDocument.ts && bun tests/taskSessions.ts",
     "test:ui": "playwright test",
+    "test:responsive": "bun tests/responsiveness.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",

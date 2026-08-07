@@ -14,6 +14,7 @@ import {
   executeAgentTaskSession,
   planAgentTaskConnectors,
   prepareAgentTaskSession,
+  resumeAgentTaskSession,
   validateAgentTaskSessionResult,
   waitForAgentTaskSession,
   type AgentTaskSessionDependencies,
@@ -511,6 +512,7 @@ function terminalSnapshot(id: number): TaskSessionSnapshot {
     attempt: 1,
     attempt_id: 4,
     fencing_token: 7,
+    opencode_session_id: "opencode-session-x",
     lease_expires_at: null,
     progress: null,
     last_event_sequence: 1,
@@ -609,6 +611,31 @@ assertEqual(
   [firstExecution.session.id, secondExecution.session.id].sort(),
   submittedIds.sort(),
   "concurrent cards should retain independent Task Session identities",
+);
+
+let resumedTaskSessionId: number | null = null;
+const resumedExecution = await resumeAgentTaskSession(42, "approved", prepared, {
+  dependencies: {
+    ...independentDependencies,
+    resume: async (sessionId) => {
+      resumedTaskSessionId = sessionId;
+      return {
+        ...terminalSnapshot(sessionId),
+        state: "queued",
+        attempt_id: null,
+        last_event_sequence: 0,
+      };
+    },
+  },
+});
+assertEqual(
+  {
+    requestedId: resumedTaskSessionId,
+    returnedId: resumedExecution.session.id,
+    opencodeSessionId: resumedExecution.session.opencode_session_id,
+  },
+  { requestedId: 42, returnedId: 42, opencodeSessionId: "opencode-session-x" },
+  "approval continuation should wait on the same durable Task Session identity",
 );
 
 let timeoutCancelledSession: number | null = null;

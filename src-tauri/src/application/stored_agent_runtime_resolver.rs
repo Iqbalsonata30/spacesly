@@ -3,6 +3,7 @@ use crate::domain::task_session::TaskSessionEnvelopeV1;
 use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerMcpServer, AiWorkerTask};
 use crate::infrastructure::execution_store::{ChatConversationSnapshot, ExecutionStore};
 use crate::infrastructure::files::WorkspaceRoot;
+use crate::infrastructure::ocp;
 use crate::infrastructure::provider_registry;
 use crate::infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
 use crate::infrastructure::secrets::AppSecretsStore;
@@ -90,6 +91,10 @@ impl StoredAgentRuntimeResolver {
             .iter()
             .map(|connector_id| {
                 let connector = self.secrets.mcp_connector(connector_id)?;
+                let environment = self.secrets.mcp_environment(connector_id)?;
+                if ocp::is_ocp_connector_env(&environment) {
+                    return ocp::ocp_worker_server(connector_id, &environment);
+                }
                 let mut command = Vec::with_capacity(connector.args.len() + 1);
                 command.push(connector.command);
                 command.extend(connector.args);
@@ -97,7 +102,7 @@ impl StoredAgentRuntimeResolver {
                     name: connector_id.clone(),
                     secret_id: connector_id.clone(),
                     command,
-                    environment: self.secrets.mcp_environment(connector_id)?,
+                    environment,
                     proxy_authority: None,
                 })
             })
@@ -188,7 +193,7 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             return Err("Agent runtime attempt ID is required.".to_string());
         }
         envelope.validate_agent_runtime_ownership()?;
-        let runtime = self.resolve_prompt_runtime(envelope)?;
+        let mut runtime = self.resolve_prompt_runtime(envelope)?;
 
         let execution_run_id = envelope
             .execution_run_id
@@ -217,12 +222,28 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             return Err("Execution contract workspace did not match the envelope.".to_string());
         }
 
+        if let Some(approval) = ocp::contract_approved_mutation(&run.contract) {
+            for server in &mut runtime.config.mcp_servers {
+                if server.environment.contains_key(ocp::ENV_MODE) {
+                    server.environment.insert(
+                        ocp::ENV_APPROVED_OPERATION.to_string(),
+                        approval.operation.clone(),
+                    );
+                    server.environment.insert(
+                        ocp::ENV_APPROVED_ARGUMENTS_DIGEST.to_string(),
+                        approval.arguments_digest.clone(),
+                    );
+                }
+            }
+        }
+
         Ok(ResolvedAgentTask {
             runtime_profile_id: runtime.runtime_profile_id,
             config: runtime.config,
             task: AiWorkerTask {
                 execution_contract: Some(run.contract),
                 session_key: Some(runtime_attempt_id.to_string()),
+                opencode_session_id: None,
             },
         })
     }

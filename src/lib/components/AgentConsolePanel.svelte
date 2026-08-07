@@ -4,6 +4,7 @@
   import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
     AgentRunLog,
+    AgentApprovalRequest,
     AgentRunStatus,
     AgentSessionEvent,
     AgentTerminalLine,
@@ -25,6 +26,7 @@
     terminalLines: AgentTerminalLine[];
     terminalInput: string;
     runCardId: string | null;
+    approval: AgentApprovalRequest | null;
     cancelPending: boolean;
     onClose: () => void;
     onCancel: (cardId: string) => void;
@@ -32,6 +34,8 @@
     onSubmitTerminalInput: () => void;
     onOpenCard: (cardId: string) => void;
     onMarkBlockedDone: (cardId: string) => void;
+    onApprove: (cardId: string) => void;
+    onDecline: (cardId: string) => void;
   };
 
   let {
@@ -48,6 +52,7 @@
     terminalLines,
     terminalInput,
     runCardId,
+    approval,
     cancelPending,
     onClose,
     onCancel,
@@ -55,6 +60,8 @@
     onSubmitTerminalInput,
     onOpenCard,
     onMarkBlockedDone,
+    onApprove,
+    onDecline,
   }: Props = $props();
 
   let technicalOpen = $state(false);
@@ -266,6 +273,47 @@
       </div>
     {/if}
   </header>
+
+  {#if approval && runCardId}
+    <section class="approval-card" aria-label="Action approval required" aria-live="polite">
+      <div class="approval-heading">
+        <div>
+          <span class="approval-eyebrow">Approval required</span>
+          <h3>{approval.label}</h3>
+        </div>
+        <span class={`risk-badge ${approval.risk}`}>{approval.risk}</span>
+      </div>
+      <p>
+        Review this action before allowing the Agent to continue. Approval applies only to this
+        exact operation and arguments in the next run.
+      </p>
+      <dl class="approval-details">
+        <div><dt>Operation</dt><dd>{approval.operation}</dd></div>
+        {#if approval.target}<div><dt>Target</dt><dd>{approval.target}</dd></div>{/if}
+        <div><dt>Category</dt><dd>{approval.category}</dd></div>
+      </dl>
+      {#if approval.status === "declined"}
+        <div class="approval-declined">Declined — no action was authorized.</div>
+      {:else}
+        <div class="approval-actions">
+          <button
+            type="button"
+            class="decline-action"
+            disabled={approval.status === "approving"}
+            onclick={() => onDecline(runCardId)}>Decline</button
+          >
+          <button
+            type="button"
+            class="approve-action"
+            disabled={isWorking || approval.status === "approving"}
+            title={isWorking ? "Waiting for the Agent to pause safely" : undefined}
+            onclick={() => onApprove(runCardId)}
+            >{approval.status === "approving" ? "Approving…" : "Approve & Continue"}</button
+          >
+        </div>
+      {/if}
+    </section>
+  {/if}
 
   {#if isBlocked}
     <section
@@ -492,7 +540,7 @@
           }}
         >
           <input
-            placeholder="Add a note or approval"
+            placeholder="Add an operator note"
             value={terminalInput}
             oninput={(event) => onTerminalInputChange(event.currentTarget.value)}
           /><button type="submit">Send</button>
@@ -667,11 +715,121 @@
     font-weight: 850;
   }
   .console-section,
-  .attention-card {
+  .attention-card,
+  .approval-card {
     margin: 12px 14px 0;
     border: 1px solid var(--border-subtle);
     border-radius: 13px;
     background: var(--surface-raised);
+  }
+  .approval-card {
+    padding: 14px;
+    border-color: color-mix(in srgb, var(--accent) 38%, var(--border-subtle));
+    background: color-mix(in srgb, var(--selection-bg) 36%, var(--surface-raised));
+  }
+  .approval-heading,
+  .approval-actions {
+    display: flex;
+    align-items: center;
+  }
+  .approval-heading {
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .approval-eyebrow {
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .approval-heading h3 {
+    margin: 4px 0 0;
+    overflow-wrap: anywhere;
+    font-size: 14px;
+    line-height: 1.3;
+  }
+  .risk-badge {
+    flex: 0 0 auto;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 3px 7px;
+    color: var(--text-secondary);
+    font-size: 9px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+  .risk-badge.destructive,
+  .risk-badge.credential_sensitive {
+    border-color: var(--danger-border);
+    color: var(--danger);
+  }
+  .approval-card > p {
+    margin: 10px 0 0;
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .approval-details {
+    display: grid;
+    gap: 5px;
+    margin: 12px 0 0;
+  }
+  .approval-details div {
+    display: grid;
+    grid-template-columns: 68px minmax(0, 1fr);
+    gap: 8px;
+  }
+  .approval-details dt,
+  .approval-details dd {
+    margin: 0;
+    font-size: 10px;
+  }
+  .approval-details dt {
+    color: var(--text-dim);
+    font-weight: 800;
+  }
+  .approval-details dd {
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+  }
+  .approval-actions {
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .approval-actions button {
+    min-height: 32px;
+    border-radius: 8px;
+    padding: 0 11px;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 900;
+  }
+  .decline-action {
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--text-primary);
+  }
+  .approve-action {
+    border: 0;
+    background: var(--accent);
+    color: var(--surface);
+  }
+  .approval-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .approval-declined {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 750;
   }
   .section-heading {
     justify-content: space-between;

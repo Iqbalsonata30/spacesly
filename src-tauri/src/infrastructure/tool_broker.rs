@@ -47,7 +47,10 @@ pub fn tool_display_context(tool_name: &str, arguments: &serde_json::Value) -> T
         "git"
     } else if normalized.contains("jira") || normalized.contains("atlassian") {
         "jira"
-    } else if normalized.contains("kubernetes") || normalized.contains("kube") {
+    } else if normalized.contains("kubernetes")
+        || normalized.contains("kube")
+        || normalized.starts_with("ocp_")
+    {
         "kubernetes"
     } else if normalized.contains("bamboo") {
         "bamboo"
@@ -513,6 +516,13 @@ mod tests {
         assert_eq!(jira.category, "jira");
         assert_eq!(jira.target.as_deref(), Some("APP-123"));
         assert!(!jira.label.contains("private"));
+
+        let openshift = tool_display_context(
+            "ocp_restart_deployment",
+            &serde_json::json!({"namespace": "payments", "name": "api"}),
+        );
+        assert_eq!(openshift.category, "kubernetes");
+        assert_eq!(openshift.target.as_deref(), Some("api"));
     }
 
     #[test]

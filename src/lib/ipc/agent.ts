@@ -79,6 +79,13 @@ export interface ExecutionContract {
   runtime_inputs: {
     operator_notes: string | null;
     previous_output: string | null;
+    approvals?: Array<{
+      operation: string;
+      arguments_digest: string;
+      decision: "approved";
+      decided_at: string;
+      contract_version: number;
+    }>;
     selected_skill_ids?: string[];
     selected_skills_snapshot?: string;
   };

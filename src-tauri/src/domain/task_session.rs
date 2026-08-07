@@ -928,6 +928,8 @@ pub struct TaskSessionSnapshot {
     pub attempt_id: Option<u64>,
     /// Monotonic token that fences stale Worker completions.
     pub fencing_token: u64,
+    /// Durable OpenCode conversation identity owned by this Task Session.
+    pub opencode_session_id: Option<String>,
     /// Lease expiry for a currently running assignment, in Unix milliseconds.
     pub lease_expires_at: Option<u64>,
     /// Latest semantic progress projection, if the session has reported progress.
