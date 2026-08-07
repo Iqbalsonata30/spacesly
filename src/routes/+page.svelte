@@ -1400,6 +1400,7 @@
   async function hydrateDurableExecutionRuns() {
     try {
       const runs = await listActiveExecutionRuns();
+      if (runs.length === 0) return;
       const retainedTaskSessions =
         typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
           ? await listTaskSessions()

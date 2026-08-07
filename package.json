@@ -7,7 +7,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "bun tests/themes.ts && bun tests/icons.ts && bun tests/agentRules.ts && bun tests/agentSkills.ts && bun tests/editorDocument.ts && bun tests/taskSessions.ts",
+    "test": "bun test",
     "test:ui": "playwright test",
     "test:responsive": "bun tests/responsiveness.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
