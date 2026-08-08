@@ -34,6 +34,8 @@ const HIDDEN_PRESENTATION_LABELS = new Set(["board", "local", "model", "operator
 
 export function timelineActivities(logs: AgentRunLog[], limit = 10): TimelineActivity[] {
   const activities: TimelineActivity[] = [];
+  const activitiesByKey = new Map<string, TimelineActivity>();
+  const sectionLinesByKey = new Map<string, Map<string, Set<string>>>();
   const seenLogIds = new Set<string>();
   let terminalStatus: Extract<TimelineStatus, "completed" | "failed" | "cancelled"> | null = null;
   for (const log of logs) {
@@ -45,8 +47,7 @@ export function timelineActivities(logs: AgentRunLog[], limit = 10): TimelineAct
     const lifecycleState = lifecycleStateFromLog(log);
     const incomingTerminalStatus = terminalActivityStatus(lifecycleState);
     if (terminalStatus && !incomingTerminalStatus) continue;
-    const existingIndex = activities.findIndex((candidate) => candidate.key === activity.key);
-    const existing = existingIndex >= 0 ? activities[existingIndex] : null;
+    const existing = activitiesByKey.get(activity.key) ?? null;
 
     if (incomingTerminalStatus) {
       terminalStatus = incomingTerminalStatus;
@@ -72,12 +73,19 @@ export function timelineActivities(logs: AgentRunLog[], limit = 10): TimelineAct
       existing.summary = activity.summary;
       existing.status = activity.status;
       existing.importance = activity.importance;
-      existing.sections = mergeSections(existing.sections, activity.sections);
+      existing.sections = mergeSections(
+        existing.sections,
+        activity.sections,
+        sectionLinesByKey.get(activity.key)!,
+      );
+      const existingIndex = activities.indexOf(existing);
       activities.splice(existingIndex, 1);
       activities.push(existing);
       continue;
     }
     activities.push(activity);
+    activitiesByKey.set(activity.key, activity);
+    sectionLinesByKey.set(activity.key, sectionLineIndex(activity.sections));
   }
   return activities.slice(-limit).reverse();
 }
@@ -395,17 +403,31 @@ function firstUsefulLine(lines: string[]): string | null {
   return lines.map(cleanTimelineLine).find(Boolean) ?? null;
 }
 
-function mergeSections(left: TimelineSection[], right: TimelineSection[]): TimelineSection[] {
-  const merged = left.map((section) => ({ ...section, lines: [...section.lines] }));
+function sectionLineIndex(sections: TimelineSection[]): Map<string, Set<string>> {
+  return new Map(sections.map((section) => [section.title, new Set(section.lines)]));
+}
+
+function mergeSections(
+  left: TimelineSection[],
+  right: TimelineSection[],
+  lineIndex: Map<string, Set<string>>,
+): TimelineSection[] {
+  const sectionsByTitle = new Map(left.map((section) => [section.title, section]));
   for (const section of right) {
-    const existing = merged.find((candidate) => candidate.title === section.title);
+    const existing = sectionsByTitle.get(section.title);
     if (!existing) {
-      merged.push({ ...section, lines: [...section.lines] });
+      const added = { ...section, lines: [...section.lines] };
+      left.push(added);
+      sectionsByTitle.set(section.title, added);
+      lineIndex.set(section.title, new Set(section.lines));
       continue;
     }
+    const knownLines = lineIndex.get(section.title)!;
     for (const line of section.lines) {
-      if (!existing.lines.includes(line)) existing.lines.push(line);
+      if (knownLines.has(line)) continue;
+      knownLines.add(line);
+      existing.lines.push(line);
     }
   }
-  return merged;
+  return left;
 }
