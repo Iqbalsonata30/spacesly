@@ -90,6 +90,7 @@ export type AgentTaskSessionDependencies = {
 export type ExecuteAgentTaskSessionOptions = {
   timeoutMs?: number;
   cancellationTimeoutMs?: number;
+  initialEventSequence?: number;
   onEvent?: (event: TaskSessionEvent) => void;
   onSubmitted?: (session: TaskSessionSnapshot) => void;
   dependencies?: Partial<AgentTaskSessionDependencies>;
@@ -397,7 +398,11 @@ export async function resumeAgentTaskSession(
     throw new Error("Scheduler replaced the Task Session during approval resume.");
   }
   options.onSubmitted?.(resumed);
-  return waitForAgentTaskSession(sessionId, { ...options, dependencies: deps });
+  return waitForAgentTaskSession(sessionId, {
+    ...options,
+    initialEventSequence: resumed.last_event_sequence,
+    dependencies: deps,
+  });
 }
 
 /** Continues the same interrupted Task Session and Task Session-owned OpenCode session. */
@@ -421,7 +426,11 @@ export async function continueAgentTaskSession(
     throw new Error("Continued Task Session lost its durable OpenCode session identity.");
   }
   options.onSubmitted?.(resumed);
-  return waitForAgentTaskSession(sessionId, { ...options, dependencies: deps });
+  return waitForAgentTaskSession(sessionId, {
+    ...options,
+    initialEventSequence: resumed.last_event_sequence,
+    dependencies: deps,
+  });
 }
 
 /** Replays one retained Agent Task Session without resubmitting it. */
@@ -431,7 +440,7 @@ export async function waitForAgentTaskSession(
 ): Promise<AgentTaskSessionExecution> {
   const deps = { ...defaultDependencies, ...options.dependencies };
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  let cursor = 0;
+  let cursor = options.initialEventSequence ?? 0;
   let terminalAttemptId: number | null = null;
   let terminalFencingToken: number | null = null;
   let candidateAttemptId: number | null = null;

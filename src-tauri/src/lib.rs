@@ -2,6 +2,10 @@ mod application;
 mod domain;
 mod infrastructure;
 
+pub fn initialize_performance() {
+    infrastructure::performance::initialize();
+}
+
 pub fn run_mcp_proxy() -> Result<(), String> {
     infrastructure::mcp::run_mcp_proxy_from_env()
 }
@@ -74,6 +78,7 @@ use infrastructure::ocp::{
     save_draft as ocp_save_draft_impl, OcpConfigInput, OcpConfigSpec, OcpConnectorStatus, OcpError,
     OcpSecretStatus, OcpStructuredError, OcpTimeoutPolicy, PreflightReport,
 };
+use infrastructure::performance::{FrontendStartupMetrics, PerformanceMode, PerformanceSnapshot};
 use infrastructure::provider_registry::profile as provider_profile;
 use infrastructure::pty::{
     close_all_terminals, close_pty_terminal as close_pty_terminal_impl,
@@ -219,6 +224,29 @@ fn file_ipc_error(operation: &str, error: impl std::fmt::Display) -> String {
 #[tauri::command]
 fn get_workspace(app_state: State<'_, AppState>) -> Workspace {
     app_state.workspace()
+}
+
+#[tauri::command]
+fn get_performance_metrics() -> PerformanceSnapshot {
+    infrastructure::performance::snapshot()
+}
+
+#[tauri::command]
+fn set_performance_mode(mode: PerformanceMode) -> PerformanceSnapshot {
+    infrastructure::performance::set_mode(mode);
+    infrastructure::performance::snapshot()
+}
+
+#[tauri::command]
+fn reset_performance_metrics() -> PerformanceSnapshot {
+    infrastructure::performance::reset();
+    infrastructure::performance::snapshot()
+}
+
+#[tauri::command]
+fn record_frontend_startup(metrics: FrontendStartupMetrics) {
+    infrastructure::performance::record_frontend_startup(metrics);
+    infrastructure::performance::write_startup_report_if_configured();
 }
 
 #[tauri::command]
@@ -2941,6 +2969,7 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    infrastructure::performance::initialize();
     let pty_state: PtyState = Arc::new(Mutex::new(PtyRegistry::new()));
     let shutdown_state = pty_state.clone();
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
@@ -3032,6 +3061,7 @@ pub fn run() {
         .manage(AgentRunRegistry::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            infrastructure::performance::mark_backend_ready();
             let app_handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("spacesly-task-session-events".to_string())
@@ -3054,6 +3084,11 @@ pub fn run() {
                             }
                         }
                         for update in latest.into_values() {
+                            infrastructure::performance::increment(
+                                "task_session_update_events",
+                                "ipc_event",
+                                1,
+                            );
                             let _ = app_handle
                                 .emit::<TaskSessionUpdate>(TASK_SESSION_UPDATE_EVENT, update);
                         }
@@ -3062,6 +3097,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_performance_metrics,
+            set_performance_mode,
+            reset_performance_metrics,
+            record_frontend_startup,
             get_workspace,
             get_jira_issues,
             get_jira_boards,

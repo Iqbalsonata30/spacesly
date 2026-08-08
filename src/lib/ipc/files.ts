@@ -1,5 +1,6 @@
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { recordIpcEvent } from "$lib/performance";
 
 export interface FileEntry {
   name: string;
@@ -109,5 +110,8 @@ export async function unwatchWorkspaceFiles(workspaceId: string): Promise<boolea
 export function onWorkspaceFileChange(
   handler: (change: WorkspaceFileChange) => void,
 ): Promise<UnlistenFn> {
-  return listen<WorkspaceFileChange>("workspace-file-change", (event) => handler(event.payload));
+  return listen<WorkspaceFileChange>("workspace-file-change", (event) => {
+    recordIpcEvent("workspace-file-change", event.payload);
+    handler(event.payload);
+  });
 }

@@ -1,5 +1,6 @@
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { recordIpcEvent } from "$lib/performance";
 
 const TASK_SESSION_UPDATE_EVENT = "task-session-update";
 const taskSessionActivityHandlers = new Set<(update: TaskSessionUpdate) => void>();
@@ -410,6 +411,7 @@ export async function onTaskSessionActivity(
   if (!taskSessionActivityUnlisten) {
     taskSessionActivityUnlisten = listen<unknown>(TASK_SESSION_UPDATE_EVENT, (event) => {
       if (!isTaskSessionUpdate(event.payload)) return;
+      recordIpcEvent(TASK_SESSION_UPDATE_EVENT, event.payload);
       for (const subscriber of taskSessionActivityHandlers) subscriber(event.payload);
     });
   }

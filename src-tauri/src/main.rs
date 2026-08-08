@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    spacesly_lib::initialize_performance();
     if std::env::args().any(|argument| argument == "--spacesly-task-tools") {
         if let Err(error) = spacesly_lib::run_task_tools() {
             eprintln!("{error}");

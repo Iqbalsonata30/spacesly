@@ -1,4 +1,5 @@
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { measuredInvoke as invoke } from "$lib/performance";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 import type { FileEntry } from "$lib/ipc/files";

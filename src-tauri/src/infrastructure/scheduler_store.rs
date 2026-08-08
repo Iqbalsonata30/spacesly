@@ -20,7 +20,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -641,6 +641,9 @@ impl SchedulerStore {
     }
 
     pub(crate) fn register_owner(&self) -> Result<u64, String> {
+        let _metric =
+            crate::infrastructure::performance::span("scheduler_owner_register", "sqlite_write");
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let now = now_millis();
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         connection
@@ -677,6 +680,11 @@ impl SchedulerStore {
         grant_source: &str,
         now: u64,
     ) -> Result<TaskSessionSnapshot, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "task_session_enqueue",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let capabilities = validate_capability_grants(capabilities, grant_source)?;
         let ownership = request_ownership(request);
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
@@ -776,6 +784,11 @@ impl SchedulerStore {
         approval_resume: bool,
         action: &str,
     ) -> Result<TaskSessionSnapshot, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "task_session_resume",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let now = now_millis();
         let capabilities = validate_capability_grants(capabilities, grant_source)?;
         let ownership = request_ownership(request);
@@ -903,35 +916,50 @@ impl SchedulerStore {
             },
             now,
         )?;
+        let resumed = load_session(&transaction, id)?
+            .ok_or_else(|| "Resumed Task Session was not found.".to_string())?;
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit Task Session continuation: {error}"))?;
-        drop(connection);
-        self.get_session(id)?
-            .ok_or_else(|| "Resumed Task Session was not found.".to_string())
+        Ok(resumed)
     }
 
     pub(crate) fn get_session(
         &self,
         id: TaskSessionId,
     ) -> Result<Option<TaskSessionSnapshot>, String> {
+        let _metric = crate::infrastructure::performance::span("task_session_get", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
+        let lock_started = Instant::now();
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
         load_session(&connection, id)
     }
 
     pub(crate) fn list_sessions(&self) -> Result<Vec<TaskSessionSnapshot>, String> {
+        let _metric = crate::infrastructure::performance::span("task_session_list", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
+        let lock_started = Instant::now();
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
         let mut statement = connection
             .prepare(SESSION_SELECT_ALL)
             .map_err(|error| format!("Failed to prepare scheduler session query: {error}"))?;
         let rows = statement
             .query_map([], stored_session_from_row)
             .map_err(|error| format!("Failed to query scheduler sessions: {error}"))?;
-        rows.map(|row| {
-            row.map_err(|error| format!("Failed to decode scheduler session: {error}"))?
-                .into_snapshot()
-        })
-        .collect()
+        let sessions = rows
+            .map(|row| {
+                row.map_err(|error| format!("Failed to decode scheduler session: {error}"))?
+                    .into_snapshot()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::infrastructure::performance::increment(
+            "sqlite_rows_read_total",
+            "sqlite",
+            sessions.len() as u64,
+        );
+        Ok(sessions)
     }
 
     pub(crate) fn append_assignment_event(
@@ -948,6 +976,9 @@ impl SchedulerStore {
         input: TaskSessionEventInput,
         now: u64,
     ) -> Result<TaskSessionEvent, String> {
+        let _metric =
+            crate::infrastructure::performance::span("journal_append", "sqlite_write_transaction");
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         match (&input.kind, &input.progress) {
             (TaskSessionEventKind::Lifecycle, _) => {
                 return Err("Task lifecycle events are Scheduler-owned.".to_string());
@@ -965,7 +996,9 @@ impl SchedulerStore {
             .as_ref()
             .map(TaskProgress::validate)
             .transpose()?;
+        let lock_started = Instant::now();
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("Failed to start task event transaction: {error}"))?;
@@ -992,6 +1025,8 @@ impl SchedulerStore {
         session_id: TaskSessionId,
         sequence: u64,
     ) -> Result<Vec<TaskSessionEvent>, String> {
+        let _metric = crate::infrastructure::performance::span("journal_replay", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
@@ -1021,10 +1056,15 @@ impl SchedulerStore {
         sequence: u64,
         limit: usize,
     ) -> Result<TaskSessionEventPage, String> {
+        let _metric =
+            crate::infrastructure::performance::span("journal_page", "sqlite_read_transaction");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         if !(1..=500).contains(&limit) {
             return Err("Task Session event page limit must be between 1 and 500.".to_string());
         }
+        let lock_started = Instant::now();
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
         let transaction = connection
             .transaction()
             .map_err(|error| format!("Failed to start task event page transaction: {error}"))?;
@@ -1068,6 +1108,11 @@ impl SchedulerStore {
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = events.len() > limit;
         events.truncate(limit);
+        crate::infrastructure::performance::increment(
+            "sqlite_rows_read_total",
+            "sqlite",
+            events.len() as u64,
+        );
         let next_cursor = events.last().map_or(sequence, |event| event.sequence);
         drop(statement);
         transaction
@@ -4367,6 +4412,36 @@ mod tests {
         session.subject_id = Some(subject_id.to_string());
         session.execution_run_id = Some(format!("run-{label}"));
         TaskRequest::from_envelope(label, &envelope).expect("owned request")
+    }
+
+    #[test]
+    #[ignore = "repeatable performance harness; run explicitly with --ignored --nocapture"]
+    fn performance_baseline_sqlite_task_sessions() {
+        crate::infrastructure::performance::reset();
+        let store = SchedulerStore::open_in_memory().expect("benchmark store");
+        for index in 0..1_000 {
+            store
+                .enqueue(&owned_agent_request(
+                    &format!("benchmark-{index}"),
+                    &format!("conversation-{index}"),
+                    &format!("subject-{index}"),
+                ))
+                .expect("benchmark session enqueued");
+        }
+        let sessions = store.list_sessions().expect("benchmark sessions listed");
+        for session in sessions.iter().rev().take(100) {
+            store
+                .get_session(session.id)
+                .expect("benchmark session loaded");
+            store
+                .event_page(session.id, 0, 100)
+                .expect("benchmark journal page loaded");
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::infrastructure::performance::snapshot())
+                .expect("benchmark snapshot encoded")
+        );
     }
 
     fn agent_output(status: AgentTaskCompletionStatus) -> TaskExecutionOutput {

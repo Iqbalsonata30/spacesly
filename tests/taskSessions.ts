@@ -632,6 +632,7 @@ assertEqual(
 );
 
 const submittedIds: number[] = [];
+const initialEventSequences = new Map<number, number>();
 let nextSessionId = 20;
 const independentDependencies: Partial<AgentTaskSessionDependencies> = {
   submit: async () => {
@@ -640,17 +641,22 @@ const independentDependencies: Partial<AgentTaskSessionDependencies> = {
     return { ...terminalSnapshot(id), state: "queued", attempt_id: null, last_event_sequence: 0 };
   },
   watch: async () => ({ unlisten() {}, acknowledge() {} }),
-  listEvents: async (sessionId) => ({
+  listEvents: async (sessionId, afterSequence) => {
+    if (!initialEventSequences.has(sessionId)) {
+      initialEventSequences.set(sessionId, afterSequence);
+    }
+    return {
     events: [
       {
-        ...event(1, "lifecycle", { state: "succeeded" }, null, sessionId),
+          ...event(afterSequence + 1, "lifecycle", { state: "succeeded" }, null, sessionId),
         attempt_id: 4,
         fencing_token: 7,
       },
     ],
-    next_cursor: 1,
+      next_cursor: afterSequence + 1,
     has_more: false,
-  }),
+    };
+  },
   getSession: async (sessionId) => terminalSnapshot(sessionId),
   getResult: async (sessionId) => taskResult(sessionId),
 };
@@ -674,7 +680,7 @@ const resumedExecution = await resumeAgentTaskSession(42, "approved", prepared, 
         ...terminalSnapshot(sessionId),
         state: "queued",
         attempt_id: null,
-        last_event_sequence: 0,
+        last_event_sequence: 7,
       };
     },
   },
@@ -684,9 +690,15 @@ assertEqual(
     requestedId: resumedTaskSessionId,
     returnedId: resumedExecution.session.id,
     opencodeSessionId: resumedExecution.session.opencode_session_id,
+    initialEventSequence: initialEventSequences.get(42),
   },
-  { requestedId: 42, returnedId: 42, opencodeSessionId: "opencode-session-x" },
-  "approval continuation should wait on the same durable Task Session identity",
+  {
+    requestedId: 42,
+    returnedId: 42,
+    opencodeSessionId: "opencode-session-x",
+    initialEventSequence: 7,
+  },
+  "approval continuation should retain identity and skip historical approval events",
 );
 
 let continuedTaskSessionId: number | null = null;
@@ -699,7 +711,7 @@ const continuedExecution = await continueAgentTaskSession(43, "continue", prepar
         ...terminalSnapshot(sessionId),
         state: "queued",
         attempt_id: null,
-        last_event_sequence: 0,
+        last_event_sequence: 9,
       };
     },
   },
@@ -709,9 +721,15 @@ assertEqual(
     requestedId: continuedTaskSessionId,
     returnedId: continuedExecution.session.id,
     opencodeSessionId: continuedExecution.session.opencode_session_id,
+    initialEventSequence: initialEventSequences.get(43),
   },
-  { requestedId: 43, returnedId: 43, opencodeSessionId: "opencode-session-x" },
-  "generic continuation should retain both Task Session and OpenCode session identity",
+  {
+    requestedId: 43,
+    returnedId: 43,
+    opencodeSessionId: "opencode-session-x",
+    initialEventSequence: 9,
+  },
+  "generic continuation should retain identity and skip historical terminal events",
 );
 
 let timeoutCancelledSession: number | null = null;

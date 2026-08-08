@@ -1,4 +1,5 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { measuredInvoke as invoke } from "$lib/performance";
 import { IPC_POLICIES, invokeWithPolicy } from "$lib/ipc/policy";
 
 export interface ShellCommandRequest {

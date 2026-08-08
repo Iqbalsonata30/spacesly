@@ -25,6 +25,8 @@ impl WorkspaceTrustRegistry {
     }
 
     pub fn status_path(&self, path: &Path) -> Result<WorkspaceTrustStatus, String> {
+        let _metric =
+            crate::infrastructure::performance::span("workspace_trust_validation_ms", "workspace");
         let path = canonical_workspace_path(path)?;
         let trusted = self
             .trusted_paths
@@ -82,6 +84,8 @@ impl WorkspaceTrustRegistry {
 }
 
 fn canonical_workspace_path(path: &Path) -> Result<PathBuf, String> {
+    let _metric =
+        crate::infrastructure::performance::span("workspace_canonicalization_ms", "workspace");
     let expanded;
     let path = if path == Path::new("~") || path.starts_with("~/") {
         let relative = path

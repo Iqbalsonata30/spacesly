@@ -1,6 +1,6 @@
 <script lang="ts">
   import AgentConsolePanel from "$lib/components/AgentConsolePanel.svelte";
-  import type { AgentApprovalRequest } from "$lib/agentRun";
+  import type { AgentApprovalRequest, AgentRunStatus } from "$lib/agentRun";
 
   let approval = $state<AgentApprovalRequest | null>({
     id: "approval-test",
@@ -14,19 +14,20 @@
     status: "approving",
   });
   let approvalClicks = $state(0);
+  let runStatus = $state<AgentRunStatus>("blocked");
 </script>
 
 <AgentConsolePanel
   style="position: relative; width: min(900px, 100vw); height: 100vh;"
   title="Approval recovery"
-  status="Blocked"
+  status={runStatus}
   progress={50}
   logs={[]}
   transcript={[]}
   output=""
   result={null}
   executionRun={null}
-  runStatus="blocked"
+  {runStatus}
   terminalLines={[]}
   terminalInput=""
   runCardId="card-test"
@@ -41,8 +42,10 @@
   onApprove={() => {
     approvalClicks += 1;
     approval = null;
+    runStatus = "running";
   }}
   onDecline={() => {}}
 />
 
 <output id="approval-clicks">{approvalClicks}</output>
+<output id="task-status">{runStatus}</output>

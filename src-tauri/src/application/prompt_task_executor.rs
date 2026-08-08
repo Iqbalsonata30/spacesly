@@ -169,6 +169,11 @@ impl PromptTaskExecutor {
             },
             json!({ "runtime_profile_id": envelope.session.runtime_profile_id }),
         )?;
+        let runtime_preparation =
+            crate::infrastructure::performance::span("runtime_preparation_ms", "agent_runtime")
+                .with_context("task_session_id", context.session_id().0.to_string())
+                .with_context("execution_attempt", context.attempt_id().to_string())
+                .with_context("worker_id", context.worker_id().to_string());
         let mut resolved = self
             .resolver
             .resolve(&envelope.session, &envelope.prompt_input)
@@ -186,6 +191,7 @@ impl PromptTaskExecutor {
         resolved.config.fenced_tools_only = true;
         resolved.config.isolated_opencode_process = true;
         resolved.config.mcp_servers.clear();
+        runtime_preparation.finish();
         context.ensure_current()?;
         context.report_progress(
             TaskProgress {
@@ -234,6 +240,9 @@ impl PromptTaskExecutor {
                         .push(event);
                     Ok(())
                 });
+                let provider_request =
+                    crate::infrastructure::performance::span("provider_request_ms", "provider")
+                        .with_context("task_session_id", context.session_id().0.to_string());
                 let result = self.runner.chat(
                     resolved.config,
                     AiWorkerChatRequest {
@@ -250,6 +259,7 @@ impl PromptTaskExecutor {
                     context.cancellation().shared_flag(),
                     callback,
                 );
+                provider_request.finish();
                 drop(callback_guard);
                 let result = result.map_err(TaskExecutionError::new)?;
                 self.resolver
@@ -287,6 +297,9 @@ impl PromptTaskExecutor {
             }
             TaskSessionInputV2::Edit(input) => {
                 let file_path = input.file_path.clone();
+                let provider_request =
+                    crate::infrastructure::performance::span("provider_request_ms", "provider")
+                        .with_context("task_session_id", context.session_id().0.to_string());
                 let result = self
                     .runner
                     .edit(
@@ -295,6 +308,7 @@ impl PromptTaskExecutor {
                         context.cancellation().shared_flag(),
                     )
                     .map_err(TaskExecutionError::new)?;
+                provider_request.finish();
                 if result.content.len() > MAX_PROMPT_RESULT_CONTENT_BYTES
                     || result.summary.len() > MAX_PROMPT_RESULT_SUMMARY_BYTES
                 {

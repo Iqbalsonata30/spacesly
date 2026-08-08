@@ -55,6 +55,14 @@ impl StoredAgentRuntimeResolver {
         &self,
         envelope: &TaskSessionEnvelopeV1,
     ) -> Result<ResolvedPromptRuntime, String> {
+        let total = crate::infrastructure::performance::span(
+            "runtime_context_resolution_ms",
+            "agent_runtime",
+        );
+        let profile_resolution = crate::infrastructure::performance::span(
+            "runtime_profile_resolution_ms",
+            "agent_runtime",
+        );
         let profile = self
             .profiles
             .get(&envelope.runtime_profile_id)?
@@ -64,20 +72,27 @@ impl StoredAgentRuntimeResolver {
                     envelope.runtime_profile_id
                 )
             })?;
+        profile_resolution.finish();
         validate_profile_binding(envelope, &profile)?;
 
+        let workspace_resolution =
+            crate::infrastructure::performance::span("workspace_resolution_ms", "workspace");
         let workspace = resolve_profile_workspace(
             &profile,
             &self.workspace_roots,
             &self.workspace_trust,
             &envelope.workspace_id,
         )?;
+        workspace_resolution.finish();
         if envelope.kind != crate::domain::task_session::TaskSessionKind::Chat {
+            let workspace_validation =
+                crate::infrastructure::performance::span("workspace_validation_ms", "workspace");
             let workspace_revision = self.workspace_roots.revision(&envelope.workspace_id)?;
             if envelope.context_revision.as_deref() != Some(workspace_revision.to_string().as_str())
             {
                 return Err("Prompt workspace revision did not match the envelope.".to_string());
             }
+            workspace_validation.finish();
         }
 
         let (provider_id, model) = profile
@@ -86,6 +101,8 @@ impl StoredAgentRuntimeResolver {
             .ok_or_else(|| "Agent model must use the '<provider>/<model>' form.".to_string())?;
         let provider = provider_registry::profile(provider_id);
 
+        let connector_resolution =
+            crate::infrastructure::performance::span("connector_resolution_ms", "agent_runtime");
         let mcp_servers = envelope
             .connector_ids
             .iter()
@@ -107,8 +124,18 @@ impl StoredAgentRuntimeResolver {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        connector_resolution.finish();
 
-        Ok(ResolvedPromptRuntime {
+        let rules_resolution =
+            crate::infrastructure::performance::span("rules_resolution_ms", "agent_runtime");
+        let agent_rules = profile.agent_rules;
+        rules_resolution.finish();
+        let skills_resolution =
+            crate::infrastructure::performance::span("skills_resolution_ms", "agent_runtime");
+        let agent_skills = profile.agent_skills;
+        skills_resolution.finish();
+
+        let resolved = ResolvedPromptRuntime {
             runtime_profile_id: profile.id,
             config: AiWorkerConfig {
                 workspace_id: envelope.workspace_id.clone(),
@@ -128,8 +155,8 @@ impl StoredAgentRuntimeResolver {
                 opencode_model: envelope.model.clone(),
                 opencode_workdir: Some(workspace.to_string_lossy().to_string()),
                 opencode_auto_approve: false,
-                agent_rules: profile.agent_rules,
-                agent_skills: profile.agent_skills,
+                agent_rules,
+                agent_skills,
                 temperature: profile.temperature,
                 restrict_tools: true,
                 fenced_tools_only: true,
@@ -138,7 +165,9 @@ impl StoredAgentRuntimeResolver {
                 mcp_servers,
             },
             chat_snapshot: None,
-        })
+        };
+        total.finish();
+        Ok(resolved)
     }
 
     /// Resolves an exact backend-owned Chat snapshot from durable conversation state.

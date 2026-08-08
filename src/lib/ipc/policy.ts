@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { measuredInvoke } from "$lib/performance";
 
 export type IpcErrorCategory =
   | "timeout"
@@ -67,7 +67,7 @@ export class IpcPolicyError extends Error {
 
 export async function invokeWithPolicy<T>(
   command: string,
-  args: Parameters<typeof invoke<T>>[1],
+  args: Record<string, unknown> | undefined,
   policy: IpcPolicy,
 ): Promise<T> {
   const retries = policy.retries ?? 0;
@@ -75,7 +75,7 @@ export async function invokeWithPolicy<T>(
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await withTimeout(invoke<T>(command, args), policy.timeoutMs, command);
+      return await withTimeout(measuredInvoke<T>(command, args), policy.timeoutMs, command);
     } catch (reason) {
       const error = normalizeIpcError(command, reason);
       lastError = error;

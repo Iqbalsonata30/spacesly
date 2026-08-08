@@ -244,6 +244,11 @@ impl ExecutionStore {
     }
 
     pub fn save(&self, run: &ExecutionRun) -> Result<ExecutionRun, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "execution_run_save",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         validate_run(run)?;
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
@@ -579,6 +584,11 @@ impl ExecutionStore {
         owner: &str,
         lease_ms: u64,
     ) -> Result<(), String> {
+        let _metric = crate::infrastructure::performance::span(
+            "execution_step_claim",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -630,6 +640,11 @@ impl ExecutionStore {
         status: &str,
         summary: Option<&str>,
     ) -> Result<(), String> {
+        let _metric = crate::infrastructure::performance::span(
+            "execution_step_finish",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -670,6 +685,8 @@ impl ExecutionStore {
     }
 
     pub fn get(&self, run_id: &str) -> Result<Option<ExecutionRun>, String> {
+        let _metric = crate::infrastructure::performance::span("execution_run_get", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         load_run(&connection, run_id)
     }
@@ -680,6 +697,8 @@ impl ExecutionStore {
         event_type: &str,
         payload: &Value,
     ) -> Result<(), String> {
+        let _metric = crate::infrastructure::performance::span("ai_audit_append", "sqlite_write");
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let payload_json = serde_json::to_string(payload)
             .map_err(|error| format!("Failed to encode AI audit payload: {error}"))?;
@@ -697,6 +716,8 @@ impl ExecutionStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ConversationRecord>, String> {
+        let _metric = crate::infrastructure::performance::span("conversation_list", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let started_at = Instant::now();
         let lock_started_at = Instant::now();
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
@@ -740,6 +761,9 @@ impl ExecutionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<ConversationHistoryRecord>, String> {
+        let _metric =
+            crate::infrastructure::performance::span("conversation_history_load", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
@@ -809,6 +833,9 @@ impl ExecutionStore {
         workspace_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<ConversationMessageRecord>, String> {
+        let _metric =
+            crate::infrastructure::performance::span("conversation_messages_load", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         if !conversation_exists_in(&connection, workspace_id, conversation_id)? {
             return Err("Conversation does not belong to this workspace.".to_string());
@@ -842,6 +869,9 @@ impl ExecutionStore {
         workspace_id: &str,
         conversation_id: &str,
     ) -> Result<bool, String> {
+        let _metric =
+            crate::infrastructure::performance::span("conversation_exists", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         conversation_exists_in(&connection, workspace_id, conversation_id)
     }
@@ -860,6 +890,11 @@ impl ExecutionStore {
         message_sequence: u64,
         message_text: &str,
     ) -> Result<ChatConversationSnapshot, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "chat_snapshot_resolve",
+            "sqlite_read_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction()
@@ -1046,6 +1081,11 @@ impl ExecutionStore {
         title: &str,
         input: &ConversationMessageInput,
     ) -> Result<ConversationMessageRecord, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "conversation_message_append",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
         self.append_conversation_message_with_authority(
             workspace_id,
             conversation_id,
@@ -1221,6 +1261,9 @@ impl ExecutionStore {
     }
 
     pub fn list_active(&self) -> Result<Vec<ExecutionRun>, String> {
+        let _metric =
+            crate::infrastructure::performance::span("execution_active_list", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(

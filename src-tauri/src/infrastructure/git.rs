@@ -128,6 +128,8 @@ pub fn workspace_git_info(
 }
 
 pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
+    let _metric =
+        crate::infrastructure::performance::span("workspace_repository_context_ms", "workspace");
     let Some(repo_root) = git_repo_root(path)? else {
         return Ok(GitWorkspaceInfo {
             is_git_repo: false,
@@ -449,6 +451,8 @@ pub fn rebase_workspace_git_branch(
 }
 
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
+    let _metric =
+        crate::infrastructure::performance::span("workspace_repository_discovery_ms", "workspace");
     let mut command = Command::new(git_executable()?);
     inject_global_environment(&mut command);
     let output = command

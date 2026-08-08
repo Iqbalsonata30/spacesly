@@ -23,3 +23,7 @@ test("editor document", async () => {
 test("task sessions", async () => {
   await import("./taskSessions");
 });
+
+test("performance metrics", async () => {
+  await import("./performanceMetrics");
+});

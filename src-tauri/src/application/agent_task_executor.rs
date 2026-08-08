@@ -123,12 +123,29 @@ impl TaskExecutor for AgentTaskExecutor {
             json!({ "runtime_profile_id": envelope.runtime_profile_id }),
         )?;
         let runtime_attempt_id = context.runtime_attempt_id();
+        let runtime_preparation =
+            crate::infrastructure::performance::span("runtime_preparation_ms", "agent_runtime")
+                .with_context("task_session_id", context.session_id().0.to_string())
+                .with_context("execution_attempt", context.attempt_id().to_string())
+                .with_context("worker_id", context.worker_id().to_string())
+                .with_context("runtime_id", runtime_attempt_id.clone());
         let mut resolved = self
             .resolver
             .resolve(&envelope, &runtime_attempt_id)
             .map_err(TaskExecutionError::new)?;
         validate_resolved_task(&envelope, &resolved).map_err(TaskExecutionError::new)?;
-        resolved.task.opencode_session_id = context.opencode_session_id()?;
+        let opencode_resolution = crate::infrastructure::performance::span(
+            "opencode_session_resolution_ms",
+            "agent_runtime",
+        );
+        let opencode_session_id = context.opencode_session_id()?;
+        let opencode_resolution = if let Some(session_id) = opencode_session_id.as_deref() {
+            opencode_resolution.with_context("opencode_session_id", session_id)
+        } else {
+            opencode_resolution
+        };
+        resolved.task.opencode_session_id = opencode_session_id;
+        opencode_resolution.finish();
         if resolved.config.runtime != "opencode" {
             return Err(TaskExecutionError::new(
                 "Scheduler Agent execution requires the isolated fenced OpenCode runtime.",
@@ -165,6 +182,7 @@ impl TaskExecutor for AgentTaskExecutor {
             },
             json!({ "runtime_attempt_id": runtime_attempt_id }),
         )?;
+        runtime_preparation.finish();
 
         let reporter = context.event_reporter();
         let callback_open = Arc::new(Mutex::new(true));
@@ -206,12 +224,17 @@ impl TaskExecutor for AgentTaskExecutor {
             }
             emit_runtime_event(&reporter, event)
         });
+        let provider_request =
+            crate::infrastructure::performance::span("provider_or_runtime_request_ms", "provider")
+                .with_context("task_session_id", context.session_id().0.to_string())
+                .with_context("runtime_id", runtime_attempt_id);
         let result = self.runner.execute(
             resolved.config,
             resolved.task,
             context.cancellation().shared_flag(),
             callback,
         );
+        provider_request.finish();
         drop(callback_guard);
         let result = result.map_err(|error| {
             if error.contains("[approval_required]") {

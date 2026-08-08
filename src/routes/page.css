@@ -134,12 +134,14 @@ button:active:not(:disabled) {
   white-space: nowrap;
 }
 
-.worker-pill .worker-state {
-  color: var(--text-dim);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+.worker-indicator {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 70%, transparent);
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-dim) 12%, transparent);
 }
 
 .worker-pill > strong {
@@ -147,9 +149,16 @@ button:active:not(:disabled) {
   text-overflow: ellipsis;
 }
 
-.worker-pill.connected,
-.worker-pill.connected .worker-state {
-  color: var(--success);
+.worker-pill.connected .worker-indicator {
+  border-color: color-mix(in srgb, var(--success) 70%, transparent);
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 16%, transparent);
+}
+
+.worker-pill.error .worker-indicator {
+  border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 16%, transparent);
 }
 
 .sync-button {

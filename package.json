@@ -10,6 +10,7 @@
     "test": "bun test",
     "test:ui": "playwright test",
     "test:responsive": "bun tests/responsiveness.mjs",
+    "benchmark:performance": "bun tests/performance-benchmark.ts",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",

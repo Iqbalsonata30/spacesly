@@ -297,6 +297,13 @@
   import { formatJiraExecutionComment } from "$lib/jiraComment";
   import { opencodeModelOptions } from "$lib/opencodeModels";
   import {
+    finishPerformanceSpanAfterPaint,
+    frontendUptimeMs,
+    observeFrontendPerformance,
+    reportFrontendStartup,
+    startPerformanceSpan,
+  } from "$lib/performance";
+  import {
     cachedWorkspaceSizeBytes,
     loadCachedWorkspace,
     locallyDeleteCachedCard,
@@ -306,6 +313,7 @@
   } from "$lib/workspaceCache";
 
   const initialSettings = loadSettings();
+  const settingsHydratedAt = frontendUptimeMs();
   const initialAppSecrets = loadLegacySettingsSecrets();
   const AGENT_STATUS_KEY = "spacesly.agent.status.v1";
   const MAX_AGENT_LOGS = 120;
@@ -421,6 +429,7 @@
     "jira",
     "environment",
     "theme",
+    "diagnostics",
   ] as const;
   type SettingsTab = (typeof settingsTabOrder)[number];
   const themeModeOptions: Array<{ mode: ThemeMode; label: string; description: string }> = [
@@ -511,6 +520,9 @@
   let globalEnvironmentLoading = $state(false);
   let workspaceCacheHydrated = $state(false);
   let durableRunsHydrated = $state(false);
+  let startupReported = false;
+  let frontendMountedAt = 0;
+  let workspaceReadyAt = 0;
   let durableConversationWorkspaceId = $state<string | null>(null);
   let durableConversationHydrationTimer: ReturnType<typeof setTimeout> | null = null;
   let filesStateHydrated = $state(false);
@@ -595,6 +607,12 @@
   );
   let agentConsoleRuntime: Promise<
     typeof import("$lib/components/AgentConsolePanel.svelte")
+  > | null = null;
+  let performanceDiagnosticsModule = $state<
+    typeof import("$lib/components/PerformanceDiagnostics.svelte") | null
+  >(null);
+  let performanceDiagnosticsRuntime: Promise<
+    typeof import("$lib/components/PerformanceDiagnostics.svelte")
   > | null = null;
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
@@ -726,6 +744,8 @@
 
   onMount(() => {
     let disposed = false;
+    frontendMountedAt = frontendUptimeMs();
+    const stopPerformanceObserver = observeFrontendPerformance();
     const unregisterThemeChanges = onThemeChange(() => {
       if (workspaceTerminal) workspaceTerminal.options.theme = getTerminalTheme();
     });
@@ -818,6 +838,7 @@
     }, 60_000);
     return () => {
       disposed = true;
+      stopPerformanceObserver();
       window.clearInterval(timer);
       if (lspSyncTimer) clearTimeout(lspSyncTimer);
       if (lspDiagnosticPollTimer) clearTimeout(lspDiagnosticPollTimer);
@@ -850,8 +871,25 @@
 
   $effect(() => {
     if (!workspace || durableRunsHydrated) return;
+    if (workspaceReadyAt === 0) workspaceReadyAt = frontendUptimeMs();
     durableRunsHydrated = true;
     void hydrateDurableExecutionRuns();
+  });
+
+  $effect(() => {
+    if (startupReported || !workspace || !workspaceCacheHydrated || frontendMountedAt === 0) return;
+    startupReported = true;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const firstInteractiveFrame = frontendUptimeMs();
+        void reportFrontendStartup({
+          frontend_boot_ms: frontendMountedAt,
+          hydration_ms: settingsHydratedAt,
+          workspace_boot_ms: workspaceReadyAt || firstInteractiveFrame,
+          first_interactive_frame_ms: firstInteractiveFrame,
+        });
+      });
+    });
   });
 
   $effect(() => {
@@ -890,6 +928,12 @@
   $effect(() => {
     if (settingsOpen && settingsTab === "environment") {
       void loadGlobalEnvironmentRuntime();
+    }
+  });
+
+  $effect(() => {
+    if (settingsOpen && settingsTab === "diagnostics") {
+      void loadPerformanceDiagnosticsRuntime();
     }
   });
 
@@ -1236,10 +1280,15 @@
   );
   let selectedAgentConnection = $derived(agentConnectionStates[selectedAgentStatusKey] ?? null);
   let workerConnected = $derived(selectedAgentConnection?.connected === true);
+  let workerConnectionState = $derived<"untested" | "connected" | "failed">(
+    !selectedAgentConnection ? "untested" : workerConnected ? "connected" : "failed",
+  );
   let workerStatusLabel = $derived(
-    workerConnected
+    workerConnectionState === "connected"
       ? `${selectedAgentLabel} connected · ${relativeTime(selectedAgentConnection?.testedAt ?? Date.now())}`
-      : `${selectedAgentLabel} not tested`,
+      : workerConnectionState === "failed"
+        ? `${selectedAgentLabel} connection failed · ${relativeTime(selectedAgentConnection?.testedAt ?? Date.now())}`
+        : `${selectedAgentLabel} not tested`,
   );
   let visibleAgentSession = $derived<AgentRunSession | null>(
     agentConsoleCardId ? (agentRunSessions[agentConsoleCardId] ?? null) : null,
@@ -1267,6 +1316,7 @@
       jira: "Jira Sync",
       theme: "Theme",
       environment: "Global Environment",
+      diagnostics: "Performance Diagnostics",
     }[settingsTab],
   );
 
@@ -4558,6 +4608,16 @@
     return agentConsoleRuntime;
   }
 
+  function loadPerformanceDiagnosticsRuntime() {
+    performanceDiagnosticsRuntime ??= import("$lib/components/PerformanceDiagnostics.svelte").then(
+      (module) => {
+        performanceDiagnosticsModule = module;
+        return module;
+      },
+    );
+    return performanceDiagnosticsRuntime;
+  }
+
   function flushWorkspaceChatStream(sessionId: string, generation: number) {
     const pending = workspaceChatPendingStreams.get(sessionId);
     if (!pending || pending.generation !== generation) return;
@@ -5899,8 +5959,10 @@
             ),
           ],
       continuation && previousSession ? (previousSession.executionRun ?? null) : null,
-      null,
+      continuation ? (previousSession?.taskSessionId ?? null) : null,
       continuation ? (previousSession?.conversationId ?? null) : null,
+      continuation ? (previousSession?.taskSessionState ?? null) : null,
+      continuation ? (previousSession?.workflowCheckpoint ?? null) : null,
     );
     agentRunSessions = retainAgentSessions({ ...agentRunSessions, [card.id]: session });
     updateAgentTaskCardProjection(card.id, session);
@@ -6018,7 +6080,9 @@
   }
 
   function openAgentRunForCard(card: CardProjection) {
+    const finishLookup = startPerformanceSpan("agent_console_state_lookup_ms", "frontend");
     const session = agentRunSessions[card.id];
+    finishLookup();
     if (!session) {
       appNotice = {
         tone: "info",
@@ -6027,6 +6091,7 @@
       return;
     }
 
+    measureAgentConsoleOpen(session, agentConsoleOpen && agentConsoleCardId !== session.cardId);
     agentConsoleOpen = true;
     agentConsoleCardId = session.cardId;
     agentTerminalInput = "";
@@ -6038,14 +6103,36 @@
       return;
     }
 
+    const finishLookup = startPerformanceSpan("agent_console_state_lookup_ms", "frontend");
     const session = visibleAgentSession ?? latestAgentSession;
+    finishLookup();
     if (session) {
+      measureAgentConsoleOpen(session, agentConsoleOpen && agentConsoleCardId !== session.cardId);
       agentConsoleOpen = true;
       agentConsoleCardId = session.cardId;
       return;
     }
 
     appNotice = { tone: "info", message: "No Agent console session is available yet." };
+  }
+
+  function measureAgentConsoleOpen(session: AgentRunSession, switching: boolean) {
+    const finish = startPerformanceSpan(
+      switching ? "task_session_switch_ms" : "agent_console_open_ms",
+      "frontend",
+      {
+        event_count: String(session.transcript.length + session.logs.length),
+        status: session.status,
+      },
+    );
+    const finishModuleLoad = startPerformanceSpan("agent_console_module_load_ms", "frontend");
+    void loadAgentConsoleRuntime().then(async () => {
+      finishModuleLoad();
+      const finishRender = startPerformanceSpan("agent_console_render_paint_ms", "frontend");
+      await tick();
+      finishPerformanceSpanAfterPaint(finish);
+      finishPerformanceSpanAfterPaint(finishRender);
+    });
   }
 
   function selectCard(card: CardProjection) {
@@ -6681,8 +6768,28 @@
 
     updateAgentSessionForCard(cardId, (current) => ({
       ...current,
+      status: "running",
+      taskSessionState: "running",
       pendingApproval: null,
+      executionRun: current.executionRun
+        ? {
+            ...current.executionRun,
+            status: "running",
+            current_step_ids: ["worker.execute"],
+            completed_at: null,
+            step_runs: {
+              ...current.executionRun.step_runs,
+              "worker.execute": {
+                ...current.executionRun.step_runs["worker.execute"],
+                status: "running",
+                completed_at: null,
+                summary: "Resuming approved execution.",
+              },
+            },
+          }
+        : null,
     }));
+    updateCardExecution(cardId, "running");
     try {
       appendAgentSessionTranscriptForCard(
         cardId,
@@ -6715,8 +6822,11 @@
     } catch (reason) {
       updateAgentSessionForCard(cardId, (current) => ({
         ...current,
+        status: "blocked",
+        taskSessionState: "blocked",
         pendingApproval: { ...approval, status: "pending" },
       }));
+      updateCardExecution(cardId, { blocked: { reason: "Waiting for operator approval." } });
       appNotice = {
         tone: "error",
         message: `Approval could not be recorded: ${reason instanceof Error ? reason.message : String(reason)}`,
@@ -7249,20 +7359,33 @@
     executionMode: "continue" | "fresh" = "continue",
     approvedAction: AgentApprovalRequest | null = null,
   ) {
+    const approvalResume = approvedAction !== null;
     const restoreApproval = () => {
       if (!approvedAction) return;
       updateAgentSessionForCard(cardId, (session) => ({
         ...session,
+        status: "blocked",
+        taskSessionState: "blocked",
         pendingApproval: { ...approvedAction, status: "pending" },
+        executionRun: session.executionRun
+          ? updateExecutionStep(
+              { ...session.executionRun, status: "blocked" },
+              "worker.execute",
+              "blocked",
+              "Waiting for operator approval.",
+            )
+          : null,
       }));
+      updateCardExecution(cardId, { blocked: { reason: "Waiting for operator approval." } });
     };
     const retainedSession = agentSessionForCard(cardId);
     const retainedTaskState = retainedSession?.taskSessionState;
     if (
       runningWorkerCardIds.has(cardId) ||
-      agentSessionForCard(cardId)?.status === "running" ||
-      (retainedTaskState &&
-        ["queued", "running", "cancelling", "committing"].includes(retainedTaskState))
+      (!approvalResume &&
+        (agentSessionForCard(cardId)?.status === "running" ||
+          (retainedTaskState &&
+            ["queued", "running", "cancelling", "committing"].includes(retainedTaskState))))
     ) {
       restoreApproval();
       appNotice = { tone: "info", message: "Agent is already running this card." };
@@ -7270,11 +7393,7 @@
     }
 
     const card = activeCardById.get(cardId);
-    const resumingStalledApproval =
-      approvedAction !== null &&
-      retainedSession?.status !== "running" &&
-      retainedTaskState === "blocked";
-    if (!card || (card.execution === "running" && !resumingStalledApproval)) {
+    if (!card || (card.execution === "running" && !approvalResume)) {
       restoreApproval();
       return;
     }
@@ -7313,6 +7432,7 @@
 
     const existingSession = agentRunSessions[cardId];
     const isContinuation =
+      approvalResume ||
       existingSession?.status === "blocked" ||
       existingSession?.status === "blocked_for_resume" ||
       existingSession?.status === "timeout";
@@ -7619,8 +7739,9 @@
         );
         await setExecutionRunForCard(cardId, executionRun);
       }
-      let result: AiWorkerTaskResult;
+      let result: AiWorkerTaskResult | null = null;
       let lastAgentEventSequence = 0;
+      let approvalResumeEventSequence: number | null = null;
       if (resumeAuthoritativeResult) {
         result = resumeAuthoritativeResult;
         appendStructuredAgentLogForCard(
@@ -7634,7 +7755,6 @@
         );
       } else
         try {
-          backendExecutionStarted = true;
           if (useTaskSession) {
             const approvalResumeSessionId =
               executionMode === "continue" && isContinuation && approvedAction !== null
@@ -7644,6 +7764,19 @@
               executionMode === "continue" && isContinuation && !approvalResumeSessionId
                 ? (existingSession?.taskSessionId ?? null)
                 : null;
+            if (approvalResumeSessionId) {
+              const retained = await getTaskSession(approvalResumeSessionId);
+              if (
+                !retained ||
+                retained.state !== "blocked" ||
+                !retained.error?.includes("[approval_required]")
+              ) {
+                throw new Error(
+                  "The retained Task Session is no longer waiting for this approval.",
+                );
+              }
+              approvalResumeEventSequence = retained.last_event_sequence;
+            }
             if (continuationSessionId) {
               const retained = await getTaskSession(continuationSessionId);
               if (!retained || !["blocked", "failed"].includes(retained.state)) {
@@ -7671,6 +7804,7 @@
             }));
             const taskSessionOptions = {
               onSubmitted: (session: TaskSessionSnapshot) => {
+                backendExecutionStarted = true;
                 commitManualSkillReservation();
                 updateAgentSessionForCard(cardId, (current) => ({
                   ...current,
@@ -7695,9 +7829,10 @@
                     prepared,
                     taskSessionOptions,
                   )
-              : await executeAgentTaskSession(ticketLabel(card), prepared, taskSessionOptions);
+                : await executeAgentTaskSession(ticketLabel(card), prepared, taskSessionOptions);
             result = execution.result;
           } else {
+            backendExecutionStarted = true;
             result = await executeAiWorkerTask(
               runId,
               config,
@@ -7805,6 +7940,7 @@
             commitManualSkillReservation();
           }
         } catch (reason) {
+          let recoveredFromResumeTimeout = false;
           if (reason instanceof AgentTaskSessionApprovalRequiredError) {
             updateAgentSessionForCard(cardId, (session) => ({
               ...session,
@@ -7830,8 +7966,56 @@
             return;
           }
           if (
-            reason instanceof AgentTaskSessionTimeoutError ||
-            (reason instanceof IpcPolicyError && reason.category === "timeout")
+            reason instanceof IpcPolicyError &&
+            reason.category === "timeout" &&
+            approvedAction &&
+            useTaskSession &&
+            !backendExecutionStarted
+          ) {
+            if (existingSession?.taskSessionId && approvalResumeEventSequence !== null) {
+              try {
+                const recovered = await waitForAgentTaskSession(existingSession.taskSessionId, {
+                  initialEventSequence: approvalResumeEventSequence,
+                  onEvent: (event) => projectTaskSessionEvent(cardId, event),
+                });
+                commitManualSkillReservation();
+                backendExecutionStarted = true;
+                result = recovered.result;
+                recoveredFromResumeTimeout = true;
+              } catch (recoveryReason) {
+                if (recoveryReason instanceof AgentTaskSessionApprovalRequiredError) {
+                  updateAgentSessionForCard(cardId, (session) => ({
+                    ...session,
+                    status: "blocked",
+                    taskSessionState: "blocked",
+                    pendingApproval: session.pendingApproval
+                      ? { ...session.pendingApproval, status: "pending" }
+                      : null,
+                  }));
+                  updateExecutionRunForCard(cardId, (run) =>
+                    updateExecutionStep(
+                      { ...run, status: "blocked" },
+                      "worker.execute",
+                      "blocked",
+                      "Waiting for operator approval.",
+                    ),
+                  );
+                  updateCardExecution(cardId, {
+                    blocked: { reason: "Waiting for operator approval." },
+                  });
+                  return;
+                }
+                throw recoveryReason;
+              }
+            } else {
+              throw reason;
+            }
+          }
+          if (
+            !recoveredFromResumeTimeout &&
+            (reason instanceof AgentTaskSessionTimeoutError ||
+              reason instanceof IpcPolicyError &&
+              reason.category === "timeout")
           ) {
             const cancelled =
               reason instanceof AgentTaskSessionTimeoutError
@@ -7883,8 +8067,9 @@
             return;
           }
 
-          throw reason;
+          if (!recoveredFromResumeTimeout) throw reason;
         }
+      if (!result) throw new Error("Agent execution ended without a structured result.");
       appendStructuredAgentLogForCard(
         cardId,
         result.completion_status === "completed" ? "success" : "error",
@@ -8107,6 +8292,35 @@
       };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
+      if (approvedAction && !backendExecutionStarted) {
+        const retainedTaskSession = existingSession?.taskSessionId
+          ? await getTaskSession(existingSession.taskSessionId).catch(() => null)
+          : null;
+        const approvalStillRequired =
+          retainedTaskSession?.state === "blocked" &&
+          retainedTaskSession.error?.includes("[approval_required]");
+        if (!useTaskSession || approvalStillRequired) {
+          restoreApproval();
+          appNotice = { tone: "error", message };
+          return;
+        }
+        if (
+          retainedTaskSession &&
+          ["queued", "running", "cancelling", "committing"].includes(retainedTaskSession.state)
+        ) {
+          updateAgentSessionForCard(cardId, (session) => ({
+            ...session,
+            status: "running",
+            taskSessionState: retainedTaskSession.state,
+          }));
+          updateCardExecution(cardId, "running");
+          appNotice = {
+            tone: "info",
+            message: `${ticketLabel(card)} resumed in the backend; reconnect to follow its progress.`,
+          };
+          return;
+        }
+      }
       updateExecutionRunForCard(cardId, (run) => {
         const currentStep = run.current_step_ids[0] ?? run.contract.current_step;
         return updateExecutionStep(
@@ -8200,12 +8414,14 @@
 
       <button
         class:connected={workerConnected}
+        class:error={workerConnectionState === "failed"}
         class="worker-pill"
         type="button"
         title={workerStatusLabel}
+        aria-label={workerStatusLabel}
         onclick={() => openSettings("agent")}
       >
-        <span class="worker-state">{workerConnected ? "Connected" : "Not tested"}</span>
+        <span class="worker-indicator" aria-hidden="true"></span>
         <strong>{selectedAgentLabel}</strong>
       </button>
 
@@ -8346,6 +8562,20 @@
                 <strong>Theme</strong>
                 <span>Appearance preferences</span>
               </button>
+              <button
+                id="diagnostics-settings-tab"
+                class:active={settingsTab === "diagnostics"}
+                type="button"
+                role="tab"
+                aria-selected={settingsTab === "diagnostics"}
+                aria-controls="diagnostics-settings-panel"
+                tabindex={settingsTab === "diagnostics" ? 0 : -1}
+                onclick={() => switchSettingsTab("diagnostics")}
+                onkeydown={(event) => handleSettingsTabKeydown(event, "diagnostics")}
+              >
+                <strong>Performance</strong>
+                <span>Local engineering diagnostics</span>
+              </button>
             </div>
 
             {#if settingsTab === "mcp"}
@@ -8361,9 +8591,9 @@
                         settings = { ...settings, jira: { ...settings.jira, serverId: server.id } };
                       }
                     }}
-                    >
-                      <strong>{server.name || "Unnamed MCP"}</strong>
-                      <span
+                  >
+                    <strong>{server.name || "Unnamed MCP"}</strong>
+                    <span
                       >{server.kind.toUpperCase()} · {server.kind === "ocp"
                         ? "Embedded"
                         : server.command || "No command configured"}</span
@@ -8429,6 +8659,24 @@
                       <button type="button" class="add-server" onclick={addMcpServer}
                         >Add MCP connection</button
                       >
+                    </SettingsCard>
+                  </SettingsPage>
+                {/if}
+              {/if}
+
+              {#if settingsTab === "diagnostics"}
+                {#if performanceDiagnosticsModule}
+                  {@const PerformanceDiagnostics = performanceDiagnosticsModule.default}
+                  <PerformanceDiagnostics />
+                {:else}
+                  <SettingsPage
+                    id="diagnostics-settings"
+                    eyebrow="Developer diagnostics"
+                    title="Loading performance metrics"
+                    description="Preparing the local diagnostics view."
+                  >
+                    <SettingsCard tone="subtle">
+                      <p class="field-help">Loading local metrics…</p>
                     </SettingsCard>
                   </SettingsPage>
                 {/if}
@@ -9477,7 +9725,7 @@
                 <ValidationMessage error={settingsError} success={connectionMessage} />
               {/if}
 
-              {#if settingsTab !== "theme" && settingsTab !== "skills" && settingsTab !== "rules"}
+              {#if settingsTab !== "theme" && settingsTab !== "skills" && settingsTab !== "rules" && settingsTab !== "diagnostics"}
                 <SettingsActionBar>
                   {#if settingsTab === "mcp"}
                     <button

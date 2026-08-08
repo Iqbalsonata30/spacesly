@@ -533,6 +533,11 @@ struct StdioMcpClient {
 
 impl StdioMcpClient {
     fn start(config: &McpServerConfig) -> Result<Self, String> {
+        let spawn_metric = crate::infrastructure::performance::span("mcp_process_spawn_ms", "mcp")
+            .with_context(
+                "mcp_connection_id",
+                config.scope_id.as_deref().unwrap_or("unscoped"),
+            );
         if config.command.trim().is_empty() {
             return Err("MCP server command is required.".to_string());
         }
@@ -578,7 +583,7 @@ impl StdioMcpClient {
         spawn_stdout_reader(stdout, Arc::clone(&pending), Arc::clone(&reader_error));
         spawn_stderr_reader(stderr, Arc::clone(&stderr_buffer));
 
-        Ok(Self {
+        let client = Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             pending,
@@ -586,10 +591,14 @@ impl StdioMcpClient {
             reader_error,
             next_id: AtomicU64::new(request_seed()),
             tool_metadata: Mutex::new(None),
-        })
+        };
+        spawn_metric.finish();
+        Ok(client)
     }
 
     fn initialize(&self) -> Result<(), String> {
+        let metric =
+            crate::infrastructure::performance::span("mcp_transport_initialization_ms", "mcp");
         self.request(
             "initialize",
             json!({
@@ -601,7 +610,9 @@ impl StdioMcpClient {
                 }
             }),
         )?;
-        self.notify("notifications/initialized", json!({}))
+        self.notify("notifications/initialized", json!({}))?;
+        metric.finish();
+        Ok(())
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -616,13 +627,30 @@ impl StdioMcpClient {
     }
 
     fn list_tool_metadata(&self) -> Result<Vec<McpToolMetadata>, String> {
+        let discovery = crate::infrastructure::performance::span("mcp_schema_discovery_ms", "mcp");
         let result = self.request("tools/list", json!({}))?;
+        if crate::infrastructure::performance::mode()
+            == crate::infrastructure::performance::PerformanceMode::Profiling
+        {
+            let serialization =
+                crate::infrastructure::performance::span("mcp_schema_serialization_ms", "mcp");
+            let schema_bytes = serde_json::to_vec(&result)
+                .map(|value| value.len())
+                .unwrap_or(0);
+            serialization.finish();
+            crate::infrastructure::performance::increment(
+                "mcp_schema_bytes_total",
+                "mcp",
+                schema_bytes as u64,
+            );
+        }
+        let parsing = crate::infrastructure::performance::span("mcp_schema_parsing_ms", "mcp");
         let tools = result
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(|| "MCP server did not return a tools list".to_string())?;
 
-        Ok(tools
+        let metadata = tools
             .iter()
             .filter_map(|tool| {
                 Some(McpToolMetadata {
@@ -634,7 +662,15 @@ impl StdioMcpClient {
                     input_schema: tool.get("inputSchema").cloned(),
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        crate::infrastructure::performance::increment(
+            "mcp_tools_discovered_total",
+            "mcp",
+            metadata.len() as u64,
+        );
+        parsing.finish();
+        discovery.finish();
+        Ok(metadata)
     }
 
     fn tools(&self) -> Result<Vec<String>, String> {
@@ -644,8 +680,10 @@ impl StdioMcpClient {
             .map_err(|error| error.to_string())?
             .clone()
         {
+            crate::infrastructure::performance::increment("mcp_schema_cache_hits_total", "mcp", 1);
             return Ok(metadata.into_iter().map(|tool| tool.name).collect());
         }
+        crate::infrastructure::performance::increment("mcp_schema_cache_misses_total", "mcp", 1);
         let metadata = self.list_tool_metadata()?;
         let tools: Vec<String> = metadata.iter().map(|tool| tool.name.clone()).collect();
         *self
@@ -662,6 +700,7 @@ impl StdioMcpClient {
             .map_err(|error| error.to_string())?
             .clone()
         {
+            crate::infrastructure::performance::increment("mcp_schema_cache_hits_total", "mcp", 1);
             return Ok(metadata);
         }
         self.tools()?;
@@ -844,8 +883,20 @@ where
     drop(expired);
 
     let session = if let Some(session) = session {
+        crate::infrastructure::performance::increment("mcp_session_cache_hits_total", "mcp", 1);
+        crate::infrastructure::performance::record_duration(
+            "mcp_init_warm_ms",
+            "mcp",
+            now.elapsed(),
+        );
         session
     } else {
+        crate::infrastructure::performance::increment("mcp_session_cache_misses_total", "mcp", 1);
+        let cold_initialization =
+            crate::infrastructure::performance::span("mcp_init_cold_ms", "mcp").with_context(
+                "mcp_connection_id",
+                server.scope_id.as_deref().unwrap_or("unscoped"),
+            );
         let initialization = manager
             .initializations
             .lock()
@@ -853,7 +904,7 @@ where
             .entry(key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        {
+        let initialized = {
             let _initialization_guard = initialization.lock().map_err(|error| error.to_string())?;
             // Remove the map entry while holding the guard so that:
             //   1. Any concurrent waiter queued behind us will see None after we release
@@ -897,7 +948,9 @@ where
                 drop(evicted);
                 candidate
             }
-        }
+        };
+        cold_initialization.finish();
+        initialized
     };
 
     let result = operation(&session).map_err(|error| redact_mcp_diagnostic(&error, &server.env));
@@ -1504,6 +1557,44 @@ done
             .unwrap();
         assert_eq!(status.tools, vec!["mock_tool"]);
         close_mcp_session(cleanup).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "repeatable performance harness; run explicitly with --ignored --nocapture"]
+    fn performance_baseline_mcp_cold_and_warm() {
+        crate::infrastructure::performance::reset();
+        crate::infrastructure::performance::set_mode(
+            crate::infrastructure::performance::PerformanceMode::Profiling,
+        );
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mock_tool","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let server = McpServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            scope_id: Some(format!("performance-baseline-{}", request_seed())),
+            secret_id: None,
+        };
+        test_mcp_connection(server.clone()).expect("cold MCP initialization");
+        test_mcp_connection(server.clone()).expect("warm MCP initialization");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::infrastructure::performance::snapshot())
+                .expect("benchmark snapshot encoded")
+        );
+        close_mcp_session(server).expect("benchmark MCP session closed");
     }
 
     #[test]

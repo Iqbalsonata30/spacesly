@@ -78,6 +78,8 @@ impl WorkspaceRoot {
     }
 
     pub fn path(&self, workspace_id: &str) -> Result<PathBuf, String> {
+        let _metric =
+            crate::infrastructure::performance::span("workspace_config_lookup_ms", "workspace");
         Ok(self.snapshot(workspace_id)?.0)
     }
 
@@ -139,6 +141,8 @@ pub fn list_directory(
     workspace_id: String,
     relative_path: String,
 ) -> Result<Vec<FileEntry>, String> {
+    let _metric =
+        crate::infrastructure::performance::span("workspace_filesystem_scan_ms", "workspace");
     let root = root.path(&workspace_id)?;
     let directory = resolve_workspace_path(&root, &relative_path)?;
     if !directory.is_dir() {
