@@ -145,8 +145,10 @@
     waitForPromptTaskSession,
   } from "$lib/promptTaskSessions";
   import {
+    AgentTaskSessionApprovalRequiredError,
     AgentTaskSessionTimeoutError,
     agentEnvelopeFromSnapshot,
+    canonicalAgentApprovalOperation,
     executionRepositoryContext,
     continueAgentTaskSession,
     executeAgentTaskSession,
@@ -6276,7 +6278,11 @@
     payload: Record<string, unknown>,
     fallbackId: string,
   ): AgentApprovalRequest | null {
-    const operation = typeof payload.tool_name === "string" ? payload.tool_name : "";
+    const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
+    const operation = canonicalAgentApprovalOperation(
+      toolName,
+      typeof payload.error === "string" ? payload.error : "",
+    );
     const argumentsDigest =
       typeof payload.arguments_digest === "string" ? payload.arguments_digest : "";
     if (!operation || !argumentsDigest) return null;
@@ -6299,11 +6305,16 @@
 
   function setPendingAgentApproval(cardId: string, approval: AgentApprovalRequest) {
     updateAgentSessionForCard(cardId, (session) => {
+      const approvalStalled =
+        session.pendingApproval?.status === "approving" &&
+        session.status !== "running" &&
+        session.taskSessionState === "blocked";
       if (
-        session.pendingApproval?.id === approval.id ||
-        (session.pendingApproval?.status === "pending" &&
-          session.pendingApproval.operation === approval.operation &&
-          session.pendingApproval.argumentsDigest === approval.argumentsDigest)
+        !approvalStalled &&
+        (session.pendingApproval?.id === approval.id ||
+          (session.pendingApproval?.status === "pending" &&
+            session.pendingApproval.operation === approval.operation &&
+            session.pendingApproval.argumentsDigest === approval.argumentsDigest))
       )
         return session;
       return { ...session, pendingApproval: approval };
@@ -6494,7 +6505,7 @@
             ? [
                 ...(previousRun.contract.runtime_inputs.approvals ?? []),
                 {
-                  operation: approval.operation,
+                  operation: canonicalAgentApprovalOperation(approval.operation),
                   arguments_digest: approval.argumentsDigest,
                   decision: "approved",
                   decided_at: new Date().toISOString(),
@@ -6652,7 +6663,17 @@
     const session = agentSessionForCard(cardId);
     const approval = session?.pendingApproval;
     const executionRun = session?.executionRun;
-    if (!session || !approval || approval.status !== "pending" || !executionRun) return;
+    const retryingStalledApproval =
+      approval?.status === "approving" &&
+      session?.status === "blocked" &&
+      session.taskSessionState === "blocked";
+    if (
+      !session ||
+      !approval ||
+      (approval.status !== "pending" && !retryingStalledApproval) ||
+      !executionRun
+    )
+      return;
     if (session.status === "running") {
       appNotice = { tone: "info", message: "Waiting for the Agent to pause safely." };
       return;
@@ -6660,9 +6681,7 @@
 
     updateAgentSessionForCard(cardId, (current) => ({
       ...current,
-      pendingApproval: current.pendingApproval
-        ? { ...current.pendingApproval, status: "approving" }
-        : null,
+      pendingApproval: null,
     }));
     try {
       appendAgentSessionTranscriptForCard(
@@ -6681,15 +6700,22 @@
           ...(approval.target ? [`Target: ${approval.target}`] : []),
         ],
         ["Approval was recorded as structured execution authority for the next run only."],
-        ["Continue the Agent with the approved action."],
+        ["Agent continuation was requested with the approved action."],
       );
-      await startWorkerForCard(cardId, true);
+      appendStructuredAgentLogForCard(
+        cardId,
+        "info",
+        "resume",
+        "Approval accepted. Resuming Agent execution.",
+        [`Operation: ${canonicalAgentApprovalOperation(approval.operation)}`],
+        ["The approval panel was closed and the existing Task Session will be resumed."],
+        ["Wait for execution and verification evidence."],
+      );
+      await startWorkerForCard(cardId, true, "continue", approval);
     } catch (reason) {
       updateAgentSessionForCard(cardId, (current) => ({
         ...current,
-        pendingApproval: current.pendingApproval
-          ? { ...current.pendingApproval, status: "pending" }
-          : null,
+        pendingApproval: { ...approval, status: "pending" },
       }));
       appNotice = {
         tone: "error",
@@ -7221,23 +7247,41 @@
     cardId: string,
     backlogAlreadyApproved = false,
     executionMode: "continue" | "fresh" = "continue",
+    approvedAction: AgentApprovalRequest | null = null,
   ) {
-    const retainedTaskState = agentSessionForCard(cardId)?.taskSessionState;
+    const restoreApproval = () => {
+      if (!approvedAction) return;
+      updateAgentSessionForCard(cardId, (session) => ({
+        ...session,
+        pendingApproval: { ...approvedAction, status: "pending" },
+      }));
+    };
+    const retainedSession = agentSessionForCard(cardId);
+    const retainedTaskState = retainedSession?.taskSessionState;
     if (
       runningWorkerCardIds.has(cardId) ||
       agentSessionForCard(cardId)?.status === "running" ||
       (retainedTaskState &&
         ["queued", "running", "cancelling", "committing"].includes(retainedTaskState))
     ) {
+      restoreApproval();
       appNotice = { tone: "info", message: "Agent is already running this card." };
       return;
     }
 
     const card = activeCardById.get(cardId);
-    if (!card || card.execution === "running") return;
+    const resumingStalledApproval =
+      approvedAction !== null &&
+      retainedSession?.status !== "running" &&
+      retainedTaskState === "blocked";
+    if (!card || (card.execution === "running" && !resumingStalledApproval)) {
+      restoreApproval();
+      return;
+    }
     const inProgressColumnId = columnIdByIntent("in_progress");
     const doneColumnId = columnIdByIntent("done");
     if (!inProgressColumnId || !doneColumnId) {
+      restoreApproval();
       appNotice = {
         tone: "error",
         message: "Agent cannot start because this board is missing an In Progress or Done column.",
@@ -7283,6 +7327,7 @@
       try {
         retainedLegacyGovernanceSnapshot = await retainedAgentGovernanceSnapshot(existingSession);
       } catch (reason) {
+        restoreApproval();
         rollbackPreflightMove();
         finishWorkerRun(cardId, runId);
         appNotice = {
@@ -7297,11 +7342,13 @@
         retainedLegacyGovernanceSnapshot?.rules,
     );
     if (!config) {
+      restoreApproval();
       rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
       return;
     }
     if (!(await ensureAiWorkspaceTrusted(config))) {
+      restoreApproval();
       rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
       return;
@@ -7323,6 +7370,7 @@
         ] as ("workspace_read" | "workspace_write" | "shell" | "git" | "external_tools")[];
         await grantAiRunCapabilities(runId, grantedCapabilities);
       } catch (reason) {
+        restoreApproval();
         await releaseAiWorkerRun(runId).catch(() => false);
         rollbackPreflightMove();
         finishWorkerRun(cardId, runId);
@@ -7477,9 +7525,7 @@
                 existingSession.executionRun,
                 operatorNotes,
                 previousOutput,
-                existingSession.pendingApproval?.status === "approving"
-                  ? existingSession.pendingApproval
-                  : null,
+                approvedAction,
               )
             : createExecutionRun(
                 runId,
@@ -7591,9 +7637,7 @@
           backendExecutionStarted = true;
           if (useTaskSession) {
             const approvalResumeSessionId =
-              executionMode === "continue" &&
-              isContinuation &&
-              existingSession?.pendingApproval?.status === "approving"
+              executionMode === "continue" && isContinuation && approvedAction !== null
                 ? (existingSession.taskSessionId ?? null)
                 : null;
             const continuationSessionId =
@@ -7708,6 +7752,7 @@
                         tool_name: event.tool_name,
                         arguments_digest: event.arguments_digest,
                         operation_id: event.operation_id,
+                        error: event.error,
                         risk: event.risk,
                         display_context: event.display_context,
                       },
@@ -7760,6 +7805,30 @@
             commitManualSkillReservation();
           }
         } catch (reason) {
+          if (reason instanceof AgentTaskSessionApprovalRequiredError) {
+            updateAgentSessionForCard(cardId, (session) => ({
+              ...session,
+              status: "blocked",
+              taskSessionState: "blocked",
+              pendingApproval: session.pendingApproval
+                ? { ...session.pendingApproval, status: "pending" }
+                : null,
+            }));
+            updateExecutionRunForCard(cardId, (run) =>
+              updateExecutionStep(
+                { ...run, status: "blocked" },
+                "worker.execute",
+                "blocked",
+                "Waiting for operator approval.",
+              ),
+            );
+            updateCardExecution(cardId, { blocked: { reason: "Waiting for operator approval." } });
+            appNotice = {
+              tone: "info",
+              message: `${ticketLabel(card)} is waiting for approval before continuing.`,
+            };
+            return;
+          }
           if (
             reason instanceof AgentTaskSessionTimeoutError ||
             (reason instanceof IpcPolicyError && reason.category === "timeout")

@@ -121,6 +121,17 @@ export class AgentTaskSessionTimeoutError extends Error {
   }
 }
 
+/** Expected terminal pause while a fenced tool waits for explicit operator approval. */
+export class AgentTaskSessionApprovalRequiredError extends Error {
+  readonly session: TaskSessionSnapshot;
+
+  constructor(session: TaskSessionSnapshot) {
+    super(`Agent Task Session ${session.id} is waiting for operator approval.`);
+    this.name = "AgentTaskSessionApprovalRequiredError";
+    this.session = session;
+  }
+}
+
 const defaultDependencies: AgentTaskSessionDependencies = {
   appendMessage: appendConversationMessage,
   cancel: cancelTaskSession,
@@ -548,6 +559,30 @@ export function agentTaskCandidateFromEvent(event: TaskSessionEvent): AiWorkerTa
   return event.payload.result;
 }
 
+/** Converts OpenCode-prefixed MCP tool names to the operation ID enforced by OCP approval checks. */
+export function canonicalAgentApprovalOperation(toolName: string, error = ""): string {
+  const marker = "[approval_required]:";
+  const markerIndex = error.indexOf(marker);
+  if (markerIndex >= 0) {
+    try {
+      const payload = JSON.parse(error.slice(markerIndex + marker.length).trim()) as unknown;
+      if (isRecord(payload) && typeof payload.operation === "string") {
+        const operation = canonicalOcpOperation(payload.operation);
+        if (operation) return operation;
+      }
+    } catch {
+      // Fall back to the stable tool-name suffix when an upstream error has extra text.
+    }
+  }
+  return canonicalOcpOperation(toolName) ?? toolName;
+}
+
+function canonicalOcpOperation(value: string): string | null {
+  const operation = value.trim();
+  if (/^(?:ocp|kubernetes)_[a-z0-9_]+$/.test(operation)) return operation;
+  return operation.match(/(?:^|_)((?:ocp|kubernetes)_[a-z0-9_]+)$/)?.[1] ?? null;
+}
+
 /** Validates an authoritative result against the exact terminal assignment attempt. */
 export function validateAgentTaskSessionResult(
   snapshot: TaskSessionSnapshot,
@@ -575,6 +610,10 @@ export function validateAgentTaskSessionResult(
       snapshot.error?.trim() ||
         `Task Session ${snapshot.id} ended in terminal state ${snapshot.state} without a structured Agent result.`,
     );
+  }
+  if (snapshot.state === "blocked" && snapshot.error?.includes("[approval_required]")) {
+    if (authoritative !== null) throw taskSessionResultMismatch(snapshot, authoritative);
+    throw new AgentTaskSessionApprovalRequiredError(snapshot);
   }
   if (
     !authoritative ||

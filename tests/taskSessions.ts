@@ -6,8 +6,10 @@ import {
 } from "../src/lib/ipc/taskSessions";
 import { promptTaskCandidateFromEvent } from "../src/lib/promptTaskSessions";
 import {
+  AgentTaskSessionApprovalRequiredError,
   AgentTaskSessionTimeoutError,
   agentTaskCandidateFromEvent,
+  canonicalAgentApprovalOperation,
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
   executionRepositoryContext,
@@ -568,6 +570,33 @@ try {
   staleAttemptRejected = true;
 }
 assertEqual(staleAttemptRejected, true, "a stale candidate attempt should be rejected");
+
+assertEqual(
+  canonicalAgentApprovalOperation(
+    "spacesly-mcp-test_kubernetes_resources_create",
+    'config[approval_required]: {"operation":"kubernetes_resources_create","arguments_digest":"abc"}',
+  ),
+  "kubernetes_resources_create",
+  "approval operation should use the connector operation ID rather than the OpenCode tool prefix",
+);
+
+const approvalSnapshot = {
+  ...terminalSnapshot(12),
+  state: "blocked" as const,
+  error:
+    'External tool failed. Cause: config[approval_required]: {"operation":"kubernetes_resources_create"}',
+};
+let approvalPauseRecognized = false;
+try {
+  validateAgentTaskSessionResult(approvalSnapshot, null, 4, 7, null);
+} catch (reason) {
+  approvalPauseRecognized = reason instanceof AgentTaskSessionApprovalRequiredError;
+}
+assertEqual(
+  approvalPauseRecognized,
+  true,
+  "approval-blocked terminal sessions should pause without requiring an authoritative result",
+);
 
 const failedSnapshot = {
   ...terminalSnapshot(11),

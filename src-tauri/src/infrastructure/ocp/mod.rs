@@ -415,11 +415,9 @@ pub fn contract_approved_mutation(contract: &Value) -> Option<ApprovedMutation> 
             if approval.get("contract_version").and_then(Value::as_u64) != Some(contract_version) {
                 return None;
             }
-            let operation = approval.get("operation")?.as_str()?.trim();
+            let operation = canonical_approval_operation(approval.get("operation")?.as_str()?);
             let arguments_digest = approval.get("arguments_digest")?.as_str()?.trim();
-            if !(operation.starts_with("ocp_") || operation.starts_with("kubernetes_"))
-                || arguments_digest.is_empty()
-            {
+            if operation.is_empty() || arguments_digest.is_empty() {
                 return None;
             }
             Some(ApprovedMutation {
@@ -427,6 +425,18 @@ pub fn contract_approved_mutation(contract: &Value) -> Option<ApprovedMutation> 
                 arguments_digest: arguments_digest.to_string(),
             })
         })
+}
+
+fn canonical_approval_operation(value: &str) -> &str {
+    let operation = value.trim();
+    if operation.starts_with("ocp_") || operation.starts_with("kubernetes_") {
+        return operation;
+    }
+    ["_ocp_", "_kubernetes_"]
+        .iter()
+        .filter_map(|marker| operation.rfind(marker).map(|index| &operation[index + 1..]))
+        .find(|candidate| candidate.starts_with("ocp_") || candidate.starts_with("kubernetes_"))
+        .unwrap_or("")
 }
 
 fn default_connector_dir_silent() -> PathBuf {
@@ -1434,6 +1444,21 @@ mod tests {
             Some(ApprovedMutation {
                 operation: "ocp_restart_deployment".to_string(),
                 arguments_digest: "abc123".to_string(),
+            })
+        );
+        assert_eq!(
+            contract_approved_mutation(&json!({
+                "runtime_inputs": { "approvals": [{
+                    "operation": "spacesly-mcp-test_kubernetes_resources_create",
+                    "arguments_digest": "ghi789",
+                    "decision": "approved",
+                    "contract_version": 4
+                }] },
+                "version": 4
+            })),
+            Some(ApprovedMutation {
+                operation: "kubernetes_resources_create".to_string(),
+                arguments_digest: "ghi789".to_string(),
             })
         );
         assert_eq!(

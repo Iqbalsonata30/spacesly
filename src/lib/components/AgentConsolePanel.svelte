@@ -288,9 +288,18 @@
         exact operation and arguments in the next run.
       </p>
       <dl class="approval-details">
-        <div><dt>Operation</dt><dd>{approval.operation}</dd></div>
-        {#if approval.target}<div><dt>Target</dt><dd>{approval.target}</dd></div>{/if}
-        <div><dt>Category</dt><dd>{approval.category}</dd></div>
+        <div>
+          <dt>Operation</dt>
+          <dd>{approval.operation}</dd>
+        </div>
+        {#if approval.target}<div>
+            <dt>Target</dt>
+            <dd>{approval.target}</dd>
+          </div>{/if}
+        <div>
+          <dt>Category</dt>
+          <dd>{approval.category}</dd>
+        </div>
       </dl>
       {#if approval.status === "declined"}
         <div class="approval-declined">Declined — no action was authorized.</div>
@@ -299,16 +308,18 @@
           <button
             type="button"
             class="decline-action"
-            disabled={approval.status === "approving"}
+            disabled={isWorking}
             onclick={() => onDecline(runCardId)}>Decline</button
           >
           <button
             type="button"
             class="approve-action"
-            disabled={isWorking || approval.status === "approving"}
+            disabled={isWorking}
             title={isWorking ? "Waiting for the Agent to pause safely" : undefined}
             onclick={() => onApprove(runCardId)}
-            >{approval.status === "approving" ? "Approving…" : "Approve & Continue"}</button
+            >{approval.status === "approving" && isWorking
+              ? "Approving…"
+              : "Approve & Continue"}</button
           >
         </div>
       {/if}
