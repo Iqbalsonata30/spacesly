@@ -41,6 +41,22 @@ const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
 const MESSAGE_AUTHORITY_RENDERER: &str = "renderer";
 const MESSAGE_AUTHORITY_BACKEND: &str = "backend";
 
+/// Returns the `task-session:<instance>:<session>` origin of a scheduler projection ID, or `None`
+/// when the ID is not a well-formed scheduler projection. Every attempt of one Task Session shares
+/// the same origin, so a continued attempt may legitimately supersede the previous one on a reused
+/// execution run, while a projection from a different Task Session must still be rejected.
+fn projection_session_origin(projection_id: &str) -> Option<String> {
+    let mut segments = projection_id.split(':');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("task-session"), Some(instance), Some(session))
+            if !instance.is_empty() && !session.is_empty() =>
+        {
+            Some(format!("task-session:{instance}:{session}"))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionStore {
     connection: Arc<Mutex<Connection>>,
@@ -147,7 +163,11 @@ struct CanonicalChatSnapshot<'a> {
 
 impl ExecutionStore {
     pub fn open() -> Result<Self, String> {
-        let path = database_path()?;
+        Self::open_at(database_path()?)
+    }
+
+    /// Opens or creates a persistent execution database at an explicit path.
+    pub(crate) fn open_at(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("Failed to create execution data directory: {error}"))?;
@@ -487,10 +507,18 @@ impl ExecutionStore {
             .optional()
             .map_err(|error| format!("Failed to verify worker.execute step: {error}"))?
             .ok_or_else(|| "Completion execution run has no worker.execute step.".to_string())?;
-        if step_projection
-            .as_deref()
-            .is_some_and(|projection| projection != completion.projection_id)
-        {
+        let projection_origin = projection_session_origin(&completion.projection_id);
+        let same_session = match step_projection.as_deref() {
+            None => true,
+            Some(existing) => match (
+                projection_session_origin(existing),
+                projection_origin.as_deref(),
+            ) {
+                (Some(existing_origin), Some(origin)) => existing_origin == origin,
+                _ => existing == completion.projection_id.as_str(),
+            },
+        };
+        if !same_session {
             return Err(
                 "worker.execute already has different Task Session provenance.".to_string(),
             );
@@ -527,7 +555,9 @@ impl ExecutionStore {
                         task_session_projection_id = ?7, lease_owner = NULL,
                         lease_expires_at = NULL, updated_at = ?4
                   WHERE run_id = ?1 AND step_id = ?2
-                    AND (task_session_projection_id IS NULL OR task_session_projection_id = ?7)",
+                    AND (task_session_projection_id IS NULL
+                         OR task_session_projection_id = ?7
+                         OR substr(task_session_projection_id, 1, length(?8)) = ?8)",
                 params![
                     completion.execution_run_id,
                     "worker.execute",
@@ -535,7 +565,11 @@ impl ExecutionStore {
                     now.to_string(),
                     summary,
                     output_json,
-                    completion.projection_id
+                    completion.projection_id,
+                    projection_origin
+                        .as_deref()
+                        .map(|origin| format!("{origin}:"))
+                        .unwrap_or_else(|| format!("{}:", completion.projection_id)),
                 ],
             )
             .map_err(|error| format!("Failed to project worker.execute result: {error}"))?;
@@ -1785,6 +1819,62 @@ mod tests {
         assert_eq!(provenance, "projection-1");
         assert_eq!(authority, MESSAGE_AUTHORITY_BACKEND);
         assert_eq!(receipts, 1);
+    }
+
+    #[test]
+    fn agent_completion_projection_allows_same_session_but_rejects_other_sessions() {
+        let store = projection_test_store();
+        let completed = |projection_id: &str, session_id| StagedCompletion {
+            projection_id: projection_id.to_string(),
+            session_id,
+            attempt_id: 1,
+            fencing_token: 1,
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            execution_run_id: "run-1".to_string(),
+            output: TaskExecutionOutput::Agent(AgentTaskResult {
+                summary: "Work completed".to_string(),
+                evidence: Vec::new(),
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AgentTaskCompletionStatus::Completed,
+                blocked_reason: None,
+            }),
+            terminal_state: TaskSessionState::Succeeded,
+        };
+
+        store
+            .project_task_completion(&completed(
+                "task-session:instance-1:1:2:3",
+                TaskSessionId(1),
+            ))
+            .expect("first attempt projects");
+
+        let rejected = store
+            .project_task_completion(&completed(
+                "task-session:instance-1:2:2:3",
+                TaskSessionId(2),
+            ))
+            .expect_err("a different Task Session must be rejected");
+        assert!(rejected.contains("different Task Session provenance"));
+
+        store
+            .project_task_completion(&completed(
+                "task-session:instance-1:1:3:4",
+                TaskSessionId(1),
+            ))
+            .expect("a continuation of the same Task Session may supersede");
+
+        let connection = store.connection.lock().unwrap();
+        let provenance: String = connection
+            .query_row(
+                "SELECT task_session_projection_id FROM step_runs
+                  WHERE run_id = 'run-1' AND step_id = 'worker.execute'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provenance, "task-session:instance-1:1:3:4");
     }
 
     #[test]

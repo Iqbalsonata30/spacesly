@@ -436,10 +436,11 @@ pub(crate) fn emit_runtime_event(
 mod tests {
     use super::*;
     use crate::application::execution_engine::ExecutionEngine;
+    use crate::domain::execution::{ExecutionRun, StepRun};
     use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState, TaskToolState};
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
     use crate::infrastructure::tool_broker::ToolDisplayContext;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
     use std::time::{Duration, Instant};
@@ -1121,6 +1122,114 @@ mod tests {
                 .as_slice(),
             &[None, Some("opencode-session-continued".to_string())]
         );
+    }
+
+    #[test]
+    fn blocked_continuation_projects_onto_reused_execution_run() {
+        let directory = tempdir().expect("temp directory");
+        let executions = crate::infrastructure::execution_store::ExecutionStore::open_at(
+            directory.path().join("executions.db"),
+        )
+        .expect("execution store opens");
+        let workspace_id = "workspace-personal";
+        let conversation_id = "conversation-1";
+        let run_id = "run-1";
+        executions
+            .save(&ExecutionRun {
+                run_id: run_id.to_string(),
+                contract: serde_json::json!({
+                    "contract_id": format!("contract-{run_id}"),
+                    "task_id": "task-1",
+                    "workspace_id": workspace_id,
+                    "version": 1,
+                    "created_at": "2026-07-31T00:00:00Z"
+                }),
+                status: "running".to_string(),
+                current_step_ids: vec!["worker.execute".to_string()],
+                step_runs: BTreeMap::from([(
+                    "worker.execute".to_string(),
+                    StepRun {
+                        step_id: "worker.execute".to_string(),
+                        status: "ready".to_string(),
+                        attempt: 0,
+                        started_at: None,
+                        completed_at: None,
+                        summary: None,
+                        lease_owner: None,
+                        lease_expires_at: None,
+                    },
+                )]),
+                started_at: "2026-07-31T00:00:00Z".to_string(),
+                completed_at: None,
+                revision: 0,
+            })
+            .expect("execution run saved");
+        executions
+            .append_conversation_message(
+                workspace_id,
+                conversation_id,
+                "Agent card",
+                &crate::infrastructure::execution_store::ConversationMessageInput {
+                    id: "agent-context".to_string(),
+                    role: "user".to_string(),
+                    text: "Execute the contract".to_string(),
+                },
+            )
+            .expect("conversation seeded");
+
+        let runner = Arc::new(BlockedThenCompleteRunner {
+            executions: AtomicUsize::new(0),
+            seen_session_ids: Mutex::new(Vec::new()),
+        });
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            runner.clone(),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor_and_projector(
+            Arc::new(executor),
+            Arc::new(executions.clone()),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+
+        let envelope = test_envelope();
+        let session = engine
+            .submit_envelope_with_grants(
+                "blocked-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let blocked = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task blocks");
+        assert_eq!(blocked.state, TaskSessionState::Blocked);
+
+        let continued = engine
+            .continue_interrupted_session(
+                session.id,
+                "continued-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+            )
+            .expect("task continued");
+        assert_eq!(continued.id, session.id);
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("continued task completes");
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        let step = executions
+            .get(run_id)
+            .expect("run loaded")
+            .expect("run exists")
+            .step_runs
+            .remove("worker.execute")
+            .expect("worker.execute step projected");
+        assert_eq!(step.status, "completed");
     }
 
     #[test]
