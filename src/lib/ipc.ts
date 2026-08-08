@@ -76,6 +76,7 @@ export {
   digestAgentExecutionContract,
   getSchedulerHealth,
   getTaskSession,
+  getTaskSessionGovernance,
   getTaskSessionResult,
   getTaskSessionMcpContext,
   getTaskSessionToolState,

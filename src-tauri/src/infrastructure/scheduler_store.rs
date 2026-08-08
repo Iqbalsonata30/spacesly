@@ -4,6 +4,7 @@
 //! mutation is transactional so the Scheduler can keep only process-local Worker handles and
 //! cancellation tokens in memory.
 
+use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskMcpContext,
     TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
@@ -266,6 +267,13 @@ impl SchedulerStore {
                     grant_source TEXT NOT NULL,
                     granted_at INTEGER NOT NULL,
                     PRIMARY KEY(session_id, capability),
+                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE TABLE IF NOT EXISTS scheduler_task_governance (
+                    session_id INTEGER PRIMARY KEY,
+                    resolution_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
                       ON DELETE CASCADE
                   );
@@ -1178,6 +1186,77 @@ impl SchedulerStore {
                 |row| row.get(0),
             )
             .map_err(|error| format!("Failed to load Task Session OpenCode identity: {error}"))
+    }
+
+    /// Loads the immutable governance snapshot for one retained Task Session.
+    pub(crate) fn governance_resolution(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Option<GovernanceResolutionRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let encoded = connection
+            .query_row(
+                "SELECT resolution_json FROM scheduler_task_governance WHERE session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load Task Session governance: {error}"))?;
+        encoded
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| format!("Failed to decode Task Session governance: {error}"))
+            })
+            .transpose()
+    }
+
+    /// Persists a governance snapshot exactly once under the active assignment fence.
+    pub(crate) fn bind_governance_resolution(
+        &self,
+        fence: AssignmentFence,
+        resolution: &GovernanceResolutionRecord,
+    ) -> Result<GovernanceResolutionRecord, String> {
+        if resolution.task_session_id != fence.session_id.0 {
+            return Err("Governance snapshot Task Session identity does not match.".to_string());
+        }
+        let encoded = serde_json::to_string(resolution)
+            .map_err(|error| format!("Failed to encode Task Session governance: {error}"))?;
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start governance transaction: {error}"))?;
+        if !assignment_is_current_on(&transaction, fence, now)? {
+            return Err("Governance snapshot assignment fence is stale.".to_string());
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT resolution_json FROM scheduler_task_governance WHERE session_id = ?1",
+                params![to_i64(fence.session_id.0)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect Task Session governance: {error}"))?;
+        if let Some(existing) = existing {
+            if existing != encoded {
+                return Err(format!(
+                    "Task Session {} already owns a different governance snapshot.",
+                    fence.session_id.0
+                ));
+            }
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO scheduler_task_governance
+                       (session_id, resolution_json, created_at) VALUES (?1, ?2, ?3)",
+                    params![to_i64(fence.session_id.0)?, encoded, to_i64(now)?],
+                )
+                .map_err(|error| format!("Failed to persist Task Session governance: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit Task Session governance: {error}"))?;
+        Ok(resolution.clone())
     }
 
     pub(crate) fn bind_opencode_session(

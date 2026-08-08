@@ -1,4 +1,5 @@
 use super::agent_task_executor::{AgentRuntimeResolver, ResolvedAgentTask};
+use crate::domain::governance::{resolve_governance, GovernanceResolutionRecord};
 use crate::domain::task_session::TaskSessionEnvelopeV1;
 use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerMcpServer, AiWorkerTask};
 use crate::infrastructure::execution_store::{ChatConversationSnapshot, ExecutionStore};
@@ -26,6 +27,7 @@ pub(crate) struct ResolvedPromptRuntime {
     pub runtime_profile_id: String,
     pub config: AiWorkerConfig,
     pub chat_snapshot: Option<ChatConversationSnapshot>,
+    profile: AgentRuntimeProfile,
 }
 
 impl StoredAgentRuntimeResolver {
@@ -128,18 +130,18 @@ impl StoredAgentRuntimeResolver {
 
         let rules_resolution =
             crate::infrastructure::performance::span("rules_resolution_ms", "agent_runtime");
-        let agent_rules = profile.agent_rules;
+        let agent_rules = profile.agent_rules.clone();
         rules_resolution.finish();
         let skills_resolution =
             crate::infrastructure::performance::span("skills_resolution_ms", "agent_runtime");
-        let agent_skills = profile.agent_skills;
+        let agent_skills = profile.agent_skills.clone();
         skills_resolution.finish();
 
         let resolved = ResolvedPromptRuntime {
-            runtime_profile_id: profile.id,
+            runtime_profile_id: profile.id.clone(),
             config: AiWorkerConfig {
                 workspace_id: envelope.workspace_id.clone(),
-                runtime: profile.runtime,
+                runtime: profile.runtime.clone(),
                 provider_name: provider
                     .map_or(provider_id, |profile| profile.name)
                     .to_string(),
@@ -151,12 +153,14 @@ impl StoredAgentRuntimeResolver {
                     .to_string(),
                 api_key: self.secrets.ai_api_key(provider_id)?,
                 model: model.to_string(),
-                opencode_command: profile.opencode_command,
+                opencode_command: profile.opencode_command.clone(),
                 opencode_model: envelope.model.clone(),
                 opencode_workdir: Some(workspace.to_string_lossy().to_string()),
                 opencode_auto_approve: false,
                 agent_rules,
                 agent_skills,
+                governance_schema_version: profile.governance_schema_version,
+                skill_catalog: profile.skill_catalog.clone(),
                 temperature: profile.temperature,
                 restrict_tools: true,
                 fenced_tools_only: true,
@@ -165,6 +169,7 @@ impl StoredAgentRuntimeResolver {
                 mcp_servers,
             },
             chat_snapshot: None,
+            profile,
         };
         total.finish();
         Ok(resolved)
@@ -215,8 +220,10 @@ fn resolve_profile_workspace(
 impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
     fn resolve(
         &self,
+        task_session_id: u64,
         envelope: &TaskSessionEnvelopeV1,
         runtime_attempt_id: &str,
+        retained_governance: Option<&GovernanceResolutionRecord>,
     ) -> Result<ResolvedAgentTask, String> {
         if runtime_attempt_id.trim().is_empty() {
             return Err("Agent runtime attempt ID is required.".to_string());
@@ -251,6 +258,16 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             return Err("Execution contract workspace did not match the envelope.".to_string());
         }
 
+        let governance = match retained_governance {
+            Some(resolution) => {
+                resolution.validate_for(task_session_id)?;
+                resolution.clone()
+            }
+            None => resolve_governance(task_session_id, &runtime.profile, &run.contract)?,
+        };
+        runtime.config.agent_rules = governance.rules.snapshot.clone();
+        runtime.config.agent_skills = governance.skills.snapshot.clone();
+
         if let Some(approval) = ocp::contract_approved_mutation(&run.contract) {
             for server in &mut runtime.config.mcp_servers {
                 if server.environment.contains_key(ocp::ENV_MODE) {
@@ -269,6 +286,7 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
         Ok(ResolvedAgentTask {
             runtime_profile_id: runtime.runtime_profile_id,
             config: runtime.config,
+            governance,
             task: AiWorkerTask {
                 execution_contract: Some(run.contract),
                 session_key: Some(runtime_attempt_id.to_string()),
@@ -381,6 +399,8 @@ mod tests {
             prompt_template_version: "agent-v1".to_string(),
             rules_revision: content_revision("Use evidence."),
             skills_revision: content_revision("Verify changes."),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
         }
     }
 }

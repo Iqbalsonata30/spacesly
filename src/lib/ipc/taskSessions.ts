@@ -145,6 +145,45 @@ export type AgentRuntimeProfile = {
   prompt_template_version: string;
   rules_revision: string;
   skills_revision: string;
+  governance_schema_version: number;
+  skill_catalog: import("$lib/ipc/agent").AgentSkillRuntimeDefinition[];
+};
+
+export type GovernanceResolutionStatus = "authoritative" | "legacy_unavailable";
+
+export type TaskGovernanceResolution = {
+  schema_version: number;
+  task_session_id: number;
+  resolved_at: number;
+  status: GovernanceResolutionStatus;
+  rules: {
+    normalization_version: string;
+    final_digest: string;
+    entries: Array<{
+      rule_id: string;
+      scope: "platform" | "global" | "workspace" | "task";
+      source: string;
+      revision: string;
+      precedence: number;
+      digest: string;
+    }>;
+    snapshot: string;
+  };
+  skills: {
+    catalog_revision: string | null;
+    selected_skill_ids: string[];
+    entries: Array<{
+      skill_id: string;
+      selected: boolean;
+      trigger: string;
+      matched_domains: string[];
+      matched_intents: string[];
+      priority: number;
+      reason: string;
+      selection_order: number | null;
+    }>;
+    snapshot: string;
+  };
 };
 
 export type TaskProgress = {
@@ -261,6 +300,17 @@ export function listTaskSessions(): Promise<TaskSessionSnapshot[]> {
 /** Reads scheduler health directly from backend shared state. */
 export function getSchedulerHealth(): Promise<SchedulerHealth> {
   return invokeWithPolicy("get_scheduler_health", {}, IPC_POLICIES.taskSessionRead);
+}
+
+/** Returns the persisted backend-authoritative Rules and Skills resolution for one session. */
+export function getTaskSessionGovernance(
+  sessionId: number,
+): Promise<TaskGovernanceResolution | null> {
+  return invokeWithPolicy(
+    "get_task_session_governance",
+    { sessionId },
+    IPC_POLICIES.taskSessionRead,
+  );
 }
 
 /** Lists non-secret Agent runtime profiles available for future Task Session submissions. */

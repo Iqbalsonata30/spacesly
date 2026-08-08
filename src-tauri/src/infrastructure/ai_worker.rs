@@ -9,6 +9,7 @@ use super::scheduler_store::{ExternalAssignmentAuthority, TaskToolAuthority};
 use super::shell_env::inject_shell_env;
 use super::task_tools::TASK_TOOLS_AUTHORITY_ENV;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
+use crate::domain::governance::AgentSkillDefinition;
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,10 @@ pub struct AiWorkerConfig {
     pub opencode_auto_approve: bool,
     pub agent_rules: String,
     pub agent_skills: String,
+    #[serde(default)]
+    pub governance_schema_version: u32,
+    #[serde(default)]
+    pub skill_catalog: Vec<AgentSkillDefinition>,
     pub temperature: f32,
     #[serde(skip)]
     pub restrict_tools: bool,
@@ -2972,6 +2977,8 @@ mod tests {
             opencode_auto_approve: false,
             agent_rules: rules.to_string(),
             agent_skills: skills.to_string(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
             temperature: 0.2,
             restrict_tools: false,
             fenced_tools_only: false,

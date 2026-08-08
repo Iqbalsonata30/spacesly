@@ -594,6 +594,47 @@ async fn execute_ai_worker_task(
     if submitted_contract != &persisted_run.contract {
         return Err("Execution contract does not match the persisted run.".to_string());
     }
+    if config.governance_schema_version > 0 {
+        let skills_revision = domain::governance::skill_catalog_revision(&config.skill_catalog)?;
+        let profile = AgentRuntimeProfile {
+            id: format!("ephemeral-{run_id}"),
+            runtime: config.runtime.clone(),
+            model: config.opencode_model.clone(),
+            opencode_command: config.opencode_command.clone(),
+            opencode_workdir: config.opencode_workdir.clone(),
+            agent_rules: config.agent_rules.clone(),
+            agent_skills: String::new(),
+            temperature: config.temperature,
+            connector_ids: config
+                .mcp_servers
+                .iter()
+                .map(|server| server.secret_id.clone())
+                .collect(),
+            prompt_template_version: "direct-agent-v1".to_string(),
+            rules_revision: infrastructure::runtime_profile_store::content_revision(
+                &config.agent_rules,
+            ),
+            skills_revision,
+            governance_schema_version: config.governance_schema_version,
+            skill_catalog: config.skill_catalog.clone(),
+        };
+        let governance = domain::governance::resolve_governance(0, &profile, submitted_contract)?;
+        config.agent_rules = governance.rules.snapshot.clone();
+        config.agent_skills = governance.skills.snapshot.clone();
+        execution_store.record_ai_audit(
+            Some(&run_id),
+            "governance_resolved",
+            &serde_json::json!({
+                "status": governance.status,
+                "rules": governance.rules.entries,
+                "normalization_version": governance.rules.normalization_version,
+                "final_rules_digest": governance.rules.final_digest,
+                "skill_catalog_revision": governance.skills.catalog_revision,
+                "selected_skill_ids": governance.skills.selected_skill_ids,
+                "skill_entries": governance.skills.entries,
+            }),
+        )?;
+    }
     let ocp_approval = infrastructure::ocp::contract_approved_mutation(&persisted_run.contract);
     prepare_ocp_agent_servers(&mut config, ocp_approval.as_ref())?;
     ai_runs.require_capabilities(
@@ -2393,6 +2434,19 @@ async fn get_task_session_mcp_context(
 }
 
 #[tauri::command]
+async fn get_task_session_governance(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Option<domain::governance::GovernanceResolutionRecord>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.governance_resolution(TaskSessionId(session_id))
+    })
+    .await
+    .map_err(|error| format!("Get Task Session governance task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn format_code(formatter: String, source: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || format_code_impl(formatter, source))
         .await
@@ -2903,6 +2957,8 @@ mod tests {
             opencode_auto_approve: false,
             agent_rules: String::new(),
             agent_skills: String::new(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
             temperature: 0.2,
             restrict_tools: false,
             fenced_tools_only: false,
@@ -2935,6 +2991,8 @@ mod tests {
             opencode_auto_approve: false,
             agent_rules: String::new(),
             agent_skills: String::new(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
             temperature: 0.0,
             restrict_tools: false,
             fenced_tools_only: false,
@@ -3176,6 +3234,7 @@ pub fn run() {
             list_task_session_events,
             get_task_session_tool_state,
             get_task_session_mcp_context,
+            get_task_session_governance,
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
             save_immutable_agent_runtime_profile,

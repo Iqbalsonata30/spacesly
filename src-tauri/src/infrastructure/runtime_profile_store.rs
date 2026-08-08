@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::domain::governance::{skill_catalog_revision, AgentSkillDefinition};
+
 const MAX_RULES_BYTES: usize = 32 * 1024;
 const MAX_SKILLS_BYTES: usize = 32 * 1024;
 
@@ -25,6 +27,12 @@ pub struct AgentRuntimeProfile {
     pub prompt_template_version: String,
     pub rules_revision: String,
     pub skills_revision: String,
+    /// Version 0 represents a legacy text-only profile. Version 1 is resolved by the backend.
+    #[serde(default)]
+    pub governance_schema_version: u32,
+    /// Immutable execution fields for the complete Skill catalog used by backend selection.
+    #[serde(default)]
+    pub skill_catalog: Vec<AgentSkillDefinition>,
 }
 
 impl AgentRuntimeProfile {
@@ -85,6 +93,26 @@ impl AgentRuntimeProfile {
                 MAX_SKILLS_BYTES / 1024
             ));
         }
+        match self.governance_schema_version {
+            0 if !self.skill_catalog.is_empty() => {
+                return Err(
+                    "Legacy Agent runtime profiles cannot contain a structured Skill catalog."
+                        .to_string(),
+                );
+            }
+            1 if !self.agent_skills.is_empty() => {
+                return Err(
+                    "Backend-authoritative Agent profiles cannot contain a renderer-selected Skill snapshot."
+                        .to_string(),
+                );
+            }
+            0 | 1 => {}
+            version => {
+                return Err(format!(
+                    "Agent governance schema version {version} is not supported."
+                ));
+            }
+        }
         let connectors = self.connector_ids.iter().collect::<HashSet<_>>();
         if connectors.len() != self.connector_ids.len()
             || self.connector_ids.iter().any(|connector| {
@@ -102,8 +130,13 @@ impl AgentRuntimeProfile {
 
     /// Verifies that persisted revision claims match the profile content.
     pub fn validate_content_revisions(&self) -> Result<(), String> {
+        let skills_revision = if self.governance_schema_version == 0 {
+            content_revision(&self.agent_skills)
+        } else {
+            skill_catalog_revision(&self.skill_catalog)?
+        };
         if self.rules_revision != content_revision(&self.agent_rules)
-            || self.skills_revision != content_revision(&self.agent_skills)
+            || self.skills_revision != skills_revision
         {
             return Err(
                 "Agent runtime profile rule or skill revision did not match its content."
@@ -364,6 +397,8 @@ mod tests {
             temperature: 0.2,
             connector_ids: vec!["jira".to_string()],
             prompt_template_version: "agent-v1".to_string(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
         }
     }
 }

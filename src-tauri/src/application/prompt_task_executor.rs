@@ -917,6 +917,8 @@ mod tests {
             opencode_auto_approve: true,
             agent_rules: String::new(),
             agent_skills: String::new(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
             temperature: 0.0,
             restrict_tools: false,
             fenced_tools_only: false,

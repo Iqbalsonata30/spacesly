@@ -174,6 +174,7 @@
     getJiraBoards,
     getAiRun,
     getTaskSession,
+    getTaskSessionGovernance,
     getPathGitInfo,
     getWorkspaceGitInfo,
     getWorkspace,
@@ -272,7 +273,6 @@
     categoryLabel,
     createAgentSkill,
     duplicateAgentSkill,
-    resolveAgentSkillSnapshot,
     skillCategories,
     skillMatchesSearch,
     triggerLabel,
@@ -4036,6 +4036,19 @@
       opencode_auto_approve: false,
       agent_rules: agentRules,
       agent_skills: "",
+      governance_schema_version: 1,
+      skill_catalog: effectiveSettings.aiWorker.skills.map((skill) => ({
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+        category: skill.category,
+        custom_category: skill.custom_category,
+        trigger: skill.trigger,
+        priority: skill.priority,
+        enabled: skill.enabled,
+        instructions: skill.instructions,
+        updated_at: skill.updated_at,
+      })),
       temperature: effectiveSettings.aiWorker.temperature,
       mcp_servers: effectiveSettings.mcpServers.flatMap((server) => {
         const command = [server.command.trim(), ...server.args].filter(Boolean);
@@ -7330,13 +7343,21 @@
 
   async function retainedAgentGovernanceSnapshot(
     session: AgentRunSession,
-  ): Promise<{ rules: string; skills: string }> {
+  ): Promise<{ rules: string; skills: string; legacy: boolean }> {
     if (!session.taskSessionId) {
       throw new Error(
         "Cannot continue safely because the original governance snapshot has no retained Task Session.",
       );
     }
     try {
+      const governance = await getTaskSessionGovernance(session.taskSessionId);
+      if (governance) {
+        return {
+          rules: governance.rules.snapshot,
+          skills: governance.skills.snapshot,
+          legacy: governance.status === "legacy_unavailable",
+        };
+      }
       const snapshot = await getTaskSession(session.taskSessionId);
       if (!snapshot) throw new Error("retained Task Session was not found");
       const envelope = agentEnvelopeFromSnapshot(snapshot);
@@ -7344,7 +7365,7 @@
       const profiles = await listAgentRuntimeProfiles();
       const profile = profiles.find((candidate) => candidate.id === envelope.runtime_profile_id);
       if (!profile) throw new Error("retained Agent runtime profile was not found");
-      return { rules: profile.agent_rules, skills: profile.agent_skills };
+      return { rules: profile.agent_rules, skills: profile.agent_skills, legacy: true };
     } catch (reason) {
       throw new Error(
         `Cannot continue safely because the original governance snapshot is unavailable: ${reason instanceof Error ? reason.message : String(reason)}`,
@@ -7436,7 +7457,11 @@
       existingSession?.status === "blocked" ||
       existingSession?.status === "blocked_for_resume" ||
       existingSession?.status === "timeout";
-    let retainedLegacyGovernanceSnapshot: { rules: string; skills: string } | null = null;
+    let retainedGovernanceSnapshot: {
+      rules: string;
+      skills: string;
+      legacy: boolean;
+    } | null = null;
     if (
       isContinuation &&
       existingSession?.taskSessionId &&
@@ -7445,7 +7470,7 @@
           undefined)
     ) {
       try {
-        retainedLegacyGovernanceSnapshot = await retainedAgentGovernanceSnapshot(existingSession);
+        retainedGovernanceSnapshot = await retainedAgentGovernanceSnapshot(existingSession);
       } catch (reason) {
         restoreApproval();
         rollbackPreflightMove();
@@ -7459,13 +7484,18 @@
     }
     const config = buildAiWorkerConfig(
       existingSession?.executionRun?.contract.runtime_inputs.agent_rules_snapshot ??
-        retainedLegacyGovernanceSnapshot?.rules,
+        retainedGovernanceSnapshot?.rules,
     );
     if (!config) {
       restoreApproval();
       rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
       return;
+    }
+    if (retainedGovernanceSnapshot?.legacy) {
+      config.governance_schema_version = 0;
+      config.agent_skills = retainedGovernanceSnapshot.skills;
+      config.skill_catalog = [];
     }
     if (!(await ensureAiWorkspaceTrusted(config))) {
       restoreApproval();
@@ -7659,27 +7689,29 @@
                   executionRepositoryContext(config, executionGitInfo, workspaceRoot),
                 ),
               );
-      const rulesSnapshot =
+      const retainedRulesSnapshot =
         executionRun.contract.runtime_inputs.agent_rules_snapshot ??
-        retainedLegacyGovernanceSnapshot?.rules ??
-        config.agent_rules;
-      config.agent_rules = rulesSnapshot;
-      executionRun = {
-        ...executionRun,
-        contract: {
-          ...executionRun.contract,
-          runtime_inputs: {
-            ...executionRun.contract.runtime_inputs,
-            agent_rules_snapshot: rulesSnapshot,
+        (retainedGovernanceSnapshot?.legacy ? retainedGovernanceSnapshot.rules : undefined);
+      if (isContinuation && retainedRulesSnapshot !== undefined) {
+        config.agent_rules = retainedRulesSnapshot;
+        executionRun = {
+          ...executionRun,
+          contract: {
+            ...executionRun.contract,
+            runtime_inputs: {
+              ...executionRun.contract.runtime_inputs,
+              agent_rules_snapshot: retainedRulesSnapshot,
+            },
           },
-        },
-      };
+        };
+      }
       if (
         executionRun.contract.runtime_inputs.selected_skills_snapshot === undefined &&
         isContinuation &&
-        existingSession
+        existingSession &&
+        retainedGovernanceSnapshot?.legacy
       ) {
-        if (retainedLegacyGovernanceSnapshot === null) {
+        if (retainedGovernanceSnapshot === null) {
           throw new Error("Cannot continue safely because the original Skill snapshot is missing.");
         }
         executionRun = {
@@ -7689,7 +7721,7 @@
             runtime_inputs: {
               ...executionRun.contract.runtime_inputs,
               selected_skill_ids: [],
-              selected_skills_snapshot: retainedLegacyGovernanceSnapshot.skills,
+              selected_skills_snapshot: retainedGovernanceSnapshot.skills,
             },
           },
         };
@@ -7700,17 +7732,22 @@
       if (cancelledManualSkillReservationRunIds.delete(runId)) {
         throw new Error("Agent run was cancelled before submission.");
       }
-      const skillSnapshot = resolveAgentSkillSnapshot(
-        settings.aiWorker.skills,
-        executionRun.contract,
-        [...manuallyQueuedSkillIds],
-      );
-      config.agent_skills = skillSnapshot.snapshot;
-      executionRun = { ...executionRun, contract: skillSnapshot.contract };
-      const consumedManualSkillIds = skillSnapshot.reused
-        ? []
-        : skillSnapshot.selectedSkillIds.filter((skillId) => manuallyQueuedSkillIds.has(skillId));
-      reservedManualSkillIds = consumedManualSkillIds;
+      const retainedRequestedSkillIds =
+        executionRun.contract.runtime_inputs.requested_skill_ids ?? [];
+      reservedManualSkillIds = isContinuation ? [] : [...manuallyQueuedSkillIds];
+      executionRun = {
+        ...executionRun,
+        contract: {
+          ...executionRun.contract,
+          runtime_inputs: {
+            ...executionRun.contract.runtime_inputs,
+            requested_skill_ids:
+              retainedRequestedSkillIds.length > 0
+                ? retainedRequestedSkillIds
+                : reservedManualSkillIds,
+          },
+        },
+      };
       for (const skillId of reservedManualSkillIds) manuallyQueuedSkillIds.delete(skillId);
       const commitManualSkillReservation = () => {
         manualSkillReservationCommitted = true;
@@ -8014,8 +8051,7 @@
           if (
             !recoveredFromResumeTimeout &&
             (reason instanceof AgentTaskSessionTimeoutError ||
-              reason instanceof IpcPolicyError &&
-              reason.category === "timeout")
+              (reason instanceof IpcPolicyError && reason.category === "timeout"))
           ) {
             const cancelled =
               reason instanceof AgentTaskSessionTimeoutError

@@ -24,8 +24,23 @@ export interface AiWorkerConfig {
   opencode_auto_approve: boolean;
   agent_rules: string;
   agent_skills: string;
+  governance_schema_version: number;
+  skill_catalog: AgentSkillRuntimeDefinition[];
   temperature: number;
   mcp_servers: AiWorkerMcpServer[];
+}
+
+export interface AgentSkillRuntimeDefinition {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  custom_category: string;
+  trigger: string;
+  priority: number;
+  enabled: boolean;
+  instructions: string;
+  updated_at: string;
 }
 
 export interface AiWorkerTask {
@@ -89,6 +104,7 @@ export interface ExecutionContract {
     agent_rules_snapshot?: string;
     selected_skill_ids?: string[];
     selected_skills_snapshot?: string;
+    requested_skill_ids?: string[];
   };
 }
 

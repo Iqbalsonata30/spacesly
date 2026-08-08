@@ -3,14 +3,10 @@ import {
   duplicateAgentSkill,
   migrateLegacyAgentSkills,
   normalizeAgentSkills,
-  resolveAgentSkillSnapshot,
-  selectAgentSkills,
-  serializeSelectedSkills,
   skillMatchesSearch,
   validateAgentSkillCatalog,
   type AgentSkill,
 } from "../src/lib/agentSkills";
-import type { ExecutionContract } from "../src/lib/ipc";
 import { normalizeSettings, settingsWithoutSecrets } from "../src/lib/settings";
 
 function assertEqual<T>(actual: T, expected: T, message: string): void {
@@ -159,91 +155,6 @@ const catalog = [
   skill({ id: "disabled", name: "Disabled", trigger: "automatic", enabled: false }),
 ];
 
-const contract: ExecutionContract = {
-  contract_id: "contract-1",
-  version: 1,
-  task_id: "task-1",
-  workspace_id: "workspace-1",
-  created_at: "2026-08-01T00:00:00.000Z",
-  objective: {
-    summary: "Deploy the service to Kubernetes",
-    success_criteria: ["Verify the rollout and commit the manifest"],
-  },
-  task_context: { description: "Update Helm configuration", execution_detail: "Run tests first" },
-  ticket: {
-    provider: "local",
-    key: null,
-    url: null,
-    title: "Release service",
-    labels: ["infrastructure"],
-    status: null,
-    updated_at: null,
-    fetched_at: null,
-  },
-  workflow: [
-    { step_id: "worker", title: "Deploy and verify", type: "worker.execute", status: "current" },
-  ],
-  completed_steps: [],
-  current_step: "worker",
-  remaining_steps: [],
-  repository: { root_path: "/workspace", branch: "main", head_commit: "abc" },
-  constraints: {
-    execution_only: true,
-    planning_completed: true,
-    must_not_read_jira_for_planning: true,
-    must_not_classify_ticket: true,
-    must_not_regenerate_workflow: true,
-    must_not_rediscover_repository: true,
-    may_modify_files: true,
-    may_update_jira: false,
-  },
-  runtime_inputs: { operator_notes: null, previous_output: null },
-};
-
-const selection = selectAgentSkills(catalog, contract);
-assertEqual(
-  selection.skills.map((selected) => selected.id),
-  ["deployment", "git", "baseline"],
-  "selection should include only automatic and matching contextual skills in priority order",
-);
-assertEqual(
-  selection.categories,
-  ["deployment", "infrastructure", "git", "testing"],
-  "classification should derive deterministic categories from immutable task signals",
-);
-assertEqual(
-  selectAgentSkills(catalog, contract, ["manual"]).skills.map((selected) => selected.id),
-  ["manual", "deployment", "git", "baseline"],
-  "manual-only skills should load only when explicitly requested",
-);
-assertEqual(
-  selectAgentSkills(catalog, contract, ["disabled"]).skills.some(
-    (selected) => selected.id === "disabled",
-  ),
-  false,
-  "disabled skills should remain unavailable even when explicitly requested",
-);
-assertEqual(
-  selectAgentSkills(catalog, contract, ["documentation"]).skills.some(
-    (selected) => selected.id === "documentation",
-  ),
-  false,
-  "requesting a contextual skill should not bypass category matching",
-);
-
-const serialized = serializeSelectedSkills(selection);
-assertEqual(serialized.includes("Skill: Deployment"), true, "selected skills should be serialized");
-assertEqual(
-  serialized.includes("Skill: Documentation"),
-  false,
-  "unrelated skills must not reach prompts",
-);
-assertEqual(
-  serialized.includes("Private maintainer note"),
-  false,
-  "private notes must not reach prompts",
-);
-
 assertEqual(
   skillMatchesSearch(catalog[1], "deployment enabled contextual"),
   true,
@@ -266,61 +177,6 @@ assertEqual(
   true,
   "duplicate names should fail catalog validation",
 );
-let duplicateCatalogRejected = false;
-try {
-  resolveAgentSkillSnapshot([...catalog, { ...catalog[0], id: "duplicate-name" }], contract);
-} catch {
-  duplicateCatalogRejected = true;
-}
-assertEqual(
-  duplicateCatalogRejected,
-  true,
-  "runtime resolution should fail closed for an invalid catalog",
-);
-
-let selectedSkillLimitRejected = false;
-try {
-  resolveAgentSkillSnapshot(
-    Array.from({ length: 17 }, (_, index) =>
-      skill({
-        id: `automatic-${index}`,
-        name: `Automatic ${index}`,
-        trigger: "automatic",
-        priority: 100 - index,
-      }),
-    ),
-    contract,
-  );
-} catch {
-  selectedSkillLimitRejected = true;
-}
-assertEqual(
-  selectedSkillLimitRejected,
-  true,
-  "runtime resolution should not silently omit Skills above the selected-skill limit",
-);
-
-let selectedSkillBytesRejected = false;
-try {
-  resolveAgentSkillSnapshot(
-    Array.from({ length: 5 }, (_, index) =>
-      skill({
-        id: `large-selected-${index}`,
-        name: `Large Selected ${index}`,
-        trigger: "automatic",
-        instructions: "x".repeat(8 * 1024),
-      }),
-    ),
-    contract,
-  );
-} catch {
-  selectedSkillBytesRejected = true;
-}
-assertEqual(
-  selectedSkillBytesRejected,
-  true,
-  "runtime resolution should not silently omit Skills above the prompt byte limit",
-);
 const oversizedCatalog = Array.from({ length: 65 }, (_, index) =>
   skill({ id: `large-${index}`, name: `Large ${index}` }),
 );
@@ -338,25 +194,6 @@ assertEqual(
   skillMatchesSearch(skill({ id: "unicode", name: "Déploiement Étendu" }), "déploiement"),
   true,
   "search should preserve non-ASCII letters",
-);
-
-const firstSnapshot = resolveAgentSkillSnapshot(catalog, contract);
-const changedCatalog = catalog.map((entry) =>
-  entry.id === "deployment" ? { ...entry, instructions: "Changed later." } : entry,
-);
-const retainedSnapshot = resolveAgentSkillSnapshot(changedCatalog, firstSnapshot.contract);
-assertEqual(
-  {
-    reused: retainedSnapshot.reused,
-    snapshot: retainedSnapshot.snapshot,
-    selectedSkillIds: retainedSnapshot.selectedSkillIds,
-  },
-  {
-    reused: true,
-    snapshot: firstSnapshot.snapshot,
-    selectedSkillIds: firstSnapshot.selectedSkillIds,
-  },
-  "continuation should retain the immutable skill snapshot after catalog edits",
 );
 
 const duplicate = duplicateAgentSkill(catalog[0], "2026-08-02T00:00:00.000Z");

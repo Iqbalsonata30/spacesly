@@ -1,6 +1,7 @@
 use super::execution_engine::{
     TaskEventReporter, TaskExecutionContext, TaskExecutionError, TaskExecutor,
 };
+use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskProgress,
     TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionKind,
@@ -32,14 +33,17 @@ pub struct ResolvedAgentTask {
     pub runtime_profile_id: String,
     pub config: AiWorkerConfig,
     pub task: AiWorkerTask,
+    pub governance: GovernanceResolutionRecord,
 }
 
 /// Backend authority that resolves profiles, contracts, secrets, and trusted workspace paths.
 pub trait AgentRuntimeResolver: Send + Sync + 'static {
     fn resolve(
         &self,
+        task_session_id: u64,
         envelope: &TaskSessionEnvelopeV1,
         runtime_attempt_id: &str,
+        retained_governance: Option<&GovernanceResolutionRecord>,
     ) -> Result<ResolvedAgentTask, String>;
 }
 
@@ -129,11 +133,36 @@ impl TaskExecutor for AgentTaskExecutor {
                 .with_context("execution_attempt", context.attempt_id().to_string())
                 .with_context("worker_id", context.worker_id().to_string())
                 .with_context("runtime_id", runtime_attempt_id.clone());
+        let retained_governance = context.governance_resolution()?;
         let mut resolved = self
             .resolver
-            .resolve(&envelope, &runtime_attempt_id)
+            .resolve(
+                context.session_id().0,
+                &envelope,
+                &runtime_attempt_id,
+                retained_governance.as_ref(),
+            )
             .map_err(TaskExecutionError::new)?;
         validate_resolved_task(&envelope, &resolved).map_err(TaskExecutionError::new)?;
+        if retained_governance.is_none() {
+            context.bind_governance_resolution(&resolved.governance)?;
+        }
+        context.emit_event(
+            TaskSessionEventKind::Runtime,
+            json!({
+                "type": "governance_resolved",
+                "task_session_id": resolved.governance.task_session_id,
+                "status": resolved.governance.status,
+                "rules_revision": envelope.rules_revision,
+                "skill_catalog_revision": resolved.governance.skills.catalog_revision,
+                "selected_skill_ids": resolved.governance.skills.selected_skill_ids,
+                "selected_skill_count": resolved.governance.skills.selected_skill_ids.len(),
+                "resolved_rule_count": resolved.governance.rules.entries.len(),
+                "rules_prompt_bytes": resolved.governance.rules.snapshot.len(),
+                "skills_prompt_bytes": resolved.governance.skills.snapshot.len(),
+                "reused": retained_governance.is_some(),
+            }),
+        )?;
         let opencode_resolution = crate::infrastructure::performance::span(
             "opencode_session_resolution_ms",
             "agent_runtime",
@@ -329,6 +358,14 @@ fn validate_resolved_task(
             "Resolved Agent execution contract digest did not match the envelope.".to_string(),
         );
     }
+    if resolved.config.agent_rules != resolved.governance.rules.snapshot
+        || resolved.config.agent_skills != resolved.governance.skills.snapshot
+    {
+        return Err(
+            "Runtime Rules or Skills do not match the authoritative governance snapshot."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -454,8 +491,10 @@ mod tests {
     impl AgentRuntimeResolver for FakeResolver {
         fn resolve(
             &self,
+            task_session_id: u64,
             _envelope: &TaskSessionEnvelopeV1,
             runtime_attempt_id: &str,
+            retained_governance: Option<&GovernanceResolutionRecord>,
         ) -> Result<ResolvedAgentTask, String> {
             self.attempts
                 .lock()
@@ -469,6 +508,9 @@ mod tests {
                     session_key: None,
                     opencode_session_id: None,
                 },
+                governance: retained_governance
+                    .cloned()
+                    .unwrap_or_else(|| test_governance(task_session_id)),
             })
         }
     }
@@ -1062,6 +1104,19 @@ mod tests {
             .filter(|event| event.payload["action"] == json!("created"))
             .count();
         assert_eq!(created_count, 1);
+        let governance_events = engine
+            .events_after(session.id, 0)
+            .expect("events replayed")
+            .into_iter()
+            .filter(|event| event.payload["type"] == "governance_resolved")
+            .collect::<Vec<_>>();
+        assert_eq!(governance_events.len(), 2);
+        assert_eq!(governance_events[0].payload["reused"], false);
+        assert_eq!(governance_events[1].payload["reused"], true);
+        assert_eq!(
+            governance_events[0].payload["selected_skill_ids"],
+            governance_events[1].payload["selected_skill_ids"]
+        );
     }
 
     #[test]
@@ -1401,10 +1456,34 @@ mod tests {
                 session_key: None,
                 opencode_session_id: None,
             },
+            governance: test_governance(1),
         };
         assert!(validate_resolved_task(&envelope, &resolved)
             .expect_err("model mismatch")
             .contains("model"));
+    }
+
+    #[test]
+    fn runtime_governance_must_match_the_persisted_resolution() {
+        let envelope = match test_envelope() {
+            TaskSessionEnvelope::V1(envelope) => envelope,
+            TaskSessionEnvelope::V2(_) => panic!("expected V1 Agent envelope"),
+        };
+        let mut config = test_config();
+        config.agent_skills = "unpersisted skill instructions".to_string();
+        let resolved = ResolvedAgentTask {
+            runtime_profile_id: envelope.runtime_profile_id.clone(),
+            config,
+            task: AiWorkerTask {
+                execution_contract: Some(json!({ "contract": "test" })),
+                session_key: None,
+                opencode_session_id: None,
+            },
+            governance: test_governance(1),
+        };
+        assert!(validate_resolved_task(&envelope, &resolved)
+            .expect_err("governance mismatch")
+            .contains("authoritative governance snapshot"));
     }
 
     #[test]
@@ -1462,6 +1541,8 @@ mod tests {
             opencode_auto_approve: true,
             agent_rules: String::new(),
             agent_skills: String::new(),
+            governance_schema_version: 0,
+            skill_catalog: Vec::new(),
             temperature: 0.0,
             restrict_tools: false,
             fenced_tools_only: false,
@@ -1474,6 +1555,31 @@ mod tests {
                 environment: HashMap::from([("JIRA_URL".to_string(), "test".to_string())]),
                 proxy_authority: None,
             }],
+        }
+    }
+
+    fn test_governance(task_session_id: u64) -> GovernanceResolutionRecord {
+        use crate::domain::governance::{
+            GovernanceResolutionStatus, RulesResolutionRecord, SkillResolutionRecord,
+            GOVERNANCE_RESOLUTION_VERSION,
+        };
+        GovernanceResolutionRecord {
+            schema_version: GOVERNANCE_RESOLUTION_VERSION,
+            task_session_id,
+            resolved_at: 1,
+            status: GovernanceResolutionStatus::LegacyUnavailable,
+            rules: RulesResolutionRecord {
+                normalization_version: "legacy_unavailable".to_string(),
+                final_digest: crate::infrastructure::runtime_profile_store::content_revision(""),
+                entries: Vec::new(),
+                snapshot: String::new(),
+            },
+            skills: SkillResolutionRecord {
+                catalog_revision: None,
+                selected_skill_ids: Vec::new(),
+                entries: Vec::new(),
+                snapshot: String::new(),
+            },
         }
     }
 

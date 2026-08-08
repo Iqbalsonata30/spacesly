@@ -1,0 +1,905 @@
+//! Durable, backend-authoritative Rules and Skills resolution for Agent Task Sessions.
+
+use crate::infrastructure::runtime_profile_store::{content_revision, AgentRuntimeProfile};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
+pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
+const MAX_SELECTED_SKILLS: usize = 16;
+const MAX_SELECTED_SKILL_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSkillDefinition {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    #[serde(default)]
+    pub custom_category: String,
+    pub trigger: String,
+    pub priority: u8,
+    pub enabled: bool,
+    pub instructions: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceResolutionStatus {
+    Authoritative,
+    LegacyUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillResolutionEntry {
+    pub skill_id: String,
+    pub selected: bool,
+    pub trigger: String,
+    pub matched_domains: Vec<String>,
+    pub matched_intents: Vec<String>,
+    pub priority: u8,
+    pub reason: String,
+    pub selection_order: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillResolutionRecord {
+    pub catalog_revision: Option<String>,
+    pub selected_skill_ids: Vec<String>,
+    pub entries: Vec<SkillResolutionEntry>,
+    /// Exact selected instructions injected into the runtime. Never emitted in metrics.
+    pub snapshot: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleScope {
+    Platform,
+    Global,
+    Workspace,
+    Task,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuleResolutionEntry {
+    pub rule_id: String,
+    pub scope: RuleScope,
+    pub source: String,
+    pub revision: String,
+    pub precedence: u32,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RulesResolutionRecord {
+    pub normalization_version: String,
+    pub final_digest: String,
+    pub entries: Vec<RuleResolutionEntry>,
+    /// Exact normalized user Rules injected below platform instructions.
+    pub snapshot: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GovernanceResolutionRecord {
+    pub schema_version: u32,
+    pub task_session_id: u64,
+    pub resolved_at: u64,
+    pub status: GovernanceResolutionStatus,
+    pub rules: RulesResolutionRecord,
+    pub skills: SkillResolutionRecord,
+}
+
+impl GovernanceResolutionRecord {
+    pub fn validate_for(&self, task_session_id: u64) -> Result<(), String> {
+        if self.task_session_id != task_session_id {
+            return Err("Governance snapshot belongs to a different Task Session.".to_string());
+        }
+        if self.schema_version != GOVERNANCE_RESOLUTION_VERSION {
+            return Err("Governance snapshot schema is not supported.".to_string());
+        }
+        if self.rules.final_digest != content_revision(&self.rules.snapshot) {
+            return Err("Governance Rules snapshot digest is invalid.".to_string());
+        }
+        if self.status == GovernanceResolutionStatus::Authoritative
+            && self.rules.normalization_version != RULES_NORMALIZATION_VERSION
+        {
+            return Err("Governance snapshot normalization version is not supported.".to_string());
+        }
+        let mut selected = self
+            .skills
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|entry| entry.selection_order);
+        if self.status == GovernanceResolutionStatus::Authoritative
+            && (selected.len() != self.skills.selected_skill_ids.len()
+                || selected.iter().enumerate().any(|(index, entry)| {
+                    entry.selection_order != Some(index as u32)
+                        || self.skills.selected_skill_ids[index] != entry.skill_id
+                }))
+        {
+            return Err("Governance selected Skill ordering is inconsistent.".to_string());
+        }
+        Ok(())
+    }
+}
+
+pub fn skill_catalog_revision(catalog: &[AgentSkillDefinition]) -> Result<String, String> {
+    validate_catalog(catalog)?;
+    serde_json::to_string(catalog)
+        .map(|encoded| content_revision(&encoded))
+        .map_err(|error| format!("Failed to encode Agent Skill catalog: {error}"))
+}
+
+pub fn resolve_governance(
+    task_session_id: u64,
+    profile: &AgentRuntimeProfile,
+    contract: &Value,
+) -> Result<GovernanceResolutionRecord, String> {
+    if profile.governance_schema_version == 0 {
+        return Ok(legacy_resolution(task_session_id, profile, contract));
+    }
+    if profile.governance_schema_version != GOVERNANCE_RESOLUTION_VERSION {
+        return Err(format!(
+            "Agent governance schema version {} is not supported.",
+            profile.governance_schema_version
+        ));
+    }
+    if contract
+        .pointer("/runtime_inputs/selected_skills_snapshot")
+        .is_some()
+        || contract
+            .pointer("/runtime_inputs/agent_rules_snapshot")
+            .is_some()
+    {
+        return Err(
+            "Legacy renderer governance snapshots cannot be submitted with backend-authoritative governance."
+                .to_string(),
+        );
+    }
+    let rules_started = std::time::Instant::now();
+    let rules = resolve_rules(profile)?;
+    crate::infrastructure::performance::record_duration_with_context(
+        "rules_resolution_latency_ms",
+        "agent_runtime",
+        rules_started.elapsed(),
+        BTreeMap::from([
+            ("task_session_id".to_string(), task_session_id.to_string()),
+            ("rules_revision".to_string(), profile.rules_revision.clone()),
+            (
+                "resolved_rule_count".to_string(),
+                rules.entries.len().to_string(),
+            ),
+            (
+                "rules_prompt_bytes".to_string(),
+                rules.snapshot.len().to_string(),
+            ),
+            (
+                "rules_estimated_prompt_tokens".to_string(),
+                estimated_tokens(&rules.snapshot).to_string(),
+            ),
+        ]),
+    );
+    let skills_started = std::time::Instant::now();
+    let skills = resolve_skills(profile, contract)?;
+    crate::infrastructure::performance::record_duration_with_context(
+        "skill_resolution_latency_ms",
+        "agent_runtime",
+        skills_started.elapsed(),
+        BTreeMap::from([
+            ("task_session_id".to_string(), task_session_id.to_string()),
+            (
+                "skill_catalog_revision".to_string(),
+                profile.skills_revision.clone(),
+            ),
+            (
+                "selected_skill_count".to_string(),
+                skills.selected_skill_ids.len().to_string(),
+            ),
+            (
+                "resolved_rule_count".to_string(),
+                rules.entries.len().to_string(),
+            ),
+            (
+                "skills_prompt_bytes".to_string(),
+                skills.snapshot.len().to_string(),
+            ),
+            (
+                "skills_estimated_prompt_tokens".to_string(),
+                estimated_tokens(&skills.snapshot).to_string(),
+            ),
+        ]),
+    );
+    Ok(GovernanceResolutionRecord {
+        schema_version: GOVERNANCE_RESOLUTION_VERSION,
+        task_session_id,
+        resolved_at: now_millis()?,
+        status: GovernanceResolutionStatus::Authoritative,
+        rules,
+        skills,
+    })
+}
+
+fn resolve_rules(profile: &AgentRuntimeProfile) -> Result<RulesResolutionRecord, String> {
+    let snapshot = normalize_rules(&profile.agent_rules)?;
+    let final_digest = content_revision(&snapshot);
+    if final_digest != profile.rules_revision {
+        return Err(
+            "Agent Rules revision does not match backend normalization version agent-rules-lines-v1."
+                .to_string(),
+        );
+    }
+    let mut entries = vec![RuleResolutionEntry {
+        rule_id: "platform.agent_worker.system".to_string(),
+        scope: RuleScope::Platform,
+        source: "runtime.ai_worker".to_string(),
+        revision: profile.prompt_template_version.clone(),
+        precedence: 0,
+        digest: content_revision(&format!(
+            "platform-agent-worker:{}",
+            profile.prompt_template_version
+        )),
+    }];
+    if !snapshot.is_empty() {
+        entries.push(RuleResolutionEntry {
+            rule_id: "global.agent_rules".to_string(),
+            scope: RuleScope::Global,
+            source: "settings.ai_worker.agent_rules".to_string(),
+            revision: profile.rules_revision.clone(),
+            precedence: 1_000,
+            digest: content_revision(&snapshot),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.precedence
+            .cmp(&right.precedence)
+            .then_with(|| left.rule_id.cmp(&right.rule_id))
+    });
+    Ok(RulesResolutionRecord {
+        normalization_version: RULES_NORMALIZATION_VERSION.to_string(),
+        final_digest,
+        entries,
+        snapshot,
+    })
+}
+
+fn resolve_skills(
+    profile: &AgentRuntimeProfile,
+    contract: &Value,
+) -> Result<SkillResolutionRecord, String> {
+    validate_catalog(&profile.skill_catalog)?;
+    let revision = skill_catalog_revision(&profile.skill_catalog)?;
+    if revision != profile.skills_revision {
+        return Err("Agent Skill catalog revision did not match its content.".to_string());
+    }
+    let contract_text = normalized_contract_text(contract);
+    let category_matches = category_matches(&contract_text);
+    let requested = contract
+        .pointer("/runtime_inputs/requested_skill_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    let mut decisions = Vec::with_capacity(profile.skill_catalog.len());
+    for (catalog_index, skill) in profile.skill_catalog.iter().enumerate() {
+        let mut domains = Vec::new();
+        let mut intents = Vec::new();
+        let (selected, reason, manual) = if !skill.enabled || skill.trigger == "disabled" {
+            (false, "Skill is disabled.".to_string(), false)
+        } else if skill.trigger == "automatic" {
+            (true, "Automatic trigger is enabled.".to_string(), false)
+        } else if skill.trigger == "manual" {
+            if requested.contains(skill.id.as_str()) {
+                (
+                    true,
+                    "Explicitly requested for this task.".to_string(),
+                    true,
+                )
+            } else {
+                (false, "Manual Skill was not requested.".to_string(), false)
+            }
+        } else if skill.trigger == "contextual" {
+            if skill.category == "custom" {
+                let term = normalize_text(&skill.custom_category);
+                if !term.is_empty() && includes_phrase(&contract_text, &term) {
+                    domains.push(skill.custom_category.trim().to_string());
+                    intents.push(term.clone());
+                    (true, format!("Matched custom category '{term}'."), false)
+                } else {
+                    (false, "No contextual category matched.".to_string(), false)
+                }
+            } else if let Some(terms) = category_matches.get(skill.category.as_str()) {
+                domains.push(skill.category.clone());
+                intents.extend(terms.iter().cloned());
+                (
+                    true,
+                    format!("Matched {} task context.", skill.category),
+                    false,
+                )
+            } else {
+                (false, "No contextual category matched.".to_string(), false)
+            }
+        } else {
+            return Err(format!(
+                "Agent Skill '{}' has unsupported trigger '{}'.",
+                skill.id, skill.trigger
+            ));
+        };
+        decisions.push((
+            catalog_index,
+            skill,
+            selected,
+            manual,
+            domains,
+            intents,
+            reason,
+        ));
+    }
+    let mut selected = decisions.iter().filter(|entry| entry.2).collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        right
+            .3
+            .cmp(&left.3)
+            .then_with(|| right.1.priority.cmp(&left.1.priority))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    if selected.len() > MAX_SELECTED_SKILLS {
+        return Err(format!("Cannot resolve Agent Skills: {} skills matched this task, exceeding the {MAX_SELECTED_SKILLS}-skill execution limit.", selected.len()));
+    }
+    let mut sections = Vec::with_capacity(selected.len());
+    let mut ids = Vec::with_capacity(selected.len());
+    let mut orders = HashMap::new();
+    let mut bytes = 0;
+    for (order, entry) in selected.iter().enumerate() {
+        let skill = entry.1;
+        let section = format!(
+            "Skill: {}\nSkill ID: {}\nCategory: {}\nDescription: {}\nInstructions:\n{}",
+            skill.name.trim(),
+            skill.id,
+            display_category(skill),
+            skill.description.trim(),
+            skill.instructions.trim()
+        );
+        let separator = usize::from(!sections.is_empty()) * 2;
+        if bytes + separator + section.len() > MAX_SELECTED_SKILL_BYTES {
+            return Err(format!("Cannot resolve Agent Skills: selected Skills exceed the {} KiB prompt limit at '{}'.", MAX_SELECTED_SKILL_BYTES / 1024, skill.name));
+        }
+        bytes += separator + section.len();
+        sections.push(section);
+        ids.push(skill.id.clone());
+        orders.insert(skill.id.as_str(), order as u32);
+    }
+    let entries = decisions
+        .into_iter()
+        .map(
+            |(_, skill, selected, _, matched_domains, matched_intents, reason)| {
+                SkillResolutionEntry {
+                    skill_id: skill.id.clone(),
+                    selected,
+                    trigger: skill.trigger.clone(),
+                    matched_domains,
+                    matched_intents,
+                    priority: skill.priority,
+                    reason,
+                    selection_order: orders.get(skill.id.as_str()).copied(),
+                }
+            },
+        )
+        .collect();
+    Ok(SkillResolutionRecord {
+        catalog_revision: Some(revision),
+        selected_skill_ids: ids,
+        entries,
+        snapshot: sections.join("\n\n"),
+    })
+}
+
+fn legacy_resolution(
+    task_session_id: u64,
+    profile: &AgentRuntimeProfile,
+    contract: &Value,
+) -> GovernanceResolutionRecord {
+    let ids = contract
+        .pointer("/runtime_inputs/selected_skill_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect();
+    let rules = contract
+        .pointer("/runtime_inputs/agent_rules_snapshot")
+        .and_then(Value::as_str)
+        .unwrap_or(&profile.agent_rules)
+        .to_string();
+    let skills = contract
+        .pointer("/runtime_inputs/selected_skills_snapshot")
+        .and_then(Value::as_str)
+        .unwrap_or(&profile.agent_skills)
+        .to_string();
+    GovernanceResolutionRecord {
+        schema_version: GOVERNANCE_RESOLUTION_VERSION,
+        task_session_id,
+        resolved_at: now_millis().unwrap_or_default(),
+        status: GovernanceResolutionStatus::LegacyUnavailable,
+        rules: RulesResolutionRecord {
+            normalization_version: "legacy_unavailable".to_string(),
+            final_digest: content_revision(&rules),
+            entries: Vec::new(),
+            snapshot: rules,
+        },
+        skills: SkillResolutionRecord {
+            catalog_revision: None,
+            selected_skill_ids: ids,
+            entries: Vec::new(),
+            snapshot: skills,
+        },
+    }
+}
+
+fn normalize_rules(value: &str) -> Result<String, String> {
+    if value.len() > 32 * 1024 {
+        return Err("Agent Rules exceed the 32 KiB execution limit.".to_string());
+    }
+    let mut seen = HashSet::new();
+    Ok(value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| seen.insert((*line).to_string()))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn validate_catalog(catalog: &[AgentSkillDefinition]) -> Result<(), String> {
+    if catalog.len() > 64 {
+        return Err("Agent Skill catalog exceeds the 64-skill limit.".to_string());
+    }
+    let mut ids = HashSet::new();
+    for skill in catalog {
+        if skill.id.trim().is_empty()
+            || !ids.insert(skill.id.as_str())
+            || skill.name.trim().is_empty()
+            || skill.description.trim().is_empty()
+            || skill.instructions.trim().is_empty()
+            || skill.instructions.len() > 8 * 1024
+            || skill.priority > 100
+            || skill.updated_at.trim().is_empty()
+            || !matches!(
+                skill.trigger.as_str(),
+                "automatic" | "contextual" | "manual" | "disabled"
+            )
+            || !matches!(
+                skill.category.as_str(),
+                "diagnostics"
+                    | "deployment"
+                    | "infrastructure"
+                    | "git"
+                    | "coding"
+                    | "testing"
+                    | "security"
+                    | "database"
+                    | "documentation"
+                    | "custom"
+            )
+            || (skill.category == "custom" && skill.custom_category.trim().is_empty())
+        {
+            return Err(format!("Agent Skill '{}' is invalid.", skill.id));
+        }
+    }
+    Ok(())
+}
+
+fn display_category(skill: &AgentSkillDefinition) -> &str {
+    if skill.category == "custom" {
+        skill.custom_category.trim()
+    } else {
+        skill.category.as_str()
+    }
+}
+
+fn normalized_contract_text(contract: &Value) -> String {
+    let mut values = Vec::new();
+    collect_string(contract.pointer("/objective/summary"), &mut values);
+    collect_array(contract.pointer("/objective/success_criteria"), &mut values);
+    collect_string(contract.pointer("/task_context/description"), &mut values);
+    collect_string(
+        contract.pointer("/task_context/execution_detail"),
+        &mut values,
+    );
+    collect_string(contract.pointer("/ticket/title"), &mut values);
+    collect_array(contract.pointer("/ticket/labels"), &mut values);
+    if let Some(workflow) = contract.get("workflow").and_then(Value::as_array) {
+        for step in workflow {
+            collect_string(step.get("title"), &mut values);
+            collect_string(step.get("type"), &mut values);
+        }
+    }
+    collect_string(
+        contract.pointer("/runtime_inputs/operator_notes"),
+        &mut values,
+    );
+    normalize_text(&values.join(" "))
+}
+
+fn collect_string(value: Option<&Value>, output: &mut Vec<String>) {
+    if let Some(value) = value.and_then(Value::as_str) {
+        output.push(value.to_string());
+    }
+}
+fn collect_array(value: Option<&Value>, output: &mut Vec<String>) {
+    if let Some(values) = value.and_then(Value::as_array) {
+        output.extend(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string),
+        );
+    }
+}
+
+fn category_matches(text: &str) -> BTreeMap<&'static str, Vec<String>> {
+    category_terms()
+        .into_iter()
+        .filter_map(|(category, terms)| {
+            let matched = terms
+                .into_iter()
+                .filter(|term| includes_phrase(text, term))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            (!matched.is_empty()).then_some((category, matched))
+        })
+        .collect()
+}
+
+fn category_terms() -> BTreeMap<&'static str, Vec<&'static str>> {
+    BTreeMap::from([
+        (
+            "diagnostics",
+            vec![
+                "diagnose",
+                "diagnostic",
+                "troubleshoot",
+                "failure",
+                "failed",
+                "error",
+                "incident",
+                "logs",
+                "events",
+                "crash",
+                "timeout",
+            ],
+        ),
+        (
+            "deployment",
+            vec![
+                "deploy",
+                "deployment",
+                "release",
+                "rollout",
+                "bamboo",
+                "build plan",
+            ],
+        ),
+        (
+            "infrastructure",
+            vec![
+                "infrastructure",
+                "kubernetes",
+                "openshift",
+                "ocp",
+                "pod",
+                "namespace",
+                "cluster",
+                "terraform",
+                "helm",
+            ],
+        ),
+        (
+            "git",
+            vec![
+                "git",
+                "commit",
+                "branch",
+                "merge",
+                "pull request",
+                "repository",
+            ],
+        ),
+        (
+            "coding",
+            vec![
+                "code",
+                "implement",
+                "refactor",
+                "function",
+                "component",
+                "module",
+                "bug",
+                "fix",
+            ],
+        ),
+        (
+            "testing",
+            vec![
+                "test",
+                "testing",
+                "lint",
+                "coverage",
+                "verify",
+                "validation",
+            ],
+        ),
+        (
+            "security",
+            vec![
+                "security",
+                "vulnerability",
+                "credential",
+                "secret",
+                "permission",
+                "authentication",
+                "authorization",
+            ],
+        ),
+        (
+            "database",
+            vec![
+                "database",
+                "sql",
+                "postgres",
+                "mysql",
+                "sqlite",
+                "migration",
+                "schema",
+            ],
+        ),
+        (
+            "documentation",
+            vec!["documentation", "docs", "readme", "runbook", "guide"],
+        ),
+    ])
+}
+
+fn normalize_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '#' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn includes_phrase(text: &str, phrase: &str) -> bool {
+    format!(" {text} ").contains(&format!(" {phrase} "))
+}
+fn estimated_tokens(value: &str) -> usize {
+    value.chars().count().div_ceil(4)
+}
+fn now_millis() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "Timestamp exceeds u64 milliseconds.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(id: &str, category: &str, trigger: &str, priority: u8) -> AgentSkillDefinition {
+        AgentSkillDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: format!("{id} guidance"),
+            category: category.to_string(),
+            custom_category: String::new(),
+            trigger: trigger.to_string(),
+            priority,
+            enabled: true,
+            instructions: format!("Follow {id}."),
+            updated_at: "2026-08-08T00:00:00.000Z".to_string(),
+        }
+    }
+
+    fn profile(catalog: Vec<AgentSkillDefinition>) -> AgentRuntimeProfile {
+        let agent_rules = "Verify first.\nAsk before deleting.\nVerify first.".to_string();
+        let skills_revision = skill_catalog_revision(&catalog).expect("catalog revision");
+        AgentRuntimeProfile {
+            id: "agent-governance-test".to_string(),
+            runtime: "opencode".to_string(),
+            model: "openai/gpt-5".to_string(),
+            opencode_command: "opencode".to_string(),
+            opencode_workdir: None,
+            rules_revision: content_revision("Verify first.\nAsk before deleting."),
+            skills_revision,
+            agent_rules,
+            agent_skills: String::new(),
+            temperature: 0.2,
+            connector_ids: Vec::new(),
+            prompt_template_version: "agent-task-v1".to_string(),
+            governance_schema_version: GOVERNANCE_RESOLUTION_VERSION,
+            skill_catalog: catalog,
+        }
+    }
+
+    fn contract(summary: &str) -> Value {
+        serde_json::json!({
+            "objective": { "summary": summary, "success_criteria": ["Verify the result"] },
+            "task_context": { "description": "", "execution_detail": "" },
+            "ticket": { "title": summary, "labels": [] },
+            "workflow": [],
+            "runtime_inputs": { "operator_notes": null, "requested_skill_ids": [] }
+        })
+    }
+
+    #[test]
+    fn kubernetes_selection_records_matches_and_rejections() {
+        let profile = profile(vec![
+            skill("kubernetes", "infrastructure", "contextual", 90),
+            skill("documentation", "documentation", "contextual", 80),
+        ]);
+        let resolution = resolve_governance(
+            42,
+            &profile,
+            &contract("Diagnose the failed Kubernetes pod in the cluster"),
+        )
+        .expect("governance resolves");
+        assert_eq!(resolution.skills.selected_skill_ids, vec!["kubernetes"]);
+        let kubernetes = &resolution.skills.entries[0];
+        assert!(kubernetes.selected);
+        assert_eq!(kubernetes.matched_domains, vec!["infrastructure"]);
+        assert!(kubernetes
+            .matched_intents
+            .contains(&"kubernetes".to_string()));
+        assert!(kubernetes.matched_intents.contains(&"pod".to_string()));
+        assert!(!resolution.skills.entries[1].selected);
+        assert_eq!(
+            resolution.skills.entries[1].reason,
+            "No contextual category matched."
+        );
+        assert_eq!(
+            resolution.skills.catalog_revision.as_deref(),
+            Some(profile.skills_revision.as_str())
+        );
+        assert!(resolution.skills.snapshot.contains("Skill ID: kubernetes"));
+        assert!(!resolution
+            .skills
+            .snapshot
+            .contains("Skill ID: documentation"));
+    }
+
+    #[test]
+    fn rules_are_normalized_and_ordered_deterministically() {
+        let profile = profile(Vec::new());
+        let first = resolve_governance(7, &profile, &contract("Review a change"))
+            .expect("first resolution");
+        let second = resolve_governance(8, &profile, &contract("Review a change"))
+            .expect("second resolution");
+        assert_eq!(first.rules.snapshot, "Verify first.\nAsk before deleting.");
+        assert_eq!(first.rules.entries, second.rules.entries);
+        assert_eq!(first.rules.entries[0].scope, RuleScope::Platform);
+        assert_eq!(first.rules.entries[1].scope, RuleScope::Global);
+        assert!(first.rules.entries[0].precedence < first.rules.entries[1].precedence);
+        assert_eq!(
+            first.rules.normalization_version,
+            RULES_NORMALIZATION_VERSION
+        );
+    }
+
+    #[test]
+    fn retained_resolution_is_self_consistent_and_catalog_independent() {
+        let initial = profile(vec![skill("kubernetes", "infrastructure", "automatic", 90)]);
+        let resolution = resolve_governance(5, &initial, &contract("Run diagnostics"))
+            .expect("initial resolution");
+        let changed = profile(vec![skill(
+            "documentation",
+            "documentation",
+            "automatic",
+            90,
+        )]);
+        assert_ne!(initial.skills_revision, changed.skills_revision);
+        resolution
+            .validate_for(5)
+            .expect("retained snapshot remains authoritative after settings change");
+        assert_eq!(resolution.skills.selected_skill_ids, vec!["kubernetes"]);
+    }
+
+    #[test]
+    fn legacy_execution_does_not_fabricate_resolution_reasons() {
+        let mut profile = profile(Vec::new());
+        profile.governance_schema_version = 0;
+        profile.agent_skills = "Skill: Legacy".to_string();
+        profile.skills_revision = content_revision(&profile.agent_skills);
+        let resolution =
+            resolve_governance(9, &profile, &contract("Legacy task")).expect("legacy resolution");
+        assert_eq!(
+            resolution.status,
+            GovernanceResolutionStatus::LegacyUnavailable
+        );
+        assert!(resolution.skills.entries.is_empty());
+        assert_eq!(resolution.skills.snapshot, "Skill: Legacy");
+    }
+
+    #[test]
+    fn full_catalog_injects_only_relevant_skills_with_bounded_prompt_growth() {
+        let mut catalog = (0..63)
+            .map(|index| {
+                skill(
+                    &format!("documentation-{index}"),
+                    "documentation",
+                    "contextual",
+                    50,
+                )
+            })
+            .collect::<Vec<_>>();
+        catalog.push(skill("kubernetes", "infrastructure", "contextual", 90));
+        let profile = profile(catalog);
+        let started = std::time::Instant::now();
+        let resolution =
+            resolve_governance(64, &profile, &contract("Diagnose a Kubernetes pod failure"))
+                .expect("large catalog resolves");
+        assert_eq!(resolution.skills.entries.len(), 64);
+        assert_eq!(resolution.skills.selected_skill_ids, vec!["kubernetes"]);
+        assert_eq!(resolution.skills.snapshot.matches("Skill ID:").count(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "64-skill selection should remain outside the startup critical path"
+        );
+    }
+
+    #[test]
+    fn concurrent_resolutions_never_share_task_or_skill_state() {
+        let handles = (1..=5)
+            .map(|task_session_id| {
+                std::thread::spawn(move || {
+                    let skill_id = format!("task-{task_session_id}-skill");
+                    let profile =
+                        profile(vec![skill(&skill_id, "infrastructure", "automatic", 90)]);
+                    resolve_governance(
+                        task_session_id,
+                        &profile,
+                        &contract("Concurrent worker task"),
+                    )
+                    .expect("concurrent governance resolves")
+                })
+            })
+            .collect::<Vec<_>>();
+        let resolutions = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("resolution thread"))
+            .collect::<Vec<_>>();
+        for (index, resolution) in resolutions.iter().enumerate() {
+            let task_session_id = index as u64 + 1;
+            assert_eq!(resolution.task_session_id, task_session_id);
+            assert_eq!(
+                resolution.skills.selected_skill_ids,
+                vec![format!("task-{task_session_id}-skill")]
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_profiles_reject_renderer_governance_snapshots() {
+        let profile = profile(Vec::new());
+        let mut contract = contract("New task");
+        contract["runtime_inputs"]["selected_skills_snapshot"] = Value::String(String::new());
+        assert!(resolve_governance(10, &profile, &contract)
+            .expect_err("renderer snapshot must not downgrade backend authority")
+            .contains("Legacy renderer governance snapshots"));
+    }
+}

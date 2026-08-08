@@ -223,6 +223,8 @@ const config: AiWorkerConfig = {
   opencode_auto_approve: false,
   agent_rules: "Use evidence.",
   agent_skills: "Verify changes.",
+  governance_schema_version: 0,
+  skill_catalog: [],
   temperature: 0.2,
   mcp_servers: [
     { name: "Z", secret_id: "zeta", command: ["zeta"] },
@@ -646,15 +648,15 @@ const independentDependencies: Partial<AgentTaskSessionDependencies> = {
       initialEventSequences.set(sessionId, afterSequence);
     }
     return {
-    events: [
-      {
+      events: [
+        {
           ...event(afterSequence + 1, "lifecycle", { state: "succeeded" }, null, sessionId),
-        attempt_id: 4,
-        fencing_token: 7,
-      },
-    ],
+          attempt_id: 4,
+          fencing_token: 7,
+        },
+      ],
       next_cursor: afterSequence + 1,
-    has_more: false,
+      has_more: false,
     };
   },
   getSession: async (sessionId) => terminalSnapshot(sessionId),

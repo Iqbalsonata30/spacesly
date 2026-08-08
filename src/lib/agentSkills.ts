@@ -1,5 +1,3 @@
-import type { ExecutionContract } from "$lib/ipc";
-
 export const skillCategories = [
   "diagnostics",
   "deployment",
@@ -43,23 +41,8 @@ export type AgentSkill = {
   metadata: Record<string, string | number | boolean | null>;
 };
 
-export type SkillSelection = {
-  skills: AgentSkill[];
-  categories: SkillCategory[];
-  reasons: Record<string, string[]>;
-};
-
-export type SkillSnapshotResolution = {
-  contract: ExecutionContract;
-  snapshot: string;
-  selectedSkillIds: string[];
-  reused: boolean;
-};
-
 const MAX_SKILLS = 64;
-const MAX_SELECTED_SKILLS = 16;
 const MAX_INSTRUCTIONS_BYTES = 8 * 1024;
-const MAX_SELECTED_BYTES = 32 * 1024;
 
 const categoryTerms: Record<Exclude<SkillCategory, "custom">, string[]> = {
   diagnostics: [
@@ -320,123 +303,6 @@ export function validateAgentSkillCatalog(skills: AgentSkill[]): string | null {
   return null;
 }
 
-export function selectAgentSkills(
-  skills: AgentSkill[],
-  contract: ExecutionContract,
-  requestedSkillIds: string[] = [],
-): SkillSelection {
-  const catalogError = validateAgentSkillCatalog(skills);
-  if (catalogError) throw new Error(`Cannot resolve Agent Skills: ${catalogError}`);
-  const categories = classifyExecutionContract(contract);
-  const requested = new Set(requestedSkillIds);
-  const reasons: Record<string, string[]> = {};
-  const selected = skills.filter((skill) => {
-    if (!skill.enabled || skill.trigger === "disabled") return false;
-    const skillReasons: string[] = [];
-    if (skill.trigger === "automatic") skillReasons.push("automatic");
-    if (skill.trigger === "contextual") {
-      if (skill.category === "custom") {
-        const term = normalizeText(skill.custom_category);
-        if (term && includesPhrase(normalizedContractText(contract), term)) {
-          skillReasons.push(`category:${term}`);
-        }
-      } else if (categories.includes(skill.category)) {
-        skillReasons.push(`category:${skill.category}`);
-      }
-    }
-    if (skill.trigger === "manual" && requested.has(skill.id)) skillReasons.push("manual");
-    if (skill.trigger === "manual" && !requested.has(skill.id)) return false;
-    if (skillReasons.length === 0) return false;
-    reasons[skill.id] = skillReasons;
-    return true;
-  });
-
-  selected.sort((left, right) => {
-    const leftManual = reasons[left.id]?.includes("manual") ? 1 : 0;
-    const rightManual = reasons[right.id]?.includes("manual") ? 1 : 0;
-    return (
-      rightManual - leftManual ||
-      right.priority - left.priority ||
-      skills.indexOf(left) - skills.indexOf(right)
-    );
-  });
-  if (selected.length > MAX_SELECTED_SKILLS) {
-    throw new Error(
-      `Cannot resolve Agent Skills: ${selected.length} skills matched this task, exceeding the ${MAX_SELECTED_SKILLS}-skill execution limit. Disable or narrow lower-priority Skills.`,
-    );
-  }
-  return { skills: selected, categories, reasons };
-}
-
-export function serializeSelectedSkills(selection: SkillSelection): string {
-  return serializeSkillSelection(selection).snapshot;
-}
-
-function serializeSkillSelection(selection: SkillSelection): {
-  snapshot: string;
-  selectedSkillIds: string[];
-} {
-  const sections: string[] = [];
-  const selectedSkillIds: string[] = [];
-  let bytes = 0;
-  for (const skill of selection.skills) {
-    const section = [
-      `Skill: ${skill.name}`,
-      `Skill ID: ${skill.id}`,
-      `Category: ${categoryLabel(skill.category, skill.custom_category)}`,
-      `Description: ${skill.description.trim()}`,
-      "Instructions:",
-      skill.instructions.trim(),
-    ].join("\n");
-    const sectionBytes = new TextEncoder().encode(section).length;
-    const separatorBytes = sections.length === 0 ? 0 : 2;
-    if (bytes + separatorBytes + sectionBytes > MAX_SELECTED_BYTES) {
-      throw new Error(
-        `Cannot resolve Agent Skills: selected Skills exceed the ${MAX_SELECTED_BYTES / 1024} KiB prompt limit at “${skill.name}”. Shorten or disable Skills before starting the task.`,
-      );
-    }
-    sections.push(section);
-    selectedSkillIds.push(skill.id);
-    bytes += separatorBytes + sectionBytes;
-  }
-  return { snapshot: sections.join("\n\n"), selectedSkillIds };
-}
-
-export function resolveAgentSkillSnapshot(
-  skills: AgentSkill[],
-  contract: ExecutionContract,
-  requestedSkillIds: string[] = [],
-): SkillSnapshotResolution {
-  const retained = contract.runtime_inputs.selected_skills_snapshot;
-  if (retained !== undefined) {
-    return {
-      contract,
-      snapshot: retained,
-      selectedSkillIds: contract.runtime_inputs.selected_skill_ids ?? [],
-      reused: true,
-    };
-  }
-  const selection = selectAgentSkills(skills, contract, requestedSkillIds);
-  const { snapshot, selectedSkillIds } = serializeSkillSelection(selection);
-  return {
-    contract: {
-      ...contract,
-      runtime_inputs: {
-        ...contract.runtime_inputs,
-        selected_skill_ids: selectedSkillIds,
-        selected_skills_snapshot: snapshot,
-      },
-    },
-    snapshot,
-    selectedSkillIds,
-    reused: false,
-  };
-}
-
-export function classifyExecutionContract(contract: ExecutionContract): SkillCategory[] {
-  return classifySkillText(normalizedContractText(contract));
-}
-
 export function skillMatchesSearch(skill: AgentSkill, search: string): boolean {
   const query = normalizeText(search);
   if (!query) return true;
@@ -451,23 +317,6 @@ export function skillMatchesSearch(skill: AgentSkill, search: string): boolean {
     ].join(" "),
   );
   return query.split(" ").every((term) => searchable.includes(term));
-}
-
-function normalizedContractText(contract: ExecutionContract): string {
-  return normalizeText(
-    [
-      contract.objective.summary,
-      ...contract.objective.success_criteria,
-      contract.task_context.description,
-      contract.task_context.execution_detail,
-      contract.ticket.title,
-      ...contract.ticket.labels,
-      ...contract.workflow
-        .filter((step) => step.status !== "completed")
-        .flatMap((step) => [step.title, step.type]),
-      contract.runtime_inputs.operator_notes ?? "",
-    ].join(" "),
-  );
 }
 
 function classifySkillText(value: string): SkillCategory[] {

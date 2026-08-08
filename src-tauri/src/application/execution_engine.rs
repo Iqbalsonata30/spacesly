@@ -5,6 +5,7 @@
 //! threads are created once, execute one mock Task Session at a time, reset their task-local
 //! context, and return to idle until the engine is dropped.
 
+use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
     TaskCapabilityGrant, TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope,
     TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionId,
@@ -275,6 +276,28 @@ impl TaskExecutionContext {
         self.event_sink
             .store
             .assignment_opencode_session(self.event_sink.fence)
+            .map_err(TaskExecutionError::new)
+    }
+
+    /// Loads this Task Session's immutable Rules and Skills resolution, if already bound.
+    pub fn governance_resolution(
+        &self,
+    ) -> Result<Option<GovernanceResolutionRecord>, TaskExecutionError> {
+        self.ensure_current()?;
+        self.event_sink
+            .store
+            .governance_resolution(self.session_id)
+            .map_err(TaskExecutionError::new)
+    }
+
+    /// Binds the first Rules and Skills resolution under the current assignment fence.
+    pub fn bind_governance_resolution(
+        &self,
+        resolution: &GovernanceResolutionRecord,
+    ) -> Result<GovernanceResolutionRecord, TaskExecutionError> {
+        self.event_sink
+            .store
+            .bind_governance_resolution(self.event_sink.fence, resolution)
             .map_err(TaskExecutionError::new)
     }
 

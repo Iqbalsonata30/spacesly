@@ -274,7 +274,11 @@ export async function ensureOpenCodeAgentProfile(
   const deps = { ...defaultDependencies, ...dependencies };
   const { connectorIds, capabilities } = agentTaskCapabilities(config);
   const rulesRevision = `sha256:${await sha256(config.agent_rules)}`;
-  const skillsRevision = `sha256:${await sha256(config.agent_skills)}`;
+  const skillsRevision = `sha256:${await sha256(
+    config.governance_schema_version > 0
+      ? JSON.stringify(config.skill_catalog)
+      : config.agent_skills,
+  )}`;
   const opencodeWorkdir = config.opencode_workdir?.trim() || null;
   const identity = await sha256(
     JSON.stringify({
@@ -302,6 +306,8 @@ export async function ensureOpenCodeAgentProfile(
     prompt_template_version: AGENT_TASK_TEMPLATE_VERSION,
     rules_revision: rulesRevision,
     skills_revision: skillsRevision,
+    governance_schema_version: config.governance_schema_version,
+    skill_catalog: config.skill_catalog,
   };
   await deps.saveProfile(profile);
   return {
