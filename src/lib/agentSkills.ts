@@ -325,11 +325,12 @@ export function selectAgentSkills(
   contract: ExecutionContract,
   requestedSkillIds: string[] = [],
 ): SkillSelection {
+  const catalogError = validateAgentSkillCatalog(skills);
+  if (catalogError) throw new Error(`Cannot resolve Agent Skills: ${catalogError}`);
   const categories = classifyExecutionContract(contract);
   const requested = new Set(requestedSkillIds);
   const reasons: Record<string, string[]> = {};
   const selected = skills.filter((skill) => {
-    if (validateAgentSkill(skill, [skill])) return false;
     if (!skill.enabled || skill.trigger === "disabled") return false;
     const skillReasons: string[] = [];
     if (skill.trigger === "automatic") skillReasons.push("automatic");
@@ -359,7 +360,12 @@ export function selectAgentSkills(
       skills.indexOf(left) - skills.indexOf(right)
     );
   });
-  return { skills: selected.slice(0, MAX_SELECTED_SKILLS), categories, reasons };
+  if (selected.length > MAX_SELECTED_SKILLS) {
+    throw new Error(
+      `Cannot resolve Agent Skills: ${selected.length} skills matched this task, exceeding the ${MAX_SELECTED_SKILLS}-skill execution limit. Disable or narrow lower-priority Skills.`,
+    );
+  }
+  return { skills: selected, categories, reasons };
 }
 
 export function serializeSelectedSkills(selection: SkillSelection): string {
@@ -384,7 +390,11 @@ function serializeSkillSelection(selection: SkillSelection): {
     ].join("\n");
     const sectionBytes = new TextEncoder().encode(section).length;
     const separatorBytes = sections.length === 0 ? 0 : 2;
-    if (bytes + separatorBytes + sectionBytes > MAX_SELECTED_BYTES) continue;
+    if (bytes + separatorBytes + sectionBytes > MAX_SELECTED_BYTES) {
+      throw new Error(
+        `Cannot resolve Agent Skills: selected Skills exceed the ${MAX_SELECTED_BYTES / 1024} KiB prompt limit at “${skill.name}”. Shorten or disable Skills before starting the task.`,
+      );
+    }
     sections.push(section);
     selectedSkillIds.push(skill.id);
     bytes += separatorBytes + sectionBytes;

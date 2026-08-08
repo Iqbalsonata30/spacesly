@@ -439,6 +439,27 @@ assertEqual(
   "profile identity should bind the configured working directory",
 );
 
+const alternateGovernanceProfiles: AgentRuntimeProfile[] = [];
+await ensureOpenCodeAgentProfile(
+  { ...config, agent_rules: "Never deploy.", agent_skills: "Review only." },
+  {
+    saveProfile: async (profile) => {
+      alternateGovernanceProfiles.push(profile);
+      return profile;
+    },
+  },
+);
+assertEqual(
+  {
+    profileChanged: alternateGovernanceProfiles[0]?.id !== savedProfile?.id,
+    rulesChanged: alternateGovernanceProfiles[0]?.rules_revision !== savedProfile?.rules_revision,
+    skillsChanged:
+      alternateGovernanceProfiles[0]?.skills_revision !== savedProfile?.skills_revision,
+  },
+  { profileChanged: true, rulesChanged: true, skillsChanged: true },
+  "different Rules and Skills must create isolated immutable runtime profiles",
+);
+
 const appendedMessages: Array<{ conversationId: string; id: string; text: string }> = [];
 const preparationDependencies: Partial<AgentTaskSessionDependencies> = {
   saveProfile: async (profile: AgentRuntimeProfile) => profile,

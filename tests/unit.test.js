@@ -1,5 +1,4 @@
-// @ts-nocheck -- this file is executed by Bun's test runtime, not the app TypeScript environment.
-import { test } from "bun:test";
+/* global test */
 
 test("themes", async () => {
   await import("./themes");

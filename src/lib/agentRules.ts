@@ -16,6 +16,28 @@ export const exampleAgentRules = [
   "Avoid modifying files unrelated to the task.",
 ].join("\n");
 
+const MAX_AGENT_RULES_BYTES = 32 * 1024;
+
+/** Builds the deterministic Rules snapshot used by new Agent executions. */
+export function resolveAgentRulesSnapshot(value: string): string {
+  const seen = new Set<string>();
+  const rules: string[] = [];
+  for (const line of value.split("\n")) {
+    const rule = line.trim();
+    if (!rule || seen.has(rule)) continue;
+    seen.add(rule);
+    rules.push(rule);
+  }
+  const snapshot = rules.join("\n");
+  const bytes = new TextEncoder().encode(snapshot).length;
+  if (bytes > MAX_AGENT_RULES_BYTES) {
+    throw new Error(
+      `Agent Rules exceed the ${MAX_AGENT_RULES_BYTES / 1024} KiB execution limit (${bytes} bytes).`,
+    );
+  }
+  return snapshot;
+}
+
 export function summarizeAgentRules(value: string): AgentRulesSummary {
   const lines = value.split("\n");
   const rules = lines.map((line) => line.trim()).filter(Boolean);

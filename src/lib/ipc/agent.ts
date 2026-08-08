@@ -86,6 +86,7 @@ export interface ExecutionContract {
       decided_at: string;
       contract_version: number;
     }>;
+    agent_rules_snapshot?: string;
     selected_skill_ids?: string[];
     selected_skills_snapshot?: string;
   };

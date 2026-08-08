@@ -279,6 +279,7 @@
     type SkillCategory,
     type SkillTrigger,
   } from "$lib/agentSkills";
+  import { resolveAgentRulesSnapshot } from "$lib/agentRules";
   import {
     createMcpServer,
     defaultSettings,
@@ -3926,8 +3927,8 @@
     };
   }
 
-  function buildAiWorkerConfig(): AiWorkerConfig | null {
-    const effectiveSettings = settingsWithInstructionDrafts();
+  function buildAiWorkerConfig(agentRulesOverride?: string): AiWorkerConfig | null {
+    const effectiveSettings = settings;
     const effectiveProvider = providerById(effectiveSettings.aiWorker.providerId);
     const effectiveModel = modelById(effectiveProvider, effectiveSettings.aiWorker.modelId);
     const effectiveApiKey = appSecrets.ai_api_keys[effectiveProvider.id] ?? "";
@@ -3952,6 +3953,20 @@
       return null;
     }
 
+    let agentRules: string;
+    try {
+      agentRules = resolveAgentRulesSnapshot(
+        agentRulesOverride ?? effectiveSettings.aiWorker.agentRules,
+      );
+    } catch (reason) {
+      openSettings("rules");
+      appNotice = {
+        tone: "error",
+        message: reason instanceof Error ? reason.message : String(reason),
+      };
+      return null;
+    }
+
     return {
       workspace_id: workspace?.id ?? "workspace-personal",
       runtime: effectiveSettings.aiWorker.runtime,
@@ -3967,7 +3982,7 @@
       opencode_model: effectiveSettings.aiWorker.opencodeModel,
       opencode_workdir: effectiveSettings.aiWorker.opencodeWorkdir.trim() || null,
       opencode_auto_approve: false,
-      agent_rules: effectiveSettings.aiWorker.agentRules,
+      agent_rules: agentRules,
       agent_skills: "",
       temperature: effectiveSettings.aiWorker.temperature,
       mcp_servers: effectiveSettings.mcpServers.flatMap((server) => {
@@ -5519,6 +5534,12 @@
       settingsError = "Jira tool name is required.";
       return;
     }
+    try {
+      resolveAgentRulesSnapshot(nextSettings.aiWorker.agentRules);
+    } catch (reason) {
+      settingsError = reason instanceof Error ? reason.message : String(reason);
+      return;
+    }
     const skillError = validateAgentSkillCatalog(nextSettings.aiWorker.skills);
     if (skillError) {
       settingsError = skillError;
@@ -5561,6 +5582,7 @@
     agentRulesSaveMessage = null;
     await tick();
     try {
+      resolveAgentRulesSnapshot(agentRulesDraft);
       const persisted = loadSettings();
       const nextSettings = {
         ...persisted,
@@ -7170,10 +7192,12 @@
     }
   }
 
-  async function retainedAgentSkillSnapshot(session: AgentRunSession): Promise<string> {
+  async function retainedAgentGovernanceSnapshot(
+    session: AgentRunSession,
+  ): Promise<{ rules: string; skills: string }> {
     if (!session.taskSessionId) {
       throw new Error(
-        "Cannot continue safely because the original Skill snapshot has no retained Task Session.",
+        "Cannot continue safely because the original governance snapshot has no retained Task Session.",
       );
     }
     try {
@@ -7184,10 +7208,10 @@
       const profiles = await listAgentRuntimeProfiles();
       const profile = profiles.find((candidate) => candidate.id === envelope.runtime_profile_id);
       if (!profile) throw new Error("retained Agent runtime profile was not found");
-      return profile.agent_skills;
+      return { rules: profile.agent_rules, skills: profile.agent_skills };
     } catch (reason) {
       throw new Error(
-        `Cannot continue safely because the original Skill snapshot is unavailable: ${reason instanceof Error ? reason.message : String(reason)}`,
+        `Cannot continue safely because the original governance snapshot is unavailable: ${reason instanceof Error ? reason.message : String(reason)}`,
         { cause: reason },
       );
     }
@@ -7243,7 +7267,35 @@
       optimisticallyMoved = true;
     }
 
-    const config = buildAiWorkerConfig();
+    const existingSession = agentRunSessions[cardId];
+    const isContinuation =
+      existingSession?.status === "blocked" ||
+      existingSession?.status === "blocked_for_resume" ||
+      existingSession?.status === "timeout";
+    let retainedLegacyGovernanceSnapshot: { rules: string; skills: string } | null = null;
+    if (
+      isContinuation &&
+      existingSession?.taskSessionId &&
+      (existingSession.executionRun?.contract.runtime_inputs.agent_rules_snapshot === undefined ||
+        existingSession.executionRun?.contract.runtime_inputs.selected_skills_snapshot ===
+          undefined)
+    ) {
+      try {
+        retainedLegacyGovernanceSnapshot = await retainedAgentGovernanceSnapshot(existingSession);
+      } catch (reason) {
+        rollbackPreflightMove();
+        finishWorkerRun(cardId, runId);
+        appNotice = {
+          tone: "error",
+          message: reason instanceof Error ? reason.message : String(reason),
+        };
+        return;
+      }
+    }
+    const config = buildAiWorkerConfig(
+      existingSession?.executionRun?.contract.runtime_inputs.agent_rules_snapshot ??
+        retainedLegacyGovernanceSnapshot?.rules,
+    );
     if (!config) {
       rollbackPreflightMove();
       finishWorkerRun(cardId, runId);
@@ -7286,11 +7338,6 @@
     }
 
     const issueKey = jiraKey(card);
-    const existingSession = agentRunSessions[cardId];
-    const isContinuation =
-      existingSession?.status === "blocked" ||
-      existingSession?.status === "blocked_for_resume" ||
-      existingSession?.status === "timeout";
     const operatorNotes = operatorNotesForCard(cardId);
     const previousOutput = previousOutputForCard(cardId);
     const resumeAuthoritativeResult =
@@ -7302,16 +7349,8 @@
     let reservedManualSkillIds: string[] = [];
     let manualSkillReservationCommitted = false;
     let releaseManualSkillReservation: (() => void) | null = null;
-    let retainedLegacySkillSnapshot: string | null = null;
 
     try {
-      if (
-        isContinuation &&
-        existingSession &&
-        existingSession.executionRun?.contract.runtime_inputs.selected_skills_snapshot === undefined
-      ) {
-        retainedLegacySkillSnapshot = await retainedAgentSkillSnapshot(existingSession);
-      }
       beginAgentRun(card, isContinuation, null);
       const runtimeLabel =
         config.runtime === "opencode"
@@ -7454,12 +7493,27 @@
                   executionRepositoryContext(config, executionGitInfo, workspaceRoot),
                 ),
               );
+      const rulesSnapshot =
+        executionRun.contract.runtime_inputs.agent_rules_snapshot ??
+        retainedLegacyGovernanceSnapshot?.rules ??
+        config.agent_rules;
+      config.agent_rules = rulesSnapshot;
+      executionRun = {
+        ...executionRun,
+        contract: {
+          ...executionRun.contract,
+          runtime_inputs: {
+            ...executionRun.contract.runtime_inputs,
+            agent_rules_snapshot: rulesSnapshot,
+          },
+        },
+      };
       if (
         executionRun.contract.runtime_inputs.selected_skills_snapshot === undefined &&
         isContinuation &&
         existingSession
       ) {
-        if (retainedLegacySkillSnapshot === null) {
+        if (retainedLegacyGovernanceSnapshot === null) {
           throw new Error("Cannot continue safely because the original Skill snapshot is missing.");
         }
         executionRun = {
@@ -7469,7 +7523,7 @@
             runtime_inputs: {
               ...executionRun.contract.runtime_inputs,
               selected_skill_ids: [],
-              selected_skills_snapshot: retainedLegacySkillSnapshot,
+              selected_skills_snapshot: retainedLegacyGovernanceSnapshot.skills,
             },
           },
         };

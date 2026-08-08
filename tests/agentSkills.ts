@@ -266,6 +266,61 @@ assertEqual(
   true,
   "duplicate names should fail catalog validation",
 );
+let duplicateCatalogRejected = false;
+try {
+  resolveAgentSkillSnapshot([...catalog, { ...catalog[0], id: "duplicate-name" }], contract);
+} catch {
+  duplicateCatalogRejected = true;
+}
+assertEqual(
+  duplicateCatalogRejected,
+  true,
+  "runtime resolution should fail closed for an invalid catalog",
+);
+
+let selectedSkillLimitRejected = false;
+try {
+  resolveAgentSkillSnapshot(
+    Array.from({ length: 17 }, (_, index) =>
+      skill({
+        id: `automatic-${index}`,
+        name: `Automatic ${index}`,
+        trigger: "automatic",
+        priority: 100 - index,
+      }),
+    ),
+    contract,
+  );
+} catch {
+  selectedSkillLimitRejected = true;
+}
+assertEqual(
+  selectedSkillLimitRejected,
+  true,
+  "runtime resolution should not silently omit Skills above the selected-skill limit",
+);
+
+let selectedSkillBytesRejected = false;
+try {
+  resolveAgentSkillSnapshot(
+    Array.from({ length: 5 }, (_, index) =>
+      skill({
+        id: `large-selected-${index}`,
+        name: `Large Selected ${index}`,
+        trigger: "automatic",
+        instructions: "x".repeat(8 * 1024),
+      }),
+    ),
+    contract,
+  );
+} catch {
+  selectedSkillBytesRejected = true;
+}
+assertEqual(
+  selectedSkillBytesRejected,
+  true,
+  "runtime resolution should not silently omit Skills above the prompt byte limit",
+);
 const oversizedCatalog = Array.from({ length: 65 }, (_, index) =>
   skill({ id: `large-${index}`, name: `Large ${index}` }),
 );

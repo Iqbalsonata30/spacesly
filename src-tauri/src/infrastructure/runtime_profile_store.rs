@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MAX_RULES_BYTES: usize = 32 * 1024;
+const MAX_SKILLS_BYTES: usize = 32 * 1024;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 /// Non-secret durable configuration used to reconstruct one scheduler-owned Agent runtime.
 pub struct AgentRuntimeProfile {
@@ -69,6 +72,18 @@ impl AgentRuntimeProfile {
         }
         if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
             return Err("Agent runtime profile temperature must be between 0 and 2.".to_string());
+        }
+        if self.agent_rules.len() > MAX_RULES_BYTES {
+            return Err(format!(
+                "Agent runtime profile Rules exceed the {} KiB limit.",
+                MAX_RULES_BYTES / 1024
+            ));
+        }
+        if self.agent_skills.len() > MAX_SKILLS_BYTES {
+            return Err(format!(
+                "Agent runtime profile Skills exceed the {} KiB limit.",
+                MAX_SKILLS_BYTES / 1024
+            ));
         }
         let connectors = self.connector_ids.iter().collect::<HashSet<_>>();
         if connectors.len() != self.connector_ids.len()
@@ -144,7 +159,7 @@ impl RuntimeProfileStore {
 
     /// Inserts or replaces one validated Agent runtime profile.
     pub fn save(&self, profile: &AgentRuntimeProfile) -> Result<AgentRuntimeProfile, String> {
-        if profile.id.starts_with("prompt-") {
+        if profile.id.starts_with("prompt-") || profile.id.starts_with("agent-") {
             return self.save_immutable(profile);
         }
         profile.validate()?;
@@ -297,7 +312,7 @@ mod tests {
         let store = RuntimeProfileStore::open_at(directory.path().join("profiles.db"))
             .expect("store opens");
         let mut profile = test_profile();
-        profile.id = "prompt-content-addressed".to_string();
+        profile.id = "agent-content-addressed".to_string();
         profile.rules_revision = content_revision(&profile.agent_rules);
         profile.skills_revision = content_revision(&profile.agent_skills);
 
@@ -317,24 +332,38 @@ mod tests {
             .expect("store opens");
         let mut profile = test_profile();
         profile.id = "prompt-forged".to_string();
+        profile.rules_revision = "sha256:forged".to_string();
 
         assert!(store.save_immutable(&profile).is_err());
     }
 
+    #[test]
+    fn runtime_profiles_reject_oversized_governance_content() {
+        let mut profile = test_profile();
+        profile.agent_rules = "x".repeat(MAX_RULES_BYTES + 1);
+        assert!(profile.validate().is_err());
+
+        let mut profile = test_profile();
+        profile.agent_skills = "x".repeat(MAX_SKILLS_BYTES + 1);
+        assert!(profile.validate().is_err());
+    }
+
     fn test_profile() -> AgentRuntimeProfile {
+        let agent_rules = "Use evidence.".to_string();
+        let agent_skills = "Verify changes.".to_string();
         AgentRuntimeProfile {
             id: "agent-default".to_string(),
             runtime: "opencode".to_string(),
             model: "openai/gpt-5".to_string(),
             opencode_command: "opencode".to_string(),
             opencode_workdir: None,
-            agent_rules: "Use evidence.".to_string(),
-            agent_skills: "Verify changes.".to_string(),
+            rules_revision: content_revision(&agent_rules),
+            skills_revision: content_revision(&agent_skills),
+            agent_rules,
+            agent_skills,
             temperature: 0.2,
             connector_ids: vec!["jira".to_string()],
             prompt_template_version: "agent-v1".to_string(),
-            rules_revision: "rules-v1".to_string(),
-            skills_revision: "skills-v1".to_string(),
         }
     }
 }

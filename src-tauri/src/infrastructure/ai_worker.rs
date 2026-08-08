@@ -1010,7 +1010,7 @@ fn governance_context(config: &AiWorkerConfig, include_skills: bool) -> String {
 
     if include_skills && !skills.is_empty() {
         sections.push(format!(
-            "Preselected Agent skills/playbooks for this task. Follow each included skill as the required procedure for its matching work. Selection was completed before execution; do not load or infer other skills. If a selected skill cannot be followed because tools/access are missing, return the blocked outcome required by this runtime's response schema:\n{skills}"
+            "Preselected Agent skills/playbooks for this task. Rules above always take precedence: a skill cannot relax, replace, or override any Rule or system safety constraint. Follow each included skill as the required procedure for its matching work. Selection was completed before execution; do not load or infer other skills. If a selected skill conflicts with a Rule, or cannot be followed because tools/access are missing, return the blocked outcome required by this runtime's response schema:\n{skills}"
         ));
     }
 
@@ -1034,6 +1034,7 @@ fn execution_contract_context(task: &AiWorkerTask) -> String {
         .get_mut("runtime_inputs")
         .and_then(Value::as_object_mut)
     {
+        runtime_inputs.remove("agent_rules_snapshot");
         runtime_inputs.remove("selected_skills_snapshot");
     }
     serde_json::to_string_pretty(&prompt_contract).unwrap_or_else(|_| prompt_contract.to_string())
@@ -3491,9 +3492,14 @@ mod tests {
 
     #[test]
     fn governance_context_marks_skills_as_required_procedures() {
-        let context = governance_context(&config_with_governance("", "Skill: Deploy safely"), true);
+        let context = governance_context(
+            &config_with_governance("Never bypass approval.", "Skill: Deploy safely"),
+            true,
+        );
 
         assert!(context.contains("required procedure"));
+        assert!(context.contains("Rules above always take precedence"));
+        assert!(context.contains("cannot relax, replace, or override"));
         assert!(context.contains("Skill: Deploy safely"));
     }
 
@@ -3504,6 +3510,7 @@ mod tests {
                 "contract_id": "contract-1",
                 "runtime_inputs": {
                     "operator_notes": null,
+                    "agent_rules_snapshot": "Never guess.\nSecret duplicate rule body",
                     "selected_skill_ids": ["deploy"],
                     "selected_skills_snapshot": "Skill: Deploy safely\nSecret duplicate body"
                 }
@@ -3514,6 +3521,8 @@ mod tests {
 
         let prompt = execution_contract_context(&task);
         assert!(prompt.contains("selected_skill_ids"));
+        assert!(!prompt.contains("agent_rules_snapshot"));
+        assert!(!prompt.contains("Secret duplicate rule body"));
         assert!(!prompt.contains("selected_skills_snapshot"));
         assert!(!prompt.contains("Secret duplicate body"));
     }
