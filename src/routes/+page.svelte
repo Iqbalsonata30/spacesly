@@ -5,19 +5,10 @@
   import type { Terminal as XtermTerminal } from "@xterm/xterm";
   import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
   import BoardWorkspace from "$lib/components/BoardWorkspace.svelte";
-  import AgentRulesSettings from "$lib/components/AgentRulesSettings.svelte";
   import NewTaskPopover from "$lib/components/NewTaskPopover.svelte";
   import NotificationStack from "$lib/components/NotificationStack.svelte";
   import SegmentedControl from "$lib/components/SegmentedControl.svelte";
-  import SkillEditorDialog from "$lib/components/SkillEditorDialog.svelte";
   import UnsavedChangesDialog from "$lib/components/UnsavedChangesDialog.svelte";
-  import SettingsActionBar from "$lib/components/settings/SettingsActionBar.svelte";
-  import SettingsCard from "$lib/components/settings/SettingsCard.svelte";
-  import SettingsInput from "$lib/components/settings/SettingsInput.svelte";
-  import SettingsLabel from "$lib/components/settings/SettingsLabel.svelte";
-  import SettingsPage from "$lib/components/settings/SettingsPage.svelte";
-  import SettingsRow from "$lib/components/settings/SettingsRow.svelte";
-  import ValidationMessage from "$lib/components/settings/ValidationMessage.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import { formatEditorText, validateEditorSyntax } from "$lib/editorFormatting";
   import { ocpTestMcpConnection } from "$lib/ipc/ocp";
@@ -614,6 +605,20 @@
   let performanceDiagnosticsRuntime: Promise<
     typeof import("$lib/components/PerformanceDiagnostics.svelte")
   > | null = null;
+  let settingsSurfaceModule = $state<typeof import("$lib/components/settings/runtime") | null>(
+    null,
+  );
+  let settingsSurfaceRuntime: Promise<typeof import("$lib/components/settings/runtime")> | null =
+    null;
+  let AgentRulesSettings = $derived(settingsSurfaceModule?.AgentRulesSettings);
+  let SkillEditorDialog = $derived(settingsSurfaceModule?.SkillEditorDialog);
+  let SettingsActionBar = $derived(settingsSurfaceModule?.SettingsActionBar);
+  let SettingsCard = $derived(settingsSurfaceModule?.SettingsCard);
+  let SettingsInput = $derived(settingsSurfaceModule?.SettingsInput);
+  let SettingsLabel = $derived(settingsSurfaceModule?.SettingsLabel);
+  let SettingsPage = $derived(settingsSurfaceModule?.SettingsPage);
+  let SettingsRow = $derived(settingsSurfaceModule?.SettingsRow);
+  let ValidationMessage = $derived(settingsSurfaceModule?.ValidationMessage);
   let workspaceChatTextarea: HTMLTextAreaElement | null = $state(null);
   let workspaceChatEnd: HTMLDivElement | null = $state(null);
   let workspaceChatRuns = $state<WorkspaceChatRuns>({});
@@ -3504,6 +3509,7 @@
   }
 
   function openSettings(tab?: SettingsTab) {
+    prepareSettingsSurface();
     if (tab) settingsTab = tab;
     agentRulesSaveError = null;
     agentRulesSaveMessage = null;
@@ -3512,6 +3518,25 @@
     void tick().then(() => {
       settingsForm?.scrollTo({ top: 0 });
       document.getElementById(`${settingsTab}-settings-tab`)?.focus();
+    });
+  }
+
+  function loadSettingsSurfaceRuntime() {
+    settingsSurfaceRuntime ??= import("$lib/components/settings/runtime")
+      .then((module) => {
+        settingsSurfaceModule = module;
+        return module;
+      })
+      .catch((reason) => {
+        settingsSurfaceRuntime = null;
+        throw reason;
+      });
+    return settingsSurfaceRuntime;
+  }
+
+  function prepareSettingsSurface() {
+    void loadSettingsSurfaceRuntime().catch((reason: unknown) => {
+      settingsError = `Could not load settings controls: ${reason instanceof Error ? reason.message : String(reason)}`;
     });
   }
 
@@ -8437,8 +8462,13 @@
         <strong>{workspace?.projects[0]?.name.toLowerCase() ?? "spacesly"}</strong>
       </div>
 
-      <button class="icon-button" type="button" aria-label="Settings" onclick={() => openSettings()}
-        >Settings</button
+      <button
+        class="icon-button"
+        type="button"
+        aria-label="Settings"
+        onfocus={prepareSettingsSurface}
+        onpointerenter={prepareSettingsSurface}
+        onclick={() => openSettings()}>Settings</button
       >
 
       <nav class="mode-switch" aria-label="Workspace mode">
@@ -8491,7 +8521,7 @@
       {/if}
     </header>
 
-    {#if settingsOpen}
+    {#if settingsOpen && settingsSurfaceModule}
       <section class="settings-backdrop" aria-label="Settings dialog">
         <div
           bind:this={settingsDialog}
@@ -9819,7 +9849,29 @@
       </section>
     {/if}
 
-    {#if skillEditor}
+    {#if settingsOpen && !settingsSurfaceModule}
+      <section class="settings-backdrop" aria-label="Settings dialog">
+        <div class="settings-panel settings-loading" role="dialog" aria-modal="true">
+          <header>
+            <div>
+              <p>Settings</p>
+              <h2>Preparing settings</h2>
+            </div>
+            <button type="button" aria-label="Close settings" onclick={closeSettings}
+              ><X size={16} aria-hidden="true" /></button
+            >
+          </header>
+          {#if settingsError}
+            <p class="settings-error">{settingsError}</p>
+            <button type="button" onclick={prepareSettingsSurface}>Retry</button>
+          {:else}
+            <p class="field-help">Loading local settings controls…</p>
+          {/if}
+        </div>
+      </section>
+    {/if}
+
+    {#if skillEditor && SkillEditorDialog}
       {#key `${skillEditor.skill.id}:${skillEditor.isNew}`}
         <SkillEditorDialog
           skill={skillEditor.skill}
