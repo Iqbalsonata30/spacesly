@@ -380,14 +380,17 @@ pub fn run_ocp_mcp_server() -> Result<(), String> {
         std::time::Duration::from_secs(BREAKER_RESET_AFTER_SECS),
     );
     let mutation_used = AtomicBool::new(false);
+    let mutation_approval = MutationApproval {
+        operation: env.approved_operation.as_deref(),
+        arguments_digest: env.approved_arguments_digest.as_deref(),
+        used: &mutation_used,
+    };
     serve_stdio(
         client,
         &breaker,
         &audit,
         secrets,
-        env.approved_operation.as_deref(),
-        env.approved_arguments_digest.as_deref(),
-        &mutation_used,
+        &mutation_approval,
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
     )
@@ -443,6 +446,12 @@ fn default_connector_dir_silent() -> PathBuf {
     config::default_connector_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+struct MutationApproval<'a> {
+    operation: Option<&'a str>,
+    arguments_digest: Option<&'a str>,
+    used: &'a AtomicBool,
+}
+
 pub fn resolve_cluster(env: &OcpConnectorEnv) -> OcpResult<ResolvedCluster> {
     let credentials = match &env.credentials_file {
         Some(path) => read_credentials_file(path)?,
@@ -488,9 +497,7 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
     breaker: &CircuitBreaker,
     audit: &AuditLog,
     secrets: Vec<String>,
-    approved_operation: Option<&str>,
-    approved_arguments_digest: Option<&str>,
-    mutation_used: &AtomicBool,
+    mutation_approval: &MutationApproval<'_>,
     mut reader: R,
     mut writer: W,
 ) -> Result<(), String> {
@@ -539,15 +546,8 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
                     None,
                     0,
                 );
-                let outcome = call_tool(
-                    &client,
-                    breaker,
-                    &tool_name,
-                    &arguments,
-                    approved_operation,
-                    approved_arguments_digest,
-                    mutation_used,
-                );
+                let outcome =
+                    call_tool(&client, breaker, &tool_name, &arguments, mutation_approval);
                 let latency_ms = started.elapsed().as_millis() as u64;
                 match outcome {
                     Ok(value) => {
@@ -608,9 +608,7 @@ fn call_tool(
     breaker: &CircuitBreaker,
     tool_name: &str,
     arguments: &Value,
-    approved_operation: Option<&str>,
-    approved_arguments_digest: Option<&str>,
-    mutation_used: &AtomicBool,
+    mutation_approval: &MutationApproval<'_>,
 ) -> OcpResult<Value> {
     breaker.allow()?;
     let tool = OcpTool::parse(tool_name)
@@ -622,8 +620,8 @@ fn call_tool(
                 format!("Could not identify OpenShift operation arguments: {error}"),
             )
         })?;
-        if approved_operation != Some(tool.as_str())
-            || approved_arguments_digest != Some(actual_digest.as_str())
+        if mutation_approval.operation != Some(tool.as_str())
+            || mutation_approval.arguments_digest != Some(actual_digest.as_str())
         {
             // Report approval as a successful MCP tool result. OpenCode retries JSON-RPC
             // errors internally, which can issue the same mutation repeatedly and flood the
@@ -635,7 +633,8 @@ fn call_tool(
                 "message": "This action is waiting for an operator decision in Spacesly. Do not retry it."
             }));
         }
-        if mutation_used
+        if mutation_approval
+            .used
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -1300,14 +1299,18 @@ mod tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let audit = AuditLog::new(audit_dir.path().to_path_buf());
         let mut output = Vec::new();
+        let mutation_used = AtomicBool::new(false);
+        let mutation_approval = MutationApproval {
+            operation: None,
+            arguments_digest: None,
+            used: &mutation_used,
+        };
         serve_stdio(
             client,
             &breaker,
             &audit,
             vec![],
-            None,
-            None,
-            &AtomicBool::new(false),
+            &mutation_approval,
             std::io::Cursor::new(input.as_bytes()),
             &mut output,
         )

@@ -234,6 +234,163 @@ export type TaskSessionEventPage = {
   has_more: boolean;
 };
 
+export type TaskExecutionTraceEntry = {
+  sequence: number;
+  attempt_id: number | null;
+  assignment_attempt: number | null;
+  fencing_token: number;
+  event_type: string;
+  created_at: number;
+  state: string | null;
+  stage: string | null;
+  duration_us: number | null;
+  outcome: string | null;
+  worker_id: number | null;
+  runtime_id: string | null;
+  opencode_session_id: string | null;
+  tool_call_id: string | null;
+  tool_name: string | null;
+  tool_success: boolean | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  recovery: string | null;
+  approval_operation: string | null;
+};
+
+export type TaskExecutionTracePage = {
+  schema_version: number;
+  trace_id: string;
+  task_session_id: number;
+  subject_id: string | null;
+  execution_run_id: string | null;
+  runtime_profile_id: string | null;
+  model: string | null;
+  opencode_session_id: string | null;
+  coverage: "complete" | "partial";
+  unknown_fields: string[];
+  entries: TaskExecutionTraceEntry[];
+  next_cursor: number;
+  has_more: boolean;
+};
+
+export type ContextContributionKind =
+  | "system_instructions"
+  | "rules"
+  | "skills"
+  | "task"
+  | "workspace"
+  | "external"
+  | "tool_definitions"
+  | "conversation";
+
+export type ContextContribution = {
+  kind: ContextContributionKind;
+  source: string;
+  revision: string | null;
+  digest: string | null;
+  stored_content_bytes: number | null;
+  estimated_tokens: number | null;
+  token_measurement: "chars_div4_estimate" | "unavailable";
+  item_count: number | null;
+  note: string;
+};
+
+export type TaskContextInspection = {
+  schema_version: number;
+  task_session_id: number;
+  status: "partial" | "legacy_unavailable" | "corrupt";
+  identity: {
+    kind: TaskSessionKind | null;
+    state: TaskSessionState;
+    workspace_id: string | null;
+    subject_id: string | null;
+    conversation_id: string | null;
+    execution_run_id: string | null;
+    runtime_profile_id: string | null;
+    model: string | null;
+    prompt_template_version: string | null;
+    context_digest: string | null;
+    context_revision: string | null;
+    rules_revision: string | null;
+    skills_revision: string | null;
+    opencode_session_id: string | null;
+  };
+  known_stored_content_bytes: number;
+  known_estimated_tokens: number;
+  total_is_partial: boolean;
+  contributions: ContextContribution[];
+  rules: {
+    status: string;
+    normalization_version: string | null;
+    final_digest: string | null;
+    entries: Array<{
+      rule_id: string;
+      scope: "platform" | "global" | "workspace" | "task";
+      source: string;
+      revision: string;
+      precedence: number;
+      digest: string;
+    }>;
+    truncated: boolean;
+  };
+  skills: {
+    status: string;
+    catalog_revision: string | null;
+    selected_skill_ids: string[];
+    entries: Array<{
+      skill_id: string;
+      selected: boolean;
+      trigger: string;
+      matched_domains: string[];
+      matched_intents: string[];
+      priority: number;
+      reason: string;
+      selection_order: number | null;
+    }>;
+    truncated: boolean;
+  };
+  connectors: TaskMcpConnectorContext[];
+  unknown_fields: string[];
+};
+
+export type TaskExecutionManifest = {
+  schema_version: number;
+  task_session_id: number;
+  assignment_attempt_id: number;
+  assignment_attempt: number;
+  worker_id: number;
+  fencing_token: number;
+  started_at: number;
+  kind: TaskSessionKind;
+  workspace_id: string;
+  subject_id: string | null;
+  conversation_id: string | null;
+  execution_run_id: string | null;
+  context_digest: string;
+  context_revision: string | null;
+  runtime: string;
+  runtime_profile_id: string;
+  runtime_id: string;
+  model: string;
+  model_configuration: {
+    provider_id: string;
+    api_style: string;
+    temperature: string;
+  };
+  prompt_template_version: string;
+  rules_revision: string | null;
+  skills_revision: string | null;
+  rules: TaskGovernanceResolution["rules"]["entries"];
+  rules_digest: string;
+  skills_catalog_revision: string | null;
+  skills: TaskGovernanceResolution["skills"]["entries"];
+  connectors: TaskMcpConnectorContext[];
+  tool_permission_mode: string;
+  unknown_fields: string[];
+  opencode_session_id: string | null;
+  coverage: "partial";
+};
+
 export type TaskToolStatus = "running" | "succeeded" | "failed";
 
 export type TaskToolCallState = {
@@ -428,6 +585,39 @@ export function listTaskSessionEvents(
   return invokeWithPolicy(
     "list_task_session_events",
     { sessionId, afterSequence, limit },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Reads a safe, indexed, bounded developer execution trace after a raw journal cursor. */
+export function listTaskSessionExecutionTrace(
+  sessionId: number,
+  afterSequence = 0,
+  limit = 100,
+): Promise<TaskExecutionTracePage> {
+  return invokeWithPolicy(
+    "list_task_session_execution_trace",
+    { sessionId, afterSequence, limit },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Returns a safe metadata-only projection of the context available to one Task Session. */
+export function getTaskSessionContextInspection(sessionId: number): Promise<TaskContextInspection> {
+  return invokeWithPolicy(
+    "get_task_session_context_inspection",
+    { sessionId },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Returns the latest durable, assignment-fenced Execution Manifest for one Task Session. */
+export function getTaskSessionExecutionManifest(
+  sessionId: number,
+): Promise<TaskExecutionManifest | null> {
+  return invokeWithPolicy(
+    "get_task_session_execution_manifest",
+    { sessionId },
     IPC_POLICIES.taskSessionRead,
   );
 }

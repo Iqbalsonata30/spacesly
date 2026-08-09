@@ -1,5 +1,6 @@
 pub mod agent_task_executor;
 pub mod app;
+pub mod context_inspector;
 #[allow(dead_code)]
 pub mod execution_engine;
 pub mod files_service;

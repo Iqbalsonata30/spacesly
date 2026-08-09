@@ -565,6 +565,49 @@ pub struct TaskSessionEventPage {
     pub has_more: bool,
 }
 
+/// Bounded developer-oriented execution trace projected from the authoritative Task Session journal.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TaskExecutionTracePage {
+    pub schema_version: u32,
+    pub trace_id: String,
+    pub task_session_id: TaskSessionId,
+    pub subject_id: Option<String>,
+    pub execution_run_id: Option<String>,
+    pub runtime_profile_id: Option<String>,
+    pub model: Option<String>,
+    pub opencode_session_id: Option<String>,
+    pub coverage: String,
+    pub unknown_fields: Vec<String>,
+    pub entries: Vec<TaskExecutionTraceEntry>,
+    pub next_cursor: u64,
+    pub has_more: bool,
+}
+
+/// Safe, allowlisted metadata for one durable execution-trace fact.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskExecutionTraceEntry {
+    pub sequence: u64,
+    pub attempt_id: Option<u64>,
+    pub assignment_attempt: Option<u32>,
+    pub fencing_token: u64,
+    pub event_type: String,
+    pub created_at: u64,
+    pub state: Option<String>,
+    pub stage: Option<String>,
+    pub duration_us: Option<u64>,
+    pub outcome: Option<String>,
+    pub worker_id: Option<u64>,
+    pub runtime_id: Option<String>,
+    pub opencode_session_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_success: Option<bool>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub recovery: Option<String>,
+    pub approval_operation: Option<String>,
+}
+
 /// Current lifecycle status for one tool call within a Task Session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

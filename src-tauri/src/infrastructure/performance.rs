@@ -524,11 +524,7 @@ pub fn snapshot() -> PerformanceSnapshot {
         recent_spans,
         instrumentation_overhead: InstrumentationOverhead {
             samples: overhead_samples,
-            average_ns: if overhead_samples == 0 {
-                0
-            } else {
-                overhead_total / overhead_samples
-            },
+            average_ns: overhead_total.checked_div(overhead_samples).unwrap_or(0),
             max_ns: registry.overhead_max_ns.load(Ordering::Relaxed),
         },
     }

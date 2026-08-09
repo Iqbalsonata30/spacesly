@@ -5,6 +5,7 @@
 //! threads are created once, execute one mock Task Session at a time, reset their task-local
 //! context, and return to idle until the engine is dropped.
 
+use crate::domain::execution_manifest::{ExecutionManifest, ExecutionManifestDraft};
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
     TaskCapabilityGrant, TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope,
@@ -298,6 +299,17 @@ impl TaskExecutionContext {
         self.event_sink
             .store
             .bind_governance_resolution(self.event_sink.fence, resolution)
+            .map_err(TaskExecutionError::new)
+    }
+
+    /// Captures the effective, secret-free runtime manifest for this assignment attempt.
+    pub fn bind_execution_manifest(
+        &self,
+        draft: &ExecutionManifestDraft,
+    ) -> Result<ExecutionManifest, TaskExecutionError> {
+        self.event_sink
+            .store
+            .bind_execution_manifest(self.event_sink.fence, draft)
             .map_err(TaskExecutionError::new)
     }
 

@@ -24,7 +24,10 @@ export function projectAgentTaskSessionEvent(
       : 55
     : null;
 
-  if (event.kind === "runtime" && eventType === "text_delta") {
+  if (
+    event.kind === "runtime" &&
+    (eventType === "text_delta" || eventType === "execution_trace_stage")
+  ) {
     return { progress, taskSessionState: null, logs: [] };
   }
 

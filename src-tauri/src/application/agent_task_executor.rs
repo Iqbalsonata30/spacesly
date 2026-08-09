@@ -1,10 +1,12 @@
 use super::execution_engine::{
     TaskEventReporter, TaskExecutionContext, TaskExecutionError, TaskExecutor,
 };
+use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskProgress,
-    TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionKind,
+    AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskMcpConnectorContext,
+    TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind,
+    TaskSessionKind,
 };
 use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
@@ -173,7 +175,7 @@ impl TaskExecutor for AgentTaskExecutor {
         } else {
             opencode_resolution
         };
-        resolved.task.opencode_session_id = opencode_session_id;
+        resolved.task.opencode_session_id = opencode_session_id.clone();
         opencode_resolution.finish();
         if resolved.config.runtime != "opencode" {
             return Err(TaskExecutionError::new(
@@ -185,6 +187,57 @@ impl TaskExecutor for AgentTaskExecutor {
         resolved.config.restrict_tools = false;
         resolved.config.fenced_tools_only = true;
         resolved.config.isolated_opencode_process = true;
+        let granted_capabilities = context
+            .capability_grants()
+            .iter()
+            .map(|grant| grant.capability.as_str())
+            .collect::<HashSet<_>>();
+        let connectors = envelope
+            .connector_ids
+            .iter()
+            .map(|connector_id| {
+                let capability = format!("external_tools:{connector_id}");
+                TaskMcpConnectorContext {
+                    connector_id: connector_id.clone(),
+                    requested: true,
+                    granted: granted_capabilities.contains(capability.as_str()),
+                    capability,
+                }
+            })
+            .collect::<Vec<_>>();
+        context.bind_execution_manifest(&ExecutionManifestDraft {
+            kind: envelope.kind,
+            workspace_id: envelope.workspace_id.clone(),
+            subject_id: envelope.subject_id.clone(),
+            conversation_id: envelope.conversation_id.clone(),
+            execution_run_id: envelope.execution_run_id.clone(),
+            context_digest: envelope.context_digest.clone(),
+            context_revision: envelope.context_revision.clone(),
+            runtime: resolved.config.runtime.clone(),
+            runtime_profile_id: resolved.runtime_profile_id.clone(),
+            runtime_id: runtime_attempt_id.clone(),
+            model: resolved.config.model.clone(),
+            model_configuration: ExecutionModelConfiguration {
+                provider_id: resolved.config.provider_id.clone(),
+                api_style: resolved.config.api_style.clone(),
+                temperature: resolved.config.temperature.to_string(),
+            },
+            prompt_template_version: envelope.prompt_template_version.clone(),
+            rules_revision: envelope.rules_revision.clone(),
+            skills_revision: envelope.skills_revision.clone(),
+            rules: resolved.governance.rules.entries.clone(),
+            rules_digest: resolved.governance.rules.final_digest.clone(),
+            skills_catalog_revision: resolved.governance.skills.catalog_revision.clone(),
+            skills: resolved.governance.skills.entries.clone(),
+            connectors,
+            tool_permission_mode: "fenced_tools_only".to_string(),
+            unknown_fields: vec![
+                "git_revision".to_string(),
+                "environment_fingerprint".to_string(),
+                "mcp_implementation_versions".to_string(),
+                "mcp_connection_ids".to_string(),
+            ],
+        })?;
         let workspace_root =
             resolved.config.opencode_workdir.as_deref().ok_or_else(|| {
                 TaskExecutionError::new("Trusted Agent workspace root is required.")
@@ -211,7 +264,15 @@ impl TaskExecutor for AgentTaskExecutor {
             },
             json!({ "runtime_attempt_id": runtime_attempt_id }),
         )?;
-        runtime_preparation.finish();
+        let runtime_preparation_duration = runtime_preparation.finish();
+        emit_execution_trace_stage(
+            context,
+            "runtime_preparation",
+            runtime_preparation_duration,
+            "succeeded",
+            &runtime_attempt_id,
+            opencode_session_id.as_deref(),
+        );
 
         let reporter = context.event_reporter();
         let callback_open = Arc::new(Mutex::new(true));
@@ -256,14 +317,29 @@ impl TaskExecutor for AgentTaskExecutor {
         let provider_request =
             crate::infrastructure::performance::span("provider_or_runtime_request_ms", "provider")
                 .with_context("task_session_id", context.session_id().0.to_string())
-                .with_context("runtime_id", runtime_attempt_id);
+                .with_context("runtime_id", runtime_attempt_id.clone());
         let result = self.runner.execute(
             resolved.config,
             resolved.task,
             context.cancellation().shared_flag(),
             callback,
         );
-        provider_request.finish();
+        let provider_duration = provider_request.finish();
+        let provider_outcome = match &result {
+            Ok(_) => "succeeded",
+            Err(error) if error.contains("[approval_required]") => "blocked",
+            Err(_) if context.cancellation().is_cancelled() => "cancelled",
+            Err(_) => "failed",
+        };
+        let bound_opencode_session_id = context.opencode_session_id().ok().flatten();
+        emit_execution_trace_stage(
+            context,
+            "agent_runtime_request",
+            provider_duration,
+            provider_outcome,
+            &runtime_attempt_id,
+            bound_opencode_session_id.as_deref(),
+        );
         drop(callback_guard);
         let result = result.map_err(|error| {
             if error.contains("[approval_required]") {
@@ -293,6 +369,38 @@ impl TaskExecutor for AgentTaskExecutor {
             completion_status,
             blocked_reason: result.blocked_reason,
         }))
+    }
+}
+
+fn emit_execution_trace_stage(
+    context: &TaskExecutionContext,
+    stage: &'static str,
+    duration: std::time::Duration,
+    outcome: &'static str,
+    runtime_id: &str,
+    opencode_session_id: Option<&str>,
+) {
+    let result = context.emit_event(
+        TaskSessionEventKind::Runtime,
+        json!({
+            "type": "execution_trace_stage",
+            "schema_version": 1,
+            "trace_id": format!("task-session:{}", context.session_id().0),
+            "span_id": format!("attempt:{}:{stage}", context.attempt_id()),
+            "stage": stage,
+            "duration_us": duration.as_micros().min(u64::MAX as u128) as u64,
+            "outcome": outcome,
+            "worker_id": context.worker_id(),
+            "runtime_id": runtime_id,
+            "opencode_session_id": opencode_session_id,
+        }),
+    );
+    if result.is_err() {
+        crate::infrastructure::performance::increment(
+            "execution_trace_events_dropped_total",
+            "observability",
+            1,
+        );
     }
 }
 
@@ -861,6 +969,32 @@ mod tests {
                     && event.payload["authoritative"] == false
                     && event.payload["result"]["completion_status"] == "completed"
             }));
+        let trace = engine
+            .events_after(session.id, 0)
+            .expect("events replayed")
+            .into_iter()
+            .filter(|event| event.payload["type"] == "execution_trace_stage")
+            .collect::<Vec<_>>();
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].payload["stage"], "runtime_preparation");
+        assert_eq!(trace[1].payload["stage"], "agent_runtime_request");
+        for event in &trace {
+            assert_eq!(event.payload["schema_version"], 1);
+            assert_eq!(
+                event.payload["trace_id"],
+                format!("task-session:{}", session.id.0)
+            );
+            assert_eq!(event.payload["worker_id"], 1);
+            assert!(event.payload["duration_us"].as_u64().is_some());
+            assert!(event.payload["runtime_id"]
+                .as_str()
+                .is_some_and(|runtime_id| runtime_id.contains("attempt-")));
+        }
+        assert!(trace[0].payload["opencode_session_id"].is_null());
+        assert_eq!(
+            trace[1].payload["opencode_session_id"],
+            "opencode-session-fake"
+        );
     }
 
     #[test]

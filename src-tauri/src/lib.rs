@@ -22,6 +22,7 @@ use application::agent_task_executor::{
     execution_contract_digest, AgentTaskExecutor, AiWorkerRuntimeRunner,
 };
 use application::app::AppState;
+use application::context_inspector::{inspect_task_context, TaskContextInspection};
 use application::execution_engine::{ExecutionEngine, SchedulerHealth};
 use application::files_service::FilesService;
 use application::git_service::GitService;
@@ -33,9 +34,11 @@ use application::stored_agent_runtime_resolver::StoredAgentRuntimeResolver;
 use base64::Engine;
 use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
+use domain::execution_manifest::TaskExecutionManifest;
 use domain::task_session::{
-    TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2,
-    TaskSessionResult, TaskSessionSnapshot, TaskSessionUpdate, TaskToolState,
+    TaskExecutionTracePage, TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage,
+    TaskSessionId, TaskSessionInputV2, TaskSessionResult, TaskSessionSnapshot, TaskSessionUpdate,
+    TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -2412,6 +2415,25 @@ async fn list_task_session_events(
 }
 
 #[tauri::command]
+async fn list_task_session_execution_trace(
+    session_id: u64,
+    after_sequence: u64,
+    limit: Option<usize>,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<TaskExecutionTracePage, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.execution_trace_page(
+            TaskSessionId(session_id),
+            after_sequence,
+            limit.unwrap_or(100),
+        )
+    })
+    .await
+    .map_err(|error| format!("List Task Session execution trace task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn get_task_session_tool_state(
     session_id: u64,
     scheduler_store: State<'_, SchedulerStore>,
@@ -2444,6 +2466,69 @@ async fn get_task_session_governance(
     })
     .await
     .map_err(|error| format!("Get Task Session governance task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_task_session_context_inspection(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<TaskContextInspection, String> {
+    let scheduler = scheduler_store.inner().clone();
+    let executions = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session_id = TaskSessionId(session_id);
+        let snapshot = scheduler
+            .get_session(session_id)?
+            .ok_or_else(|| format!("Task Session {} was not found.", session_id.0))?;
+        let envelope = snapshot.request.envelope();
+        let execution_run_id = envelope
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|value| value.session().execution_run_id.clone());
+        let execution_run = execution_run_id
+            .as_deref()
+            .map(|run_id| executions.get(run_id))
+            .transpose()?
+            .flatten();
+        let governance = scheduler.governance_resolution(session_id)?;
+        // Corrupt/legacy envelopes intentionally yield partial inspection rather than leaking the
+        // underlying decoder error through the MCP projection.
+        let mcp = scheduler.mcp_context(session_id).ok();
+        Ok(inspect_task_context(
+            &snapshot,
+            envelope,
+            governance.as_ref(),
+            mcp.as_ref(),
+            execution_run.as_ref(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("Get Task Session context inspection task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn get_task_session_execution_manifest(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Option<TaskExecutionManifest>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session_id = TaskSessionId(session_id);
+        let snapshot = store
+            .get_session(session_id)?
+            .ok_or_else(|| format!("Task Session {} was not found.", session_id.0))?;
+        store.latest_execution_manifest(session_id).map(|manifest| {
+            manifest.map(|manifest| TaskExecutionManifest {
+                manifest,
+                opencode_session_id: snapshot.opencode_session_id,
+                coverage: "partial".to_string(),
+            })
+        })
+    })
+    .await
+    .map_err(|error| format!("Get Task Session Execution Manifest task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -3033,7 +3118,7 @@ pub fn run() {
     let workspace_root = WorkspaceRoot::home().expect("failed to initialize workspace root");
 
     // Initialize the most expensive startup resources in parallel:
-    //   - ExecutionStore: opens SQLite + runs schema DDL + recover_interrupted_runs()
+    //   - ExecutionStore: opens SQLite + runs schema DDL
     //   - RecoveryStore:  opens SQLite + runs schema DDL + prune_expired()
     //   - AppSecretsStore: reads secrets.json + keyring round-trips
     //   - GlobalEnvironmentStore: reads managed process environment variables
@@ -3232,9 +3317,12 @@ pub fn run() {
             get_task_session,
             get_task_session_result,
             list_task_session_events,
+            list_task_session_execution_trace,
             get_task_session_tool_state,
             get_task_session_mcp_context,
             get_task_session_governance,
+            get_task_session_context_inspection,
+            get_task_session_execution_manifest,
             list_agent_runtime_profiles,
             save_agent_runtime_profile,
             save_immutable_agent_runtime_profile,

@@ -1,6 +1,17 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { AlertCircle, Check, ChevronDown, Circle, Loader2, X } from "lucide-svelte";
-  import type { AiWorkerTaskResult } from "$lib/ipc";
+  import {
+    getTaskSessionContextInspection,
+    getTaskSessionExecutionManifest,
+    listTaskSessionExecutionTrace,
+    type AiWorkerTaskResult,
+    type ContextContributionKind,
+    type TaskContextInspection,
+    type TaskExecutionManifest,
+    type TaskExecutionTraceEntry,
+    type TaskExecutionTracePage,
+  } from "$lib/ipc";
   import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
     AgentRunLog,
@@ -27,6 +38,7 @@
     terminalInput: string;
     runCardId: string | null;
     approval: AgentApprovalRequest | null;
+    taskSessionId?: number | null;
     cancelPending: boolean;
     onClose: () => void;
     onCancel: (cardId: string) => void;
@@ -53,6 +65,7 @@
     terminalInput,
     runCardId,
     approval,
+    taskSessionId = null,
     cancelPending,
     onClose,
     onCancel,
@@ -68,6 +81,27 @@
   let attentionOpen = $state(true);
   let expandedActivities = $state<Record<string, boolean>>({});
   let timelineNow = $state(Date.now());
+  let traceOpen = $state(false);
+  let traceState = $state<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
+  let traceEntries = $state<TaskExecutionTraceEntry[]>([]);
+  let tracePage = $state<TaskExecutionTracePage | null>(null);
+  let traceCursor = $state(0);
+  let traceHasMore = $state(false);
+  let traceError = $state<string | null>(null);
+  let traceSessionId: number | null | undefined = undefined;
+  let traceGeneration = 0;
+  let contextOpen = $state(false);
+  let contextState = $state<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
+  let contextInspection = $state<TaskContextInspection | null>(null);
+  let contextError = $state<string | null>(null);
+  let contextSessionId: number | null | undefined = undefined;
+  let contextGeneration = 0;
+  let manifestOpen = $state(false);
+  let manifestState = $state<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
+  let executionManifest = $state<TaskExecutionManifest | null>(null);
+  let manifestError = $state<string | null>(null);
+  let manifestSessionId: number | null | undefined = undefined;
+  let manifestGeneration = 0;
 
   let isWorking = $derived(runStatus === "running");
   let isBlocked = $derived(runStatus === "blocked" || runStatus === "timeout");
@@ -110,6 +144,172 @@
     }, 1000);
     return () => window.clearInterval(timer);
   });
+
+  $effect(() => {
+    const sessionId = taskSessionId;
+    if (contextSessionId === sessionId) return;
+    contextSessionId = sessionId;
+    resetContext(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    if (!technicalOpen || !contextOpen || taskSessionId === null || contextState !== "idle") return;
+    void loadContextInspection(taskSessionId);
+  });
+
+  $effect(() => {
+    const sessionId = taskSessionId;
+    if (manifestSessionId === sessionId) return;
+    manifestSessionId = sessionId;
+    resetManifest(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    if (!technicalOpen || !manifestOpen || taskSessionId === null || manifestState !== "idle")
+      return;
+    void loadExecutionManifest(taskSessionId);
+  });
+
+  $effect(() => {
+    const sessionId = taskSessionId;
+    if (traceSessionId === sessionId) return;
+    traceSessionId = sessionId;
+    resetTrace(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    if (!technicalOpen || !traceOpen || taskSessionId === null || traceState !== "idle") return;
+    void loadTracePage(taskSessionId, 0, true);
+  });
+
+  onDestroy(() => {
+    traceGeneration += 1;
+    contextGeneration += 1;
+    manifestGeneration += 1;
+  });
+
+  function resetTrace(state: typeof traceState = "idle") {
+    traceGeneration += 1;
+    traceEntries = [];
+    tracePage = null;
+    traceCursor = 0;
+    traceHasMore = false;
+    traceError = null;
+    traceState = state;
+  }
+
+  async function loadTracePage(sessionId: number, cursor: number, replace: boolean) {
+    if (traceState === "loading") return;
+    const generation = traceGeneration;
+    traceState = "loading";
+    traceError = null;
+    try {
+      const page = await listTaskSessionExecutionTrace(sessionId, cursor, 100);
+      if (generation !== traceGeneration || taskSessionId !== sessionId) return;
+      const bySequence = new Map<number, TaskExecutionTraceEntry>();
+      for (const entry of replace ? [] : traceEntries) bySequence.set(entry.sequence, entry);
+      for (const entry of page.entries) bySequence.set(entry.sequence, entry);
+      traceEntries = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence).slice(-200);
+      tracePage = page;
+      traceCursor = Math.max(cursor, page.next_cursor);
+      traceHasMore = page.has_more;
+      traceState = "ready";
+    } catch (reason) {
+      if (generation !== traceGeneration || taskSessionId !== sessionId) return;
+      traceError = reason instanceof Error ? reason.message : String(reason);
+      traceState = "error";
+    }
+  }
+
+  function resetContext(state: typeof contextState = "idle") {
+    contextGeneration += 1;
+    contextInspection = null;
+    contextError = null;
+    contextState = state;
+  }
+
+  async function loadContextInspection(sessionId: number) {
+    if (contextState === "loading") return;
+    const generation = contextGeneration;
+    contextState = "loading";
+    contextError = null;
+    try {
+      const inspection = await getTaskSessionContextInspection(sessionId);
+      if (generation !== contextGeneration || taskSessionId !== sessionId) return;
+      contextInspection = inspection;
+      contextState = "ready";
+    } catch (reason) {
+      if (generation !== contextGeneration || taskSessionId !== sessionId) return;
+      contextError = reason instanceof Error ? reason.message : String(reason);
+      contextState = "error";
+    }
+  }
+
+  function resetManifest(state: typeof manifestState = "idle") {
+    manifestGeneration += 1;
+    executionManifest = null;
+    manifestError = null;
+    manifestState = state;
+  }
+
+  async function loadExecutionManifest(sessionId: number) {
+    if (manifestState === "loading") return;
+    const generation = manifestGeneration;
+    manifestState = "loading";
+    manifestError = null;
+    try {
+      const manifest = await getTaskSessionExecutionManifest(sessionId);
+      if (generation !== manifestGeneration || taskSessionId !== sessionId) return;
+      executionManifest = manifest;
+      manifestState = "ready";
+    } catch (reason) {
+      if (generation !== manifestGeneration || taskSessionId !== sessionId) return;
+      manifestError = reason instanceof Error ? reason.message : String(reason);
+      manifestState = "error";
+    }
+  }
+
+  function manifestValue(value: string | number | null): string {
+    return value === null ? "Unknown" : String(value);
+  }
+
+  function contextLabel(kind: ContextContributionKind): string {
+    return (
+      {
+        system_instructions: "System instructions",
+        rules: "Rules",
+        skills: "Skills",
+        task: "Task context",
+        workspace: "Workspace context",
+        external: "External context",
+        tool_definitions: "Tool definitions",
+        conversation: "Conversation context",
+      } satisfies Record<ContextContributionKind, string>
+    )[kind];
+  }
+
+  function formatCount(value: number): string {
+    return new Intl.NumberFormat().format(value);
+  }
+
+  function traceLabel(entry: TaskExecutionTraceEntry): string {
+    if (entry.event_type === "lifecycle") return `Session ${entry.state ?? "transition"}`;
+    if (entry.event_type === "tool_started") return `Tool started: ${entry.tool_name ?? "Unknown"}`;
+    if (entry.event_type === "tool_completed")
+      return `Tool ${entry.tool_success === false ? "failed" : "completed"}: ${entry.tool_name ?? "Unknown"}`;
+    if (entry.event_type === "usage_updated") return "Token usage updated";
+    if (entry.event_type === "opencode_session") return "OpenCode session bound";
+    if (entry.event_type === "approval_requested")
+      return `Approval requested: ${entry.approval_operation ?? "operation"}`;
+    return (entry.stage ?? entry.event_type).replaceAll("_", " ");
+  }
+
+  function traceDuration(durationUs: number | null): string {
+    if (durationUs === null || !Number.isFinite(durationUs) || durationUs < 0) return "";
+    if (durationUs < 1_000) return `${Math.round(durationUs)} µs`;
+    if (durationUs < 1_000_000) return `${(durationUs / 1_000).toFixed(1)} ms`;
+    return `${(durationUs / 1_000_000).toFixed(1)} s`;
+  }
 
   function userFacingActivity(
     currentStatus: AgentRunStatus,
@@ -525,6 +725,431 @@
     >
     {#if technicalOpen}
       <div class="technical-body">
+        <section class="trace-disclosure">
+          <button
+            class="trace-heading"
+            type="button"
+            aria-expanded={traceOpen}
+            aria-controls="execution-trace-body"
+            onclick={() => (traceOpen = !traceOpen)}
+          >
+            <span>Execution trace</span>
+            <ChevronDown size={14} aria-hidden="true" class={traceOpen ? "rotated" : ""} />
+          </button>
+          {#if traceOpen}
+            <div id="execution-trace-body" class="trace-body" aria-busy={traceState === "loading"}>
+              {#if taskSessionId === null}
+                <p class="trace-empty">Execution trace is unavailable for this legacy run.</p>
+              {:else if traceState === "loading" && traceEntries.length === 0}
+                <p class="trace-empty">Loading execution trace…</p>
+              {:else if traceState === "error"}
+                <p class="trace-error" role="alert">
+                  {traceError ?? "Execution trace could not be loaded."}
+                </p>
+                <button class="trace-action" type="button" onclick={() => resetTrace()}
+                  >Retry</button
+                >
+              {:else}
+                {#if tracePage}
+                  <div class="trace-summary">
+                    <strong>Task Session #{tracePage.task_session_id}</strong>
+                    <span
+                      >{tracePage.coverage === "complete"
+                        ? "Complete coverage"
+                        : "Partial coverage"}</span
+                    >
+                    <span>Agent Turn ID: Unknown</span>
+                    <span>MCP Connection ID: Unknown</span>
+                  </div>
+                {/if}
+                {#if traceEntries.length === 0}
+                  <p class="trace-empty">
+                    No developer trace stages were recorded for this session.
+                  </p>
+                {:else}
+                  <ol class="trace-list">
+                    {#each traceEntries as entry (entry.sequence)}
+                      <li class="trace-row">
+                        <div>
+                          <strong>{traceLabel(entry)}</strong>
+                          <span>
+                            Attempt {entry.assignment_attempt ?? "Unknown"} · Worker {entry.worker_id ??
+                              "Unknown"}
+                          </span>
+                          {#if entry.runtime_id}<span>Runtime: {entry.runtime_id}</span>{/if}
+                          {#if entry.opencode_session_id}<span
+                              >OpenCode: {entry.opencode_session_id}</span
+                            >{/if}
+                          {#if entry.input_tokens !== null || entry.output_tokens !== null}<span>
+                              Tokens: {entry.input_tokens ?? "Unknown"} in / {entry.output_tokens ??
+                                "Unknown"} out
+                            </span>{/if}
+                        </div>
+                        <div class="trace-result">
+                          {#if traceDuration(entry.duration_us)}<time
+                              >{traceDuration(entry.duration_us)}</time
+                            >{/if}
+                          <span
+                            class:error={entry.outcome === "failed" || entry.tool_success === false}
+                            >{entry.outcome ??
+                              entry.state ??
+                              (entry.tool_success === false ? "failed" : "recorded")}</span
+                          >
+                        </div>
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+                <div class="trace-actions">
+                  {#if traceHasMore}<button
+                      class="trace-action"
+                      type="button"
+                      disabled={traceState === "loading"}
+                      onclick={() => void loadTracePage(taskSessionId, traceCursor, false)}
+                      >Load more</button
+                    >{/if}
+                  <button class="trace-action" type="button" onclick={() => resetTrace()}
+                    >Refresh</button
+                  >
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </section>
+        <section class="trace-disclosure context-disclosure">
+          <button
+            class="trace-heading"
+            type="button"
+            aria-expanded={contextOpen}
+            aria-controls="context-inspector-body"
+            onclick={() => (contextOpen = !contextOpen)}
+          >
+            <span>Context inspector</span>
+            <ChevronDown size={14} aria-hidden="true" class={contextOpen ? "rotated" : ""} />
+          </button>
+          {#if contextOpen}
+            <div
+              id="context-inspector-body"
+              class="trace-body context-body"
+              aria-busy={contextState === "loading"}
+            >
+              {#if taskSessionId === null}
+                <p class="trace-empty">Context metadata is unavailable for this legacy run.</p>
+              {:else if contextState === "loading" && !contextInspection}
+                <p class="trace-empty">Loading context metadata…</p>
+              {:else if contextState === "error"}
+                <p class="trace-error" role="alert">
+                  {contextError ?? "Context metadata could not be loaded."}
+                </p>
+                <button class="trace-action" type="button" onclick={() => resetContext()}
+                  >Retry</button
+                >
+              {:else if contextInspection}
+                <div class="context-notice">
+                  Raw prompts, instructions, task content, file paths, and secrets are not
+                  displayed. Token counts are explicit estimates and the known total is partial.
+                </div>
+                <div class="trace-summary context-summary">
+                  <strong>Task Session #{contextInspection.task_session_id}</strong>
+                  <span>Status: {contextInspection.status.replaceAll("_", " ")}</span>
+                  <span>Model: {contextInspection.identity.model ?? "Unknown"}</span>
+                  <span>Runtime: {contextInspection.identity.runtime_profile_id ?? "Unknown"}</span>
+                  <span
+                    >Worker-owned OpenCode: {contextInspection.identity.opencode_session_id ??
+                      "Unknown"}</span
+                  >
+                  <span>Workspace ID: {contextInspection.identity.workspace_id ?? "Unknown"}</span>
+                </div>
+
+                <section class="context-section" aria-label="Context composition">
+                  <div class="context-section-heading">
+                    <strong>Context composition</strong>
+                    <span
+                      >Known estimate: ~{formatCount(contextInspection.known_estimated_tokens)} tokens</span
+                    >
+                  </div>
+                  <ol class="trace-list context-list">
+                    {#each contextInspection.contributions as contribution (contribution.kind)}
+                      <li class="trace-row context-row">
+                        <div>
+                          <strong>{contextLabel(contribution.kind)}</strong>
+                          <span>{contribution.note}</span>
+                          {#if contribution.revision}<span>Revision: {contribution.revision}</span
+                            >{/if}
+                        </div>
+                        <div class="trace-result">
+                          <span>
+                            {contribution.estimated_tokens === null
+                              ? "Unknown"
+                              : `~${formatCount(contribution.estimated_tokens)} tokens`}
+                          </span>
+                          {#if contribution.stored_content_bytes !== null}<span
+                              >{formatCount(contribution.stored_content_bytes)} bytes</span
+                            >{/if}
+                        </div>
+                      </li>
+                    {/each}
+                  </ol>
+                </section>
+
+                <section class="context-section" aria-label="Active Rules">
+                  <div class="context-section-heading">
+                    <strong>Rules</strong><span
+                      >{contextInspection.rules.status.replaceAll("_", " ")}</span
+                    >
+                  </div>
+                  {#if contextInspection.rules.entries.length === 0}
+                    <p class="trace-empty">No inspectable Rule resolution was retained.</p>
+                  {:else}
+                    <ol class="governance-list">
+                      {#each contextInspection.rules.entries as rule (rule.rule_id + rule.precedence)}
+                        <li>
+                          <strong>{rule.rule_id}</strong>
+                          <span>{rule.scope} · precedence {rule.precedence}</span>
+                          <span>Source: {rule.source}</span>
+                          <span>Revision: {rule.revision}</span>
+                        </li>
+                      {/each}
+                    </ol>
+                  {/if}
+                </section>
+
+                <section class="context-section" aria-label="Skill selection">
+                  <div class="context-section-heading">
+                    <strong>Skill selection</strong>
+                    <span>{contextInspection.skills.selected_skill_ids.length} selected</span>
+                  </div>
+                  {#if contextInspection.skills.entries.length === 0}
+                    <p class="trace-empty">No inspectable Skill decisions were retained.</p>
+                  {:else}
+                    <ol class="governance-list skill-list">
+                      {#each contextInspection.skills.entries as skill (skill.skill_id)}
+                        <li class:selected={skill.selected}>
+                          <div class="skill-status">
+                            <strong>{skill.skill_id}</strong>
+                            <span>{skill.selected ? "Selected" : "Not selected"}</span>
+                          </div>
+                          <span>Reason: {skill.reason}</span>
+                          {#if skill.matched_domains.length > 0}<span
+                              >Domains: {skill.matched_domains.join(", ")}</span
+                            >{/if}
+                          {#if skill.matched_intents.length > 0}<span
+                              >Intents: {skill.matched_intents.join(", ")}</span
+                            >{/if}
+                        </li>
+                      {/each}
+                    </ol>
+                  {/if}
+                </section>
+
+                <section class="context-section" aria-label="Tool connector authority">
+                  <div class="context-section-heading">
+                    <strong>Connector authority</strong>
+                    <span>{contextInspection.connectors.length} requested</span>
+                  </div>
+                  {#if contextInspection.connectors.length === 0}
+                    <p class="trace-empty">No external connectors were requested.</p>
+                  {:else}
+                    <ul class="connector-list">
+                      {#each contextInspection.connectors as connector (connector.connector_id)}
+                        <li>
+                          <strong>{connector.connector_id}</strong>
+                          <span>{connector.granted ? "Granted" : "Not granted"}</span>
+                          <span>{connector.capability}</span>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </section>
+
+                <div class="trace-actions">
+                  <button class="trace-action" type="button" onclick={() => resetContext()}
+                    >Refresh</button
+                  >
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </section>
+        <section class="trace-disclosure context-disclosure">
+          <button
+            class="trace-heading"
+            type="button"
+            aria-expanded={manifestOpen}
+            aria-controls="execution-manifest-body"
+            onclick={() => (manifestOpen = !manifestOpen)}
+          >
+            <span>Execution manifest</span>
+            <ChevronDown size={14} aria-hidden="true" class={manifestOpen ? "rotated" : ""} />
+          </button>
+          {#if manifestOpen}
+            <div
+              id="execution-manifest-body"
+              class="trace-body context-body"
+              aria-busy={manifestState === "loading"}
+            >
+              {#if taskSessionId === null}
+                <p class="trace-empty">Execution Manifest is unavailable for this legacy run.</p>
+              {:else if manifestState === "loading" && !executionManifest}
+                <p class="trace-empty">Loading Execution Manifest…</p>
+              {:else if manifestState === "error"}
+                <p class="trace-error" role="alert">
+                  {manifestError ?? "Execution Manifest could not be loaded."}
+                </p>
+                <button class="trace-action" type="button" onclick={() => resetManifest()}
+                  >Retry</button
+                >
+              {:else if !executionManifest}
+                <p class="trace-empty">
+                  No manifest was captured. This session may predate manifest instrumentation or may
+                  not have completed runtime preparation.
+                </p>
+                <div class="trace-actions">
+                  <button class="trace-action" type="button" onclick={() => resetManifest()}
+                    >Refresh</button
+                  >
+                </div>
+              {:else}
+                <div class="context-notice">
+                  This is immutable metadata captured before runtime launch for assignment attempt
+                  {executionManifest.assignment_attempt}. Raw configuration, prompts, paths, and
+                  secrets are excluded. Unknown values were not reconstructed from current state.
+                </div>
+                <div class="trace-summary context-summary">
+                  <strong>Task Session #{executionManifest.task_session_id}</strong>
+                  <span>Schema v{executionManifest.schema_version}</span>
+                  <span>Coverage: {executionManifest.coverage}</span>
+                  <span>Attempt: {executionManifest.assignment_attempt}</span>
+                  <span>Worker: {executionManifest.worker_id}</span>
+                  <time
+                    datetime={new Date(executionManifest.started_at).toISOString()}
+                    title={new Date(executionManifest.started_at).toISOString()}
+                    >Captured {new Date(executionManifest.started_at).toLocaleString()}</time
+                  >
+                </div>
+
+                <section class="context-section" aria-label="Manifest runtime identity">
+                  <div class="context-section-heading"><strong>Runtime</strong></div>
+                  <dl class="manifest-grid">
+                    <div>
+                      <dt>Runtime</dt>
+                      <dd>{executionManifest.runtime}</dd>
+                    </div>
+                    <div>
+                      <dt>Profile</dt>
+                      <dd>{executionManifest.runtime_profile_id}</dd>
+                    </div>
+                    <div>
+                      <dt>Model</dt>
+                      <dd>{executionManifest.model}</dd>
+                    </div>
+                    <div>
+                      <dt>Provider</dt>
+                      <dd>{executionManifest.model_configuration.provider_id}</dd>
+                    </div>
+                    <div>
+                      <dt>Temperature</dt>
+                      <dd>{executionManifest.model_configuration.temperature}</dd>
+                    </div>
+                    <div>
+                      <dt>OpenCode session</dt>
+                      <dd>{manifestValue(executionManifest.opencode_session_id)}</dd>
+                    </div>
+                    <div>
+                      <dt>Runtime attempt</dt>
+                      <dd>{executionManifest.runtime_id}</dd>
+                    </div>
+                    <div>
+                      <dt>Tool policy</dt>
+                      <dd>{executionManifest.tool_permission_mode}</dd>
+                    </div>
+                  </dl>
+                </section>
+
+                <section class="context-section" aria-label="Manifest reproducibility identity">
+                  <div class="context-section-heading"><strong>Reproducibility</strong></div>
+                  <dl class="manifest-grid">
+                    <div>
+                      <dt>Workspace</dt>
+                      <dd>{executionManifest.workspace_id}</dd>
+                    </div>
+                    <div>
+                      <dt>Execution run</dt>
+                      <dd>{manifestValue(executionManifest.execution_run_id)}</dd>
+                    </div>
+                    <div>
+                      <dt>Context revision</dt>
+                      <dd>{manifestValue(executionManifest.context_revision)}</dd>
+                    </div>
+                    <div>
+                      <dt>Context digest</dt>
+                      <dd>{executionManifest.context_digest}</dd>
+                    </div>
+                    <div>
+                      <dt>Prompt template</dt>
+                      <dd>{executionManifest.prompt_template_version}</dd>
+                    </div>
+                    <div>
+                      <dt>Claimed Rules revision</dt>
+                      <dd>{manifestValue(executionManifest.rules_revision)}</dd>
+                    </div>
+                    <div>
+                      <dt>Effective Rules digest</dt>
+                      <dd>{executionManifest.rules_digest}</dd>
+                    </div>
+                    <div>
+                      <dt>Claimed Skills revision</dt>
+                      <dd>{manifestValue(executionManifest.skills_revision)}</dd>
+                    </div>
+                    <div>
+                      <dt>Effective Skill catalog</dt>
+                      <dd>{manifestValue(executionManifest.skills_catalog_revision)}</dd>
+                    </div>
+                  </dl>
+                </section>
+
+                <section class="context-section" aria-label="Manifest governance and connectors">
+                  <div class="context-section-heading"><strong>Captured authority</strong></div>
+                  <dl class="manifest-grid">
+                    <div>
+                      <dt>Rules</dt>
+                      <dd>{executionManifest.rules.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Selected Skills</dt>
+                      <dd>{executionManifest.skills.filter((skill) => skill.selected).length}</dd>
+                    </div>
+                    <div>
+                      <dt>Connectors</dt>
+                      <dd>{executionManifest.connectors.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Granted connectors</dt>
+                      <dd>
+                        {executionManifest.connectors.filter((connector) => connector.granted)
+                          .length}
+                      </dd>
+                    </div>
+                  </dl>
+                </section>
+
+                <section class="context-section" aria-label="Manifest unknown fields">
+                  <div class="context-section-heading"><strong>Not captured</strong></div>
+                  <ul class="manifest-unknowns">
+                    {#each executionManifest.unknown_fields as field (field)}
+                      <li>{field.replaceAll("_", " ")}</li>
+                    {/each}
+                  </ul>
+                </section>
+                <div class="trace-actions">
+                  <button class="trace-action" type="button" onclick={() => resetManifest()}
+                    >Refresh</button
+                  >
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </section>
         <details open>
           <summary>Runtime output</summary>
           <pre>{output || "No raw output yet."}</pre>
@@ -1254,6 +1879,242 @@
     display: grid;
     gap: 9px;
     padding: 0 12px 12px;
+  }
+  .trace-disclosure {
+    padding: 8px 0;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .trace-heading {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    border: 0;
+    padding: 2px 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+  .trace-body {
+    margin-top: 8px;
+  }
+  .trace-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 10px;
+    color: var(--text-dim);
+    font-size: 9px;
+  }
+  .trace-summary strong {
+    width: 100%;
+    color: var(--text-secondary);
+  }
+  .trace-list {
+    display: grid;
+    gap: 6px;
+    max-height: 260px;
+    margin: 8px 0 0;
+    padding: 0;
+    overflow: auto;
+    list-style: none;
+  }
+  .trace-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 8px;
+    border-radius: 8px;
+    background: var(--code-block-bg);
+  }
+  .trace-row > div:first-child,
+  .trace-result {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+  .trace-row strong {
+    color: var(--code-text);
+    font-size: 10px;
+    text-transform: capitalize;
+  }
+  .trace-row span,
+  .trace-row time,
+  .trace-empty,
+  .trace-error {
+    margin: 0;
+    color: var(--text-dim);
+    font:
+      9px/1.4 ui-monospace,
+      SFMono-Regular,
+      monospace;
+    overflow-wrap: anywhere;
+  }
+  .trace-result {
+    justify-items: end;
+    text-align: right;
+  }
+  .trace-result span.error,
+  .trace-error {
+    color: var(--danger);
+  }
+  .trace-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .trace-action {
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    padding: 5px 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 9px;
+    font-weight: 800;
+  }
+  .context-disclosure {
+    padding-top: 0;
+  }
+  .context-body {
+    display: grid;
+    gap: 10px;
+  }
+  .context-notice {
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 8px;
+    background: var(--surface-inset);
+    color: var(--text-dim);
+    font-size: 9px;
+    line-height: 1.45;
+  }
+  .context-summary span,
+  .context-summary strong {
+    overflow-wrap: anywhere;
+  }
+  .context-section {
+    min-width: 0;
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 9px;
+  }
+  .context-section-heading,
+  .skill-status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .context-section-heading {
+    color: var(--text-dim);
+    font-size: 9px;
+  }
+  .context-section-heading strong {
+    color: var(--text-secondary);
+    font-size: 10px;
+  }
+  .context-list {
+    max-height: none;
+  }
+  .context-row strong {
+    text-transform: none;
+  }
+  .governance-list,
+  .connector-list {
+    display: grid;
+    gap: 6px;
+    max-height: 260px;
+    margin: 8px 0 0;
+    padding: 0;
+    overflow: auto;
+    list-style: none;
+  }
+  .governance-list li,
+  .connector-list li {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+    padding: 8px;
+    border-radius: 8px;
+    background: var(--code-block-bg);
+  }
+  .governance-list strong,
+  .connector-list strong {
+    color: var(--code-text);
+    font-size: 10px;
+    overflow-wrap: anywhere;
+  }
+  .governance-list span,
+  .connector-list span {
+    color: var(--text-dim);
+    font:
+      9px/1.4 ui-monospace,
+      SFMono-Regular,
+      monospace;
+    overflow-wrap: anywhere;
+  }
+  .skill-list li.selected {
+    box-shadow: inset 2px 0 0 var(--success);
+  }
+  .skill-status span {
+    color: var(--success);
+    font-family: inherit;
+    font-weight: 800;
+  }
+  .skill-list li:not(.selected) .skill-status span {
+    color: var(--text-dim);
+  }
+  .manifest-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin: 8px 0 0;
+  }
+  .manifest-grid div {
+    min-width: 0;
+    border-radius: 8px;
+    padding: 8px;
+    background: var(--code-block-bg);
+  }
+  .manifest-grid dt,
+  .manifest-grid dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .manifest-grid dt {
+    color: var(--text-dim);
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .manifest-grid dd {
+    margin-top: 3px;
+    color: var(--code-text);
+    font:
+      9px/1.4 ui-monospace,
+      SFMono-Regular,
+      monospace;
+  }
+  .manifest-unknowns {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .manifest-unknowns li {
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    padding: 3px 6px;
+    color: var(--text-dim);
+    font-size: 8px;
+  }
+  @media (max-width: 420px) {
+    .manifest-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
   .technical-body details {
     padding: 8px 0;

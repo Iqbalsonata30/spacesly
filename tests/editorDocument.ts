@@ -484,6 +484,31 @@ for (let sequence = 1; sequence <= 120; sequence += 1) {
   );
 }
 assertEqual(pendingProjection.logs.length, 0, "text deltas should not create presentation logs");
+const traceProjection = projectAgentTaskSessionEvent(
+  {
+    id: 121,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 121,
+    kind: "runtime",
+    payload: {
+      type: "execution_trace_stage",
+      schema_version: 1,
+      stage: "runtime_preparation",
+      duration_us: 420_000,
+    },
+    progress: null,
+    created_at: 121,
+  },
+  "trace-121",
+  "04:30:10 AM",
+);
+assertEqual(
+  traceProjection.logs.length,
+  0,
+  "developer trace events should not leak into user-facing Activity",
+);
 assertEqual(
   pendingProjection.progress,
   55,

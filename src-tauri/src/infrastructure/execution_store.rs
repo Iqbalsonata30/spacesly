@@ -263,11 +263,9 @@ impl ExecutionStore {
             "ALTER TABLE step_runs ADD COLUMN task_session_projection_id TEXT",
             [],
         );
-        let store = Self {
+        Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
-        };
-        store.recover_interrupted_runs()?;
-        Ok(store)
+        })
     }
 
     pub fn save(&self, run: &ExecutionRun) -> Result<ExecutionRun, String> {
@@ -1446,33 +1444,6 @@ impl ExecutionStore {
             })
             .collect()
     }
-
-    fn recover_interrupted_runs(&self) -> Result<(), String> {
-        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("Failed to start execution recovery: {error}"))?;
-        let now = now_millis()?.to_string();
-        transaction
-            .execute(
-                "UPDATE step_runs SET status = 'interrupted', completed_at = ?1,
-                   summary = COALESCE(summary, 'Spacesly restarted while this step was running.'),
-                   updated_at = ?1
-                 WHERE status IN ('running', 'ready')",
-                params![now],
-            )
-            .map_err(|error| format!("Failed to recover execution steps: {error}"))?;
-        transaction
-            .execute(
-                "UPDATE execution_runs SET status = 'blocked', completed_at = ?1, updated_at = ?1
-                 WHERE status = 'running'",
-                params![now],
-            )
-            .map_err(|error| format!("Failed to recover execution runs: {error}"))?;
-        transaction
-            .commit()
-            .map_err(|error| format!("Failed to commit execution recovery: {error}"))
-    }
 }
 
 fn save_contract(transaction: &Transaction<'_>, contract: &Value) -> Result<(), String> {
@@ -1803,6 +1774,7 @@ fn now_millis() -> Result<u64, String> {
 mod tests {
     use super::*;
     use crate::domain::task_session::{AgentTaskResult, TaskSessionId, TaskSessionState};
+    use tempfile::tempdir;
 
     fn test_store() -> ExecutionStore {
         let connection = Connection::open_in_memory().unwrap();
@@ -1830,6 +1802,85 @@ mod tests {
         ExecutionStore {
             connection: Arc::new(Mutex::new(connection)),
         }
+    }
+
+    fn ready_run(run_id: &str) -> ExecutionRun {
+        ExecutionRun {
+            run_id: run_id.to_string(),
+            contract: serde_json::json!({
+                "contract_id": format!("contract-{run_id}"),
+                "task_id": format!("task-{run_id}"),
+                "workspace_id": "workspace-1",
+                "version": 1,
+                "created_at": "2026-07-31T00:00:00Z"
+            }),
+            status: "pending".to_string(),
+            current_step_ids: vec!["worker.execute".to_string()],
+            step_runs: BTreeMap::from([(
+                "worker.execute".to_string(),
+                StepRun {
+                    step_id: "worker.execute".to_string(),
+                    status: "ready".to_string(),
+                    attempt: 0,
+                    started_at: None,
+                    completed_at: None,
+                    summary: None,
+                    lease_owner: None,
+                    lease_expires_at: None,
+                },
+            )]),
+            started_at: "2026-07-31T00:00:00Z".to_string(),
+            completed_at: None,
+            revision: 0,
+        }
+    }
+
+    #[test]
+    fn reopen_preserves_ready_and_unexpired_foreign_steps() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("executions.db");
+        let first = ExecutionStore::open_at(path.clone()).expect("first store opens");
+        first.save(&ready_run("ready")).expect("ready run saved");
+        first.save(&ready_run("leased")).expect("leased run saved");
+        let mut scheduler_projection = ready_run("scheduler-projection");
+        scheduler_projection.status = "running".to_string();
+        scheduler_projection
+            .step_runs
+            .get_mut("worker.execute")
+            .expect("worker step")
+            .status = "running".to_string();
+        first
+            .save(&scheduler_projection)
+            .expect("scheduler projection saved");
+        first
+            .claim_step("leased", "worker.execute", "first-process", 60_000)
+            .expect("step claimed");
+        let before = first.get("leased").unwrap().unwrap();
+
+        let second = ExecutionStore::open_at(path).expect("second store opens");
+        let ready = second.get("ready").unwrap().unwrap();
+        assert_eq!(ready.status, "pending");
+        assert_eq!(ready.step_runs["worker.execute"].status, "ready");
+        let leased = second.get("leased").unwrap().unwrap();
+        assert_eq!(leased.status, "running");
+        assert_eq!(leased.step_runs["worker.execute"].status, "running");
+        assert_eq!(
+            leased.step_runs["worker.execute"].lease_owner.as_deref(),
+            Some("first-process")
+        );
+        assert_eq!(
+            leased.step_runs["worker.execute"].lease_expires_at,
+            before.step_runs["worker.execute"].lease_expires_at
+        );
+        let scheduler_projection = second.get("scheduler-projection").unwrap().unwrap();
+        assert_eq!(scheduler_projection.status, "running");
+        assert_eq!(
+            scheduler_projection.step_runs["worker.execute"].status,
+            "running"
+        );
+        assert!(scheduler_projection.step_runs["worker.execute"]
+            .lease_owner
+            .is_none());
     }
 
     fn projection_test_store() -> ExecutionStore {

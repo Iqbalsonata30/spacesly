@@ -9919,6 +9919,7 @@
                 terminalInput={agentTerminalInput}
                 runCardId={agentConsoleCardId}
                 approval={visibleAgentApproval}
+                taskSessionId={visibleAgentSession?.taskSessionId ?? null}
                 onClose={() => (agentConsoleOpen = false)}
                 onCancel={cancelAgentRunForCard}
                 onTerminalInputChange={(value) => (agentTerminalInput = value)}

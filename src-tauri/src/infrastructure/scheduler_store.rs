@@ -4,12 +4,20 @@
 //! mutation is transactional so the Scheduler can keep only process-local Worker handles and
 //! cancellation tokens in memory.
 
+#[cfg(test)]
+use crate::domain::execution_manifest::ExecutionModelConfiguration;
+use crate::domain::execution_manifest::{
+    ExecutionManifest, ExecutionManifestDraft, EXECUTION_MANIFEST_SCHEMA_VERSION,
+};
 use crate::domain::governance::GovernanceResolutionRecord;
+#[cfg(test)]
+use crate::domain::task_session::TaskMcpConnectorContext;
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskMcpContext,
-    TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2,
-    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskToolState,
+    AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskExecutionTraceEntry,
+    TaskExecutionTracePage, TaskMcpContext, TaskProgress, TaskRequest, TaskSessionEnvelope,
+    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionEventPage,
+    TaskSessionId, TaskSessionInputV2, TaskSessionKind, TaskSessionResult, TaskSessionSnapshot,
+    TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -24,6 +32,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RECOVERY_REQUIRES_RETRY_FRESH: &str =
+    "[recovery_requires_retry_fresh] Spacesly cannot safely resume this Agent task because no durable OpenCode session identity was recorded. Use Retry Fresh explicitly.";
+
+fn stable_manifest_identity_matches(
+    first: &ExecutionManifestDraft,
+    current: &ExecutionManifestDraft,
+) -> bool {
+    first.kind == current.kind
+        && first.workspace_id == current.workspace_id
+        && first.subject_id == current.subject_id
+        && first.conversation_id == current.conversation_id
+        && first.execution_run_id == current.execution_run_id
+        && first.runtime == current.runtime
+        && first.runtime_profile_id == current.runtime_profile_id
+        && first.model == current.model
+        && first.prompt_template_version == current.prompt_template_version
+        && first.rules_digest == current.rules_digest
+        && first.skills_catalog_revision == current.skills_catalog_revision
+}
 
 /// SQLite-backed authority for Scheduler queue and Task Session lifecycle state.
 #[derive(Clone)]
@@ -285,6 +312,19 @@ impl SchedulerStore {
                     FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
                       ON DELETE CASCADE
                   );
+                  CREATE TABLE IF NOT EXISTS scheduler_task_execution_manifests (
+                    attempt_id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(session_id, attempt_id),
+                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                      ON DELETE CASCADE,
+                    FOREIGN KEY(attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_execution_manifests_session
+                    ON scheduler_task_execution_manifests(session_id, attempt_id DESC);
                   CREATE TABLE IF NOT EXISTS scheduler_task_attempts (
                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    session_id INTEGER NOT NULL,
@@ -316,6 +356,7 @@ impl SchedulerStore {
                    fencing_token INTEGER NOT NULL DEFAULT 0,
                     sequence INTEGER NOT NULL,
                     event_kind TEXT NOT NULL,
+                    event_type TEXT,
                     payload_json TEXT NOT NULL,
                     progress_json TEXT,
                     created_at INTEGER NOT NULL,
@@ -357,6 +398,12 @@ impl SchedulerStore {
             "scheduler_metadata",
             "instance_id",
             "instance_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_metadata",
+            "event_type_backfill_version",
+            "event_type_backfill_version INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
             &migration,
@@ -420,6 +467,12 @@ impl SchedulerStore {
         )?;
         ensure_column(
             &migration,
+            "scheduler_task_events",
+            "event_type",
+            "event_type TEXT",
+        )?;
+        ensure_column(
+            &migration,
             "scheduler_task_completions",
             "projection_attempt_count",
             "projection_attempt_count INTEGER NOT NULL DEFAULT 0",
@@ -442,9 +495,76 @@ impl SchedulerStore {
                   WHERE subject_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_active_execution_run
                    ON scheduler_task_sessions(workspace_id, execution_run_id)
-                  WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');",
+                  WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
+                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace
+                   ON scheduler_task_events(session_id, sequence)
+                  WHERE event_type IN (
+                    'lifecycle', 'tool_started', 'tool_completed',
+                    'execution_trace_stage', 'usage_updated', 'opencode_session',
+                    'approval_requested'
+                  );
+                 DROP TRIGGER IF EXISTS scheduler_task_events_classify_type;
+                 CREATE TRIGGER scheduler_task_events_classify_type
+                 AFTER INSERT ON scheduler_task_events
+                 WHEN NEW.event_type IS NULL
+                 BEGIN
+                   UPDATE scheduler_task_events
+                      SET event_type = CASE
+                        WHEN NEW.event_kind = 'lifecycle' THEN 'lifecycle'
+                        WHEN NEW.event_kind = 'tool' AND json_valid(NEW.payload_json)
+                          AND json_extract(NEW.payload_json, '$.type') IN
+                              ('tool_started', 'tool_completed')
+                          THEN json_extract(NEW.payload_json, '$.type')
+                        WHEN NEW.event_kind = 'runtime' AND json_valid(NEW.payload_json)
+                          AND json_extract(NEW.payload_json, '$.type') IN (
+                            'execution_trace_stage', 'usage_updated', 'opencode_session',
+                            'approval_requested'
+                          ) THEN json_extract(NEW.payload_json, '$.type')
+                        ELSE NULL
+                      END
+                    WHERE event_id = NEW.event_id;
+                 END;",
             )
             .map_err(|error| format!("Failed to create scheduler ownership indexes: {error}"))?;
+        let event_type_backfill_version: u32 = migration
+            .query_row(
+                "SELECT event_type_backfill_version FROM scheduler_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to inspect trace event migration: {error}"))?;
+        if event_type_backfill_version < 1 {
+            migration
+                .execute_batch(
+                    "UPDATE scheduler_task_events
+                        SET event_type = CASE
+                          WHEN event_kind = 'lifecycle' THEN 'lifecycle'
+                          WHEN event_kind = 'tool' AND json_valid(payload_json)
+                            AND json_extract(payload_json, '$.type') = 'tool_started'
+                            THEN 'tool_started'
+                          WHEN event_kind = 'tool' AND json_valid(payload_json)
+                            AND json_extract(payload_json, '$.type') = 'tool_completed'
+                            THEN 'tool_completed'
+                          WHEN event_kind = 'runtime' AND json_valid(payload_json)
+                            AND json_extract(payload_json, '$.type') IN (
+                              'execution_trace_stage', 'usage_updated', 'opencode_session',
+                              'approval_requested'
+                            ) THEN json_extract(payload_json, '$.type')
+                          ELSE NULL
+                        END
+                      WHERE event_type IS NULL AND (
+                        event_kind IN ('lifecycle', 'tool')
+                        OR (event_kind = 'runtime' AND json_valid(payload_json)
+                          AND json_extract(payload_json, '$.type') IN (
+                            'execution_trace_stage', 'usage_updated', 'opencode_session',
+                            'approval_requested'
+                          ))
+                      );
+                     UPDATE scheduler_metadata SET event_type_backfill_version = 1
+                      WHERE singleton = 1;",
+                )
+                .map_err(|error| format!("Failed to backfill trace event types: {error}"))?;
+        }
         migration
             .execute(
                 "UPDATE scheduler_metadata
@@ -1141,6 +1261,132 @@ impl SchedulerStore {
         })
     }
 
+    pub(crate) fn execution_trace_page(
+        &self,
+        session_id: TaskSessionId,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<TaskExecutionTracePage, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "execution_trace_page",
+            "sqlite_read_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
+        if !(1..=200).contains(&limit) {
+            return Err("Execution trace page limit must be between 1 and 200.".to_string());
+        }
+        let lock_started = Instant::now();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Failed to start execution trace read: {error}"))?;
+        let snapshot = load_session(&transaction, session_id)?
+            .ok_or_else(|| format!("Task Session {} was not found.", session_id.0))?;
+        let envelope = snapshot.request.envelope().ok().flatten();
+        let session = envelope.as_ref().map(TaskSessionEnvelope::session);
+        let missing_indexed_events = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM scheduler_task_events
+                    WHERE session_id = ?1 AND event_type IS NULL
+                      AND event_kind IN ('lifecycle', 'tool')
+                 )",
+                params![to_i64(session_id.0)?],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("Failed to inspect execution trace coverage: {error}"))?;
+        let trace_stage_count: u64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scheduler_task_events
+                  WHERE session_id = ?1 AND event_type = 'execution_trace_stage'",
+                params![to_i64(session_id.0)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to count execution trace stages: {error}"))?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT events.event_id, events.session_id, events.attempt_id,
+                        events.fencing_token, events.sequence, events.event_kind,
+                        events.payload_json, events.progress_json, events.created_at,
+                        events.event_type, attempts.attempt_number, attempts.worker_id
+                   FROM scheduler_task_events events
+                   LEFT JOIN scheduler_task_attempts attempts
+                     ON attempts.attempt_id = events.attempt_id
+                  WHERE events.session_id = ?1 AND events.sequence > ?2
+                    AND events.event_type IN (
+                      'lifecycle', 'tool_started', 'tool_completed',
+                      'execution_trace_stage', 'usage_updated', 'opencode_session',
+                      'approval_requested'
+                    )
+                 ORDER BY sequence
+                 LIMIT ?3",
+            )
+            .map_err(|error| format!("Failed to prepare execution trace page: {error}"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_i64(session_id.0)?,
+                    to_i64(sequence)?,
+                    i64::try_from(limit + 1).map_err(|_| "Trace page limit exceeds i64.")?
+                ],
+                |row| {
+                    Ok((
+                        stored_event_from_row(row)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("Failed to query execution trace page: {error}"))?;
+        let mut entries = rows
+            .map(|row| {
+                let (event, event_type, attempt_number, worker_id) = row
+                    .map_err(|error| format!("Failed to decode execution trace event: {error}"))?;
+                trace_entry(event, event_type, attempt_number, worker_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_cursor = if has_more {
+            entries.last().map_or(sequence, |entry| entry.sequence)
+        } else {
+            snapshot.last_event_sequence.max(sequence)
+        };
+        crate::infrastructure::performance::increment(
+            "sqlite_rows_read_total",
+            "sqlite",
+            entries.len() as u64,
+        );
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit execution trace read: {error}"))?;
+        Ok(TaskExecutionTracePage {
+            schema_version: 1,
+            trace_id: format!("task-session:{}", session_id.0),
+            task_session_id: session_id,
+            subject_id: session.and_then(|value| value.subject_id.clone()),
+            execution_run_id: session.and_then(|value| value.execution_run_id.clone()),
+            runtime_profile_id: session.map(|value| value.runtime_profile_id.clone()),
+            model: session.map(|value| value.model.clone()),
+            opencode_session_id: snapshot.opencode_session_id,
+            coverage: if missing_indexed_events
+                || snapshot.attempt > 0 && trace_stage_count < u64::from(snapshot.attempt) * 2
+            {
+                "partial"
+            } else {
+                "complete"
+            }
+            .to_string(),
+            unknown_fields: vec!["agent_turn_id".to_string(), "mcp_connection_id".to_string()],
+            entries,
+            next_cursor,
+            has_more,
+        })
+    }
+
     pub(crate) fn tool_state(&self, session_id: TaskSessionId) -> Result<TaskToolState, String> {
         if self.get_session(session_id)?.is_none() {
             return Err(format!("Task Session {} was not found.", session_id.0));
@@ -1265,6 +1511,137 @@ impl SchedulerStore {
             .commit()
             .map_err(|error| format!("Failed to commit Task Session governance: {error}"))?;
         Ok(resolution.clone())
+    }
+
+    /// Persists one immutable, secret-free Execution Manifest for the current assignment attempt.
+    pub(crate) fn bind_execution_manifest(
+        &self,
+        fence: AssignmentFence,
+        draft: &ExecutionManifestDraft,
+    ) -> Result<ExecutionManifest, String> {
+        let _metric = crate::infrastructure::performance::span(
+            "execution_manifest_bind",
+            "sqlite_write_transaction",
+        );
+        crate::infrastructure::performance::increment("sqlite_writes_total", "sqlite", 1);
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start Execution Manifest transaction: {error}"))?;
+        if !assignment_is_current_on(&transaction, fence, now)? {
+            return Err("Execution Manifest assignment fence is stale.".to_string());
+        }
+        let (worker_id, started_at) = transaction
+            .query_row(
+                "SELECT attempts.worker_id, attempts.started_at
+                   FROM scheduler_task_attempts attempts
+                  WHERE attempts.attempt_id = ?1 AND attempts.session_id = ?2
+                    AND attempts.attempt_number = ?3 AND attempts.fencing_token = ?4",
+                params![
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.session_id.0)?,
+                    i64::from(fence.attempt),
+                    to_i64(fence.fencing_token)?
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| format!("Failed to resolve Execution Manifest assignment: {error}"))?;
+        let manifest = ExecutionManifest {
+            schema_version: EXECUTION_MANIFEST_SCHEMA_VERSION,
+            task_session_id: fence.session_id,
+            assignment_attempt_id: fence.attempt_id,
+            assignment_attempt: fence.attempt,
+            worker_id: from_i64(worker_id, "worker ID")? as usize,
+            fencing_token: fence.fencing_token,
+            started_at: from_i64(started_at, "assignment start timestamp")?,
+            execution: draft.clone(),
+        };
+        manifest.validate_for(fence.session_id)?;
+        if let Some(first) = transaction
+            .query_row(
+                "SELECT manifest_json FROM scheduler_task_execution_manifests
+                  WHERE session_id = ?1 ORDER BY attempt_id ASC LIMIT 1",
+                params![to_i64(fence.session_id.0)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load Execution Manifest anchor: {error}"))?
+        {
+            let first = serde_json::from_str::<ExecutionManifest>(&first)
+                .map_err(|error| format!("Failed to decode Execution Manifest anchor: {error}"))?;
+            if !stable_manifest_identity_matches(&first.execution, draft) {
+                return Err(
+                    "Execution Manifest stable Task Session identity changed across attempts."
+                        .to_string(),
+                );
+            }
+        }
+        let encoded = serde_json::to_string(&manifest)
+            .map_err(|error| format!("Failed to encode Execution Manifest: {error}"))?;
+        let existing = transaction
+            .query_row(
+                "SELECT manifest_json FROM scheduler_task_execution_manifests WHERE attempt_id = ?1",
+                params![to_i64(fence.attempt_id)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect Execution Manifest: {error}"))?;
+        match existing {
+            Some(existing) if existing != encoded => {
+                return Err(
+                    "Assignment attempt already owns a different Execution Manifest.".to_string(),
+                );
+            }
+            Some(_) => {}
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO scheduler_task_execution_manifests
+                           (attempt_id, session_id, manifest_json, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            to_i64(fence.attempt_id)?,
+                            to_i64(fence.session_id.0)?,
+                            encoded,
+                            to_i64(now)?
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to persist Execution Manifest: {error}"))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit Execution Manifest: {error}"))?;
+        Ok(manifest)
+    }
+
+    /// Loads the newest captured Execution Manifest for one Task Session.
+    pub(crate) fn latest_execution_manifest(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Option<ExecutionManifest>, String> {
+        let _metric =
+            crate::infrastructure::performance::span("execution_manifest_get", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let encoded = connection
+            .query_row(
+                "SELECT manifest_json FROM scheduler_task_execution_manifests
+                  WHERE session_id = ?1 ORDER BY attempt_id DESC LIMIT 1",
+                params![to_i64(session_id.0)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load Execution Manifest: {error}"))?;
+        encoded
+            .map(|encoded| {
+                let manifest = serde_json::from_str::<ExecutionManifest>(&encoded)
+                    .map_err(|error| format!("Failed to decode Execution Manifest: {error}"))?;
+                manifest.validate_for(session_id)?;
+                Ok(manifest)
+            })
+            .transpose()
     }
 
     pub(crate) fn bind_opencode_session(
@@ -2311,7 +2688,7 @@ impl SchedulerStore {
             .map_err(|error| format!("Failed to start scheduler owner cleanup: {error}"))?;
         let recovered = recover_matching_attempts(
             &transaction,
-            "owner_id = ?1",
+            "attempts.owner_id = ?1",
             params![to_i64(owner_id)?],
             now,
             "Scheduler owner shut down.",
@@ -2729,7 +3106,7 @@ fn recover_expired_in_transaction(
 ) -> Result<usize, String> {
     recover_matching_attempts(
         transaction,
-        "lease_expires_at <= ?1",
+        "attempts.lease_expires_at <= ?1",
         params![to_i64(now)?],
         now,
         "Assignment lease expired.",
@@ -2746,8 +3123,12 @@ fn recover_matching_attempts<P: rusqlite::Params>(
     event_reason: &str,
 ) -> Result<usize, String> {
     let query = format!(
-        "SELECT attempt_id, session_id, fencing_token FROM scheduler_task_attempts
-          WHERE state = 'running' AND {predicate}"
+        "SELECT attempts.attempt_id, attempts.session_id, attempts.fencing_token,
+                sessions.label, sessions.payload, sessions.state,
+                sessions.opencode_session_id
+           FROM scheduler_task_attempts attempts
+           JOIN scheduler_task_sessions sessions ON sessions.session_id = attempts.session_id
+          WHERE attempts.state = 'running' AND {predicate}"
     );
     let attempts = {
         let mut statement = transaction
@@ -2759,6 +3140,10 @@ fn recover_matching_attempts<P: rusqlite::Params>(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(|error| format!("Failed to query scheduler recovery: {error}"))?;
@@ -2767,15 +3152,22 @@ fn recover_matching_attempts<P: rusqlite::Params>(
             .map_err(|error| format!("Failed to decode scheduler recovery: {error}"))?;
         decoded
     };
-    for (attempt_id, session_id, fencing_token) in &attempts {
-        let previous_state = transaction
-            .query_row(
-                "SELECT state FROM scheduler_task_sessions WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("Failed to read recovered session state: {error}"))?;
-        transaction
+    for (attempt_id, session_id, fencing_token, label, payload, previous_state, opencode_id) in
+        &attempts
+    {
+        let request = TaskRequest::with_payload(label, payload);
+        let is_agent = request_is_agent_envelope(&request)?;
+        let missing_runtime_identity = previous_state != "cancelling"
+            && is_agent
+            && opencode_id
+                .as_deref()
+                .is_none_or(|identity| identity.trim().is_empty());
+        let attempt_error = if missing_runtime_identity {
+            RECOVERY_REQUIRES_RETRY_FRESH
+        } else {
+            attempt_error
+        };
+        let attempt_updated = transaction
             .execute(
                 "UPDATE scheduler_task_attempts
                     SET state = 'interrupted', lease_expires_at = NULL,
@@ -2784,21 +3176,39 @@ fn recover_matching_attempts<P: rusqlite::Params>(
                 params![attempt_id, to_i64(now)?, attempt_error],
             )
             .map_err(|error| format!("Failed to interrupt scheduler attempt: {error}"))?;
-        transaction
+        if attempt_updated != 1 {
+            return Err("Scheduler recovery lost ownership of an active attempt.".to_string());
+        }
+        let (next_state, recovery_reason, session_error) = if previous_state == "cancelling" {
+            ("cancelled", event_reason, None)
+        } else if missing_runtime_identity {
+            (
+                "blocked",
+                "recovery_missing_opencode_session",
+                Some(RECOVERY_REQUIRES_RETRY_FRESH),
+            )
+        } else {
+            ("queued", event_reason, None)
+        };
+        let session_updated = transaction
             .execute(
                 "UPDATE scheduler_task_sessions
-                    SET state = CASE WHEN state = 'cancelling' THEN 'cancelled' ELSE 'queued' END,
+                    SET state = ?4,
                         active_attempt_id = NULL, lease_expires_at = NULL,
-                        completed_at = CASE WHEN state = 'cancelling' THEN ?2 ELSE NULL END
+                        completed_at = CASE WHEN ?4 IN ('cancelled', 'blocked') THEN ?2 ELSE NULL END,
+                        error = ?5
                   WHERE session_id = ?1 AND active_attempt_id = ?3
                     AND state IN ('running', 'cancelling')",
-                params![session_id, to_i64(now)?, attempt_id],
+                params![session_id, to_i64(now)?, attempt_id, next_state, session_error],
             )
             .map_err(|error| format!("Failed to recover scheduler session: {error}"))?;
-        let next_state = if previous_state == "cancelling" {
-            "cancelled"
-        } else {
-            "queued"
+        if session_updated != 1 {
+            return Err("Scheduler recovery lost ownership of an active session.".to_string());
+        }
+        let recovery = match next_state {
+            "queued" if is_agent => Some("resume"),
+            "blocked" => Some("retry_fresh_required"),
+            _ => None,
         };
         append_event_in_transaction(
             transaction,
@@ -2809,7 +3219,11 @@ fn recover_matching_attempts<P: rusqlite::Params>(
                 kind: TaskSessionEventKind::Lifecycle,
                 payload: json!({
                     "state": next_state,
-                    "reason": event_reason
+                    "reason": recovery_reason,
+                    "recovery": recovery,
+                    "action": recovery,
+                    "error": session_error,
+                    "opencode_session_id": opencode_id
                 }),
                 progress: Some(TaskProgress {
                     phase: next_state.to_string(),
@@ -2821,6 +3235,23 @@ fn recover_matching_attempts<P: rusqlite::Params>(
         )?;
     }
     Ok(attempts.len())
+}
+
+fn request_is_agent_envelope(request: &TaskRequest) -> Result<bool, String> {
+    if request.payload.trim().is_empty() {
+        return Ok(false);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&request.payload) else {
+        return Ok(false);
+    };
+    let claims_envelope_schema =
+        value.get("schema_version").is_some() || value.get("session").is_some();
+    if !claims_envelope_schema {
+        return Ok(false);
+    }
+    request.envelope().map(|envelope| {
+        envelope.is_some_and(|value| value.session().kind == TaskSessionKind::Agent)
+    })
 }
 
 fn append_event_in_transaction(
@@ -2845,6 +3276,7 @@ fn append_event_in_transaction(
         .map_err(|error| format!("Failed to allocate task event sequence: {error}"))?;
     let payload_json = serde_json::to_string(&input.payload)
         .map_err(|error| format!("Failed to serialize task event payload: {error}"))?;
+    let event_type = indexed_event_type(input.kind, &input.payload);
     let progress_json = input
         .progress
         .as_ref()
@@ -2854,15 +3286,16 @@ fn append_event_in_transaction(
     transaction
         .execute(
             "INSERT INTO scheduler_task_events
-               (session_id, attempt_id, fencing_token, sequence, event_kind, payload_json,
-                 progress_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+               (session_id, attempt_id, fencing_token, sequence, event_kind, event_type,
+                 payload_json, progress_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 to_i64(session_id.0)?,
                 attempt_id.map(to_i64).transpose()?,
                 to_i64(fencing_token)?,
                 sequence,
                 event_kind_name(input.kind),
+                event_type,
                 payload_json,
                 progress_json,
                 to_i64(now)?
@@ -2911,6 +3344,23 @@ fn append_event_in_transaction(
     })
 }
 
+fn indexed_event_type(kind: TaskSessionEventKind, payload: &serde_json::Value) -> &'static str {
+    let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+    match (kind, payload_type) {
+        (TaskSessionEventKind::Lifecycle, _) => "lifecycle",
+        (TaskSessionEventKind::Progress, _) => "progress",
+        (TaskSessionEventKind::Activity, _) => "activity",
+        (TaskSessionEventKind::Tool, Some("tool_started")) => "tool_started",
+        (TaskSessionEventKind::Tool, Some("tool_completed")) => "tool_completed",
+        (TaskSessionEventKind::Tool, _) => "tool",
+        (TaskSessionEventKind::Runtime, Some("execution_trace_stage")) => "execution_trace_stage",
+        (TaskSessionEventKind::Runtime, Some("usage_updated")) => "usage_updated",
+        (TaskSessionEventKind::Runtime, Some("opencode_session")) => "opencode_session",
+        (TaskSessionEventKind::Runtime, Some("approval_requested")) => "approval_requested",
+        (TaskSessionEventKind::Runtime, _) => "runtime",
+    }
+}
+
 struct StoredEvent {
     id: i64,
     session_id: i64,
@@ -2921,6 +3371,60 @@ struct StoredEvent {
     payload_json: String,
     progress_json: Option<String>,
     created_at: i64,
+}
+
+fn trace_entry(
+    event: StoredEvent,
+    event_type: String,
+    attempt_number: Option<i64>,
+    worker_id: Option<i64>,
+) -> Result<TaskExecutionTraceEntry, String> {
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_json)
+        .map_err(|error| format!("Failed to decode execution trace metadata: {error}"))?;
+    let string = |key: &str, limit: usize| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.chars().take(limit).collect::<String>())
+            .filter(|value| !value.trim().is_empty())
+    };
+    Ok(TaskExecutionTraceEntry {
+        sequence: from_i64(event.sequence, "task event sequence")?,
+        attempt_id: event
+            .attempt_id
+            .map(|value| from_i64(value, "task attempt ID"))
+            .transpose()?,
+        assignment_attempt: attempt_number
+            .map(|value| {
+                u32::try_from(value).map_err(|_| "Assignment attempt exceeds u32.".to_string())
+            })
+            .transpose()?,
+        fencing_token: from_i64(event.fencing_token, "fencing token")?,
+        event_type,
+        created_at: from_i64(event.created_at, "task event timestamp")?,
+        state: string("state", 32),
+        stage: string("stage", 64),
+        duration_us: payload
+            .get("duration_us")
+            .and_then(serde_json::Value::as_u64),
+        outcome: string("outcome", 32),
+        worker_id: worker_id
+            .map(|value| from_i64(value, "worker ID"))
+            .transpose()?,
+        runtime_id: string("runtime_id", 256),
+        opencode_session_id: string("opencode_session_id", 256),
+        tool_call_id: string("tool_call_id", 256),
+        tool_name: string("tool_name", 128),
+        tool_success: payload.get("success").and_then(serde_json::Value::as_bool),
+        input_tokens: payload
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: payload
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        recovery: string("recovery", 64).or_else(|| string("action", 64)),
+        approval_operation: string("operation", 128),
+    })
 }
 
 impl StoredEvent {
@@ -3435,6 +3939,129 @@ mod tests {
     }
 
     #[test]
+    fn expired_legacy_opaque_payload_is_still_requeued() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = TaskRequest::with_payload("legacy", "opaque mock executor payload");
+        let session = store.enqueue_at(&request, 1).expect("task enqueued");
+        store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("first claim")
+            .expect("first assignment");
+
+        assert_eq!(store.recover_expired_at(1_010).expect("recovered"), 1);
+        assert_eq!(
+            store
+                .get_session(session.id)
+                .expect("session read")
+                .expect("session exists")
+                .state,
+            TaskSessionState::Queued
+        );
+    }
+
+    #[test]
+    fn malformed_versioned_envelope_fails_recovery_closed() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request =
+            TaskRequest::with_payload("malformed envelope", r#"{"schema_version":1,"session":{}}"#);
+        let session = store.enqueue_at(&request, 1).expect("task enqueued");
+        store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("claim")
+            .expect("assignment");
+
+        assert!(store
+            .recover_expired_at(1_010)
+            .expect_err("malformed durable envelope must fail closed")
+            .contains("Failed to decode Task Session envelope"));
+        assert_eq!(
+            store
+                .get_session(session.id)
+                .expect("session read")
+                .expect("session exists")
+                .state,
+            TaskSessionState::Running
+        );
+    }
+
+    #[test]
+    fn expired_agent_without_runtime_identity_requires_retry_fresh() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("pre-bind", "conversation-pre-bind", "subject-pre-bind");
+        let session = store.enqueue_at(&request, 1).expect("task enqueued");
+        let first = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("first claim")
+            .expect("first assignment");
+
+        assert_eq!(store.recover_expired_at(1_010).expect("recovered"), 1);
+        let recovered = store
+            .get_session(session.id)
+            .expect("session read")
+            .expect("session exists");
+        assert_eq!(recovered.state, TaskSessionState::Blocked);
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some(RECOVERY_REQUIRES_RETRY_FRESH)
+        );
+        assert!(store
+            .claim_next_at(owner, 1, 1_011, LEASE_MILLIS, 5)
+            .expect("claim checked")
+            .is_none());
+        let events = store.events_after(session.id, 0).expect("events read");
+        let recovery = events.last().expect("recovery event");
+        assert_eq!(recovery.attempt_id, Some(first.fence.attempt_id));
+        assert_eq!(recovery.payload["state"], "blocked");
+        assert_eq!(
+            recovery.payload["reason"],
+            "recovery_missing_opencode_session"
+        );
+        assert_eq!(recovery.payload["action"], "retry_fresh_required");
+    }
+
+    #[test]
+    fn expired_agent_resumes_the_same_durable_runtime_identity() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("resume", "conversation-resume", "subject-resume");
+        let session = store.enqueue(&request).expect("task enqueued");
+        let first = store
+            .claim_next(owner, 1, Duration::from_secs(5), 5)
+            .expect("first claim")
+            .expect("first assignment");
+        store
+            .bind_opencode_session(first.fence, "opencode-recovery-session")
+            .expect("runtime identity bound");
+
+        assert_eq!(store.abandon_owner(owner).expect("owner abandoned"), 1);
+        let queued = store
+            .get_session(session.id)
+            .expect("session read")
+            .expect("session exists");
+        assert_eq!(queued.state, TaskSessionState::Queued);
+        assert_eq!(
+            queued.opencode_session_id.as_deref(),
+            Some("opencode-recovery-session")
+        );
+        let second = store
+            .claim_next(owner, 2, Duration::from_secs(5), 5)
+            .expect("second claim")
+            .expect("second assignment");
+        assert_eq!(second.fence.session_id, session.id);
+        assert_eq!(second.fence.attempt, 2);
+        assert_eq!(
+            store
+                .assignment_opencode_session(second.fence)
+                .expect("runtime identity read")
+                .as_deref(),
+            Some("opencode-recovery-session")
+        );
+    }
+
+    #[test]
     fn renewal_prevents_expiry_and_wrong_owner_is_rejected() {
         let store = SchedulerStore::open_in_memory().expect("store opens");
         let owner = store.register_owner().expect("owner registered");
@@ -3508,6 +4135,40 @@ mod tests {
             .claim_next_at(owner, 1, 1_011, LEASE_MILLIS, 5)
             .expect("claim checked")
             .is_none());
+    }
+
+    #[test]
+    fn cancelling_agent_preserves_the_cancellation_recovery_reason() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request("cancel-agent", "conversation-cancel", "subject-cancel");
+        let session = store.enqueue_at(&request, 1).expect("task enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 10, LEASE_MILLIS, 5)
+            .expect("claim")
+            .expect("assignment");
+        store.cancel_at(session.id, 20).expect("cancel requested");
+
+        assert_eq!(store.recover_expired_at(1_010).expect("recovered"), 1);
+        let attempt_error: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT error FROM scheduler_task_attempts WHERE attempt_id = ?1",
+                params![assignment.fence.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_error, "Assignment lease expired.");
+        assert_eq!(
+            store
+                .get_session(session.id)
+                .expect("session read")
+                .expect("session exists")
+                .state,
+            TaskSessionState::Cancelled
+        );
     }
 
     #[test]
@@ -3686,6 +4347,247 @@ mod tests {
         assert_eq!(final_page.next_cursor, 5);
         assert!(!final_page.has_more);
         assert_eq!(final_page.events.len(), 1);
+    }
+
+    #[test]
+    fn execution_trace_page_is_indexed_bounded_and_sanitized() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_at(&TaskRequest::new("trace"), 10)
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next_at(owner, 3, 20, LEASE_MILLIS, 5)
+            .expect("task claimed")
+            .expect("assignment");
+        for (at, payload) in [
+            (
+                21,
+                json!({ "type": "text_delta", "text": "secret prompt text" }),
+            ),
+            (
+                22,
+                json!({
+                    "type": "execution_trace_stage",
+                    "schema_version": 1,
+                    "stage": "runtime_preparation",
+                    "duration_us": 420_000,
+                    "outcome": "succeeded",
+                    "runtime_id": "runtime-1"
+                }),
+            ),
+            (
+                23,
+                json!({ "type": "usage_updated", "input_tokens": 100, "output_tokens": 12 }),
+            ),
+        ] {
+            store
+                .append_assignment_event_at(
+                    assignment.fence,
+                    TaskSessionEventInput {
+                        kind: TaskSessionEventKind::Runtime,
+                        payload,
+                        progress: None,
+                    },
+                    at,
+                )
+                .expect("runtime event appended");
+        }
+        for (at, payload) in [
+            (
+                24,
+                json!({ "type": "tool_started", "tool_call_id": "call-1", "tool_name": "jira_search" }),
+            ),
+            (
+                25,
+                json!({
+                    "type": "tool_completed",
+                    "tool_call_id": "call-1",
+                    "tool_name": "jira_search",
+                    "success": false,
+                    "error": "secret API response"
+                }),
+            ),
+        ] {
+            store
+                .append_assignment_event_at(
+                    assignment.fence,
+                    TaskSessionEventInput {
+                        kind: TaskSessionEventKind::Tool,
+                        payload,
+                        progress: None,
+                    },
+                    at,
+                )
+                .expect("tool event appended");
+        }
+        store
+            .append_assignment_event_at(
+                assignment.fence,
+                TaskSessionEventInput {
+                    kind: TaskSessionEventKind::Runtime,
+                    payload: json!({ "type": "text_delta", "text": "trailing secret" }),
+                    progress: None,
+                },
+                26,
+            )
+            .expect("trailing delta appended");
+
+        let first = store
+            .execution_trace_page(session.id, 0, 3)
+            .expect("first trace page");
+        assert_eq!(first.entries.len(), 3);
+        assert!(first.has_more);
+        assert_eq!(first.entries[2].event_type, "execution_trace_stage");
+        assert_eq!(first.entries[2].worker_id, Some(3));
+        assert_eq!(first.entries[2].assignment_attempt, Some(1));
+        let second = store
+            .execution_trace_page(session.id, first.next_cursor, 10)
+            .expect("second trace page");
+        assert!(!second.has_more);
+        assert_eq!(second.next_cursor, 8);
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["usage_updated", "tool_started", "tool_completed"]
+        );
+        let encoded = serde_json::to_string(&(first, second)).expect("trace encoded");
+        assert!(!encoded.contains("secret prompt text"));
+        assert!(!encoded.contains("secret API response"));
+        assert!(!encoded.contains("trailing secret"));
+
+        let plan = store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM scheduler_task_events
+                  WHERE session_id = 1 AND sequence > 0 AND event_type IN (
+                    'lifecycle', 'tool_started', 'tool_completed',
+                    'execution_trace_stage', 'usage_updated', 'opencode_session',
+                    'approval_requested'
+                  ) ORDER BY sequence LIMIT 100",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" ");
+        assert!(plan.contains("idx_scheduler_events_trace"), "{plan}");
+    }
+
+    #[test]
+    fn legacy_event_insert_is_classified_for_execution_trace() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let session = store
+            .enqueue_at(&TaskRequest::new("legacy trace writer"), 1)
+            .expect("task enqueued");
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO scheduler_task_events
+                       (session_id, attempt_id, fencing_token, sequence, event_kind,
+                        payload_json, progress_json, created_at)
+                     VALUES (?1, NULL, 0, 2, 'runtime', ?2, NULL, 2)",
+                    params![
+                        session.id.0,
+                        json!({
+                            "type": "execution_trace_stage",
+                            "schema_version": 1,
+                            "stage": "runtime_preparation",
+                            "duration_us": 10,
+                            "outcome": "succeeded"
+                        })
+                        .to_string()
+                    ],
+                )
+                .expect("legacy event inserted");
+            connection
+                .execute(
+                    "UPDATE scheduler_task_sessions SET next_event_sequence = 3
+                      WHERE session_id = ?1",
+                    params![session.id.0],
+                )
+                .expect("cursor advanced");
+            let event_type: String = connection
+                .query_row(
+                    "SELECT event_type FROM scheduler_task_events
+                      WHERE session_id = ?1 AND sequence = 2",
+                    params![session.id.0],
+                    |row| row.get(0),
+                )
+                .expect("event type read");
+            assert_eq!(event_type, "execution_trace_stage");
+        }
+        let page = store
+            .execution_trace_page(session.id, 0, 100)
+            .expect("trace projected");
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[1].event_type, "execution_trace_stage");
+    }
+
+    #[test]
+    #[ignore = "10,000-event execution trace scale harness; run explicitly"]
+    fn execution_trace_page_skips_large_text_delta_history() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_at(&TaskRequest::new("large trace"), 1)
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next_at(owner, 1, 2, 20_000, 5)
+            .expect("task claimed")
+            .expect("assignment");
+        for index in 0..10_000_u64 {
+            store
+                .append_assignment_event_at(
+                    assignment.fence,
+                    TaskSessionEventInput {
+                        kind: TaskSessionEventKind::Runtime,
+                        payload: json!({ "type": "text_delta", "text": format!("delta-{index}") }),
+                        progress: None,
+                    },
+                    3 + index,
+                )
+                .expect("delta appended");
+        }
+        store
+            .append_assignment_event_at(
+                assignment.fence,
+                TaskSessionEventInput {
+                    kind: TaskSessionEventKind::Runtime,
+                    payload: json!({
+                        "type": "execution_trace_stage",
+                        "schema_version": 1,
+                        "stage": "agent_runtime_request",
+                        "duration_us": 1_000_000,
+                        "outcome": "succeeded"
+                    }),
+                    progress: None,
+                },
+                10_003,
+            )
+            .expect("trace appended");
+
+        let started = Instant::now();
+        let page = store
+            .execution_trace_page(session.id, 0, 100)
+            .expect("trace projected");
+        println!("10k execution trace page: {:?}", started.elapsed());
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(
+            page.entries.last().map(|entry| entry.sequence),
+            Some(10_003)
+        );
+        assert!(serde_json::to_string(&page)
+            .expect("page encoded")
+            .find("delta-")
+            .is_none());
     }
 
     #[test]
@@ -4582,6 +5484,109 @@ mod tests {
                 .assignment_opencode_session(assignment_b.fence)
                 .expect("task B identity"),
             Some("opencode-session-b".to_string())
+        );
+    }
+
+    fn test_execution_manifest_draft(runtime_id: &str) -> ExecutionManifestDraft {
+        ExecutionManifestDraft {
+            kind: TaskSessionKind::Agent,
+            workspace_id: "workspace-personal".to_string(),
+            subject_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            execution_run_id: Some("run-1".to_string()),
+            context_digest: "sha256:contract".to_string(),
+            context_revision: Some("context-1".to_string()),
+            runtime: "opencode".to_string(),
+            runtime_profile_id: "profile-1".to_string(),
+            runtime_id: runtime_id.to_string(),
+            model: "openai/gpt-5".to_string(),
+            model_configuration: ExecutionModelConfiguration {
+                provider_id: "openai".to_string(),
+                api_style: "responses".to_string(),
+                temperature: "0.2".to_string(),
+            },
+            prompt_template_version: "prompt-v1".to_string(),
+            rules_revision: Some("rules-1".to_string()),
+            skills_revision: Some("skills-1".to_string()),
+            rules: vec![],
+            rules_digest: "sha256:rules".to_string(),
+            skills_catalog_revision: Some("sha256:skills".to_string()),
+            skills: vec![],
+            connectors: vec![TaskMcpConnectorContext {
+                connector_id: "jira".to_string(),
+                capability: "external_tools:jira".to_string(),
+                requested: true,
+                granted: true,
+            }],
+            tool_permission_mode: "fenced_tools_only".to_string(),
+            unknown_fields: vec!["git_revision".to_string()],
+        }
+    }
+
+    #[test]
+    fn execution_manifest_is_fenced_idempotent_and_secret_free() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("manifest", &test_agent_envelope())
+                    .expect("request encodes"),
+                &["external_tools:jira".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let draft = test_execution_manifest_draft("runtime-safe");
+        let first = store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("manifest binds");
+        let second = store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("identical bind is idempotent");
+        assert_eq!(first, second);
+        assert_eq!(
+            store
+                .latest_execution_manifest(session.id)
+                .expect("manifest loads"),
+            Some(first.clone())
+        );
+        let mut conflicting = draft.clone();
+        conflicting.model_configuration.temperature = "0.9".to_string();
+        assert!(store
+            .bind_execution_manifest(assignment.fence, &conflicting)
+            .expect_err("conflicting manifest is rejected")
+            .contains("different Execution Manifest"));
+
+        store
+            .bind_opencode_session(assignment.fence, "opencode-safe")
+            .expect("runtime identity binds");
+        let encoded = serde_json::to_string(
+            &store
+                .latest_execution_manifest(session.id)
+                .expect("manifest loads")
+                .expect("manifest exists"),
+        )
+        .expect("manifest encodes");
+        assert!(!encoded.contains("opencode-safe"));
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("environment"));
+
+        let stale = AssignmentFence {
+            fencing_token: assignment.fence.fencing_token + 1,
+            ..assignment.fence
+        };
+        assert!(store.bind_execution_manifest(stale, &draft).is_err());
+        let reopened = SchedulerStore::open_query_at(path).expect("query store reopens");
+        assert_eq!(
+            reopened
+                .latest_execution_manifest(session.id)
+                .expect("reopened manifest loads"),
+            Some(first)
         );
     }
 
