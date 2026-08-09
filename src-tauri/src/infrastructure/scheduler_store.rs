@@ -110,6 +110,13 @@ pub(crate) struct DurableAssignment {
     pub(crate) grants: Vec<TaskCapabilityGrant>,
 }
 
+/// Result of one scheduler claim transaction, including every session whose
+/// durable state changed while expired assignments were reconciled.
+pub(crate) struct ClaimOutcome {
+    pub(crate) assignment: Option<DurableAssignment>,
+    pub(crate) changed_session_ids: Vec<TaskSessionId>,
+}
+
 /// Terminal outcome accepted by a fenced assignment completion.
 pub(crate) enum DurableOutcome {
     Succeeded(TaskExecutionOutput),
@@ -503,6 +510,9 @@ impl SchedulerStore {
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
                     'approval_requested'
                   );
+                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_tool_state
+                   ON scheduler_task_events(session_id, sequence)
+                  WHERE event_type IN ('tool_started', 'tool_completed');
                  DROP TRIGGER IF EXISTS scheduler_task_events_classify_type;
                  CREATE TRIGGER scheduler_task_events_classify_type
                  AFTER INSERT ON scheduler_task_events
@@ -1388,13 +1398,48 @@ impl SchedulerStore {
     }
 
     pub(crate) fn tool_state(&self, session_id: TaskSessionId) -> Result<TaskToolState, String> {
-        if self.get_session(session_id)?.is_none() {
+        let _metric = crate::infrastructure::performance::span("tool_state", "sqlite_read");
+        crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
+        let lock_started = Instant::now();
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        crate::infrastructure::performance::record_sqlite_lock_wait(lock_started.elapsed());
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM scheduler_task_sessions WHERE session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate Task Session tool state: {error}"))?
+            .is_some();
+        if !exists {
             return Err(format!("Task Session {} was not found.", session_id.0));
         }
-        Ok(TaskToolState::from_events(
-            session_id,
-            &self.events_after(session_id, 0)?,
-        ))
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, session_id, attempt_id, fencing_token, sequence,
+                        event_kind, payload_json, progress_json, created_at
+                   FROM scheduler_task_events
+                  WHERE session_id = ?1
+                    AND event_type IN ('tool_started', 'tool_completed')
+                  ORDER BY sequence",
+            )
+            .map_err(|error| format!("Failed to prepare Task Session tool state: {error}"))?;
+        let rows = statement
+            .query_map(params![to_i64(session_id.0)?], stored_event_from_row)
+            .map_err(|error| format!("Failed to query Task Session tool state: {error}"))?;
+        let events = rows
+            .map(|row| {
+                row.map_err(|error| format!("Failed to decode Task Session tool event: {error}"))?
+                    .into_event()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::infrastructure::performance::increment(
+            "sqlite_rows_read_total",
+            "sqlite",
+            events.len() as u64,
+        );
+        Ok(TaskToolState::from_events(session_id, &events))
     }
 
     pub(crate) fn mcp_context(&self, session_id: TaskSessionId) -> Result<TaskMcpContext, String> {
@@ -1730,6 +1775,7 @@ impl SchedulerStore {
         assignment_is_current_on(&connection, fence, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_next(
         &self,
         owner_id: u64,
@@ -1737,7 +1783,18 @@ impl SchedulerStore {
         lease_duration: Duration,
         global_limit: usize,
     ) -> Result<Option<DurableAssignment>, String> {
-        self.claim_next_at(
+        self.claim_next_with_changes(owner_id, worker_id, lease_duration, global_limit)
+            .map(|outcome| outcome.assignment)
+    }
+
+    pub(crate) fn claim_next_with_changes(
+        &self,
+        owner_id: u64,
+        worker_id: usize,
+        lease_duration: Duration,
+        global_limit: usize,
+    ) -> Result<ClaimOutcome, String> {
+        self.claim_next_with_changes_at(
             owner_id,
             worker_id,
             now_millis(),
@@ -1746,6 +1803,7 @@ impl SchedulerStore {
         )
     }
 
+    #[cfg(test)]
     fn claim_next_at(
         &self,
         owner_id: u64,
@@ -1754,11 +1812,23 @@ impl SchedulerStore {
         lease_millis: u64,
         global_limit: usize,
     ) -> Result<Option<DurableAssignment>, String> {
+        self.claim_next_with_changes_at(owner_id, worker_id, now, lease_millis, global_limit)
+            .map(|outcome| outcome.assignment)
+    }
+
+    fn claim_next_with_changes_at(
+        &self,
+        owner_id: u64,
+        worker_id: usize,
+        now: u64,
+        lease_millis: u64,
+        global_limit: usize,
+    ) -> Result<ClaimOutcome, String> {
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("Failed to start scheduler claim transaction: {error}"))?;
-        recover_expired_in_transaction(&transaction, now)?;
+        let mut changed_session_ids = recover_expired_in_transaction(&transaction, now)?;
         let running: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM scheduler_task_attempts
@@ -1771,7 +1841,10 @@ impl SchedulerStore {
             transaction
                 .commit()
                 .map_err(|error| format!("Failed to commit scheduler capacity check: {error}"))?;
-            return Ok(None);
+            return Ok(ClaimOutcome {
+                assignment: None,
+                changed_session_ids,
+            });
         }
 
         let candidate = transaction
@@ -1815,7 +1888,10 @@ impl SchedulerStore {
             transaction
                 .commit()
                 .map_err(|error| format!("Failed to commit empty scheduler claim: {error}"))?;
-            return Ok(None);
+            return Ok(ClaimOutcome {
+                assignment: None,
+                changed_session_ids,
+            });
         };
 
         let session_id = TaskSessionId(from_i64(session_id, "task session ID")?);
@@ -1892,17 +1968,23 @@ impl SchedulerStore {
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit scheduler assignment: {error}"))?;
-        Ok(Some(DurableAssignment {
-            fence: AssignmentFence {
-                session_id,
-                attempt_id,
-                attempt,
-                owner_id,
-                fencing_token,
-            },
-            request: TaskRequest { label, payload },
-            grants,
-        }))
+        if !changed_session_ids.contains(&session_id) {
+            changed_session_ids.push(session_id);
+        }
+        Ok(ClaimOutcome {
+            assignment: Some(DurableAssignment {
+                fence: AssignmentFence {
+                    session_id,
+                    attempt_id,
+                    attempt,
+                    owner_id,
+                    fencing_token,
+                },
+                request: TaskRequest { label, payload },
+                grants,
+            }),
+            changed_session_ids,
+        })
     }
 
     pub(crate) fn renew(
@@ -2665,10 +2747,21 @@ impl SchedulerStore {
     }
 
     pub(crate) fn recover_expired(&self) -> Result<usize, String> {
-        self.recover_expired_at(now_millis())
+        self.recover_expired_sessions()
+            .map(|sessions| sessions.len())
     }
 
+    pub(crate) fn recover_expired_sessions(&self) -> Result<Vec<TaskSessionId>, String> {
+        self.recover_expired_sessions_at(now_millis())
+    }
+
+    #[cfg(test)]
     fn recover_expired_at(&self, now: u64) -> Result<usize, String> {
+        self.recover_expired_sessions_at(now)
+            .map(|sessions| sessions.len())
+    }
+
+    fn recover_expired_sessions_at(&self, now: u64) -> Result<Vec<TaskSessionId>, String> {
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2697,7 +2790,7 @@ impl SchedulerStore {
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit scheduler owner cleanup: {error}"))?;
-        Ok(recovered)
+        Ok(recovered.len())
     }
 
     pub(crate) fn remove_terminal(&self, id: TaskSessionId) -> Result<bool, String> {
@@ -3103,7 +3196,7 @@ fn next_sequence(transaction: &Transaction<'_>, column: &str) -> Result<u64, Str
 fn recover_expired_in_transaction(
     transaction: &Transaction<'_>,
     now: u64,
-) -> Result<usize, String> {
+) -> Result<Vec<TaskSessionId>, String> {
     recover_matching_attempts(
         transaction,
         "attempts.lease_expires_at <= ?1",
@@ -3121,7 +3214,7 @@ fn recover_matching_attempts<P: rusqlite::Params>(
     now: u64,
     attempt_error: &str,
     event_reason: &str,
-) -> Result<usize, String> {
+) -> Result<Vec<TaskSessionId>, String> {
     let query = format!(
         "SELECT attempts.attempt_id, attempts.session_id, attempts.fencing_token,
                 sessions.label, sessions.payload, sessions.state,
@@ -3234,7 +3327,12 @@ fn recover_matching_attempts<P: rusqlite::Params>(
             now,
         )?;
     }
-    Ok(attempts.len())
+    attempts
+        .into_iter()
+        .map(|(_, session_id, _, _, _, _, _)| {
+            from_i64(session_id, "task session ID").map(TaskSessionId)
+        })
+        .collect()
 }
 
 fn request_is_agent_envelope(request: &TaskRequest) -> Result<bool, String> {
@@ -4478,6 +4576,62 @@ mod tests {
             .unwrap()
             .join(" ");
         assert!(plan.contains("idx_scheduler_events_trace"), "{plan}");
+
+        let tool_state = store.tool_state(session.id).expect("tool state projected");
+        assert_eq!(tool_state.calls.len(), 1);
+        let tool_plan = store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM scheduler_task_events
+                  WHERE session_id = 1
+                    AND event_type IN ('tool_started', 'tool_completed')
+                  ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" ");
+        assert!(
+            tool_plan.contains("idx_scheduler_events_tool_state"),
+            "{tool_plan}"
+        );
+    }
+
+    #[test]
+    fn claim_outcome_reports_only_sessions_changed_by_the_transaction() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let sessions = (0..50)
+            .map(|index| {
+                store
+                    .enqueue_at(&TaskRequest::new(format!("queued-{index}")), index + 1)
+                    .expect("task enqueued")
+            })
+            .collect::<Vec<_>>();
+
+        for (worker, expected) in sessions.iter().take(5).enumerate() {
+            let outcome = store
+                .claim_next_with_changes_at(owner, worker, 100, LEASE_MILLIS, 5)
+                .expect("task claimed");
+            assert_eq!(
+                outcome
+                    .assignment
+                    .as_ref()
+                    .map(|value| value.fence.session_id),
+                Some(expected.id)
+            );
+            assert_eq!(outcome.changed_session_ids, vec![expected.id]);
+        }
+
+        let capacity = store
+            .claim_next_with_changes_at(owner, 6, 101, LEASE_MILLIS, 5)
+            .expect("capacity checked");
+        assert!(capacity.assignment.is_none());
+        assert!(capacity.changed_session_ids.is_empty());
     }
 
     #[test]

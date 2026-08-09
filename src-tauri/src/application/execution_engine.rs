@@ -1462,14 +1462,6 @@ impl Scheduler {
         }
     }
 
-    fn publish_all_current(&self) {
-        if let Ok(sessions) = self.store.list_sessions() {
-            for session in sessions {
-                self.publish(&session);
-            }
-        }
-    }
-
     fn dispatch(&mut self) {
         loop {
             let worker_index = if self.active.is_empty() {
@@ -1492,21 +1484,22 @@ impl Scheduler {
                 return;
             };
             let worker_id = self.workers[worker_index].snapshot.id;
-            let claim = self.store.claim_next(
+            let claim = self.store.claim_next_with_changes(
                 self.owner_id,
                 worker_id,
                 ASSIGNMENT_LEASE_DURATION,
                 MAX_EXECUTION_WORKERS,
             );
-            self.publish_all_current();
             let assignment = match claim {
-                Ok(Some(assignment)) => {
+                Ok(outcome) => {
+                    for session_id in outcome.changed_session_ids {
+                        self.publish_current(session_id);
+                    }
                     self.record_success("claim");
+                    let Some(assignment) = outcome.assignment else {
+                        return;
+                    };
                     assignment
-                }
-                Ok(None) => {
-                    self.record_success("claim");
-                    return;
                 }
                 Err(error) => {
                     self.record_error("claim", error);
@@ -1799,13 +1792,11 @@ impl Scheduler {
                 }
             }
         }
-        match self.store.recover_expired() {
-            Ok(recovered) if recovered > 0 => {
+        match self.store.recover_expired_sessions() {
+            Ok(recovered) if !recovered.is_empty() => {
                 self.record_success("recovery");
-                if let Ok(sessions) = self.store.list_sessions() {
-                    for session in sessions {
-                        self.publish(&session);
-                    }
+                for session_id in recovered {
+                    self.publish_current(session_id);
                 }
             }
             Ok(_) => self.record_success("recovery"),

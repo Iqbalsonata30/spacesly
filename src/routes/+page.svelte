@@ -938,10 +938,6 @@
   });
 
   $effect(() => {
-    if (hasAgentConsoleSession) void loadAgentConsoleRuntime();
-  });
-
-  $effect(() => {
     if (!agentConsoleCardId || agentRunSessions[agentConsoleCardId]) return;
     const fallback = latestAgentSession;
     agentConsoleCardId = fallback?.cardId ?? null;
@@ -1395,9 +1391,11 @@
         await saveJiraSecret("password", localSecrets.jira_password);
       }
 
-      aiProviderSecrets = await aiProviderSecretStatuses();
-      mcpEnvironmentSecrets = await mcpEnvironmentSecretStatuses();
-      jiraSecrets = await jiraSecretStatuses();
+      [aiProviderSecrets, mcpEnvironmentSecrets, jiraSecrets] = await Promise.all([
+        aiProviderSecretStatuses(),
+        mcpEnvironmentSecretStatuses(),
+        jiraSecretStatuses(),
+      ]);
       appSecrets = {
         jira_api_token: "",
         jira_personal_access_token: "",
@@ -1424,6 +1422,9 @@
         const storage = typeof localStorage === "undefined" ? undefined : localStorage;
         const interruptedCardIds = loadActiveAgentRunCardIds(storage);
         workspace = recoverInterruptedAgentRuns(cached.workspace, interruptedCardIds);
+        // The default-workspace IPC request runs in parallel with cache hydration.
+        // If it failed first, a valid cache still owns startup and clears its stale error.
+        error = null;
         cacheSavedAt = cached.savedAt;
         if (interruptedCardIds.length > 0) {
           clearActiveAgentRuns(storage);
@@ -1458,14 +1459,21 @@
         typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
           ? await listTaskSessions()
           : [];
+      const latestTaskSessionByRunId = new Map<string, TaskSessionSnapshot>();
+      for (const session of retainedTaskSessions) {
+        const executionRunId = agentEnvelopeFromSnapshot(session)?.execution_run_id;
+        if (!executionRunId) continue;
+        const retained = latestTaskSessionByRunId.get(executionRunId);
+        if (!retained || session.id > retained.id) {
+          latestTaskSessionByRunId.set(executionRunId, session);
+        }
+      }
       for (const run of runs) {
         const cardId = run.contract.task_id;
         const card = activeCardById.get(cardId);
         if (!card || agentRunSessions[cardId]) continue;
         const ticketTitle = run.contract.ticket.title || card.title;
-        const retainedTaskSession = retainedTaskSessions
-          .filter((session) => agentEnvelopeFromSnapshot(session)?.execution_run_id === run.run_id)
-          .sort((left, right) => right.id - left.id)[0];
+        const retainedTaskSession = latestTaskSessionByRunId.get(run.run_id);
         const taskEnvelope = retainedTaskSession
           ? agentEnvelopeFromSnapshot(retainedTaskSession)
           : null;
@@ -1727,8 +1735,14 @@
       pendingWorkspaceFilePaths = new SvelteSet<string>();
       pendingWorkspaceStructuralChange = false;
       void refreshOpenEditorFilesFromDisk(changedPaths);
-      if (refreshExplorer) void refreshFileDirectory(fileDirectory);
-      void refreshWorkspaceGitState();
+      if (workspaceMode === "files") {
+        if (refreshExplorer) void refreshFileDirectory(fileDirectory);
+        void refreshWorkspaceGitState();
+      } else if (refreshExplorer) {
+        // Keep the hidden explorer stale without paying for directory and Git IPC.
+        // Entering Files already performs one authoritative refresh.
+        fileDirectoryLoaded = false;
+      }
     }, 250);
   }
 
