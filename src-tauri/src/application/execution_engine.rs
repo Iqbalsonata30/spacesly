@@ -512,8 +512,22 @@ pub trait TaskExecutor: Send + Sync + 'static {
 }
 
 /// Projects a staged scheduler completion into the separate authoritative execution store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionProjectionError {
+    Retryable(String),
+    Rejected(String),
+}
+
+impl CompletionProjectionError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Retryable(message) | Self::Rejected(message) => message,
+        }
+    }
+}
+
 pub(crate) trait CompletionProjector: Send + Sync + 'static {
-    fn project(&self, completion: &StagedCompletion) -> Result<(), String>;
+    fn project(&self, completion: &StagedCompletion) -> Result<(), CompletionProjectionError>;
 }
 
 #[cfg(not(test))]
@@ -521,8 +535,10 @@ struct MissingCompletionProjector;
 
 #[cfg(not(test))]
 impl CompletionProjector for MissingCompletionProjector {
-    fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
-        Err("Authoritative Agent completion projector is not configured.".to_string())
+    fn project(&self, _completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
+        Err(CompletionProjectionError::Retryable(
+            "Authoritative Agent completion projector is not configured.".to_string(),
+        ))
     }
 }
 
@@ -531,7 +547,7 @@ struct AcceptingCompletionProjector;
 
 #[cfg(test)]
 impl CompletionProjector for AcceptingCompletionProjector {
-    fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+    fn project(&self, _completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
         Ok(())
     }
 }
@@ -1065,7 +1081,7 @@ enum SchedulerMessage {
     },
     ProjectionFinished {
         completion: StagedCompletion,
-        result: Result<(), String>,
+        result: Result<(), CompletionProjectionError>,
     },
 }
 
@@ -1688,19 +1704,34 @@ impl Scheduler {
         self.refresh_pending_projection_health();
     }
 
-    fn projection_finished(&mut self, completion: StagedCompletion, result: Result<(), String>) {
+    fn projection_finished(
+        &mut self,
+        completion: StagedCompletion,
+        result: Result<(), CompletionProjectionError>,
+    ) {
         if self.projection_in_flight.as_deref() != Some(completion.projection_id.as_str()) {
             return;
         }
         self.projection_in_flight = None;
         match result {
-            Err(error) => match self.store.record_completion_error(&completion, &error) {
-                Ok(_) => {
-                    self.publish_current(completion.session_id);
-                    self.record_error("projection", error);
+            Err(CompletionProjectionError::Retryable(error)) => {
+                match self.store.record_completion_error(&completion, &error) {
+                    Ok(_) => {
+                        self.publish_current(completion.session_id);
+                        self.record_error("projection", error);
+                    }
+                    Err(store_error) => self.record_error("projection-bookkeeping", store_error),
                 }
-                Err(store_error) => self.record_error("projection-bookkeeping", store_error),
-            },
+            }
+            Err(CompletionProjectionError::Rejected(error)) => {
+                match self.store.reject_completion(&completion, &error) {
+                    Ok(FinishResult::Applied | FinishResult::Stale) => {
+                        self.publish_current(completion.session_id);
+                        self.record_error("projection-rejected", error);
+                    }
+                    Err(store_error) => self.record_error("projection-bookkeeping", store_error),
+                }
+            }
             Ok(()) => match self.store.mark_completion_projected(&completion) {
                 Ok(true) => match self.store.finalize_completion(&completion) {
                     Ok(FinishResult::Applied | FinishResult::Stale) => {
@@ -1965,7 +1996,9 @@ fn start_projection_worker(
                         let result =
                             catch_unwind(AssertUnwindSafe(|| projector.project(&completion)))
                                 .unwrap_or_else(|_| {
-                                    Err("Completion projector panicked.".to_string())
+                                    Err(CompletionProjectionError::Retryable(
+                                        "Completion projector panicked.".to_string(),
+                                    ))
                                 });
                         if scheduler
                             .send(SchedulerMessage::ProjectionFinished { completion, result })
@@ -2817,13 +2850,25 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct RejectingProjector;
+
+    impl CompletionProjector for RejectingProjector {
+        fn project(&self, _completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
+            Err(CompletionProjectionError::Rejected(
+                "Durable Chat context changed after runtime resolution.".to_string(),
+            ))
+        }
+    }
+
     impl CompletionProjector for SwitchableProjector {
-        fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+        fn project(&self, _completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.available.load(Ordering::SeqCst) {
                 Ok(())
             } else {
-                Err("executions.db unavailable".to_string())
+                Err(CompletionProjectionError::Retryable(
+                    "executions.db unavailable".to_string(),
+                ))
             }
         }
     }
@@ -2883,6 +2928,43 @@ mod tests {
         assert!(result.finalized_at.is_some());
         assert!(result.projection_error.is_none());
         assert_eq!(engine.health().status, SchedulerHealthStatus::Healthy);
+        assert_eq!(engine.health().pending_projections, 0);
+    }
+
+    #[test]
+    fn rejected_projection_terminalizes_blocked_without_retry() {
+        let directory = tempdir().expect("temporary directory");
+        let engine = ExecutionEngine::open_persistent_at_with_executor_and_projector(
+            Arc::new(StructuredOutputExecutor),
+            Arc::new(RejectingProjector),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let mut envelope = test_envelope(Vec::new());
+        let TaskSessionEnvelope::V1(session) = &mut envelope else {
+            unreachable!();
+        };
+        session.conversation_id = Some("conversation-rejected".to_string());
+        let submitted = engine
+            .submit_envelope("rejected-projection", &envelope)
+            .expect("session submitted");
+
+        let blocked = engine
+            .wait_for_terminal(submitted.id, TEST_TIMEOUT)
+            .expect("rejected projection terminalizes");
+        assert_eq!(blocked.state, TaskSessionState::Blocked);
+        assert_eq!(
+            blocked.error.as_deref(),
+            Some("Durable Chat context changed after runtime resolution.")
+        );
+        let result = engine
+            .task_session_result(submitted.id)
+            .expect("result queried")
+            .expect("result retained");
+        assert_eq!(result.terminal_state, TaskSessionState::Blocked);
+        assert_eq!(result.projection_error, blocked.error);
+        assert!(result.projected_at.is_none());
+        assert!(result.finalized_at.is_some());
         assert_eq!(engine.health().pending_projections, 0);
     }
 
@@ -2957,7 +3039,7 @@ mod tests {
     }
 
     impl CompletionProjector for GatedProjector {
-        fn project(&self, _completion: &StagedCompletion) -> Result<(), String> {
+        fn project(&self, _completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
             self.entered.store(true, Ordering::SeqCst);
             while !self.release.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(2));

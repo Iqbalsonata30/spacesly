@@ -1,6 +1,8 @@
-use crate::application::execution_engine::CompletionProjector;
+use crate::application::execution_engine::{CompletionProjectionError, CompletionProjector};
 use crate::domain::execution::{ExecutionRun, StepRun};
 use crate::domain::task_session::{AgentTaskCompletionStatus, TaskExecutionOutput};
+#[cfg(test)]
+use crate::infrastructure::scheduler_store::StagedChatHead;
 use crate::infrastructure::scheduler_store::StagedCompletion;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -63,8 +65,13 @@ pub struct ExecutionStore {
 }
 
 impl CompletionProjector for ExecutionStore {
-    fn project(&self, completion: &StagedCompletion) -> Result<(), String> {
-        self.project_task_completion(completion)
+    fn project(&self, completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
+        match &completion.output {
+            TaskExecutionOutput::Chat(_) => self.project_chat_task_completion(completion),
+            _ => self
+                .project_task_completion(completion)
+                .map_err(CompletionProjectionError::Retryable),
+        }
     }
 }
 
@@ -379,41 +386,9 @@ impl ExecutionStore {
     ) -> Result<(), String> {
         match &completion.output {
             TaskExecutionOutput::Agent(_) => self.project_agent_task_completion(completion),
-            TaskExecutionOutput::Chat(result) => {
-                if result.conversation_id != completion.conversation_id {
-                    return Err("Chat completion conversation ownership changed.".to_string());
-                }
-                let title = {
-                    let connection = self.connection.lock().map_err(|error| error.to_string())?;
-                    connection
-                        .query_row(
-                            "SELECT title FROM conversations
-                              WHERE conversation_id = ?1 AND workspace_id = ?2",
-                            params![completion.conversation_id, completion.workspace_id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|error| {
-                            format!("Failed to validate Chat completion conversation: {error}")
-                        })?
-                        .ok_or_else(|| {
-                            "Chat completion conversation does not belong to this workspace."
-                                .to_string()
-                        })?
-                };
-                self.append_conversation_message_with_authority(
-                    &completion.workspace_id,
-                    &completion.conversation_id,
-                    &title,
-                    &ConversationMessageInput {
-                        id: format!("{}:assistant", completion.projection_id),
-                        role: "agent".to_string(),
-                        text: result.message.clone(),
-                    },
-                    MESSAGE_AUTHORITY_BACKEND,
-                )?;
-                Ok(())
-            }
+            TaskExecutionOutput::Chat(_) => self
+                .project_chat_task_completion(completion)
+                .map_err(|error| error.message().to_string()),
             // Edit proposals have no conversation projection. The scheduler outbox itself is the
             // durable authoritative query surface; singular editor review state is not recreated.
             TaskExecutionOutput::Edit(_) => Ok(()),
@@ -421,6 +396,159 @@ impl ExecutionStore {
                 Err("Empty task completion cannot be projected.".to_string())
             }
         }
+    }
+
+    fn project_chat_task_completion(
+        &self,
+        completion: &StagedCompletion,
+    ) -> Result<(), CompletionProjectionError> {
+        let TaskExecutionOutput::Chat(result) = &completion.output else {
+            unreachable!();
+        };
+        if result.conversation_id != completion.conversation_id {
+            return Err(CompletionProjectionError::Rejected(
+                "Chat completion conversation ownership changed.".to_string(),
+            ));
+        }
+        let head = completion.chat_head.as_ref().ok_or_else(|| {
+            CompletionProjectionError::Rejected(
+                "Chat completion is missing its immutable expected head.".to_string(),
+            )
+        })?;
+        let message_id = format!("{}:assistant", completion.projection_id);
+        let now = now_millis().map_err(CompletionProjectionError::Retryable)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|error| CompletionProjectionError::Retryable(error.to_string()))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to start Chat completion projection: {error}"
+                ))
+            })?;
+        let existing = transaction
+            .query_row(
+                "SELECT messages.conversation_id, messages.sequence, messages.role,
+                        messages.text, conversations.workspace_id, messages.authority
+                   FROM conversation_messages messages
+                   JOIN conversations conversations
+                     ON conversations.conversation_id = messages.conversation_id
+                  WHERE messages.message_id = ?1",
+                params![message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to check Chat projection idempotency: {error}"
+                ))
+            })?;
+        if let Some((conversation_id, sequence, role, text, workspace_id, authority)) = existing {
+            if conversation_id != completion.conversation_id
+                || workspace_id != completion.workspace_id
+                || sequence != head.message_sequence + 1
+                || role != "agent"
+                || text != result.message
+                || authority != MESSAGE_AUTHORITY_BACKEND
+            {
+                return Err(CompletionProjectionError::Rejected(
+                    "Chat projection message ID is already bound to different content.".to_string(),
+                ));
+            }
+            transaction.commit().map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to commit idempotent Chat projection: {error}"
+                ))
+            })?;
+            return Ok(());
+        }
+        let current_head = transaction
+            .query_row(
+                "SELECT messages.message_id, messages.sequence, messages.role, messages.text
+                   FROM conversations
+                   JOIN conversation_messages messages
+                     ON messages.conversation_id = conversations.conversation_id
+                  WHERE conversations.conversation_id = ?1
+                    AND conversations.workspace_id = ?2
+                  ORDER BY messages.sequence DESC LIMIT 1",
+                params![completion.conversation_id, completion.workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to validate Chat completion head: {error}"
+                ))
+            })?;
+        let Some((current_id, current_sequence, current_role, current_text)) = current_head else {
+            return Err(CompletionProjectionError::Rejected(
+                "Chat completion conversation does not belong to this workspace.".to_string(),
+            ));
+        };
+        if current_id != head.message_id
+            || current_sequence != head.message_sequence
+            || current_role != "user"
+            || current_text != head.message
+        {
+            return Err(CompletionProjectionError::Rejected(
+                "Durable Chat context changed after runtime resolution.".to_string(),
+            ));
+        }
+        let sequence = head.message_sequence + 1;
+        transaction
+            .execute(
+                "INSERT INTO conversation_messages
+                   (message_id, conversation_id, sequence, role, text, created_at, authority)
+                 VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
+                params![
+                    message_id,
+                    completion.conversation_id,
+                    sequence,
+                    result.message,
+                    now,
+                    MESSAGE_AUTHORITY_BACKEND,
+                ],
+            )
+            .map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to append Chat completion: {error}"
+                ))
+            })?;
+        transaction
+            .execute(
+                "UPDATE conversations SET updated_at = ?1
+                  WHERE conversation_id = ?2 AND workspace_id = ?3",
+                params![now, completion.conversation_id, completion.workspace_id],
+            )
+            .map_err(|error| {
+                CompletionProjectionError::Retryable(format!(
+                    "Failed to update Chat completion conversation: {error}"
+                ))
+            })?;
+        transaction.commit().map_err(|error| {
+            CompletionProjectionError::Retryable(format!(
+                "Failed to commit Chat completion projection: {error}"
+            ))
+        })?;
+        Ok(())
     }
 
     fn project_agent_task_completion(&self, completion: &StagedCompletion) -> Result<(), String> {
@@ -1789,6 +1917,7 @@ mod tests {
                 blocked_reason: None,
             }),
             terminal_state: TaskSessionState::Succeeded,
+            chat_head: None,
         };
         store
             .project_task_completion(&completion)
@@ -1841,6 +1970,7 @@ mod tests {
                 blocked_reason: None,
             }),
             terminal_state: TaskSessionState::Succeeded,
+            chat_head: None,
         };
 
         store
@@ -1893,6 +2023,11 @@ mod tests {
                 message: "Recovered assistant response".to_string(),
             }),
             terminal_state: TaskSessionState::Succeeded,
+            chat_head: Some(StagedChatHead {
+                message_id: "user-1".to_string(),
+                message_sequence: 1,
+                message: "Do the work".to_string(),
+            }),
         };
 
         store.project_task_completion(&completion).unwrap();
@@ -1916,6 +2051,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(authority, MESSAGE_AUTHORITY_BACKEND);
+    }
+
+    #[test]
+    fn chat_completion_projection_rejects_an_advanced_head() {
+        let store = projection_test_store();
+        let completion = StagedCompletion {
+            projection_id: "projection-stale-chat".to_string(),
+            session_id: TaskSessionId(3),
+            attempt_id: 4,
+            fencing_token: 5,
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            execution_run_id: String::new(),
+            output: TaskExecutionOutput::Chat(crate::domain::task_session::ChatTaskResult {
+                conversation_id: "conversation-a".to_string(),
+                message: "Answer for the old head".to_string(),
+            }),
+            terminal_state: TaskSessionState::Succeeded,
+            chat_head: Some(StagedChatHead {
+                message_id: "user-1".to_string(),
+                message_sequence: 1,
+                message: "Do the work".to_string(),
+            }),
+        };
+        store
+            .append_conversation_message(
+                "workspace-a",
+                "conversation-a",
+                "Agent",
+                &ConversationMessageInput {
+                    id: "user-2".to_string(),
+                    role: "user".to_string(),
+                    text: "Newer work".to_string(),
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .project(&completion)
+            .expect_err("stale Chat projection must be rejected");
+        assert_eq!(
+            error,
+            CompletionProjectionError::Rejected(
+                "Durable Chat context changed after runtime resolution.".to_string()
+            )
+        );
+        let messages = store
+            .load_conversation_messages("workspace-a", "conversation-a")
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|message| message.id != "projection-stale-chat:assistant"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Objective
 - Turn Spacesly into a production-grade local AI agent orchestration platform through instrumentation, observability, and hardened invariants — without broad rewrites or changing existing behavior.
-- The most recent approved commit was `75e3941 perf: optimize agent activity projection`.
+- The latest completed architecture increment is the blocked-continuation provenance fix in `f79ad2a`.
 
 ## Important Details
 - Persistent constraints: do not rewrite existing systems, change business logic, redesign unrelated UI, introduce cloud dependencies, or silently convert Resume into Retry; preserve Task Session isolation, fencing, OpenCode resume, approvals, workspace isolation, and 5-worker concurrency.
@@ -11,7 +11,7 @@
 - Full Playwright suite intermittently needs `--workers=1`; parallel runs previously timed out on unrelated specs under resource contention.
 - TTI baseline on this machine used `llvmpipe` software rendering because hardware EGL initialization failed; do not treat those TTI figures as representative hardware results.
 - Shutdown was requested and approved, but `systemctl poweroff`, `sudo -n systemctl poweroff`, and the login1 D-Bus poweroff call all failed with "Interactive authentication required" / "sudo: a password is required". This is an environment limitation, not a project issue.
-- Committed history: `75e3941 perf: optimize agent activity projection` → `c1db3ca feat: add performance diagnostics and refine agent UX` → `a35108d fix: complete agent approval resume flow` → `13453bf fix: harden agent rules and skills runtime`.
+- Relevant history: `f79ad2a fix: allow same-session continuations to supersede run projection provenance` → `75e3941 perf: optimize agent activity projection` → `c1db3ca feat: add performance diagnostics and refine agent UX` → `a35108d fix: complete agent approval resume flow` → `13453bf fix: harden agent rules and skills runtime`.
 - Worktree must remain clean; only committed changes are acceptable.
 
 ## Work State
@@ -24,17 +24,19 @@
 - Previously attempted an `initialUiPainted` deferral of background hydration; measured no TTI improvement (`6.8 s` and `17.6 s` after vs `6.1–14.2 s` before) and reverted it, keeping only the proven Activity Log optimization.
 - Earlier measured improvements for `timelineActivities`: 100-event projection p50 `4.73 ms` → `2.41–3.98 ms`; 1,000-event p50 `102.83 ms` → `21.86–27.69 ms`; 10,000-event p50 `31.34 s` → `219–276 ms`.
 - Prior regression proof passed: Svelte check, ESLint, `npm test`, `npm run check`, Rust `cargo test` 337 passed + 2 ignored, full Playwright serial suite 6 passed, and production `tauri build --no-bundle`.
+- Completed Increment 1: same-session continuation attempts may supersede prior `worker.execute` projection provenance while projections from different Task Sessions remain rejected. Integration and focused provenance tests were added; `f79ad2a` is committed.
+- Completed Increment 2: scheduler Chat completion projection now derives the immutable expected user-message head from the durable V2 Task Session envelope, compares and appends atomically in one `executions.db` transaction, and permanently terminalizes stale-head conflicts as `blocked` instead of retrying forever in `committing`.
+- Increment 2 verification: Rust `cargo test` 349 passed + 2 ignored; clippy reports only the two pre-existing warnings in `ocp/mod.rs` and `performance.rs`.
 
 ### Active
-- Architecture review is complete; the implementation plan has not yet started.
-- Recommended first increment is a P0 correctness fix: blocked Agent continuation conflicts with projection provenance in `execution_store.rs` vs `scheduler_store.rs`, which can leave sessions permanently in `committing`. Add a failing integration test against the real `ExecutionStore` before fixing.
+- Architecture implementation has completed the two P0 correctness increments. The next increment is authority hardening and execution-trace observability, scoped to preserve existing Task Session behavior.
 
 ### Blocked
 - (none)
 
 ## Next Move
-1. Implement Increment 1: write a failing integration test for blocked continuation using the real `ExecutionStore`, then correct continuation projection provenance without changing normal Task Session semantics.
-2. Follow with atomic Chat append-if-current during scheduler projection and explicit projection-failure recovery, then the other architecture-report increments (authority hardening, execution trace, context/manifest, reliability/evaluation, multi-agent prerequisites).
+1. Implement authority hardening and an execution-trace query surface without changing scheduler ownership or frontend behavior.
+2. Follow with context/manifest visibility, reliability/evaluation instrumentation, and multi-agent prerequisites.
 
 ## Relevant Files
 - `src-tauri/src/infrastructure/execution_store.rs`: step-run projection provenance; blocked continuation conflict site.

@@ -8,8 +8,8 @@ use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskMcpContext,
     TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionResult,
-    TaskSessionSnapshot, TaskSessionState, TaskToolState,
+    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2,
+    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -113,6 +113,13 @@ struct TaskOwnership {
 
 /// Durable scheduler outbox entry awaiting projection into executions.db.
 #[derive(Clone, Debug)]
+pub(crate) struct StagedChatHead {
+    pub(crate) message_id: String,
+    pub(crate) message_sequence: u64,
+    pub(crate) message: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct StagedCompletion {
     pub(crate) projection_id: String,
     pub(crate) session_id: TaskSessionId,
@@ -123,6 +130,7 @@ pub(crate) struct StagedCompletion {
     pub(crate) execution_run_id: String,
     pub(crate) output: TaskExecutionOutput,
     pub(crate) terminal_state: TaskSessionState,
+    pub(crate) chat_head: Option<StagedChatHead>,
 }
 
 impl SchedulerStore {
@@ -1892,12 +1900,18 @@ impl SchedulerStore {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
-                "SELECT projection_id, session_id, attempt_id, fencing_token, workspace_id,
-                        conversation_id, execution_run_id, terminal_state, output_json
-                   FROM scheduler_task_completions
-                   WHERE finalized_at IS NULL AND projected_at IS NULL
-                     AND next_projection_at <= ?1
-                   ORDER BY staged_at, session_id",
+                "SELECT completions.projection_id, completions.session_id,
+                        completions.attempt_id, completions.fencing_token,
+                        completions.workspace_id, completions.conversation_id,
+                        completions.execution_run_id, completions.terminal_state,
+                        completions.output_json, sessions.payload
+                   FROM scheduler_task_completions completions
+                   JOIN scheduler_task_sessions sessions
+                     ON sessions.session_id = completions.session_id
+                  WHERE completions.finalized_at IS NULL
+                    AND completions.projected_at IS NULL
+                    AND completions.next_projection_at <= ?1
+                  ORDER BY completions.staged_at, completions.session_id",
             )
             .map_err(|error| format!("Failed to prepare pending completions: {error}"))?;
         let completions = statement
@@ -1918,11 +1932,17 @@ impl SchedulerStore {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
-                "SELECT projection_id, session_id, attempt_id, fencing_token, workspace_id,
-                        conversation_id, execution_run_id, terminal_state, output_json
-                   FROM scheduler_task_completions
-                  WHERE finalized_at IS NULL AND projected_at IS NOT NULL
-                  ORDER BY staged_at, session_id",
+                "SELECT completions.projection_id, completions.session_id,
+                        completions.attempt_id, completions.fencing_token,
+                        completions.workspace_id, completions.conversation_id,
+                        completions.execution_run_id, completions.terminal_state,
+                        completions.output_json, sessions.payload
+                   FROM scheduler_task_completions completions
+                   JOIN scheduler_task_sessions sessions
+                     ON sessions.session_id = completions.session_id
+                  WHERE completions.finalized_at IS NULL
+                    AND completions.projected_at IS NOT NULL
+                  ORDER BY completions.staged_at, completions.session_id",
             )
             .map_err(|error| format!("Failed to prepare projected completions: {error}"))?;
         let completions = statement
@@ -2056,6 +2076,86 @@ impl SchedulerStore {
             .commit()
             .map_err(|error| format!("Failed to commit completion projection error: {error}"))?;
         Ok(updated == 1)
+    }
+
+    /// Permanently rejects a deterministic projection conflict and releases Task Session ownership.
+    pub(crate) fn reject_completion(
+        &self,
+        completion: &StagedCompletion,
+        error: &str,
+    ) -> Result<FinishResult, String> {
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start completion rejection: {error}"))?;
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_task_sessions
+                    SET state = 'blocked', active_attempt_id = NULL, lease_expires_at = NULL,
+                        completed_at = ?4, error = ?5
+                  WHERE session_id = ?1 AND active_attempt_id = ?2 AND fencing_token = ?3
+                    AND state = 'committing'",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?,
+                    to_i64(now)?,
+                    error,
+                ],
+            )
+            .map_err(|error| format!("Failed to reject scheduler session: {error}"))?;
+        if updated != 1 {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit stale completion rejection: {error}"))?;
+            return Ok(FinishResult::Stale);
+        }
+        transaction
+            .execute(
+                "UPDATE scheduler_task_attempts
+                    SET state = 'blocked', completed_at = ?2, error = ?3
+                  WHERE attempt_id = ?1 AND state = 'committing'",
+                params![to_i64(completion.attempt_id)?, to_i64(now)?, error],
+            )
+            .map_err(|error| format!("Failed to reject scheduler attempt: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE scheduler_task_completions
+                    SET terminal_state = 'blocked', projection_error = ?2,
+                        projection_attempt_count = projection_attempt_count + 1,
+                        finalized_at = ?3
+                  WHERE session_id = ?1 AND attempt_id = ?4 AND fencing_token = ?5
+                    AND finalized_at IS NULL",
+                params![
+                    to_i64(completion.session_id.0)?,
+                    error,
+                    to_i64(now)?,
+                    to_i64(completion.attempt_id)?,
+                    to_i64(completion.fencing_token)?,
+                ],
+            )
+            .map_err(|error| format!("Failed to finalize rejected completion: {error}"))?;
+        append_event_in_transaction(
+            &transaction,
+            completion.session_id,
+            Some(completion.attempt_id),
+            completion.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Lifecycle,
+                payload: json!({ "state": "blocked", "error": error, "action": "terminal" }),
+                progress: Some(TaskProgress {
+                    phase: "blocked".to_string(),
+                    completed: 1,
+                    total: Some(1),
+                }),
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit completion rejection: {error}"))?;
+        Ok(FinishResult::Applied)
     }
 
     pub(crate) fn mark_completion_projected(
@@ -2284,10 +2384,31 @@ struct StoredCompletion {
     execution_run_id: String,
     terminal_state: String,
     output_json: String,
+    session_payload: String,
 }
 
 impl StoredCompletion {
     fn decode(self) -> Result<StagedCompletion, String> {
+        let output: TaskExecutionOutput = serde_json::from_str(&self.output_json)
+            .map_err(|error| format!("Failed to decode staged task result: {error}"))?;
+        let chat_head = if matches!(output, TaskExecutionOutput::Chat(_)) {
+            let request = TaskRequest::with_payload("staged-chat", self.session_payload);
+            match request.envelope()? {
+                Some(TaskSessionEnvelope::V2(envelope)) => match envelope.prompt_input {
+                    TaskSessionInputV2::Chat(input) => Some(StagedChatHead {
+                        message_id: input.message_id,
+                        message_sequence: input.message_sequence,
+                        message: input.message,
+                    }),
+                    TaskSessionInputV2::Edit(_) => {
+                        return Err("Chat completion has an Edit Task Session envelope.".to_string())
+                    }
+                },
+                _ => return Err("Chat completion requires a V2 Task Session envelope.".to_string()),
+            }
+        } else {
+            None
+        };
         Ok(StagedCompletion {
             projection_id: self.projection_id,
             session_id: TaskSessionId(from_i64(self.session_id, "task session ID")?),
@@ -2296,9 +2417,9 @@ impl StoredCompletion {
             workspace_id: self.workspace_id,
             conversation_id: self.conversation_id,
             execution_run_id: self.execution_run_id,
-            output: serde_json::from_str(&self.output_json)
-                .map_err(|error| format!("Failed to decode staged task result: {error}"))?,
+            output,
             terminal_state: parse_state(&self.terminal_state)?,
+            chat_head,
         })
     }
 }
@@ -2314,6 +2435,7 @@ fn staged_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Store
         execution_run_id: row.get(6)?,
         terminal_state: row.get(7)?,
         output_json: row.get(8)?,
+        session_payload: row.get(9)?,
     })
 }
 
