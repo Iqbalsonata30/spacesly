@@ -22,16 +22,16 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls", "system-proxy"] }
-yaml-rust2 = "0.9"
+yaml-rust2 = "0.11"
 libc = "0.2"
 portable-pty = "0.9"
 wait-timeout = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
-keyring = "3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+keyring = "4"
 tokio = { version = "1", features = ["macros", "time"] }
 notify = "8"
 url = "2"
