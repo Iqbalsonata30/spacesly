@@ -609,6 +609,32 @@ assertEqual(
   true,
   "runtime recovery should explain the bounded retry",
 );
+const capabilityRepairProjection = projectAgentTaskSessionEvent(
+  {
+    id: 123,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 123,
+    kind: "runtime",
+    payload: {
+      type: "capability_repair_decision",
+      repairable: true,
+      failed_tool: "jira_get_issue",
+      connector_id: "jira",
+      allowed_alternatives: ["jira_read_issue"],
+    },
+    progress: null,
+    created_at: 123,
+  },
+  "capability-repair-123",
+  "04:30:10 AM",
+);
+assertEqual(
+  (capabilityRepairProjection.logs[0]?.message ?? "").includes("jira_read_issue"),
+  true,
+  "capability repair should expose only the bounded live alternatives",
+);
 assertEqual(
   pendingProjection.progress,
   55,

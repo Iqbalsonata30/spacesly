@@ -176,7 +176,32 @@ fn validate_proxy_request(
 ) -> Result<super::tool_broker::ToolRisk, String> {
     let risk = validate_proxy_tool_call(message, exposed_tools)?;
     validate_proxy_assignment_authority(authority, connector_id, connector_binding)?;
+    validate_proxy_repair_scope(message, authority)?;
     Ok(risk)
+}
+
+fn validate_proxy_repair_scope(
+    message: &Value,
+    authority: &ProxyAssignmentAuthority,
+) -> Result<(), String> {
+    let ProxyAssignmentAuthority::Fenced(authority) = authority else {
+        return Ok(());
+    };
+    if authority.allowed_tools.is_empty() {
+        return Ok(());
+    }
+    let tool_name = message
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "MCP tool call did not include a tool name.".to_string())?;
+    if authority.allowed_tools.iter().any(|tool| tool == tool_name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "MCP capability repair scope does not allow tool '{tool_name}'."
+        ))
+    }
 }
 
 fn validate_proxy_assignment_authority(
@@ -1961,6 +1986,18 @@ done
             &connector_binding,
         )
         .is_ok());
+
+        let mut repair_scoped = authority.clone();
+        repair_scoped.allowed_tools = vec!["jira_read_issue".to_string()];
+        let error = validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(repair_scoped),
+            "jira-a",
+            &connector_binding,
+        )
+        .expect_err("repair scope must reject a different exposed tool");
+        assert!(error.contains("capability repair scope"));
 
         let mut ungranted = authority.clone();
         ungranted.capability = "external_tools:other".to_string();

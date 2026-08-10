@@ -5,7 +5,8 @@ use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelCo
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_examination::examine_task;
 use crate::domain::task_recovery::{
-    decide_runtime_recovery, RuntimeRecoveryAction, RuntimeRecoveryContext,
+    decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
+    RuntimeRecoveryContext,
 };
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, AgentTaskObjectiveResult, AgentTaskResult, TaskExecutionOutput,
@@ -29,6 +30,8 @@ struct RuntimeAttemptObservation {
     successful_tool_calls: u32,
     successful_mutation_observed: bool,
     opencode_session_id: Option<String>,
+    failed_tool: Option<String>,
+    failed_tool_risk: Option<String>,
 }
 
 struct RuntimeCallbackGate {
@@ -79,20 +82,26 @@ fn runtime_callback(
                 if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
                     observation.successful_mutation_observed = true;
                 }
-            } else if error
-                .as_deref()
-                .is_some_and(|error| error.contains("[approval_required]"))
-            {
-                reporter
-                    .emit_event(
-                        TaskSessionEventKind::Runtime,
-                        json!({
-                            "type": "approval_requested",
-                            "operation": tool_name,
-                            "arguments_digest": arguments_digest,
-                        }),
-                    )
-                    .map_err(|error| error.to_string())?;
+            } else {
+                let mut attempt = observation.lock().map_err(|error| error.to_string())?;
+                attempt.failed_tool = Some(tool_name.clone());
+                attempt.failed_tool_risk = Some(risk.clone());
+                drop(attempt);
+                if error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("[approval_required]"))
+                {
+                    reporter
+                        .emit_event(
+                            TaskSessionEventKind::Runtime,
+                            json!({
+                                "type": "approval_requested",
+                                "operation": tool_name,
+                                "arguments_digest": arguments_digest,
+                            }),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
             }
         }
         emit_runtime_event(&reporter, event)
@@ -427,7 +436,9 @@ impl TaskExecutor for AgentTaskExecutor {
                 .with_context("task_session_id", context.session_id().0.to_string())
                 .with_context("runtime_id", runtime_attempt_id.clone());
         let mut retries_attempted = 0_u8;
+        let mut capability_repairs_attempted = 0_u8;
         let mut retry_task = resolved.task;
+        let mut retry_config = resolved.config;
         let mut terminal_recovery_action = None;
         let result = loop {
             context.ensure_current()?;
@@ -439,7 +450,7 @@ impl TaskExecutor for AgentTaskExecutor {
             let callback =
                 runtime_callback(context.event_reporter(), callback_open, observation.clone());
             let attempt_result = self.runner.execute(
-                resolved.config.clone(),
+                retry_config.clone(),
                 retry_task.clone(),
                 context.cancellation().shared_flag(),
                 callback,
@@ -469,6 +480,68 @@ impl TaskExecutor for AgentTaskExecutor {
                     cancellation_requested: context.cancellation().is_cancelled(),
                 },
             );
+            if decision.failure_class == RuntimeFailureClass::MissingCapability {
+                let repair = retry_task.task_examination.as_ref().map(|examination| {
+                    decide_capability_repair(
+                        examination,
+                        recovery_input,
+                        observation.failed_tool.as_deref().unwrap_or_default(),
+                        observation.failed_tool_risk.as_deref().unwrap_or("unknown"),
+                        capability_repairs_attempted,
+                        observation.successful_mutation_observed,
+                    )
+                });
+                if let Some(repair) = repair {
+                    context.emit_event(
+                        TaskSessionEventKind::Runtime,
+                        json!({
+                            "type": "capability_repair_decision",
+                            "schema_version": repair.schema_version,
+                            "repairable": repair.repairable,
+                            "reason": repair.reason,
+                            "failed_tool": observation.failed_tool.as_deref(),
+                            "connector_id": repair.guidance.as_ref().map(|guidance| guidance.connector_id.as_str()),
+                            "allowed_alternatives": repair.guidance.as_ref().map(|guidance| guidance.allowed_alternatives.as_slice()).unwrap_or_default(),
+                            "repairs_attempted": capability_repairs_attempted,
+                        }),
+                    )?;
+                    if repair.repairable {
+                        capability_repairs_attempted =
+                            capability_repairs_attempted.saturating_add(1);
+                        if let Some(examination) = retry_task.task_examination.as_mut() {
+                            examination.runtime_repair = repair.guidance;
+                            examination
+                                .validate(&envelope.context_digest)
+                                .map_err(TaskExecutionError::new)?;
+                            if let Some(guidance) = examination.runtime_repair.as_ref() {
+                                for server in &mut retry_config.mcp_servers {
+                                    if server.secret_id == guidance.connector_id {
+                                        if let Some(authority) = server.proxy_authority.as_mut() {
+                                            authority.allowed_tools =
+                                                guidance.allowed_alternatives.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(session_id) = observation.opencode_session_id {
+                            retry_task.opencode_session_id = Some(session_id);
+                        }
+                        context.report_progress(
+                            TaskProgress {
+                                phase: "repairing_capability_plan".to_string(),
+                                completed: u64::from(capability_repairs_attempted),
+                                total: Some(1),
+                            },
+                            json!({
+                                "runtime_attempt_id": runtime_attempt_id,
+                                "repair_number": capability_repairs_attempted,
+                            }),
+                        )?;
+                        continue;
+                    }
+                }
+            }
             context.emit_event(
                 TaskSessionEventKind::Runtime,
                 json!({
@@ -803,6 +876,8 @@ mod tests {
 
     struct UnavailableConnectorResolver;
 
+    struct CapabilityRepairResolver;
+
     impl AgentRuntimeResolver for UnavailableConnectorResolver {
         fn resolve(
             &self,
@@ -863,6 +938,41 @@ mod tests {
         }
     }
 
+    impl AgentRuntimeResolver for CapabilityRepairResolver {
+        fn resolve(
+            &self,
+            task_session_id: u64,
+            envelope: &TaskSessionEnvelopeV1,
+            runtime_attempt_id: &str,
+            retained_governance: Option<&GovernanceResolutionRecord>,
+        ) -> Result<ResolvedAgentTask, String> {
+            let mut resolved = FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: envelope.runtime_profile_id.clone(),
+            }
+            .resolve(
+                task_session_id,
+                envelope,
+                runtime_attempt_id,
+                retained_governance,
+            )?;
+            resolved.connector_capabilities = vec![
+                crate::domain::task_examination::ConnectorCapabilitySnapshot {
+                    connector_id: "jira".to_string(),
+                    status: crate::domain::task_examination::ConnectorDiscoveryStatus::Available,
+                    tools: vec![crate::domain::task_examination::DiscoveredToolCapability {
+                        name: "jira_read_issue".to_string(),
+                        risk: "read".to_string(),
+                        argument_names: vec!["issue_key".to_string()],
+                    }],
+                    error: None,
+                    warnings: Vec::new(),
+                },
+            ];
+            Ok(resolved)
+        }
+    }
+
     struct FakeRunner {
         executions: Arc<AtomicUsize>,
     }
@@ -899,6 +1009,11 @@ mod tests {
 
     struct MutationThenTransientFailureRunner {
         executions: Arc<AtomicUsize>,
+    }
+
+    struct CapabilityDriftThenCompleteRunner {
+        executions: Arc<AtomicUsize>,
+        observed_alternatives: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl AgentRuntimeRunner for ToolFailureRunner {
@@ -1007,6 +1122,61 @@ mod tests {
                 },
             })?;
             unreachable!("failed follow-up callback must terminate execution")
+        }
+    }
+
+    impl AgentRuntimeRunner for CapabilityDriftThenCompleteRunner {
+        fn execute(
+            &self,
+            config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            self.observed_alternatives
+                .lock()
+                .expect("alternatives lock")
+                .push(
+                    task.task_examination
+                        .as_ref()
+                        .and_then(|examination| examination.runtime_repair.as_ref())
+                        .map(|repair| repair.allowed_alternatives.clone())
+                        .unwrap_or_default(),
+                );
+            if execution == 0 {
+                on_event(AiWorkerStreamEvent::ToolCompleted {
+                    tool_call_id: "call-stale-tool".to_string(),
+                    tool_name: "jira_get_issue".to_string(),
+                    success: false,
+                    error: Some("unknown tool jira_get_issue".to_string()),
+                    risk: "read".to_string(),
+                    arguments_digest: "digest-stale".to_string(),
+                    display_context: ToolDisplayContext {
+                        label: "Read Jira issue".to_string(),
+                        category: "jira".to_string(),
+                        target: None,
+                    },
+                })?;
+                unreachable!("missing tool callback must terminate the first execution")
+            }
+            assert_eq!(
+                config.mcp_servers[0]
+                    .proxy_authority
+                    .as_ref()
+                    .expect("repair authority")
+                    .allowed_tools,
+                vec!["jira_read_issue"]
+            );
+            Ok(AiWorkerTaskResult {
+                summary: "Capability plan repaired".to_string(),
+                evidence: vec!["jira_read_issue returned the issue".to_string()],
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AiWorkerCompletionStatus::Completed,
+                blocked_reason: None,
+                objective_results: Vec::new(),
+            })
         }
     }
 
@@ -1972,6 +2142,60 @@ mod tests {
             .expect("recovery decision journaled");
         assert_eq!(recovery.payload["action"], "review_uncertain_outcome");
         assert_eq!(recovery.payload["successful_mutation_observed"], true);
+    }
+
+    #[test]
+    fn missing_read_tool_repairs_from_live_inventory_without_expanding_authority() {
+        let directory = tempdir().expect("temp directory");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed_alternatives = Arc::new(Mutex::new(Vec::new()));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(CapabilityRepairResolver),
+            Arc::new(CapabilityDriftThenCompleteRunner {
+                executions: executions.clone(),
+                observed_alternatives: observed_alternatives.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "capability-repair-agent",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task repairs capability plan");
+
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_alternatives
+                .lock()
+                .expect("alternatives lock")
+                .as_slice(),
+            &[Vec::<String>::new(), vec!["jira_read_issue".to_string()]]
+        );
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        let repair = events
+            .iter()
+            .find(|event| event.payload["type"] == "capability_repair_decision")
+            .expect("capability repair journaled");
+        assert_eq!(repair.payload["repairable"], true);
+        assert_eq!(repair.payload["connector_id"], "jira");
+        assert_eq!(repair.payload["allowed_alternatives"][0], "jira_read_issue");
+        assert!(events.iter().any(|event| {
+            event.kind == TaskSessionEventKind::Progress
+                && event.progress.as_ref().is_some_and(|progress| {
+                    progress.phase == "repairing_capability_plan" && progress.completed == 1
+                })
+        }));
     }
 
     #[test]

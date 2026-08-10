@@ -95,11 +95,22 @@ pub struct TaskExaminationRecord {
     pub capability_mappings: Vec<ConnectorCapabilityMapping>,
     #[serde(default)]
     pub semantic_planner: Option<SemanticPlannerEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_repair: Option<CapabilityRepairGuidance>,
     pub required_capabilities: Vec<String>,
     pub unresolved_requirements: Vec<String>,
     pub mutations: Vec<String>,
     pub approval_boundaries: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapabilityRepairGuidance {
+    pub schema_version: u32,
+    pub connector_id: String,
+    pub failed_tool: String,
+    pub allowed_alternatives: Vec<String>,
+    pub reason: String,
 }
 
 impl TaskExaminationRecord {
@@ -167,6 +178,35 @@ impl TaskExaminationRecord {
                 || planner.objective_count > 8
         }) {
             return Err("Task Examination semantic planner evidence is invalid.".to_string());
+        }
+        if self.runtime_repair.as_ref().is_some_and(|repair| {
+            repair.schema_version != 1
+                || !canonical_inventory_name(&repair.connector_id, false)
+                || !canonical_inventory_name(&repair.failed_tool, true)
+                || repair.allowed_alternatives.is_empty()
+                || repair.allowed_alternatives.len() > 5
+                || repair
+                    .allowed_alternatives
+                    .iter()
+                    .any(|tool| !canonical_inventory_name(tool, true))
+                || repair
+                    .allowed_alternatives
+                    .iter()
+                    .any(|tool| tool == &repair.failed_tool)
+                || !self.connector_capabilities.iter().any(|connector| {
+                    connector.connector_id == repair.connector_id
+                        && connector.status == ConnectorDiscoveryStatus::Available
+                        && repair.allowed_alternatives.iter().all(|alternative| {
+                            connector
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == *alternative && tool.risk == "read")
+                        })
+                })
+                || repair.reason.trim().is_empty()
+                || repair.reason.len() > 256
+        }) {
+            return Err("Task Examination runtime repair guidance is invalid.".to_string());
         }
         if self
             .connector_capabilities
@@ -369,6 +409,7 @@ pub fn examine_task(
         connector_capabilities: connector_capabilities.to_vec(),
         capability_mappings,
         semantic_planner,
+        runtime_repair: None,
         required_capabilities,
         unresolved_requirements,
         mutations: mutations.into_iter().collect(),

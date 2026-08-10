@@ -1,6 +1,11 @@
 //! Provider-neutral runtime failure classification and bounded recovery policy.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+use crate::domain::task_examination::{
+    CapabilityRepairGuidance, ConnectorDiscoveryStatus, TaskExaminationRecord,
+};
 
 /// Stable class assigned to a runtime or external-tool failure.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +50,15 @@ pub struct RuntimeRecoveryDecision {
     pub action: RuntimeRecoveryAction,
     pub retryable: bool,
     pub reason: String,
+}
+
+/// Deterministic outcome of checking whether a missing read tool has a safe live replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapabilityRepairDecision {
+    pub schema_version: u32,
+    pub repairable: bool,
+    pub reason: String,
+    pub guidance: Option<CapabilityRepairGuidance>,
 }
 
 impl RuntimeRecoveryDecision {
@@ -125,6 +139,133 @@ pub fn decide_runtime_recovery(
     }
 }
 
+/// Selects strongly similar read-only alternatives from the same authorized live connector.
+pub fn decide_capability_repair(
+    examination: &TaskExaminationRecord,
+    failure: &str,
+    failed_tool: &str,
+    failed_risk: &str,
+    repairs_attempted: u8,
+    successful_mutation_observed: bool,
+) -> CapabilityRepairDecision {
+    let blocked = |reason: &str| CapabilityRepairDecision {
+        schema_version: 1,
+        repairable: false,
+        reason: reason.to_string(),
+        guidance: None,
+    };
+    if repairs_attempted > 0 {
+        return blocked("The bounded capability repair was already attempted.");
+    }
+    let failure = failure.to_ascii_lowercase();
+    if !contains_any(
+        &failure,
+        &[
+            "tool not found",
+            "unknown tool",
+            "tool is not exposed",
+            "tool was not exposed",
+            "no such tool",
+        ],
+    ) {
+        return blocked("The failure does not prove that the MCP tool inventory drifted.");
+    }
+    if successful_mutation_observed {
+        return blocked("A successful mutation was observed before capability drift.");
+    }
+    if !matches!(
+        failed_risk.trim().to_ascii_lowercase().as_str(),
+        "read" | "low"
+    ) {
+        return blocked("Only read-only tool substitutions can be repaired automatically.");
+    }
+    let failed_tool = failed_tool.trim();
+    if failed_tool.is_empty() {
+        return blocked("The failed runtime tool was not identified.");
+    }
+
+    let mapped_connector = examination.capability_mappings.iter().find(|mapping| {
+        mapping.planned_tools.iter().any(|tool| tool == failed_tool)
+            || failed_tool
+                .to_ascii_lowercase()
+                .contains(&mapping.connector_id.to_ascii_lowercase())
+    });
+    let snapshot = mapped_connector
+        .and_then(|mapping| {
+            examination
+                .connector_capabilities
+                .iter()
+                .find(|snapshot| snapshot.connector_id == mapping.connector_id)
+        })
+        .or_else(|| {
+            let available = examination
+                .connector_capabilities
+                .iter()
+                .filter(|snapshot| snapshot.status == ConnectorDiscoveryStatus::Available)
+                .collect::<Vec<_>>();
+            (available.len() == 1).then_some(available[0])
+        });
+    let Some(snapshot) = snapshot else {
+        return blocked("The failed tool could not be bound to one authorized live connector.");
+    };
+    if snapshot.status != ConnectorDiscoveryStatus::Available {
+        return blocked("The owning connector has no live tool inventory.");
+    }
+
+    let failed_tokens = repair_tokens(failed_tool);
+    let mut alternatives = snapshot
+        .tools
+        .iter()
+        .filter(|tool| tool.name != failed_tool && tool.risk == "read")
+        .filter_map(|tool| {
+            let candidate_tokens = repair_tokens(&tool.name);
+            let score = failed_tokens.intersection(&candidate_tokens).count();
+            (score >= 2).then_some((score, tool.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    alternatives.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    alternatives.dedup_by(|left, right| left.1 == right.1);
+    let alternatives = alternatives
+        .into_iter()
+        .take(5)
+        .map(|(_, tool)| tool)
+        .collect::<Vec<_>>();
+    if alternatives.is_empty() {
+        return blocked(
+            "No strongly similar read-only replacement exists in the live connector inventory.",
+        );
+    }
+
+    let reason = "The planned read tool is unavailable; use only the strongly similar live alternatives from the same authorized connector.".to_string();
+    CapabilityRepairDecision {
+        schema_version: 1,
+        repairable: true,
+        reason: reason.clone(),
+        guidance: Some(CapabilityRepairGuidance {
+            schema_version: 1,
+            connector_id: snapshot.connector_id.clone(),
+            failed_tool: failed_tool.to_string(),
+            allowed_alternatives: alternatives,
+            reason,
+        }),
+    }
+}
+
+fn repair_tokens(value: &str) -> HashSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() > 1)
+        .map(str::to_ascii_lowercase)
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "get" | "read" | "fetch" | "find" | "list" | "search" | "tool"
+            )
+        })
+        .collect()
+}
+
 fn classify_runtime_failure(error: &str, cancellation_requested: bool) -> RuntimeFailureClass {
     if cancellation_requested {
         return RuntimeFailureClass::Cancelled;
@@ -162,6 +303,9 @@ fn classify_runtime_failure(error: &str, cancellation_requested: bool) -> Runtim
         &[
             "tool not found",
             "unknown tool",
+            "tool is not exposed",
+            "tool was not exposed",
+            "no such tool",
             "missing capability",
             "capability preflight",
             "no file/git/shell tools",
@@ -221,6 +365,9 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task_examination::{
+        ConnectorCapabilityMapping, ConnectorCapabilitySnapshot, DiscoveredToolCapability,
+    };
 
     fn context(
         retries_attempted: u8,
@@ -272,5 +419,101 @@ mod tests {
             let decision = decide_runtime_recovery(error, context(0, false));
             assert_eq!(decision.action, RuntimeRecoveryAction::AwaitOperator);
         }
+    }
+
+    #[test]
+    fn missing_read_tool_repairs_only_with_same_connector_live_alternatives() {
+        let examination = TaskExaminationRecord {
+            capability_mappings: vec![ConnectorCapabilityMapping {
+                connector_id: "confluence".to_string(),
+                planned_tools: vec!["confluence_get_page".to_string()],
+                ..Default::default()
+            }],
+            connector_capabilities: vec![ConnectorCapabilitySnapshot {
+                connector_id: "confluence".to_string(),
+                status: ConnectorDiscoveryStatus::Available,
+                tools: vec![
+                    DiscoveredToolCapability {
+                        name: "confluence_read_page".to_string(),
+                        risk: "read".to_string(),
+                        argument_names: vec!["page_id".to_string()],
+                    },
+                    DiscoveredToolCapability {
+                        name: "confluence_delete_page".to_string(),
+                        risk: "destructive".to_string(),
+                        argument_names: vec!["page_id".to_string()],
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let decision = decide_capability_repair(
+            &examination,
+            "unknown tool confluence_get_page",
+            "confluence_get_page",
+            "read",
+            0,
+            false,
+        );
+        assert!(decision.repairable);
+        assert_eq!(
+            decision
+                .guidance
+                .expect("repair guidance")
+                .allowed_alternatives,
+            vec!["confluence_read_page"]
+        );
+    }
+
+    #[test]
+    fn capability_repair_rejects_mutations_and_weak_matches() {
+        let examination = TaskExaminationRecord {
+            connector_capabilities: vec![ConnectorCapabilitySnapshot {
+                connector_id: "bamboo".to_string(),
+                status: ConnectorDiscoveryStatus::Available,
+                tools: vec![DiscoveredToolCapability {
+                    name: "bamboo_list_projects".to_string(),
+                    risk: "read".to_string(),
+                    argument_names: Vec::new(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !decide_capability_repair(
+                &examination,
+                "unknown tool bamboo_trigger_build",
+                "bamboo_trigger_build",
+                "mutation",
+                0,
+                false,
+            )
+            .repairable
+        );
+        assert!(
+            !decide_capability_repair(
+                &examination,
+                "unknown tool bamboo_get_build",
+                "bamboo_get_build",
+                "read",
+                0,
+                false,
+            )
+            .repairable
+        );
+        assert!(
+            !decide_capability_repair(
+                &examination,
+                "No connection adapters were found for the Confluence URL",
+                "bamboo_get_build",
+                "read",
+                0,
+                false,
+            )
+            .repairable
+        );
     }
 }

@@ -61,6 +61,21 @@ export function projectAgentTaskSessionEvent(
         ? `Transient ${failureClass.replaceAll("_", " ")} failure; Spacesly is retrying safely.`
         : `Runtime recovery requires attention: ${failureClass.replaceAll("_", " ")}.`;
     details.push(`- Recovery action: ${action}`, `- Recovery reason: ${reason}`);
+  } else if (event.kind === "runtime" && eventType === "capability_repair_decision") {
+    const repairable = payload.repairable === true;
+    const failedTool = typeof payload.failed_tool === "string" ? payload.failed_tool : "unknown tool";
+    const connector = typeof payload.connector_id === "string" ? payload.connector_id : "connector";
+    const alternatives = Array.isArray(payload.allowed_alternatives)
+      ? payload.allowed_alternatives.filter((tool): tool is string => typeof tool === "string")
+      : [];
+    tone = repairable ? "info" : "error";
+    summary = repairable
+      ? `Capability drift detected; Spacesly repaired ${failedTool} from the live ${connector} inventory.`
+      : `Capability drift could not be repaired safely for ${failedTool}.`;
+    details.push(
+      `- Repair status: ${repairable ? "bounded retry" : "operator review required"}`,
+      ...(alternatives.length > 0 ? [`- Allowed alternatives: ${alternatives.join(", ")}`] : []),
+    );
   }
 
   return {
