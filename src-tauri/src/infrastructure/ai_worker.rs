@@ -278,6 +278,8 @@ pub struct AiWorkerMcpServer {
 pub struct AiWorkerTask {
     pub execution_contract: Option<Value>,
     #[serde(default)]
+    pub task_examination: Option<crate::domain::task_examination::TaskExaminationRecord>,
+    #[serde(default)]
     pub session_key: Option<String>,
     /// Durable OpenCode session identity owned by the Spacesly Task Session.
     #[serde(default)]
@@ -989,7 +991,7 @@ impl<'a> ContextBuilder<'a> {
 
     fn opencode_agent_prompt(&self, task: &AiWorkerTask) -> String {
         format!(
-            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
+            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, or regenerate the workflow. Do not rediscover the repository when constraints.must_not_rediscover_repository is true; when it is false and the current step requires local work, locate the requested repository only inside the assigned workspace. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
             governance_context(self.config, true),
             execution_contract_context(task),
         )
@@ -1042,7 +1044,16 @@ fn execution_contract_context(task: &AiWorkerTask) -> String {
         runtime_inputs.remove("agent_rules_snapshot");
         runtime_inputs.remove("selected_skills_snapshot");
     }
-    serde_json::to_string_pretty(&prompt_contract).unwrap_or_else(|_| prompt_contract.to_string())
+    let contract = serde_json::to_string_pretty(&prompt_contract)
+        .unwrap_or_else(|_| prompt_contract.to_string());
+    match task.task_examination.as_ref() {
+        Some(examination) => format!(
+            "{contract}\n\nSpacesly Task Examination (derived, policy-constrained context):\n{}",
+            serde_json::to_string_pretty(examination)
+                .unwrap_or_else(|_| "Task Examination could not be encoded.".to_string())
+        ),
+        None => contract,
+    }
 }
 
 fn contract_value(task: &AiWorkerTask, path: &[&str]) -> Option<String> {
@@ -3522,6 +3533,7 @@ mod tests {
                     "selected_skills_snapshot": "Skill: Deploy safely\nSecret duplicate body"
                 }
             })),
+            task_examination: None,
             session_key: None,
             opencode_session_id: None,
         };
@@ -3656,6 +3668,7 @@ mod tests {
                 "ticket": { "title": "Update API token", "labels": [] },
                 "runtime_inputs": { "operator_notes": null }
             })),
+            task_examination: None,
             session_key: None,
             opencode_session_id: None,
         };
@@ -3690,6 +3703,7 @@ mod tests {
                 "ticket": { "title": "Update env variable in Helm template", "labels": ["deployment"] },
                 "runtime_inputs": { "operator_notes": "approval granted" }
             })),
+            task_examination: None,
             session_key: None,
             opencode_session_id: None,
         };
@@ -3702,6 +3716,7 @@ mod tests {
     fn redeploy_only_tasks_do_not_require_commit_or_push() {
         let task = AiWorkerTask {
             execution_contract: None,
+            task_examination: None,
             session_key: None,
             opencode_session_id: None,
         };
@@ -3714,6 +3729,7 @@ mod tests {
     fn non_repo_chat_task_does_not_require_push() {
         let task = AiWorkerTask {
             execution_contract: None,
+            task_examination: None,
             session_key: None,
             opencode_session_id: None,
         };

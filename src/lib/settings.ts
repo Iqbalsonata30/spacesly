@@ -25,12 +25,16 @@ export function defaultMcpIntentMetadata(
   switch (kind) {
     case "jira":
       return {
-        domains: ["jira"],
+        domains: ["jira", "confluence"],
         intentTerms: [
           "jira",
           "jira issue",
           "jql",
           "ticket",
+          "confluence",
+          "atlassian",
+          "wiki",
+          "sop",
           "deploy",
           "deployment",
           "prerelease",
@@ -593,6 +597,8 @@ function normalizeServer(value: unknown): McpServerSettings {
   const kind = normalizeKind(server.kind);
   const defaults = defaultMcpIntentMetadata(kind, String(server.name ?? "MCP Server"));
 
+  const domains = normalizeIntentList(server.domains, defaults.domains);
+  const intentTerms = normalizeIntentList(server.intentTerms, defaults.intentTerms);
   return {
     id: String(server.id ?? ""),
     name: String(server.name ?? "MCP Server"),
@@ -603,8 +609,9 @@ function normalizeServer(value: unknown): McpServerSettings {
       server.env && typeof server.env === "object" && !Array.isArray(server.env)
         ? Object.fromEntries(Object.entries(server.env).map(([key, entry]) => [key, String(entry)]))
         : {},
-    domains: normalizeIntentList(server.domains, defaults.domains),
-    intentTerms: normalizeIntentList(server.intentTerms, defaults.intentTerms),
+    domains: kind === "jira" ? [...new Set([...domains, ...defaults.domains])] : domains,
+    intentTerms:
+      kind === "jira" ? [...new Set([...intentTerms, ...defaults.intentTerms])] : intentTerms,
   };
 }
 

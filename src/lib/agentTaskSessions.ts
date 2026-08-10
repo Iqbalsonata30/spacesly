@@ -148,7 +148,10 @@ const defaultDependencies: AgentTaskSessionDependencies = {
 };
 
 /** Returns sorted connector IDs and the exact capability grant set owned by those connectors. */
-export function agentTaskCapabilities(config: AiWorkerConfig): {
+export function agentTaskCapabilities(
+  config: AiWorkerConfig,
+  includeBuiltinCapabilities = true,
+): {
   connectorIds: string[];
   capabilities: string[];
 } {
@@ -159,8 +162,46 @@ export function agentTaskCapabilities(config: AiWorkerConfig): {
   connectorIds.sort();
   return {
     connectorIds,
-    capabilities: [...BUILTIN_CAPABILITIES, ...connectorIds.map((id) => `external_tools:${id}`)],
+    capabilities: [
+      ...(includeBuiltinCapabilities ? BUILTIN_CAPABILITIES : []),
+      ...connectorIds.map((id) => `external_tools:${id}`),
+    ],
   };
+}
+
+/** External-only tasks must not expose unrelated local tools to the execution worker. */
+export function agentTaskNeedsBuiltinCapabilities(
+  contract: ExecutionContract,
+  connectorCount: number,
+): boolean {
+  if (connectorCount === 0) return true;
+  const repositoryAssigned = Boolean(
+    contract.repository.branch?.trim() || contract.repository.head_commit?.trim(),
+  );
+  return (
+    (contract.constraints.may_modify_files && repositoryAssigned) ||
+    agentTaskRequestsLocalWorkspace(contract)
+  );
+}
+
+/** Detects an explicit repository/file deliverable in an otherwise external-tool task. */
+export function agentTaskRequestsLocalWorkspace(contract: ExecutionContract): boolean {
+  const intent = normalizedIntentText(contract);
+  return [
+    "helm",
+    "values yaml",
+    "chart yaml",
+    "create file",
+    "write file",
+    "modify file",
+    "new template",
+    "similar service",
+    "source code",
+    "code change",
+    "repository",
+    "checkout",
+    "commit",
+  ].some((term) => intentIncludes(intent, term));
 }
 
 /** Selects the smallest configured external connector set matching the immutable task intent. */
@@ -183,13 +224,18 @@ export function planAgentTaskConnectors(
   ) {
     requiredDomains.add("jira");
   }
-  for (const descriptor of descriptors) {
-    if (
-      [...descriptor.domains, ...descriptor.intentTerms].some((term) =>
-        intentIncludes(intent, term),
-      )
-    ) {
-      descriptor.domains.forEach((domain) => requiredDomains.add(domain));
+  const explicitDomains = new Set(
+    descriptors.flatMap((descriptor) =>
+      descriptor.domains.filter((domain) => intentIncludes(intent, domain)),
+    ),
+  );
+  if (explicitDomains.size > 0) {
+    explicitDomains.forEach((domain) => requiredDomains.add(domain));
+  } else {
+    for (const descriptor of descriptors) {
+      if (descriptor.intentTerms.some((term) => intentIncludes(intent, term))) {
+        descriptor.domains.forEach((domain) => requiredDomains.add(domain));
+      }
     }
   }
 
@@ -267,12 +313,13 @@ function intentIncludes(intent: string, term: string): boolean {
 export async function ensureOpenCodeAgentProfile(
   config: AiWorkerConfig,
   dependencies: Partial<AgentTaskSessionDependencies> = {},
+  includeBuiltinCapabilities = true,
 ): Promise<AgentTaskProfileBinding> {
   if (config.runtime !== "opencode") {
     throw new Error("Agent Task Sessions require the OpenCode runtime.");
   }
   const deps = { ...defaultDependencies, ...dependencies };
-  const { connectorIds, capabilities } = agentTaskCapabilities(config);
+  const { connectorIds, capabilities } = agentTaskCapabilities(config, includeBuiltinCapabilities);
   const rulesRevision = `sha256:${await sha256(config.agent_rules)}`;
   const skillsRevision = `sha256:${await sha256(
     config.governance_schema_version > 0
@@ -336,9 +383,11 @@ export async function prepareAgentTaskSession(
   dependencies: Partial<AgentTaskSessionDependencies> = {},
 ): Promise<PreparedAgentTaskSession> {
   const deps = { ...defaultDependencies, ...dependencies };
+  const selectedConfig = selectAgentTaskConnectors(config, contract);
   const profile = await ensureOpenCodeAgentProfile(
-    selectAgentTaskConnectors(config, contract),
+    selectedConfig,
     deps,
+    agentTaskNeedsBuiltinCapabilities(contract, selectedConfig.mcp_servers.length),
   );
   const contextDigest = await deps.digestContract(contract);
   const conversationId = await agentConversationId(config.workspace_id, cardId);

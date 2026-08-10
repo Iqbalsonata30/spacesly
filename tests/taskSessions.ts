@@ -9,6 +9,8 @@ import {
   AgentTaskSessionApprovalRequiredError,
   AgentTaskSessionTimeoutError,
   agentTaskCandidateFromEvent,
+  agentTaskNeedsBuiltinCapabilities,
+  agentTaskRequestsLocalWorkspace,
   canonicalAgentApprovalOperation,
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
@@ -18,6 +20,7 @@ import {
   planAgentTaskConnectors,
   prepareAgentTaskSession,
   resumeAgentTaskSession,
+  selectAgentTaskConnectors,
   validateAgentTaskSessionResult,
   waitForAgentTaskSession,
   type AgentTaskSessionDependencies,
@@ -371,6 +374,11 @@ assertEqual(
   "deployment tasks should select only matching operational domains",
 );
 assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Deploy Bamboo build")).connectorIds,
+  ["bamboo"],
+  "an explicitly named connector domain should override generic deployment terms",
+);
+assertEqual(
   planAgentTaskConnectors(intentConfig, contractFor("Review PR #42")).connectorIds,
   ["bitbucket"],
   "pull-request tasks should select only the configured Bitbucket domain",
@@ -401,6 +409,92 @@ assertEqual(
     ],
   },
   "connectors and external capability grants should be sorted and match exactly",
+);
+
+const externalDeployContract: ExecutionContract = {
+  ...contract,
+  objective: { summary: "Deploy Bamboo build", success_criteria: ["deployment started"] },
+  task_context: {
+    description: "Deploy https://bamboo.example/browse/PLAN-23",
+    execution_detail: "queued",
+  },
+  ticket: { ...contract.ticket, provider: "jira", title: "Request deploy PRERELEASE" },
+  repository: { root_path: "/home/user", branch: null, head_commit: null },
+  constraints: { ...contract.constraints, may_modify_files: false },
+};
+const externalDeployConfig = selectAgentTaskConnectors(intentConfig, externalDeployContract);
+assertEqual(
+  agentTaskCapabilities(
+    externalDeployConfig,
+    agentTaskNeedsBuiltinCapabilities(
+      externalDeployContract,
+      externalDeployConfig.mcp_servers.length,
+    ),
+  ).capabilities,
+  ["external_tools:bamboo"],
+  "external-only deployments should expose selected MCP connectors without local tools",
+);
+
+const repositoryDeployContract: ExecutionContract = {
+  ...externalDeployContract,
+  repository: { root_path: "/workspace", branch: "main", head_commit: "abc" },
+  constraints: { ...externalDeployContract.constraints, may_modify_files: true },
+};
+assertEqual(
+  agentTaskNeedsBuiltinCapabilities(repositoryDeployContract, 1),
+  true,
+  "repository-backed mixed deployments should retain local tools",
+);
+
+const confluenceHelmContract: ExecutionContract = {
+  ...externalDeployContract,
+  objective: { summary: "Create a Helm template", success_criteria: ["template created"] },
+  task_context: {
+    description:
+      "Fetch https://confluence.example/spaces/NQ/pages/42/SOP and create a new Helm template using a similar service",
+    execution_detail: "queued",
+  },
+};
+const confluenceHelmConfig = selectAgentTaskConnectors(
+  {
+    ...intentConfig,
+    mcp_servers: [
+      ...intentConfig.mcp_servers,
+      {
+        name: "Confluence",
+        secret_id: "confluence",
+        command: ["confluence"],
+        domains: ["confluence"],
+        intent_terms: ["confluence", "sop", "documentation"],
+      },
+    ],
+  },
+  confluenceHelmContract,
+);
+assertEqual(
+  {
+    connectors: confluenceHelmConfig.mcp_servers.map((server) => server.secret_id),
+    localRequested: agentTaskRequestsLocalWorkspace(confluenceHelmContract),
+    capabilities: agentTaskCapabilities(
+      confluenceHelmConfig,
+      agentTaskNeedsBuiltinCapabilities(
+        confluenceHelmContract,
+        confluenceHelmConfig.mcp_servers.length,
+      ),
+    ).capabilities,
+  },
+  {
+    connectors: ["confluence"],
+    localRequested: true,
+    capabilities: [
+      "workspace_read",
+      "workspace_write",
+      "shell",
+      "git",
+      "external_tools:confluence",
+    ],
+  },
+  "Confluence-backed Helm tasks should receive both documentation and local repository tools",
 );
 
 const savedProfiles: AgentRuntimeProfile[] = [];
@@ -491,6 +585,15 @@ const preparedAgain = await prepareAgentTaskSession(
   9,
   preparationDependencies,
 );
+const preparedExternalDeploy = await prepareAgentTaskSession(
+  intentConfig,
+  "card-deploy",
+  "Deploy Bamboo build",
+  "run-deploy",
+  externalDeployContract,
+  9,
+  preparationDependencies,
+);
 assertEqual(
   {
     schema: prepared.envelope.schema_version,
@@ -511,6 +614,17 @@ assertEqual(
     selectedConnectors: [],
   },
   "V1 envelope and durable context should be deterministic per card and contract",
+);
+assertEqual(
+  {
+    connectors: preparedExternalDeploy.envelope.session.connector_ids,
+    capabilities: preparedExternalDeploy.grantedCapabilities,
+  },
+  {
+    connectors: ["bamboo"],
+    capabilities: ["external_tools:bamboo"],
+  },
+  "prepared external deployments should grant MCP connectors without workspace tools",
 );
 
 const candidateEvent = {

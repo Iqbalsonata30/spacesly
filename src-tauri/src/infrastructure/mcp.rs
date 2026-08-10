@@ -14,12 +14,17 @@ use super::jira_rest;
 use super::scheduler_store::{ExternalAssignmentAuthority, SchedulerStore};
 use super::shell_env::inject_shell_env;
 use super::tool_broker::ToolBroker;
+use crate::domain::task_examination::{
+    ConnectorCapabilitySnapshot, ConnectorDiscoveryStatus, DiscoveredToolCapability,
+};
 
 const MCP_STDERR_LIMIT: usize = 64 * 1024;
 const MCP_MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
 const MCP_HEADER_LINE_LIMIT: usize = 8 * 1024;
 const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MCP_MAX_SESSIONS: usize = 8;
+const MCP_CAPABILITY_TOOL_LIMIT: usize = 128;
+const MCP_CAPABILITY_ARGUMENT_LIMIT: usize = 64;
 const MCP_PROXY_COMMAND_ENV: &str = "SPACESLY_MCP_PROXY_COMMAND";
 pub(crate) const MCP_PROXY_AUTHORITY_ENV: &str = "SPACESLY_MCP_PROXY_AUTHORITY";
 pub(crate) const MCP_PROXY_AUTHORITY_MODE_ENV: &str = "SPACESLY_MCP_PROXY_AUTHORITY_MODE";
@@ -354,6 +359,118 @@ pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatu
             tool_metadata,
         })
     })
+}
+
+/// Discovers a bounded, secret-free operation inventory for one resolved Agent connector.
+pub fn discover_mcp_capability_snapshot(
+    connector_id: &str,
+    command: &[String],
+    environment: &HashMap<String, String>,
+) -> ConnectorCapabilitySnapshot {
+    let Some((executable, args)) = command.split_first() else {
+        return unavailable_capability_snapshot(connector_id, "MCP connector command is empty.");
+    };
+    let server = McpServerConfig {
+        command: executable.clone(),
+        args: args.to_vec(),
+        env: environment.clone(),
+        scope_id: Some(format!("agent-capability:{connector_id}")),
+        secret_id: Some(connector_id.to_string()),
+    };
+    let discovery = test_mcp_connection(server.clone());
+    // The OpenCode worker creates its own fenced proxy process. Do not retain a second direct
+    // connector process after read-only preflight discovery.
+    let _ = close_mcp_session(server);
+    match discovery {
+        Ok(status) => {
+            let discovered_count = status.tool_metadata.len();
+            let mut warnings = Vec::new();
+            let mut tools = status
+                .tool_metadata
+                .into_iter()
+                .filter_map(|tool| {
+                    let name = tool.name.trim();
+                    if !canonical_capability_name(name) {
+                        return None;
+                    }
+                    let mut argument_names = tool
+                        .input_schema
+                        .as_ref()
+                        .and_then(|schema| schema.get("properties"))
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(|properties| properties.keys())
+                        .filter(|name| canonical_capability_name(name))
+                        .take(MCP_CAPABILITY_ARGUMENT_LIMIT)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    argument_names.sort();
+                    Some(DiscoveredToolCapability {
+                        name: name.to_string(),
+                        risk: ToolBroker::risk_for_tool(name).as_str().to_string(),
+                        argument_names,
+                    })
+                })
+                .take(MCP_CAPABILITY_TOOL_LIMIT)
+                .collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            if tools.len() < discovered_count {
+                warnings.push(format!(
+                    "Connector '{connector_id}' exposed tools that were invalid or exceeded the bounded inventory limit."
+                ));
+            }
+            if tools.is_empty() {
+                return unavailable_capability_snapshot(
+                    connector_id,
+                    "MCP connector exposed no canonical tools.",
+                );
+            }
+            ConnectorCapabilitySnapshot {
+                connector_id: connector_id.to_string(),
+                status: ConnectorDiscoveryStatus::Available,
+                tools,
+                error: None,
+                warnings,
+            }
+        }
+        Err(error) => {
+            unavailable_capability_snapshot(connector_id, capability_discovery_error(&error))
+        }
+    }
+}
+
+fn unavailable_capability_snapshot(
+    connector_id: &str,
+    error: impl Into<String>,
+) -> ConnectorCapabilitySnapshot {
+    ConnectorCapabilitySnapshot {
+        connector_id: connector_id.to_string(),
+        status: ConnectorDiscoveryStatus::Unavailable,
+        tools: Vec::new(),
+        error: Some(error.into()),
+        warnings: Vec::new(),
+    }
+}
+
+fn capability_discovery_error(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") {
+        "Timed out while discovering MCP tools."
+    } else if normalized.contains("not found") {
+        "MCP connector command was not found."
+    } else if normalized.contains("exposed no tools") {
+        "MCP connector exposed no tools."
+    } else {
+        "MCP tools/list discovery failed."
+    }
+}
+
+fn canonical_capability_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
+        })
 }
 
 /// Request sent by the UI when syncing Jira through an MCP server.
@@ -1521,6 +1638,47 @@ fn text_value(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_secret_free_capabilities_for_unknown_connector() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"future_search","description":"token-do-not-retain","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}},{"name":"future_trigger","inputSchema":{"type":"object","properties":{"item_id":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let connector_id = format!("future-system-{}", request_seed());
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let environment = HashMap::new();
+        let snapshot = discover_mcp_capability_snapshot(&connector_id, &command, &environment);
+
+        assert_eq!(snapshot.status, ConnectorDiscoveryStatus::Available);
+        assert_eq!(snapshot.tools.len(), 2);
+        assert_eq!(snapshot.tools[0].name, "future_search");
+        assert_eq!(snapshot.tools[0].risk, "read");
+        assert_eq!(snapshot.tools[0].argument_names, vec!["query"]);
+        assert_eq!(snapshot.tools[1].risk, "mutation");
+        assert!(!serde_json::to_string(&snapshot)
+            .expect("snapshot JSON")
+            .contains("do-not-retain"));
+
+        close_mcp_session(McpServerConfig {
+            command: command[0].clone(),
+            args: command[1..].to_vec(),
+            env: environment,
+            scope_id: Some(format!("agent-capability:{connector_id}")),
+            secret_id: Some(connector_id),
+        })
+        .expect("capability session closes");
+    }
 
     #[cfg(unix)]
     #[test]

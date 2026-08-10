@@ -87,7 +87,7 @@ export interface ExecutionContract {
     must_not_read_jira_for_planning: true;
     must_not_classify_ticket: true;
     must_not_regenerate_workflow: true;
-    must_not_rediscover_repository: true;
+    must_not_rediscover_repository: boolean;
     may_modify_files: boolean;
     may_update_jira: boolean;
   };

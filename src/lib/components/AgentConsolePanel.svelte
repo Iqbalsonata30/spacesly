@@ -1133,6 +1133,76 @@
                   </dl>
                 </section>
 
+                <section class="context-section" aria-label="Task examination">
+                  <div class="context-section-heading"><strong>Task examination</strong></div>
+                  <dl class="manifest-grid">
+                    <div>
+                      <dt>Readiness</dt>
+                      <dd>{executionManifest.task_examination.status}</dd>
+                    </div>
+                    <div>
+                      <dt>Objectives</dt>
+                      <dd>{executionManifest.task_examination.objectives.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Resources</dt>
+                      <dd>{executionManifest.task_examination.resources.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Required capabilities</dt>
+                      <dd>{executionManifest.task_examination.required_capabilities.length}</dd>
+                    </div>
+                    <div>
+                      <dt>Live MCP connectors</dt>
+                      <dd>
+                        {executionManifest.task_examination.connector_capabilities.filter(
+                          (connector) => connector.status === "available",
+                        ).length}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Discovered MCP tools</dt>
+                      <dd>
+                        {executionManifest.task_examination.connector_capabilities.reduce(
+                          (total, connector) => total + connector.tools.length,
+                          0,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Mutations</dt>
+                      <dd>
+                        {executionManifest.task_examination.mutations.join(", ") || "None"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Approval boundaries</dt>
+                      <dd>
+                        {executionManifest.task_examination.approval_boundaries.join(", ") ||
+                          "None"}
+                      </dd>
+                    </div>
+                  </dl>
+                  {#if executionManifest.task_examination.unresolved_requirements.length > 0}
+                    <ul class="manifest-unknowns">
+                      {#each executionManifest.task_examination.unresolved_requirements as requirement (requirement)}
+                        <li>{requirement}</li>
+                      {/each}
+                    </ul>
+                  {/if}
+                  {#if executionManifest.task_examination.connector_capabilities.length > 0}
+                    <ul class="manifest-unknowns">
+                      {#each executionManifest.task_examination.connector_capabilities as connector (connector.connector_id)}
+                        <li>
+                          {connector.connector_id}: {connector.status} ({connector.tools.length} tools){connector.error
+                            ? ` — ${connector.error}`
+                            : ""}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </section>
+
                 <section class="context-section" aria-label="Manifest unknown fields">
                   <div class="context-section-heading"><strong>Not captured</strong></div>
                   <ul class="manifest-unknowns">

@@ -139,6 +139,7 @@
     AgentTaskSessionApprovalRequiredError,
     AgentTaskSessionTimeoutError,
     agentEnvelopeFromSnapshot,
+    agentTaskRequestsLocalWorkspace,
     canonicalAgentApprovalOperation,
     executionRepositoryContext,
     continueAgentTaskSession,
@@ -6536,7 +6537,7 @@
       },
     ];
 
-    return {
+    const contract: ExecutionContract = {
       contract_id: `contract-${runId}`,
       version: 1,
       task_id: card.id,
@@ -6578,7 +6579,7 @@
         must_not_classify_ticket: true,
         must_not_regenerate_workflow: true,
         must_not_rediscover_repository: true,
-        may_modify_files: true,
+        may_modify_files: false,
         may_update_jira: false,
       },
       runtime_inputs: {
@@ -6586,6 +6587,12 @@
         previous_output: previousOutput,
       },
     };
+    const repositoryAssigned = Boolean(repository.branch || repository.head_commit);
+    const localWorkspaceRequired = agentTaskRequestsLocalWorkspace(contract);
+    contract.constraints.may_modify_files = repositoryAssigned || localWorkspaceRequired;
+    contract.constraints.must_not_rediscover_repository =
+      repositoryAssigned || !localWorkspaceRequired;
+    return contract;
   }
 
   function createExecutionRun(runId: string, contract: ExecutionContract): ExecutionRun {

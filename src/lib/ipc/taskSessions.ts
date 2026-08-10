@@ -382,6 +382,57 @@ export type TaskExecutionManifest = {
   skills_revision: string | null;
   rules: TaskGovernanceResolution["rules"]["entries"];
   rules_digest: string;
+  rule_facts: {
+    schema_version: number;
+    compiler_version: string;
+    source_digest: string;
+    repositories: Array<{
+      id: string;
+      remote_url: string;
+      local_path: string | null;
+      backend_path: string | null;
+      frontend_path: string | null;
+    }>;
+    protected_branches: Array<{
+      branches: string[];
+      operations: string[];
+      approval_required: boolean;
+    }>;
+    deployment_targets: Array<{
+      label: string;
+      target: string;
+      branch: string;
+      namespace: string;
+    }>;
+    warnings: string[];
+  };
+  task_examination: {
+    schema_version: number;
+    examiner_version: string;
+    contract_digest: string;
+    status: "ready" | "blocked";
+    objectives: string[];
+    resources: Array<{ kind: string; value: string; source: string }>;
+    capability_catalog: Array<{
+      capability: string;
+      provider: string;
+      connector_id: string | null;
+      discovery: string;
+      granted: boolean;
+    }>;
+    connector_capabilities: Array<{
+      connector_id: string;
+      status: "declared" | "available" | "unavailable";
+      tools: Array<{ name: string; risk: string; argument_names: string[] }>;
+      error: string | null;
+      warnings: string[];
+    }>;
+    required_capabilities: string[];
+    unresolved_requirements: string[];
+    mutations: string[];
+    approval_boundaries: string[];
+    warnings: string[];
+  };
   skills_catalog_revision: string | null;
   skills: TaskGovernanceResolution["skills"]["entries"];
   connectors: TaskMcpConnectorContext[];

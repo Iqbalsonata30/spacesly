@@ -130,7 +130,7 @@ export async function ocpPreflight(params: {
   /** Optional per-stage timeout overrides in seconds. Omit to use defaults. */
   timeout_policy?: OcpTimeoutPolicy | null;
 }): Promise<PreflightReport> {
-  return invokeWithPolicy<PreflightReport>("ocp_preflight", params, IPC_POLICIES.secret);
+  return invokeWithPolicy<PreflightReport>("ocp_preflight", params, IPC_POLICIES.ocpPreflight);
 }
 
 /** Get the current connector status (config, last-known-good, breaker, audit). */

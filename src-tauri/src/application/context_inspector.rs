@@ -606,6 +606,7 @@ mod tests {
                     precedence: 0,
                     digest: "safe-entry-digest".to_string(),
                 }],
+                facts: Default::default(),
                 snapshot: secret.to_string(),
             },
             skills: SkillResolutionRecord {

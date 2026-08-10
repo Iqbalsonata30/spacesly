@@ -4,6 +4,7 @@ use crate::domain::task_session::TaskSessionEnvelopeV1;
 use crate::infrastructure::ai_worker::{AiWorkerConfig, AiWorkerMcpServer, AiWorkerTask};
 use crate::infrastructure::execution_store::{ChatConversationSnapshot, ExecutionStore};
 use crate::infrastructure::files::WorkspaceRoot;
+use crate::infrastructure::mcp::discover_mcp_capability_snapshot;
 use crate::infrastructure::ocp;
 use crate::infrastructure::provider_registry;
 use crate::infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
@@ -283,17 +284,62 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             }
         }
 
+        let connector_capabilities = discover_connector_capabilities(&runtime.config.mcp_servers);
+
         Ok(ResolvedAgentTask {
             runtime_profile_id: runtime.runtime_profile_id,
             config: runtime.config,
             governance,
+            connector_capabilities,
             task: AiWorkerTask {
                 execution_contract: Some(run.contract),
+                task_examination: None,
                 session_key: Some(runtime_attempt_id.to_string()),
                 opencode_session_id: None,
             },
         })
     }
+}
+
+fn discover_connector_capabilities(
+    servers: &[AiWorkerMcpServer],
+) -> Vec<crate::domain::task_examination::ConnectorCapabilitySnapshot> {
+    let mut snapshots = Vec::with_capacity(servers.len());
+    for chunk in servers.chunks(8) {
+        let discovered = std::thread::scope(|scope| {
+            chunk
+                .iter()
+                .map(|server| {
+                    (
+                        server.secret_id.clone(),
+                        scope.spawn(|| {
+                            discover_mcp_capability_snapshot(
+                                &server.secret_id,
+                                &server.command,
+                                &server.environment,
+                            )
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(connector_id, handle)| {
+                    handle.join().unwrap_or_else(|_| {
+                        crate::domain::task_examination::ConnectorCapabilitySnapshot {
+                            connector_id,
+                            status: crate::domain::task_examination::ConnectorDiscoveryStatus::Unavailable,
+                            tools: Vec::new(),
+                            error: Some("MCP capability discovery panicked.".to_string()),
+                            warnings: Vec::new(),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        snapshots.extend(discovered);
+    }
+    snapshots.sort_by(|left, right| left.connector_id.cmp(&right.connector_id));
+    snapshots
 }
 
 fn validate_profile_binding(

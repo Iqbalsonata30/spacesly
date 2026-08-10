@@ -1,6 +1,7 @@
 //! Durable, backend-authoritative Rules and Skills resolution for Agent Task Sessions.
 
 use crate::infrastructure::runtime_profile_store::{content_revision, AgentRuntimeProfile};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -8,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 1;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v1";
 const MAX_SELECTED_SKILLS: usize = 16;
 const MAX_SELECTED_SKILL_BYTES: usize = 32 * 1024;
 
@@ -73,11 +76,48 @@ pub struct RuleResolutionEntry {
     pub digest: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryRuleFact {
+    pub id: String,
+    pub remote_url: String,
+    pub local_path: Option<String>,
+    pub backend_path: Option<String>,
+    pub frontend_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProtectedBranchRulePolicy {
+    pub branches: Vec<String>,
+    pub operations: Vec<String>,
+    pub approval_required: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeploymentTargetRuleFact {
+    pub label: String,
+    pub target: String,
+    pub branch: String,
+    pub namespace: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuleFactsRecord {
+    pub schema_version: u32,
+    pub compiler_version: String,
+    pub source_digest: String,
+    pub repositories: Vec<RepositoryRuleFact>,
+    pub protected_branches: Vec<ProtectedBranchRulePolicy>,
+    pub deployment_targets: Vec<DeploymentTargetRuleFact>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RulesResolutionRecord {
     pub normalization_version: String,
     pub final_digest: String,
     pub entries: Vec<RuleResolutionEntry>,
+    #[serde(default)]
+    pub facts: RuleFactsRecord,
     /// Exact normalized user Rules injected below platform instructions.
     pub snapshot: String,
 }
@@ -102,6 +142,25 @@ impl GovernanceResolutionRecord {
         }
         if self.rules.final_digest != content_revision(&self.rules.snapshot) {
             return Err("Governance Rules snapshot digest is invalid.".to_string());
+        }
+        if self.status == GovernanceResolutionStatus::Authoritative {
+            // Schema 0 is the serde default for retained v1 governance snapshots created before
+            // Rule facts existed. They remain valid and immutable; new resolutions always emit v1.
+            if self.rules.facts.schema_version != 0 {
+                if self.rules.facts.schema_version != RULE_FACTS_SCHEMA_VERSION
+                    || self.rules.facts.compiler_version != RULE_FACTS_COMPILER_VERSION
+                    || self.rules.facts.source_digest != self.rules.final_digest
+                {
+                    return Err("Governance Rule facts are stale or unsupported.".to_string());
+                }
+            }
+            if self.rules.facts.repositories.len() > 32
+                || self.rules.facts.protected_branches.len() > 32
+                || self.rules.facts.deployment_targets.len() > 64
+                || self.rules.facts.warnings.len() > 32
+            {
+                return Err("Governance Rule facts exceed bounded limits.".to_string());
+            }
         }
         if self.status == GovernanceResolutionStatus::Authoritative
             && self.rules.normalization_version != RULES_NORMALIZATION_VERSION
@@ -263,8 +322,146 @@ fn resolve_rules(profile: &AgentRuntimeProfile) -> Result<RulesResolutionRecord,
         normalization_version: RULES_NORMALIZATION_VERSION.to_string(),
         final_digest,
         entries,
+        facts: compile_rule_facts(&snapshot),
         snapshot,
     })
+}
+
+pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
+    let source_digest = content_revision(snapshot);
+    let url_pattern = Regex::new(r#"https?://[^\s`<>\"']+"#).expect("valid URL regex");
+    let backend_pattern = Regex::new(r"(?i)backend helm templates.*?folder\s+([^\s,]+)")
+        .expect("valid backend path regex");
+    let frontend_pattern = Regex::new(r"(?i)frontend helm templates.*?folder\s+([^\s,]+)")
+        .expect("valid frontend path regex");
+    let local_pattern = Regex::new(r"(?i)local (?:checkout|repository|repo).*?(/[^\s`]+)")
+        .expect("valid local path regex");
+    let protected_pattern = Regex::new(r"(?i)modify on\s+([a-z0-9_, -]+?)\s+must ask approval")
+        .expect("valid protected branch regex");
+
+    let mut remote_urls = Vec::new();
+    let mut local_path = None;
+    let mut backend_path = None;
+    let mut frontend_path = None;
+    let mut protected_branches = Vec::new();
+    let mut deployment_targets = Vec::new();
+
+    for line in snapshot.lines() {
+        for matched in url_pattern.find_iter(line) {
+            let url = matched
+                .as_str()
+                .trim_end_matches(|character: char| matches!(character, '.' | ',' | ')' | ']'))
+                .to_string();
+            if url.contains("/repos/") && !remote_urls.contains(&url) {
+                remote_urls.push(url);
+            }
+        }
+        if local_path.is_none() {
+            local_path = local_pattern
+                .captures(line)
+                .and_then(|captures| captures.get(1))
+                .map(|value| clean_rule_path(value.as_str()));
+        }
+        if backend_path.is_none() {
+            backend_path = backend_pattern
+                .captures(line)
+                .and_then(|captures| captures.get(1))
+                .map(|value| clean_rule_path(value.as_str()));
+        }
+        if frontend_path.is_none() {
+            frontend_path = frontend_pattern
+                .captures(line)
+                .and_then(|captures| captures.get(1))
+                .map(|value| clean_rule_path(value.as_str()));
+        }
+        if let Some(value) = protected_pattern
+            .captures(line)
+            .and_then(|captures| captures.get(1))
+        {
+            protected_branches.extend(
+                value
+                    .as_str()
+                    .split(',')
+                    .map(|branch| branch.trim().trim_matches('`').to_lowercase())
+                    .filter(|branch| !branch.is_empty()),
+            );
+        }
+        if line.trim_start().starts_with('|') {
+            let cells = line
+                .split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>();
+            if cells.len() >= 4
+                && cells[0].starts_with("NQLA_")
+                && !cells.iter().any(|cell| cell.chars().all(|c| c == '-'))
+            {
+                deployment_targets.push(DeploymentTargetRuleFact {
+                    label: cells[0].to_string(),
+                    target: cells[1].to_string(),
+                    branch: cells[2].to_string(),
+                    namespace: cells[3].to_string(),
+                });
+            }
+        }
+    }
+    protected_branches.sort();
+    protected_branches.dedup();
+    deployment_targets.sort_by(|left, right| left.label.cmp(&right.label));
+    deployment_targets.dedup_by(|left, right| left.label == right.label);
+
+    let repositories = remote_urls
+        .into_iter()
+        .map(|remote_url| RepositoryRuleFact {
+            id: remote_url
+                .split("/repos/")
+                .nth(1)
+                .unwrap_or("repository")
+                .trim_matches('/')
+                .to_string(),
+            remote_url,
+            local_path: local_path.clone(),
+            backend_path: backend_path.clone(),
+            frontend_path: frontend_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if !repositories.is_empty() && local_path.is_none() {
+        warnings.push(
+            "Repository remote was compiled, but Rules do not declare a local checkout path."
+                .to_string(),
+        );
+    }
+    RuleFactsRecord {
+        schema_version: RULE_FACTS_SCHEMA_VERSION,
+        compiler_version: RULE_FACTS_COMPILER_VERSION.to_string(),
+        source_digest,
+        repositories,
+        protected_branches: if protected_branches.is_empty() {
+            Vec::new()
+        } else {
+            vec![ProtectedBranchRulePolicy {
+                branches: protected_branches,
+                operations: vec![
+                    "modify".to_string(),
+                    "stage".to_string(),
+                    "commit".to_string(),
+                    "push".to_string(),
+                ],
+                approval_required: true,
+            }]
+        },
+        deployment_targets,
+        warnings,
+    }
+}
+
+fn clean_rule_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character: char| matches!(character, '`' | '.' | ',' | ')' | ']'))
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn resolve_skills(
@@ -431,6 +628,7 @@ fn legacy_resolution(
             normalization_version: "legacy_unavailable".to_string(),
             final_digest: content_revision(&rules),
             entries: Vec::new(),
+            facts: compile_rule_facts(&rules),
             snapshot: rules,
         },
         skills: SkillResolutionRecord {
@@ -799,6 +997,59 @@ mod tests {
             first.rules.normalization_version,
             RULES_NORMALIZATION_VERSION
         );
+        assert_eq!(first.rules.facts.source_digest, first.rules.final_digest);
+        assert_eq!(first.rules.facts.schema_version, RULE_FACTS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rule_compiler_extracts_helm_repository_policy_and_environment_facts() {
+        let rules = r#"
+## Helm Repository
+1. Local checkout: `/home/user/BRI/qcash-deployment`
+2. Helm Repository is at Bitbucket repo https://bitbucket.example/projects/OPS/repos/qcash-deployment
+3. Backend helm templates are at folder service/, dan frontend helm templates are at folder frontend/
+4. Modify on master,eks-green,drc,cloud must ask approval
+
+| Jira Label | Environment | Git Branch | OpenShift Namespace |
+|------------|-------------|------------|---------------------|
+| NQLA_PRESTAGE | prerelease | prerelease | qcash-prerelease |
+| NQLA_DEV | dev | dev | bricams |
+"#;
+        let facts = compile_rule_facts(rules);
+        assert_eq!(facts.schema_version, RULE_FACTS_SCHEMA_VERSION);
+        assert_eq!(facts.compiler_version, RULE_FACTS_COMPILER_VERSION);
+        assert_eq!(facts.repositories.len(), 1);
+        assert_eq!(facts.repositories[0].id, "qcash-deployment");
+        assert_eq!(
+            facts.repositories[0].local_path.as_deref(),
+            Some("/home/user/BRI/qcash-deployment")
+        );
+        assert_eq!(
+            facts.repositories[0].backend_path.as_deref(),
+            Some("service")
+        );
+        assert_eq!(
+            facts.repositories[0].frontend_path.as_deref(),
+            Some("frontend")
+        );
+        assert_eq!(
+            facts.protected_branches[0].branches,
+            vec!["cloud", "drc", "eks-green", "master"]
+        );
+        assert!(facts.protected_branches[0].approval_required);
+        assert_eq!(facts.deployment_targets[0].label, "NQLA_DEV");
+        assert_eq!(facts.deployment_targets[0].target, "dev");
+        assert_eq!(facts.deployment_targets[1].label, "NQLA_PRESTAGE");
+        assert!(facts.warnings.is_empty());
+    }
+
+    #[test]
+    fn rule_compiler_warns_when_remote_repository_has_no_local_checkout() {
+        let facts = compile_rule_facts(
+            "Helm Repository is https://bitbucket.example/projects/OPS/repos/qcash-deployment",
+        );
+        assert_eq!(facts.repositories.len(), 1);
+        assert_eq!(facts.warnings.len(), 1);
     }
 
     #[test]
@@ -817,6 +1068,16 @@ mod tests {
             .validate_for(5)
             .expect("retained snapshot remains authoritative after settings change");
         assert_eq!(resolution.skills.selected_skill_ids, vec!["kubernetes"]);
+    }
+
+    #[test]
+    fn retained_pre_facts_governance_snapshot_remains_valid() {
+        let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
+            .expect("governance resolves");
+        resolution.rules.facts = RuleFactsRecord::default();
+        resolution
+            .validate_for(5)
+            .expect("pre-facts retained governance remains compatible");
     }
 
     #[test]

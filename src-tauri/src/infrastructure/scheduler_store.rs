@@ -5664,6 +5664,8 @@ mod tests {
             skills_revision: Some("skills-1".to_string()),
             rules: vec![],
             rules_digest: "sha256:rules".to_string(),
+            rule_facts: Default::default(),
+            task_examination: Default::default(),
             skills_catalog_revision: Some("sha256:skills".to_string()),
             skills: vec![],
             connectors: vec![TaskMcpConnectorContext {

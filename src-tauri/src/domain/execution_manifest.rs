@@ -1,6 +1,7 @@
 //! Durable, secret-free evidence describing one Task Session execution attempt.
 
-use crate::domain::governance::{RuleResolutionEntry, SkillResolutionEntry};
+use crate::domain::governance::{RuleFactsRecord, RuleResolutionEntry, SkillResolutionEntry};
+use crate::domain::task_examination::TaskExaminationRecord;
 use crate::domain::task_session::{TaskMcpConnectorContext, TaskSessionId, TaskSessionKind};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,10 @@ pub struct ExecutionManifestDraft {
     pub skills_revision: Option<String>,
     pub rules: Vec<RuleResolutionEntry>,
     pub rules_digest: String,
+    #[serde(default)]
+    pub rule_facts: RuleFactsRecord,
+    #[serde(default)]
+    pub task_examination: TaskExaminationRecord,
     pub skills_catalog_revision: Option<String>,
     pub skills: Vec<SkillResolutionEntry>,
     pub connectors: Vec<TaskMcpConnectorContext>,
@@ -96,6 +101,9 @@ impl ExecutionManifest {
         {
             return Err("Execution Manifest metadata exceeds its bounded limits.".to_string());
         }
+        self.execution
+            .task_examination
+            .validate(&self.execution.context_digest)?;
         Ok(())
     }
 }

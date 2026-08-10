@@ -3,6 +3,7 @@ use super::execution_engine::{
 };
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
 use crate::domain::governance::GovernanceResolutionRecord;
+use crate::domain::task_examination::examine_task;
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskMcpConnectorContext,
     TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind,
@@ -36,6 +37,7 @@ pub struct ResolvedAgentTask {
     pub config: AiWorkerConfig,
     pub task: AiWorkerTask,
     pub governance: GovernanceResolutionRecord,
+    pub connector_capabilities: Vec<crate::domain::task_examination::ConnectorCapabilitySnapshot>,
 }
 
 /// Backend authority that resolves profiles, contracts, secrets, and trusted workspace paths.
@@ -205,6 +207,58 @@ impl TaskExecutor for AgentTaskExecutor {
                 }
             })
             .collect::<Vec<_>>();
+        let examination = examine_task(
+            resolved
+                .task
+                .execution_contract
+                .as_ref()
+                .expect("validated execution contract"),
+            &envelope.context_digest,
+            &envelope,
+            &granted_capabilities,
+            &resolved.governance.rules.facts,
+            &resolved.connector_capabilities,
+        );
+        examination
+            .validate(&envelope.context_digest)
+            .map_err(TaskExecutionError::new)?;
+        context.emit_event(
+            TaskSessionEventKind::Runtime,
+            json!({
+                "type": "task_examined",
+                "status": examination.status,
+                "objective_count": examination.objectives.len(),
+                "resource_count": examination.resources.len(),
+                "required_capability_count": examination.required_capabilities.len(),
+                "unresolved_requirement_count": examination.unresolved_requirements.len(),
+                "approval_boundary_count": examination.approval_boundaries.len(),
+                "live_connector_count": examination.connector_capabilities.iter()
+                    .filter(|connector| connector.status == crate::domain::task_examination::ConnectorDiscoveryStatus::Available)
+                    .count(),
+                "discovered_tool_count": examination.connector_capabilities.iter()
+                    .map(|connector| connector.tools.len())
+                    .sum::<usize>(),
+            }),
+        )?;
+        let connector_preflight_blockers = examination
+            .connector_capabilities
+            .iter()
+            .filter(|connector| {
+                connector.status
+                    == crate::domain::task_examination::ConnectorDiscoveryStatus::Unavailable
+            })
+            .map(|connector| {
+                format!(
+                    "{}: {}",
+                    connector.connector_id,
+                    connector
+                        .error
+                        .as_deref()
+                        .unwrap_or("MCP tools are unavailable.")
+                )
+            })
+            .collect::<Vec<_>>();
+        resolved.task.task_examination = Some(examination.clone());
         context.bind_execution_manifest(&ExecutionManifestDraft {
             kind: envelope.kind,
             workspace_id: envelope.workspace_id.clone(),
@@ -227,6 +281,8 @@ impl TaskExecutor for AgentTaskExecutor {
             skills_revision: envelope.skills_revision.clone(),
             rules: resolved.governance.rules.entries.clone(),
             rules_digest: resolved.governance.rules.final_digest.clone(),
+            rule_facts: resolved.governance.rules.facts.clone(),
+            task_examination: examination,
             skills_catalog_revision: resolved.governance.skills.catalog_revision.clone(),
             skills: resolved.governance.skills.entries.clone(),
             connectors,
@@ -238,6 +294,21 @@ impl TaskExecutor for AgentTaskExecutor {
                 "mcp_connection_ids".to_string(),
             ],
         })?;
+        if !connector_preflight_blockers.is_empty() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "MCP capability preflight blocked execution. {}",
+                connector_preflight_blockers.join(" ")
+            )));
+        }
         let workspace_root =
             resolved.config.opencode_workdir.as_deref().ok_or_else(|| {
                 TaskExecutionError::new("Trusted Agent workspace root is required.")
@@ -596,6 +667,39 @@ mod tests {
         runtime_profile_id: String,
     }
 
+    struct UnavailableConnectorResolver;
+
+    impl AgentRuntimeResolver for UnavailableConnectorResolver {
+        fn resolve(
+            &self,
+            task_session_id: u64,
+            envelope: &TaskSessionEnvelopeV1,
+            runtime_attempt_id: &str,
+            retained_governance: Option<&GovernanceResolutionRecord>,
+        ) -> Result<ResolvedAgentTask, String> {
+            let mut resolved = FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: envelope.runtime_profile_id.clone(),
+            }
+            .resolve(
+                task_session_id,
+                envelope,
+                runtime_attempt_id,
+                retained_governance,
+            )?;
+            resolved.connector_capabilities = vec![
+                crate::domain::task_examination::ConnectorCapabilitySnapshot {
+                    connector_id: "jira".to_string(),
+                    status: crate::domain::task_examination::ConnectorDiscoveryStatus::Unavailable,
+                    tools: Vec::new(),
+                    error: Some("MCP tools/list discovery failed.".to_string()),
+                    warnings: Vec::new(),
+                },
+            ];
+            Ok(resolved)
+        }
+    }
+
     impl AgentRuntimeResolver for FakeResolver {
         fn resolve(
             &self,
@@ -613,12 +717,14 @@ mod tests {
                 config: test_config(),
                 task: AiWorkerTask {
                     execution_contract: Some(json!({ "contract": "test" })),
+                    task_examination: None,
                     session_key: None,
                     opencode_session_id: None,
                 },
                 governance: retained_governance
                     .cloned()
                     .unwrap_or_else(|| test_governance(task_session_id)),
+                connector_capabilities: Vec::new(),
             })
         }
     }
@@ -1132,6 +1238,49 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_agent_executor_blocks_before_runner_when_live_tools_are_unavailable() {
+        let directory = tempdir().expect("temp directory");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(UnavailableConnectorResolver),
+            Arc::new(FakeRunner {
+                executions: executions.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "unavailable-live-tools",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task blocks");
+
+        assert_eq!(completed.state, TaskSessionState::Blocked);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(completed
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("MCP capability preflight blocked execution") }));
+        assert!(engine
+            .events_after(session.id, 0)
+            .expect("events")
+            .iter()
+            .any(|event| {
+                event.payload["type"] == "task_examined"
+                    && event.payload["live_connector_count"] == 0
+            }));
+    }
+
+    #[test]
     fn scheduler_agent_executor_preserves_blocked_terminal_outcome() {
         let directory = tempdir().expect("temp directory");
         let executor = AgentTaskExecutor::new(
@@ -1587,10 +1736,12 @@ mod tests {
             config,
             task: AiWorkerTask {
                 execution_contract: Some(json!({ "contract": "test" })),
+                task_examination: None,
                 session_key: None,
                 opencode_session_id: None,
             },
             governance: test_governance(1),
+            connector_capabilities: Vec::new(),
         };
         assert!(validate_resolved_task(&envelope, &resolved)
             .expect_err("model mismatch")
@@ -1610,10 +1761,12 @@ mod tests {
             config,
             task: AiWorkerTask {
                 execution_contract: Some(json!({ "contract": "test" })),
+                task_examination: None,
                 session_key: None,
                 opencode_session_id: None,
             },
             governance: test_governance(1),
+            connector_capabilities: Vec::new(),
         };
         assert!(validate_resolved_task(&envelope, &resolved)
             .expect_err("governance mismatch")
@@ -1706,6 +1859,7 @@ mod tests {
                 normalization_version: "legacy_unavailable".to_string(),
                 final_digest: crate::infrastructure::runtime_profile_store::content_revision(""),
                 entries: Vec::new(),
+                facts: Default::default(),
                 snapshot: String::new(),
             },
             skills: SkillResolutionRecord {

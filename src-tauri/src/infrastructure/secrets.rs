@@ -237,7 +237,14 @@ impl AppSecretsStore {
     pub fn mcp_environment(&self, server_name: &str) -> Result<HashMap<String, String>, String> {
         let server_id = server_name.strip_prefix("spacesly-").unwrap_or(server_name);
         let secrets = self.secrets.lock().map_err(|error| error.to_string())?;
-        Ok(secrets.mcp_env.get(server_id).cloned().unwrap_or_default())
+        Ok(secrets
+            .mcp_env
+            .get(server_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key, normalize_mcp_environment_value(value)))
+            .collect())
     }
 
     pub fn mcp_connector(&self, server_id: &str) -> Result<McpConnectorProfile, String> {
@@ -355,11 +362,29 @@ fn replace_mcp_environment(
     let environment = environment
         .into_iter()
         .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| (key, normalize_mcp_environment_value(value)))
         .collect::<HashMap<_, _>>();
     if environment.is_empty() {
         secrets.mcp_env.remove(server_id);
     } else {
         secrets.mcp_env.insert(server_id.to_string(), environment);
+    }
+}
+
+fn normalize_mcp_environment_value(value: String) -> String {
+    let trimmed = value.trim();
+    let unquoted = if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    if unquoted.starts_with("https://") || unquoted.starts_with("http://") {
+        unquoted.to_string()
+    } else {
+        value
     }
 }
 
@@ -429,6 +454,22 @@ fn set_private_file_permissions(_path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_environment_removes_shell_quotes_from_http_urls() {
+        assert_eq!(
+            normalize_mcp_environment_value("'https://confluence.example'".to_string()),
+            "https://confluence.example"
+        );
+        assert_eq!(
+            normalize_mcp_environment_value("\"https://confluence.example\"".to_string()),
+            "https://confluence.example"
+        );
+        assert_eq!(
+            normalize_mcp_environment_value("'literal-secret'".to_string()),
+            "'literal-secret'"
+        );
+    }
 
     #[test]
     fn store_resolves_provider_and_mcp_secrets_without_exposing_the_full_payload() {

@@ -46,7 +46,13 @@ import {
 } from "../src/lib/agentEventProjection";
 import { createAgentRunSession } from "../src/lib/agentRun";
 import { relativeTimeLabel } from "../src/lib/relativeTime";
-import { defaultSettings, loadSettings, parseEnvText, saveSettings } from "../src/lib/settings";
+import {
+  defaultSettings,
+  loadSettings,
+  normalizeSettings,
+  parseEnvText,
+  saveSettings,
+} from "../src/lib/settings";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -62,6 +68,28 @@ assertEqual(
   "generic MCP environment should be parsed as the complete textarea value",
 );
 assertEqual(parseEnvText(""), {}, "clearing generic MCP environment should remove every key");
+const migratedAtlassianConnector = normalizeSettings({
+  mcpServers: [
+    {
+      id: "jira-default",
+      name: "Jira MCP",
+      kind: "jira",
+      command: "mcp-atlassian",
+      args: [],
+      env: {},
+      domains: ["jira"],
+      intentTerms: ["jira"],
+    },
+  ],
+}).mcpServers[0];
+assertEqual(
+  {
+    domains: migratedAtlassianConnector?.domains,
+    confluenceIntent: migratedAtlassianConnector?.intentTerms.includes("confluence"),
+  },
+  { domains: ["jira", "confluence"], confluenceIntent: true },
+  "the bundled Atlassian connector should migrate to explicit Jira and Confluence routing",
+);
 
 const originalLocalStorage = globalThis.localStorage;
 const settingsStorage = new Map<string, string>();
