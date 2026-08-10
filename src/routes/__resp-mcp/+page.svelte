@@ -15,6 +15,7 @@
     },
     domains: ["bitbucket", "git", "pull request", "repository"],
     intentTerms: ["deploy", "prerelease", "pod logs"],
+    capabilityCatalog: null,
   });
 
   function update(values: Partial<McpServerSettings>) {

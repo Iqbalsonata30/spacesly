@@ -468,6 +468,9 @@ fn capability_discovery_error(error: &str) -> &'static str {
 fn canonical_capability_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
+        && !value.contains("..")
+        && !value.starts_with('/')
+        && !value.ends_with('/')
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
         })

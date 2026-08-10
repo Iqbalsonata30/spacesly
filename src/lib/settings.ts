@@ -16,6 +16,65 @@ export interface McpServerSettings {
   env: Record<string, string>;
   domains: string[];
   intentTerms: string[];
+  capabilityCatalog: McpCapabilityCatalog | null;
+}
+
+export interface McpCapabilityCatalog {
+  schemaVersion: 1;
+  testedAt: number;
+  tools: McpToolCapabilitySummary[];
+}
+
+export interface McpToolCapabilitySummary {
+  name: string;
+  risk: "read" | "mutation" | "destructive" | "credential_sensitive" | "unknown";
+  argumentNames: string[];
+}
+
+export function summarizeMcpCapabilities(
+  metadata: Array<{ name: string; input_schema: unknown | null }>,
+  testedAt = Date.now(),
+): McpCapabilityCatalog {
+  const tools = metadata
+    .flatMap((tool): McpToolCapabilitySummary[] => {
+      const name = canonicalCapabilityName(tool.name);
+      if (!name) return [];
+      const schema = isRecord(tool.input_schema) ? tool.input_schema : null;
+      const properties = schema && isRecord(schema.properties) ? schema.properties : null;
+      const argumentNames = properties
+        ? Object.keys(properties).flatMap((entry) => {
+            const name = canonicalCapabilityName(entry);
+            return name ? [name] : [];
+          })
+        : [];
+      return [
+        {
+          name,
+          risk: classifyMcpToolRisk(name),
+          argumentNames: [...new Set(argumentNames)].sort().slice(0, 64),
+        },
+      ];
+    })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .slice(0, 128);
+  return {
+    schemaVersion: 1,
+    testedAt: Number.isFinite(testedAt) && testedAt > 0 ? Math.floor(testedAt) : Date.now(),
+    tools,
+  };
+}
+
+export function classifyMcpToolRisk(name: string): McpToolCapabilitySummary["risk"] {
+  const tokens = name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (["credential", "password", "secret", "token", "auth"].some((term) => tokens.includes(term)))
+    return "credential_sensitive";
+  if (["delete", "destroy", "drop", "purge", "remove", "terminate"].some((term) => tokens.includes(term)))
+    return "destructive";
+  if (["add", "assign", "comment", "create", "deploy", "edit", "execute", "merge", "move", "patch", "restart", "run", "scale", "transition", "trigger", "update", "upload", "write"].some((term) => tokens.includes(term)))
+    return "mutation";
+  if (["describe", "download", "fetch", "get", "list", "log", "logs", "read", "search", "status", "view"].some((term) => tokens.includes(term)))
+    return "read";
+  return "unknown";
 }
 
 export function defaultMcpIntentMetadata(
@@ -160,6 +219,7 @@ export const defaultSettings: AppSettings = {
       command: "",
       args: [],
       env: {},
+      capabilityCatalog: null,
       ...defaultMcpIntentMetadata("jira"),
     },
   ],
@@ -324,6 +384,7 @@ export function createMcpServer(): McpServerSettings {
     env: {},
     domains: [],
     intentTerms: [],
+    capabilityCatalog: null,
   };
 }
 
@@ -612,7 +673,45 @@ function normalizeServer(value: unknown): McpServerSettings {
     domains: kind === "jira" ? [...new Set([...domains, ...defaults.domains])] : domains,
     intentTerms:
       kind === "jira" ? [...new Set([...intentTerms, ...defaults.intentTerms])] : intentTerms,
+    capabilityCatalog: normalizeMcpCapabilityCatalog(server.capabilityCatalog),
   };
+}
+
+function normalizeMcpCapabilityCatalog(value: unknown): McpCapabilityCatalog | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.tools)) return null;
+  return summarizeMcpCapabilities(
+    value.tools.map((tool) => {
+      const candidate = isRecord(tool) ? tool : {};
+      return {
+        name: String(candidate.name ?? ""),
+        input_schema: {
+          properties: Object.fromEntries(
+            (Array.isArray(candidate.argumentNames) ? candidate.argumentNames : []).map((name) => [
+              String(name),
+              {},
+            ]),
+          ),
+        },
+      };
+    }),
+    Number(value.testedAt),
+  );
+}
+
+function canonicalCapabilityName(value: unknown): string | null {
+  const name = String(value ?? "").trim();
+  return name &&
+    name.length <= 128 &&
+    !name.includes("..") &&
+    !name.startsWith("/") &&
+    !name.endsWith("/") &&
+    /^[a-zA-Z0-9_.\-/:]+$/.test(name)
+    ? name
+    : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function normalizeKind(value: unknown): McpServerSettings["kind"] {

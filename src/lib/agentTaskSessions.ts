@@ -215,6 +215,7 @@ export function planAgentTaskConnectors(
     index,
     domains: normalizedTerms(server.domains),
     intentTerms: normalizedTerms(server.intent_terms),
+    operationSignals: connectorOperationSignals(server.capability_tools),
   }));
   const requiredDomains = new Set<string>();
   if (contract.constraints.may_update_jira) requiredDomains.add("jira");
@@ -232,15 +233,64 @@ export function planAgentTaskConnectors(
   if (explicitDomains.size > 0) {
     explicitDomains.forEach((domain) => requiredDomains.add(domain));
   } else {
-    for (const descriptor of descriptors) {
-      if (descriptor.intentTerms.some((term) => intentIncludes(intent, term))) {
-        descriptor.domains.forEach((domain) => requiredDomains.add(domain));
+    const tokenOwners = new Map<string, number>();
+    for (const token of new Set(descriptors.flatMap((descriptor) => descriptor.operationSignals))) {
+      tokenOwners.set(
+        token,
+        descriptors.filter((descriptor) => descriptor.operationSignals.includes(token)).length,
+      );
+    }
+    const intentTokens = new Set(intent.split(" ").filter(Boolean));
+    const operationMatches = descriptors.filter((descriptor) => {
+      const score = descriptor.operationSignals.reduce(
+        (total, token) =>
+          total + (intentTokens.has(token) ? (tokenOwners.get(token) === 1 ? 2 : 1) : 0),
+        0,
+      );
+      return score >= 2;
+    });
+    if (operationMatches.length > 0) {
+      operationMatches.forEach((descriptor) =>
+        descriptor.domains.forEach((domain) => requiredDomains.add(domain)),
+      );
+    } else {
+      for (const descriptor of descriptors) {
+        if (descriptor.intentTerms.some((term) => intentIncludes(intent, term))) {
+          descriptor.domains.forEach((domain) => requiredDomains.add(domain));
+        }
       }
     }
+
+    const operationSelected = operationMatches.map((descriptor) => descriptor.id).filter(Boolean);
+    const uncovered = new Set(requiredDomains);
+    for (const descriptor of operationMatches) {
+      descriptor.domains.forEach((domain) => uncovered.delete(domain));
+    }
+    const selected = [...new Set(operationSelected)];
+    selectConnectorsForDomains(descriptors, uncovered, selected);
+    return {
+      connectorIds: selected.sort(),
+      requiredDomains: [...requiredDomains].sort(),
+      unresolvedDomains: [...uncovered].sort(),
+    };
   }
 
   const uncovered = new Set(requiredDomains);
   const selected: string[] = [];
+  selectConnectorsForDomains(descriptors, uncovered, selected);
+
+  return {
+    connectorIds: selected.sort(),
+    requiredDomains: [...requiredDomains].sort(),
+    unresolvedDomains: [...uncovered].sort(),
+  };
+}
+
+function selectConnectorsForDomains<T extends { id: string; index: number; domains: string[] }>(
+  descriptors: T[],
+  uncovered: Set<string>,
+  selected: string[],
+): void {
   while (uncovered.size > 0) {
     let best: (typeof descriptors)[number] | null = null;
     let bestCoverage = 0;
@@ -259,12 +309,6 @@ export function planAgentTaskConnectors(
     selected.push(best.id);
     best.domains.forEach((domain) => uncovered.delete(domain));
   }
-
-  return {
-    connectorIds: selected.sort(),
-    requiredDomains: [...requiredDomains].sort(),
-    unresolvedDomains: [...uncovered].sort(),
-  };
 }
 
 export function selectAgentTaskConnectors(
@@ -296,6 +340,40 @@ function normalizedIntentText(contract: ExecutionContract): string {
 
 function normalizedTerms(values: string[] | undefined): string[] {
   return [...new Set((values ?? []).map(normalizeIntent).filter(Boolean))];
+}
+
+const GENERIC_OPERATION_TOKENS = new Set([
+  "api",
+  "create",
+  "delete",
+  "get",
+  "list",
+  "mcp",
+  "read",
+  "search",
+  "tool",
+  "update",
+]);
+
+function connectorOperationSignals(
+  tools: AiWorkerConfig["mcp_servers"][number]["capability_tools"],
+): string[] {
+  return [
+    ...new Set(
+      (tools ?? []).flatMap((tool) =>
+        [tool.name, ...tool.argumentNames]
+          .flatMap((value) =>
+            value
+              .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+              .toLowerCase()
+              .split(/[^a-z0-9]+/),
+          )
+          .filter(
+            (token) => token.length >= 3 && !GENERIC_OPERATION_TOKENS.has(token),
+          ),
+      ),
+    ),
+  ];
 }
 
 function normalizeIntent(value: string): string {

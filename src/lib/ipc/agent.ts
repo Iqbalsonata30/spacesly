@@ -8,6 +8,11 @@ export interface AiWorkerMcpServer {
   environment?: Record<string, string>;
   domains?: string[];
   intent_terms?: string[];
+  capability_tools?: Array<{
+    name: string;
+    risk: "read" | "mutation" | "destructive" | "credential_sensitive" | "unknown";
+    argumentNames: string[];
+  }>;
 }
 
 export interface AiWorkerConfig {

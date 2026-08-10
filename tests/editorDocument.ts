@@ -52,6 +52,7 @@ import {
   normalizeSettings,
   parseEnvText,
   saveSettings,
+  summarizeMcpCapabilities,
 } from "../src/lib/settings";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
@@ -66,6 +67,51 @@ assertEqual(
   parseEnvText("API_URL=https://service.example\nAPI_TOKEN=secret"),
   { API_URL: "https://service.example", API_TOKEN: "secret" },
   "generic MCP environment should be parsed as the complete textarea value",
+);
+
+const capabilityCatalog = summarizeMcpCapabilities(
+  [
+    {
+      name: "future_publish_artifact",
+      input_schema: {
+        type: "object",
+        properties: { artifact_path: {}, "not valid secret": {} },
+      },
+    },
+    { name: "../../invalid", input_schema: null },
+  ],
+  123,
+);
+assertEqual(
+  capabilityCatalog,
+  {
+    schemaVersion: 1,
+    testedAt: 123,
+    tools: [
+      {
+        name: "future_publish_artifact",
+        risk: "unknown",
+        argumentNames: ["artifact_path"],
+      },
+    ],
+  },
+  "MCP capability summaries should remain bounded, canonical, and free of raw schemas",
+);
+const normalizedCatalog = normalizeSettings({
+  mcpServers: [
+    {
+      id: "future",
+      name: "Future MCP",
+      kind: "generic",
+      command: "future-mcp",
+      capabilityCatalog,
+    },
+  ],
+}).mcpServers[0]?.capabilityCatalog;
+assertEqual(
+  normalizedCatalog,
+  capabilityCatalog,
+  "persisted MCP capability summaries should survive settings normalization",
 );
 assertEqual(parseEnvText(""), {}, "clearing generic MCP environment should remove every key");
 const migratedAtlassianConnector = normalizeSettings({

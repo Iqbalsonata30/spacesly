@@ -336,6 +336,20 @@ const intentConfig: AiWorkerConfig = {
       domains: ["unrelated"],
       intent_terms: ["unrelated service"],
     },
+    {
+      name: "Artifact Vault",
+      secret_id: "artifact-vault",
+      command: ["artifact-vault"],
+      domains: ["artifact-vault"],
+      intent_terms: [],
+      capability_tools: [
+        {
+          name: "publish_artifact",
+          risk: "mutation",
+          argumentNames: ["artifact_path"],
+        },
+      ],
+    },
   ],
 };
 
@@ -393,6 +407,11 @@ assertEqual(
   planAgentTaskConnectors(intentConfig, contractFor("Inspect the unrelated service")).connectorIds,
   ["unrelated"],
   "declared generic connector intent should remain available",
+);
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractFor("Publish the generated artifact")).connectorIds,
+  ["artifact-vault"],
+  "a live operation catalog should route an unknown connector without hard-coded product terms",
 );
 
 assertEqual(

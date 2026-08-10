@@ -282,8 +282,10 @@
     saveSettings,
     secretsFromSettings,
     settingsWithoutSecrets,
+    summarizeMcpCapabilities,
     type AppSettings,
     type AppSecrets,
+    type McpServerSettings,
   } from "$lib/settings";
   import { aiProviders, defaultModelForProvider, modelById, providerById } from "$lib/aiModels";
   import { formatJiraExecutionComment } from "$lib/jiraComment";
@@ -468,7 +470,15 @@
   );
   let mcpConnectionStates = $state<Record<string, McpConnectionState>>({});
   let appNotice = $state<{ tone: "info" | "success" | "error"; message: string } | null>(null);
-  let mcpToolsByServer = $state<Record<string, string[]>>({});
+  let mcpToolsByServer = $state<Record<string, string[]>>(
+    Object.fromEntries(
+      initialSettings.mcpServers.flatMap((server) =>
+        server.capabilityCatalog
+          ? [[server.id, server.capabilityCatalog.tools.map((tool) => tool.name)]]
+          : [],
+      ),
+    ),
+  );
   let settingsOpen = $state(false);
   let settingsDialog: HTMLDivElement | null = $state(null);
   let settingsForm: HTMLFormElement | null = $state(null);
@@ -3907,8 +3917,23 @@
     mcpToolsByServer = remainingTools;
   }
 
-  function rememberMcpTools(serverId: string, tools: string[]) {
+  function rememberMcpTools(
+    serverId: string,
+    tools: string[],
+    metadata: Array<{ name: string; input_schema: unknown | null }> | null = null,
+  ) {
     mcpToolsByServer = { ...mcpToolsByServer, [serverId]: tools };
+    settings = {
+      ...settings,
+      mcpServers: settings.mcpServers.map((server) =>
+        server.id === serverId
+          ? {
+              ...server,
+              capabilityCatalog: metadata ? summarizeMcpCapabilities(metadata) : null,
+            }
+          : server,
+      ),
+    };
   }
 
   function mcpConnectionState(serverId: string): McpConnectionState | null {
@@ -4100,6 +4125,7 @@
             command,
             domains: server.domains,
             intent_terms: server.intentTerms,
+            capability_tools: server.capabilityCatalog?.tools ?? [],
           },
         ];
       }),
@@ -5353,7 +5379,7 @@
 
     try {
       const status = await testJiraMcpConnection(config);
-      rememberMcpTools(serverId, status.tools);
+      rememberMcpTools(serverId, status.tools, status.tool_metadata);
       connectionMessage =
         status.board_count > 0 || status.issue_count > 0
           ? `Jira test passed. Found ${status.board_count} board${status.board_count === 1 ? "" : "s"} and ${status.issue_count} sample ticket${status.issue_count === 1 ? "" : "s"}.`
@@ -5413,7 +5439,7 @@
         selectedServer.kind === "ocp"
           ? await ocpTestMcpConnection(serverId, workspace?.id ?? "workspace-personal")
           : await testMcpServerConnection(serverConfig);
-      rememberMcpTools(serverId, status.tools);
+      rememberMcpTools(serverId, status.tools, status.tool_metadata);
       connectionMessage = `MCP test passed. ${status.tool_count} tool${status.tool_count === 1 ? "" : "s"} available.`;
       rememberMcpConnection(serverId, {
         status: "connected",
@@ -5617,24 +5643,27 @@
   }
 
   function updateSelectedServer(
-    values: Partial<{
-      name: string;
-      kind: AppSettings["mcpServers"][number]["kind"];
-      command: string;
-      args: string[];
-      env: Record<string, string>;
-    }>,
+    values: Partial<McpServerSettings>,
   ) {
     if (!selectedServer) return;
 
     const serverId = selectedServer.id;
     const nextKind = ("kind" in values ? values.kind : selectedServer.kind) ?? selectedServer.kind;
     if ("env" in values) mcpEnvEditedServerIds.add(serverId);
-    invalidateMcpConnection(serverId);
+    const invalidatesCapabilities = ["kind", "command", "args", "env"].some((key) =>
+      Object.prototype.hasOwnProperty.call(values, key),
+    );
+    if (invalidatesCapabilities) invalidateMcpConnection(serverId);
     settings = {
       ...settings,
       mcpServers: settings.mcpServers.map((server) =>
-        server.id === serverId ? { ...server, ...values } : server,
+        server.id === serverId
+          ? {
+              ...server,
+              ...values,
+              capabilityCatalog: invalidatesCapabilities ? null : server.capabilityCatalog,
+            }
+          : server,
       ),
       jira: nextKind === "jira" ? { ...settings.jira, serverId } : settings.jira,
     };
