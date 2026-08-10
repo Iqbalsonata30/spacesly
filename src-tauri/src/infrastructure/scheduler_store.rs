@@ -503,12 +503,12 @@ impl SchedulerStore {
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_active_execution_run
                    ON scheduler_task_sessions(workspace_id, execution_run_id)
                   WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
-                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace
+                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace_v2
                    ON scheduler_task_events(session_id, sequence)
                   WHERE event_type IN (
                     'lifecycle', 'tool_started', 'tool_completed',
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
-                    'approval_requested'
+                    'approval_requested', 'runtime_recovery_decision'
                   );
                  CREATE INDEX IF NOT EXISTS idx_scheduler_events_tool_state
                    ON scheduler_task_events(session_id, sequence)
@@ -528,7 +528,7 @@ impl SchedulerStore {
                         WHEN NEW.event_kind = 'runtime' AND json_valid(NEW.payload_json)
                           AND json_extract(NEW.payload_json, '$.type') IN (
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
-                            'approval_requested'
+                            'approval_requested', 'runtime_recovery_decision'
                           ) THEN json_extract(NEW.payload_json, '$.type')
                         ELSE NULL
                       END
@@ -543,7 +543,7 @@ impl SchedulerStore {
                 |row| row.get(0),
             )
             .map_err(|error| format!("Failed to inspect trace event migration: {error}"))?;
-        if event_type_backfill_version < 1 {
+        if event_type_backfill_version < 2 {
             migration
                 .execute_batch(
                     "UPDATE scheduler_task_events
@@ -558,7 +558,7 @@ impl SchedulerStore {
                           WHEN event_kind = 'runtime' AND json_valid(payload_json)
                             AND json_extract(payload_json, '$.type') IN (
                               'execution_trace_stage', 'usage_updated', 'opencode_session',
-                              'approval_requested'
+                              'approval_requested', 'runtime_recovery_decision'
                             ) THEN json_extract(payload_json, '$.type')
                           ELSE NULL
                         END
@@ -567,10 +567,10 @@ impl SchedulerStore {
                         OR (event_kind = 'runtime' AND json_valid(payload_json)
                           AND json_extract(payload_json, '$.type') IN (
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
-                            'approval_requested'
+                            'approval_requested', 'runtime_recovery_decision'
                           ))
                       );
-                     UPDATE scheduler_metadata SET event_type_backfill_version = 1
+                     UPDATE scheduler_metadata SET event_type_backfill_version = 2
                       WHERE singleton = 1;",
                 )
                 .map_err(|error| format!("Failed to backfill trace event types: {error}"))?;
@@ -1327,7 +1327,7 @@ impl SchedulerStore {
                     AND events.event_type IN (
                       'lifecycle', 'tool_started', 'tool_completed',
                       'execution_trace_stage', 'usage_updated', 'opencode_session',
-                      'approval_requested'
+                      'approval_requested', 'runtime_recovery_decision'
                     )
                  ORDER BY sequence
                  LIMIT ?3",
@@ -3455,6 +3455,9 @@ fn indexed_event_type(kind: TaskSessionEventKind, payload: &serde_json::Value) -
         (TaskSessionEventKind::Runtime, Some("usage_updated")) => "usage_updated",
         (TaskSessionEventKind::Runtime, Some("opencode_session")) => "opencode_session",
         (TaskSessionEventKind::Runtime, Some("approval_requested")) => "approval_requested",
+        (TaskSessionEventKind::Runtime, Some("runtime_recovery_decision")) => {
+            "runtime_recovery_decision"
+        }
         (TaskSessionEventKind::Runtime, _) => "runtime",
     }
 }
@@ -4566,7 +4569,7 @@ mod tests {
                   WHERE session_id = 1 AND sequence > 0 AND event_type IN (
                     'lifecycle', 'tool_started', 'tool_completed',
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
-                    'approval_requested'
+                    'approval_requested', 'runtime_recovery_decision'
                   ) ORDER BY sequence LIMIT 100",
             )
             .unwrap()

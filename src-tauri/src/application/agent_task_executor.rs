@@ -4,6 +4,9 @@ use super::execution_engine::{
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_examination::examine_task;
+use crate::domain::task_recovery::{
+    decide_runtime_recovery, RuntimeRecoveryAction, RuntimeRecoveryContext,
+};
 use crate::domain::task_session::{
     AgentTaskCompletionStatus, AgentTaskObjectiveResult, AgentTaskResult, TaskExecutionOutput,
     TaskMcpConnectorContext, TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1,
@@ -19,6 +22,15 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+const MAX_AUTOMATIC_RUNTIME_RETRIES: u8 = 1;
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeAttemptObservation {
+    successful_tool_calls: u32,
+    successful_mutation_observed: bool,
+    opencode_session_id: Option<String>,
+}
+
 struct RuntimeCallbackGate {
     open: Arc<Mutex<bool>>,
 }
@@ -29,6 +41,62 @@ impl Drop for RuntimeCallbackGate {
             *open = false;
         }
     }
+}
+
+fn runtime_callback(
+    reporter: TaskEventReporter,
+    callback_gate: Arc<Mutex<bool>>,
+    observation: Arc<Mutex<RuntimeAttemptObservation>>,
+) -> AiWorkerEventCallback {
+    Box::new(move |event| {
+        let open = callback_gate.lock().map_err(|error| error.to_string())?;
+        if !*open {
+            return Err("Agent runtime callback is closed.".to_string());
+        }
+        if let AiWorkerStreamEvent::OpenCodeSession { session_id, .. } = &event {
+            reporter
+                .bind_opencode_session(session_id)
+                .map_err(|error| error.to_string())?;
+            observation
+                .lock()
+                .map_err(|error| error.to_string())?
+                .opencode_session_id = Some(session_id.clone());
+            return Ok(());
+        }
+        if let AiWorkerStreamEvent::ToolCompleted {
+            tool_name,
+            success,
+            error,
+            risk,
+            arguments_digest,
+            ..
+        } = &event
+        {
+            if *success {
+                let mut observation = observation.lock().map_err(|error| error.to_string())?;
+                observation.successful_tool_calls =
+                    observation.successful_tool_calls.saturating_add(1);
+                if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
+                    observation.successful_mutation_observed = true;
+                }
+            } else if error
+                .as_deref()
+                .is_some_and(|error| error.contains("[approval_required]"))
+            {
+                reporter
+                    .emit_event(
+                        TaskSessionEventKind::Runtime,
+                        json!({
+                            "type": "approval_requested",
+                            "operation": tool_name,
+                            "arguments_digest": arguments_digest,
+                        }),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        emit_runtime_event(&reporter, event)
+    })
 }
 
 /// Trusted configuration and contract reconstructed from one durable Task Session envelope.
@@ -354,58 +422,95 @@ impl TaskExecutor for AgentTaskExecutor {
             opencode_session_id.as_deref(),
         );
 
-        let reporter = context.event_reporter();
-        let callback_open = Arc::new(Mutex::new(true));
-        let callback_guard = RuntimeCallbackGate {
-            open: callback_open.clone(),
-        };
-        let callback_gate = callback_open.clone();
-        let callback: AiWorkerEventCallback = Box::new(move |event| {
-            let open = callback_gate.lock().map_err(|error| error.to_string())?;
-            if !*open {
-                return Err("Agent runtime callback is closed.".to_string());
-            }
-            if let AiWorkerStreamEvent::OpenCodeSession { session_id, .. } = &event {
-                reporter
-                    .bind_opencode_session(session_id)
-                    .map_err(|error| error.to_string())?;
-                return Ok(());
-            }
-            if let AiWorkerStreamEvent::ToolCompleted {
-                tool_name,
-                success: false,
-                error: Some(error),
-                arguments_digest,
-                ..
-            } = &event
-            {
-                if error.contains("[approval_required]") {
-                    reporter
-                        .emit_event(
-                            TaskSessionEventKind::Runtime,
-                            json!({
-                                "type": "approval_requested",
-                                "operation": tool_name,
-                                "arguments_digest": arguments_digest,
-                            }),
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-            emit_runtime_event(&reporter, event)
-        });
         let provider_request =
             crate::infrastructure::performance::span("provider_or_runtime_request_ms", "provider")
                 .with_context("task_session_id", context.session_id().0.to_string())
                 .with_context("runtime_id", runtime_attempt_id.clone());
-        let result = self.runner.execute(
-            resolved.config,
-            resolved.task,
-            context.cancellation().shared_flag(),
-            callback,
-        );
+        let mut retries_attempted = 0_u8;
+        let mut retry_task = resolved.task;
+        let mut terminal_recovery_action = None;
+        let result = loop {
+            context.ensure_current()?;
+            let observation = Arc::new(Mutex::new(RuntimeAttemptObservation::default()));
+            let callback_open = Arc::new(Mutex::new(true));
+            let callback_guard = RuntimeCallbackGate {
+                open: callback_open.clone(),
+            };
+            let callback =
+                runtime_callback(context.event_reporter(), callback_open, observation.clone());
+            let attempt_result = self.runner.execute(
+                resolved.config.clone(),
+                retry_task.clone(),
+                context.cancellation().shared_flag(),
+                callback,
+            );
+            drop(callback_guard);
+
+            let recovery_input = match &attempt_result {
+                Err(error) => Some(error.as_str()),
+                Ok(result) if result.completion_status == AiWorkerCompletionStatus::Blocked => {
+                    Some(result.blocked_reason.as_deref().unwrap_or(&result.summary))
+                }
+                Ok(_) => None,
+            };
+            let Some(recovery_input) = recovery_input else {
+                break attempt_result;
+            };
+            let observation = observation
+                .lock()
+                .map_err(|error| TaskExecutionError::new(error.to_string()))?
+                .clone();
+            let decision = decide_runtime_recovery(
+                recovery_input,
+                RuntimeRecoveryContext {
+                    retries_attempted,
+                    max_automatic_retries: MAX_AUTOMATIC_RUNTIME_RETRIES,
+                    successful_mutation_observed: observation.successful_mutation_observed,
+                    cancellation_requested: context.cancellation().is_cancelled(),
+                },
+            );
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "runtime_recovery_decision",
+                    "schema_version": decision.schema_version,
+                    "failure_class": decision.failure_class,
+                    "action": decision.action,
+                    "retryable": decision.retryable,
+                    "reason": decision.reason,
+                    "retries_attempted": retries_attempted,
+                    "max_automatic_retries": MAX_AUTOMATIC_RUNTIME_RETRIES,
+                    "successful_tool_calls": observation.successful_tool_calls,
+                    "successful_mutation_observed": observation.successful_mutation_observed,
+                }),
+            )?;
+            if !decision.should_retry() {
+                terminal_recovery_action = Some(decision.action);
+                break attempt_result;
+            }
+
+            retries_attempted = retries_attempted.saturating_add(1);
+            if let Some(session_id) = observation.opencode_session_id {
+                retry_task.opencode_session_id = Some(session_id);
+            }
+            context.report_progress(
+                TaskProgress {
+                    phase: "recovering_runtime".to_string(),
+                    completed: u64::from(retries_attempted),
+                    total: Some(u64::from(MAX_AUTOMATIC_RUNTIME_RETRIES)),
+                },
+                json!({
+                    "runtime_attempt_id": runtime_attempt_id,
+                    "retry_number": retries_attempted,
+                    "reason": decision.reason,
+                }),
+            )?;
+        };
         let provider_duration = provider_request.finish();
         let provider_outcome = match &result {
+            Ok(result) if result.completion_status == AiWorkerCompletionStatus::Blocked => {
+                "blocked"
+            }
             Ok(_) => "succeeded",
             Err(error) if error.contains("[approval_required]") => "blocked",
             Err(_) if context.cancellation().is_cancelled() => "cancelled",
@@ -420,9 +525,16 @@ impl TaskExecutor for AgentTaskExecutor {
             &runtime_attempt_id,
             bound_opencode_session_id.as_deref(),
         );
-        drop(callback_guard);
         let result = result.map_err(|error| {
-            if error.contains("[approval_required]") {
+            if error.contains("[approval_required]")
+                || matches!(
+                    terminal_recovery_action,
+                    Some(
+                        RuntimeRecoveryAction::AwaitOperator
+                            | RuntimeRecoveryAction::ReviewUncertainOutcome
+                    )
+                )
+            {
                 TaskExecutionError::blocked(error)
             } else {
                 TaskExecutionError::new(error)
@@ -780,6 +892,15 @@ mod tests {
 
     struct ToolFailureRunner;
 
+    struct TransientThenCompleteRunner {
+        executions: Arc<AtomicUsize>,
+        resumed_session_ids: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    struct MutationThenTransientFailureRunner {
+        executions: Arc<AtomicUsize>,
+    }
+
     impl AgentRuntimeRunner for ToolFailureRunner {
         fn execute(
             &self,
@@ -802,6 +923,90 @@ mod tests {
                 },
             })?;
             unreachable!("failed tool callback must terminate execution")
+        }
+    }
+
+    impl AgentRuntimeRunner for TransientThenCompleteRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            self.resumed_session_ids
+                .lock()
+                .expect("resumed sessions lock")
+                .push(task.opencode_session_id.clone());
+            if execution == 0 {
+                on_event(AiWorkerStreamEvent::OpenCodeSession {
+                    session_id: "opencode-recovery-session".to_string(),
+                    action: "created".to_string(),
+                })?;
+                on_event(AiWorkerStreamEvent::ToolCompleted {
+                    tool_call_id: "call-transient".to_string(),
+                    tool_name: "confluence_get_page".to_string(),
+                    success: false,
+                    error: Some("HTTP 503 service unavailable".to_string()),
+                    risk: "read".to_string(),
+                    arguments_digest: "digest-read".to_string(),
+                    display_context: ToolDisplayContext {
+                        label: "Read Confluence page".to_string(),
+                        category: "external".to_string(),
+                        target: None,
+                    },
+                })?;
+                unreachable!("failed tool callback must terminate the first execution")
+            }
+            Ok(AiWorkerTaskResult {
+                summary: "Recovered and completed".to_string(),
+                evidence: vec!["Confluence page was read on retry".to_string()],
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AiWorkerCompletionStatus::Completed,
+                blocked_reason: None,
+                objective_results: Vec::new(),
+            })
+        }
+    }
+
+    impl AgentRuntimeRunner for MutationThenTransientFailureRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            _task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-mutation".to_string(),
+                tool_name: "bamboo_trigger_build".to_string(),
+                success: true,
+                error: None,
+                risk: "mutation".to_string(),
+                arguments_digest: "digest-mutation".to_string(),
+                display_context: ToolDisplayContext {
+                    label: "Trigger Bamboo build".to_string(),
+                    category: "external".to_string(),
+                    target: None,
+                },
+            })?;
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-follow-up".to_string(),
+                tool_name: "bamboo_get_build".to_string(),
+                success: false,
+                error: Some("gateway timeout".to_string()),
+                risk: "read".to_string(),
+                arguments_digest: "digest-follow-up".to_string(),
+                display_context: ToolDisplayContext {
+                    label: "Inspect Bamboo build".to_string(),
+                    category: "external".to_string(),
+                    target: None,
+                },
+            })?;
+            unreachable!("failed follow-up callback must terminate execution")
         }
     }
 
@@ -1663,6 +1868,110 @@ mod tests {
                 && event.payload["success"] == false
                 && event.payload["error"] == "Connection refused while reading stdout."
         }));
+        let recovery = events
+            .iter()
+            .filter(|event| event.payload["type"] == "runtime_recovery_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(recovery.len(), 2);
+        assert_eq!(recovery[0].payload["action"], "retry_current_assignment");
+        assert_eq!(recovery[1].payload["action"], "stop_failed");
+    }
+
+    #[test]
+    fn transient_read_failure_retries_once_in_the_same_opencode_session() {
+        let directory = tempdir().expect("temp directory");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let resumed_session_ids = Arc::new(Mutex::new(Vec::new()));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            Arc::new(TransientThenCompleteRunner {
+                executions: executions.clone(),
+                resumed_session_ids: resumed_session_ids.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "transient-recovery-agent",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task recovers");
+
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            resumed_session_ids
+                .lock()
+                .expect("sessions lock")
+                .as_slice(),
+            &[None, Some("opencode-recovery-session".to_string())]
+        );
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        let recovery = events
+            .iter()
+            .find(|event| event.payload["type"] == "runtime_recovery_decision")
+            .expect("recovery decision journaled");
+        assert_eq!(recovery.payload["failure_class"], "transient_transport");
+        assert_eq!(recovery.payload["action"], "retry_current_assignment");
+        assert!(events.iter().any(|event| {
+            event.kind == TaskSessionEventKind::Progress
+                && event.progress.as_ref().is_some_and(|progress| {
+                    progress.phase == "recovering_runtime" && progress.completed == 1
+                })
+        }));
+    }
+
+    #[test]
+    fn transient_failure_after_mutation_blocks_without_replay() {
+        let directory = tempdir().expect("temp directory");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            Arc::new(MutationThenTransientFailureRunner {
+                executions: executions.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "uncertain-mutation-agent",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task blocks");
+
+        assert_eq!(completed.state, TaskSessionState::Blocked);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        let recovery = events
+            .iter()
+            .find(|event| event.payload["type"] == "runtime_recovery_decision")
+            .expect("recovery decision journaled");
+        assert_eq!(recovery.payload["action"], "review_uncertain_outcome");
+        assert_eq!(recovery.payload["successful_mutation_observed"], true);
     }
 
     #[test]

@@ -583,6 +583,32 @@ assertEqual(
   0,
   "developer trace events should not leak into user-facing Activity",
 );
+const recoveryProjection = projectAgentTaskSessionEvent(
+  {
+    id: 122,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 122,
+    kind: "runtime",
+    payload: {
+      type: "runtime_recovery_decision",
+      failure_class: "transient_transport",
+      action: "retry_current_assignment",
+      reason: "The failure is transient and safe to retry.",
+    },
+    progress: null,
+    created_at: 122,
+  },
+  "recovery-122",
+  "04:30:10 AM",
+);
+assertEqual(recoveryProjection.logs.length, 1, "runtime recovery should be visible in Activity");
+assertEqual(
+  (recoveryProjection.logs[0]?.message ?? "").includes("retrying safely"),
+  true,
+  "runtime recovery should explain the bounded retry",
+);
 assertEqual(
   pendingProjection.progress,
   55,

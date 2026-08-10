@@ -34,6 +34,7 @@ export function projectAgentTaskSessionEvent(
   let tone: AgentRunLog["tone"] = "info";
   let summary = `Task Session ${event.kind}: ${eventType}.`;
   let taskSessionState: TaskSessionState | null = null;
+  const details: string[] = [];
   if (event.kind === "lifecycle" && typeof payload.state === "string") {
     taskSessionState = payload.state as TaskSessionState;
     tone = payload.state === "failed" || payload.state === "blocked" ? "error" : "info";
@@ -49,6 +50,17 @@ export function projectAgentTaskSessionEvent(
     summary = `${payload.type === "tool_completed" ? (failed ? "Tool failed" : "Tool completed; task still running") : "Tool started"}: ${String(label ?? "Agent tool")}.`;
   } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
     summary = "Agent result staged for authoritative Task Session commit.";
+  } else if (event.kind === "runtime" && eventType === "runtime_recovery_decision") {
+    const action = typeof payload.action === "string" ? payload.action : "stop_failed";
+    const failureClass =
+      typeof payload.failure_class === "string" ? payload.failure_class : "unknown";
+    const reason = typeof payload.reason === "string" ? payload.reason : "No reason recorded.";
+    tone = action === "retry_current_assignment" ? "info" : "error";
+    summary =
+      action === "retry_current_assignment"
+        ? `Transient ${failureClass.replaceAll("_", " ")} failure; Spacesly is retrying safely.`
+        : `Runtime recovery requires attention: ${failureClass.replaceAll("_", " ")}.`;
+    details.push(`- Recovery action: ${action}`, `- Recovery reason: ${reason}`);
   }
 
   return {
@@ -68,6 +80,7 @@ export function projectAgentTaskSessionEvent(
           `- Assignment attempt: ${event.attempt_id ?? "unassigned"}`,
           "DETAILS:",
           ...(event.progress ? [`- Progress phase: ${event.progress.phase}`] : []),
+          ...details,
         ].join("\n"),
       },
     ],
