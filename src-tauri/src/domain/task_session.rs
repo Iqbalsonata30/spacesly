@@ -858,11 +858,22 @@ pub struct AgentTaskObjectiveResult {
     pub blocked_reason: Option<String>,
 }
 
+/// Secret-free identity of a successful tool call supporting an objective checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskObjectiveToolReceipt {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub risk: String,
+    pub arguments_digest: String,
+}
+
 /// Durable evidence that one semantic objective completed in an earlier assignment attempt.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTaskObjectiveCheckpoint {
     pub objective_id: String,
     pub evidence: Vec<String>,
+    #[serde(default)]
+    pub tool_receipts: Vec<AgentTaskObjectiveToolReceipt>,
     pub source_attempt_id: u64,
     pub recorded_at: u64,
 }

@@ -8,10 +8,10 @@
 use crate::domain::execution_manifest::{ExecutionManifest, ExecutionManifestDraft};
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
-    AgentTaskObjectiveCheckpoint, TaskCapabilityGrant, TaskExecutionOutput, TaskProgress,
-    TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionId, TaskSessionResult, TaskSessionSnapshot, TaskSessionState,
-    TaskSessionUpdate,
+    AgentTaskObjectiveCheckpoint, AgentTaskObjectiveToolReceipt, TaskCapabilityGrant,
+    TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent,
+    TaskSessionEventInput, TaskSessionEventKind, TaskSessionId, TaskSessionResult,
+    TaskSessionSnapshot, TaskSessionState, TaskSessionUpdate,
 };
 use crate::infrastructure::mcp::mcp_connector_binding_digest;
 use crate::infrastructure::scheduler_store::{
@@ -378,11 +378,17 @@ impl TaskEventReporter {
         &self,
         objective_id: &str,
         evidence: &[String],
+        tool_receipts: &[AgentTaskObjectiveToolReceipt],
     ) -> Result<TaskSessionEvent, TaskExecutionError> {
         let event = self
             .event_sink
             .store
-            .record_objective_checkpoint(self.event_sink.fence, objective_id, evidence)
+            .record_objective_checkpoint(
+                self.event_sink.fence,
+                objective_id,
+                evidence,
+                tool_receipts,
+            )
             .map_err(TaskExecutionError::new)?;
         self.event_sink.notifier.publish(TaskSessionUpdate {
             session_id: event.session_id,

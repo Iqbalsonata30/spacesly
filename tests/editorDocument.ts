@@ -621,6 +621,15 @@ const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
       type: "objective_checkpointed",
       objective_id: "deploy-bamboo-build",
       evidence: ["Bamboo build 842 completed successfully."],
+      tool_receipt_count: 1,
+      tool_receipts: [
+        {
+          tool_call_id: "bamboo-842",
+          tool_name: "bamboo_trigger_build",
+          risk: "mutation",
+          arguments_digest: "a".repeat(64),
+        },
+      ],
     },
     progress: null,
     created_at: 124,
@@ -634,6 +643,13 @@ assertEqual(
   ),
   true,
   "objective checkpoints should explain continuation behavior",
+);
+assertEqual(
+  (objectiveCheckpointProjection.logs[0]?.message ?? "").includes(
+    "Bound successful tool calls: 1",
+  ),
+  true,
+  "objective checkpoints should expose authoritative tool receipt counts",
 );
 const capabilityRepairProjection = projectAgentTaskSessionEvent(
   {

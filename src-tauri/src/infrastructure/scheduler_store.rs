@@ -13,11 +13,12 @@ use crate::domain::governance::GovernanceResolutionRecord;
 #[cfg(test)]
 use crate::domain::task_session::TaskMcpConnectorContext;
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, AgentTaskObjectiveCheckpoint, TaskCapabilityGrant,
-    TaskExecutionOutput, TaskExecutionTraceEntry, TaskExecutionTracePage, TaskMcpContext,
-    TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
-    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2, TaskSessionKind,
-    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskToolState,
+    AgentTaskCompletionStatus, AgentTaskObjectiveCheckpoint, AgentTaskObjectiveToolReceipt,
+    TaskCapabilityGrant, TaskExecutionOutput, TaskExecutionTraceEntry, TaskExecutionTracePage,
+    TaskMcpContext, TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent,
+    TaskSessionEventInput, TaskSessionEventKind, TaskSessionEventPage, TaskSessionId,
+    TaskSessionInputV2, TaskSessionKind, TaskSessionResult, TaskSessionSnapshot, TaskSessionState,
+    TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -400,6 +401,7 @@ impl SchedulerStore {
                     session_id INTEGER NOT NULL,
                     objective_id TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
+                    tool_receipts_json TEXT NOT NULL DEFAULT '[]',
                     source_attempt_id INTEGER NOT NULL,
                     source_fencing_token INTEGER NOT NULL,
                     recorded_at INTEGER NOT NULL,
@@ -506,6 +508,12 @@ impl SchedulerStore {
             "scheduler_task_completions",
             "next_projection_at",
             "next_projection_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_task_objective_checkpoints",
+            "tool_receipts_json",
+            "tool_receipts_json TEXT NOT NULL DEFAULT '[]'",
         )?;
         migration
             .execute_batch(
@@ -1148,6 +1156,7 @@ impl SchedulerStore {
         fence: AssignmentFence,
         objective_id: &str,
         evidence: &[String],
+        tool_receipts: &[AgentTaskObjectiveToolReceipt],
     ) -> Result<TaskSessionEvent, String> {
         if objective_id.trim() != objective_id
             || objective_id.is_empty()
@@ -1157,6 +1166,29 @@ impl SchedulerStore {
             || evidence
                 .iter()
                 .any(|item| item.trim().is_empty() || item.len() > 2_000)
+            || tool_receipts.len() > 32
+            || tool_receipts.iter().any(|receipt| {
+                receipt.tool_call_id.trim().is_empty()
+                    || receipt.tool_call_id.len() > 256
+                    || receipt.tool_name.trim().is_empty()
+                    || receipt.tool_name.len() > 128
+                    || receipt.tool_name.contains("..")
+                    || receipt.tool_name.starts_with('/')
+                    || receipt.tool_name.ends_with('/')
+                    || !receipt.tool_name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
+                    })
+                    || !matches!(
+                        receipt.risk.as_str(),
+                        "read" | "mutation" | "destructive" | "credential_sensitive" | "unknown"
+                    )
+                    || receipt.arguments_digest.len() != 64
+                    || !receipt
+                        .arguments_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
         {
             return Err("Objective checkpoint payload is invalid.".to_string());
         }
@@ -1172,16 +1204,19 @@ impl SchedulerStore {
         }
         let evidence_json = serde_json::to_string(evidence)
             .map_err(|error| format!("Failed to encode objective checkpoint: {error}"))?;
+        let tool_receipts_json = serde_json::to_string(tool_receipts)
+            .map_err(|error| format!("Failed to encode objective tool receipts: {error}"))?;
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO scheduler_task_objective_checkpoints
-                   (session_id, objective_id, evidence_json, source_attempt_id,
-                    source_fencing_token, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                   (session_id, objective_id, evidence_json, tool_receipts_json,
+                    source_attempt_id, source_fencing_token, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     to_i64(fence.session_id.0)?,
                     objective_id,
                     evidence_json,
+                    tool_receipts_json,
                     to_i64(fence.attempt_id)?,
                     to_i64(fence.fencing_token)?,
                     to_i64(now)?,
@@ -1197,9 +1232,11 @@ impl SchedulerStore {
                 kind: TaskSessionEventKind::Runtime,
                 payload: json!({
                     "type": "objective_checkpointed",
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "objective_id": objective_id,
                     "evidence": evidence,
+                    "tool_receipts": tool_receipts,
+                    "tool_receipt_count": tool_receipts.len(),
                     "new_checkpoint": inserted == 1,
                 }),
                 progress: None,
@@ -2358,34 +2395,6 @@ impl SchedulerStore {
             TaskExecutionOutput::None => unreachable!(),
         };
         let terminal_state_text = state_text(terminal_state);
-        if let TaskExecutionOutput::Agent(result) = &output {
-            for objective in result.objective_results.iter().filter(|objective| {
-                objective.completion_status == AgentTaskCompletionStatus::Completed
-                    && !objective.objective_id.trim().is_empty()
-                    && !objective.evidence.is_empty()
-            }) {
-                let evidence_json =
-                    serde_json::to_string(&objective.evidence).map_err(|error| {
-                        format!("Failed to encode objective checkpoint evidence: {error}")
-                    })?;
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO scheduler_task_objective_checkpoints
-                           (session_id, objective_id, evidence_json, source_attempt_id,
-                            source_fencing_token, recorded_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            to_i64(fence.session_id.0)?,
-                            objective.objective_id,
-                            evidence_json,
-                            to_i64(fence.attempt_id)?,
-                            to_i64(fence.fencing_token)?,
-                            to_i64(now)?,
-                        ],
-                    )
-                    .map_err(|error| format!("Failed to persist objective checkpoint: {error}"))?;
-            }
-        }
         let output_json = serde_json::to_string(&output)
             .map_err(|error| format!("Failed to encode staged task result: {error}"))?;
         let workspace_id = workspace_id
@@ -2605,7 +2614,8 @@ impl SchedulerStore {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
-                "SELECT objective_id, evidence_json, source_attempt_id, recorded_at
+                "SELECT objective_id, evidence_json, tool_receipts_json,
+                        source_attempt_id, recorded_at
                    FROM scheduler_task_objective_checkpoints
                   WHERE session_id = ?1
                   ORDER BY recorded_at, objective_id",
@@ -2616,18 +2626,22 @@ impl SchedulerStore {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|error| format!("Failed to query objective checkpoints: {error}"))?
             .map(|row| {
-                let (objective_id, evidence, source_attempt_id, recorded_at) =
+                let (objective_id, evidence, tool_receipts, source_attempt_id, recorded_at) =
                     row.map_err(|error| format!("Failed to read objective checkpoint: {error}"))?;
                 Ok(AgentTaskObjectiveCheckpoint {
                     objective_id,
                     evidence: serde_json::from_str(&evidence).map_err(|error| {
                         format!("Failed to decode objective checkpoint evidence: {error}")
+                    })?,
+                    tool_receipts: serde_json::from_str(&tool_receipts).map_err(|error| {
+                        format!("Failed to decode objective checkpoint tool receipts: {error}")
                     })?,
                     source_attempt_id: from_i64(source_attempt_id, "checkpoint attempt ID")?,
                     recorded_at: from_i64(recorded_at, "checkpoint timestamp")?,
@@ -3922,6 +3936,15 @@ mod tests {
                    created_at INTEGER NOT NULL,
                    started_at INTEGER,
                    completed_at INTEGER
+                 );
+                 CREATE TABLE scheduler_task_objective_checkpoints (
+                   session_id INTEGER NOT NULL,
+                   objective_id TEXT NOT NULL,
+                   evidence_json TEXT NOT NULL,
+                   source_attempt_id INTEGER NOT NULL,
+                   source_fencing_token INTEGER NOT NULL,
+                   recorded_at INTEGER NOT NULL,
+                   PRIMARY KEY(session_id, objective_id)
                  );",
             )
             .expect("legacy schema created");
@@ -3967,6 +3990,19 @@ mod tests {
                 .len(),
             1
         );
+        let checkpoint_columns = store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .prepare("PRAGMA table_info(scheduler_task_objective_checkpoints)")
+            .expect("checkpoint columns prepared")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("checkpoint columns queried")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("checkpoint columns read");
+        assert!(checkpoint_columns
+            .iter()
+            .any(|column| column == "tool_receipts_json"));
     }
 
     #[test]

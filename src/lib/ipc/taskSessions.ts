@@ -449,6 +449,12 @@ export type TaskExecutionManifest = {
     objective_checkpoints?: Array<{
       objective_id: string;
       evidence: string[];
+      tool_receipts: Array<{
+        tool_call_id: string;
+        tool_name: string;
+        risk: string;
+        arguments_digest: string;
+      }>;
       source_attempt_id: number;
       recorded_at: number;
     }>;

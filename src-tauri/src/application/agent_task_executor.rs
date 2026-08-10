@@ -9,9 +9,9 @@ use crate::domain::task_recovery::{
     RuntimeRecoveryContext,
 };
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, AgentTaskObjectiveResult, AgentTaskResult, TaskExecutionOutput,
-    TaskMcpConnectorContext, TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1,
-    TaskSessionEventKind, TaskSessionKind,
+    AgentTaskCompletionStatus, AgentTaskObjectiveResult, AgentTaskObjectiveToolReceipt,
+    AgentTaskResult, TaskExecutionOutput, TaskMcpConnectorContext, TaskProgress,
+    TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind, TaskSessionKind,
 };
 use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
@@ -29,6 +29,8 @@ const MAX_AUTOMATIC_RUNTIME_RETRIES: u8 = 1;
 struct RuntimeAttemptObservation {
     successful_tool_calls: u32,
     successful_mutation_observed: bool,
+    in_flight_tools: HashMap<String, AgentTaskObjectiveToolReceipt>,
+    uncheckpointed_tool_receipts: Vec<AgentTaskObjectiveToolReceipt>,
     opencode_session_id: Option<String>,
     failed_tool: Option<String>,
     failed_tool_risk: Option<String>,
@@ -51,6 +53,7 @@ fn runtime_callback(
     callback_gate: Arc<Mutex<bool>>,
     observation: Arc<Mutex<RuntimeAttemptObservation>>,
     objective_mutations: Arc<HashMap<String, bool>>,
+    protected_mutations: Arc<Mutex<HashMap<(String, String), String>>>,
 ) -> AiWorkerEventCallback {
     Box::new(move |event| {
         let open = callback_gate.lock().map_err(|error| error.to_string())?;
@@ -75,22 +78,76 @@ fn runtime_callback(
             let mutation_expected = objective_mutations.get(objective_id).ok_or_else(|| {
                 format!("Agent checkpoint referenced unknown objective '{objective_id}'.")
             })?;
+            let tool_receipts = {
+                let mut observation = observation.lock().map_err(|error| error.to_string())?;
+                std::mem::take(&mut observation.uncheckpointed_tool_receipts)
+            };
             if *mutation_expected
-                && !observation
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .successful_mutation_observed
+                && !tool_receipts
+                    .iter()
+                    .any(|receipt| !matches!(receipt.risk.as_str(), "read"))
             {
                 return Err(format!(
                     "Mutation objective '{objective_id}' cannot checkpoint before a successful mutation tool event."
                 ));
             }
-            reporter
-                .record_objective_checkpoint(objective_id, evidence)
+            let checkpoint_event = reporter
+                .record_objective_checkpoint(objective_id, evidence, &tool_receipts)
                 .map_err(|error| error.to_string())?;
+            if checkpoint_event.payload["new_checkpoint"] == true {
+                let mut protected = protected_mutations
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                for receipt in tool_receipts
+                    .iter()
+                    .filter(|receipt| receipt.risk != "read")
+                {
+                    protected.insert(
+                        (receipt.tool_name.clone(), receipt.arguments_digest.clone()),
+                        objective_id.clone(),
+                    );
+                }
+            }
             return Ok(());
         }
+        if let AiWorkerStreamEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+            risk,
+            arguments_digest,
+            ..
+        } = &event
+        {
+            let normalized_tool_name = tool_name.trim().to_ascii_lowercase();
+            if let Some(objective_id) = protected_mutations
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(&(normalized_tool_name.clone(), arguments_digest.clone()))
+                .cloned()
+            {
+                return Err(format!(
+                    "Tool call '{tool_name}' replays completed objective '{objective_id}' with identical arguments."
+                ));
+            }
+            observation
+                .lock()
+                .map_err(|error| error.to_string())?
+                .in_flight_tools
+                .insert(
+                    tool_call_id.clone(),
+                    AgentTaskObjectiveToolReceipt {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: normalized_tool_name,
+                        risk: match risk.trim().to_ascii_lowercase().as_str() {
+                            "low" => "read".to_string(),
+                            normalized => normalized.to_string(),
+                        },
+                        arguments_digest: arguments_digest.clone(),
+                    },
+                );
+        }
         if let AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
             tool_name,
             success,
             error,
@@ -106,8 +163,21 @@ fn runtime_callback(
                 if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
                     observation.successful_mutation_observed = true;
                 }
+                let receipt = observation.in_flight_tools.remove(tool_call_id).unwrap_or(
+                    AgentTaskObjectiveToolReceipt {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.trim().to_ascii_lowercase(),
+                        risk: match risk.trim().to_ascii_lowercase().as_str() {
+                            "low" => "read".to_string(),
+                            normalized => normalized.to_string(),
+                        },
+                        arguments_digest: arguments_digest.clone(),
+                    },
+                );
+                observation.uncheckpointed_tool_receipts.push(receipt);
             } else {
                 let mut attempt = observation.lock().map_err(|error| error.to_string())?;
+                attempt.in_flight_tools.remove(tool_call_id);
                 attempt.failed_tool = Some(tool_name.clone());
                 attempt.failed_tool_risk = Some(risk.clone());
                 drop(attempt);
@@ -321,6 +391,23 @@ impl TaskExecutor for AgentTaskExecutor {
             &resolved.connector_capabilities,
         );
         let objective_checkpoints = context.objective_checkpoints()?;
+        let protected_mutations = Arc::new(Mutex::new(
+            objective_checkpoints
+                .iter()
+                .flat_map(|checkpoint| {
+                    checkpoint
+                        .tool_receipts
+                        .iter()
+                        .filter(|receipt| receipt.risk != "read")
+                        .map(|receipt| {
+                            (
+                                (receipt.tool_name.clone(), receipt.arguments_digest.clone()),
+                                checkpoint.objective_id.clone(),
+                            )
+                        })
+                })
+                .collect::<HashMap<_, _>>(),
+        ));
         let semantic_objective_mutations = resolved
             .task
             .execution_contract
@@ -507,6 +594,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 callback_open,
                 observation.clone(),
                 semantic_objective_mutations.clone(),
+                protected_mutations.clone(),
             );
             let attempt_result = self.runner.execute(
                 retry_config.clone(),
@@ -934,7 +1022,7 @@ mod tests {
     use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState, TaskToolState};
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
     use crate::infrastructure::ai_worker::AiWorkerObjectiveResult;
-    use crate::infrastructure::tool_broker::ToolDisplayContext;
+    use crate::infrastructure::tool_broker::{argument_digest, ToolDisplayContext};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
@@ -1120,6 +1208,10 @@ mod tests {
     struct CheckpointThenCompleteRunner {
         executions: Arc<AtomicUsize>,
         observed_checkpoints: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    struct MutationCheckpointReplayRunner {
+        executions: Arc<AtomicUsize>,
     }
 
     impl AgentRuntimeRunner for ToolFailureRunner {
@@ -1361,6 +1453,73 @@ mod tests {
                         completion_status: AiWorkerCompletionStatus::Completed,
                         evidence: vec!["Rollout healthy".to_string()],
                         blocked_reason: None,
+                    },
+                ],
+            })
+        }
+    }
+
+    impl AgentRuntimeRunner for MutationCheckpointReplayRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            _task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            let digest = argument_digest(&json!({ "plan_key": "QCASH-BUILD" }))?;
+            on_event(AiWorkerStreamEvent::OpenCodeSession {
+                session_id: "opencode-mutation-checkpoint-session".to_string(),
+                action: if execution == 0 { "created" } else { "resumed" }.to_string(),
+            })?;
+            on_event(AiWorkerStreamEvent::ToolStarted {
+                tool_call_id: format!("bamboo-call-{execution}"),
+                tool_name: "bamboo_trigger_build".to_string(),
+                risk: "mutation".to_string(),
+                arguments_digest: digest.clone(),
+                display_context: ToolDisplayContext {
+                    label: "Triggering QCASH-BUILD".to_string(),
+                    category: "bamboo".to_string(),
+                    target: Some("QCASH-BUILD".to_string()),
+                },
+            })?;
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: format!("bamboo-call-{execution}"),
+                tool_name: "bamboo_trigger_build".to_string(),
+                success: true,
+                error: None,
+                risk: "mutation".to_string(),
+                arguments_digest: argument_digest(&json!({}))?,
+                display_context: ToolDisplayContext {
+                    label: "Triggering QCASH-BUILD".to_string(),
+                    category: "bamboo".to_string(),
+                    target: Some("QCASH-BUILD".to_string()),
+                },
+            })?;
+            on_event(AiWorkerStreamEvent::ObjectiveCheckpoint {
+                objective_id: "objective-1".to_string(),
+                evidence: vec!["Bamboo build 842 succeeded".to_string()],
+            })?;
+            Ok(AiWorkerTaskResult {
+                summary: "Deployment still needs operator input".to_string(),
+                evidence: vec!["Bamboo build 842 succeeded".to_string()],
+                details: Vec::new(),
+                next: vec!["Continue deployment".to_string()],
+                completion_status: AiWorkerCompletionStatus::Blocked,
+                blocked_reason: Some("operator input required".to_string()),
+                objective_results: vec![
+                    AiWorkerObjectiveResult {
+                        objective_id: "objective-1".to_string(),
+                        completion_status: AiWorkerCompletionStatus::Completed,
+                        evidence: vec!["Bamboo build 842 succeeded".to_string()],
+                        blocked_reason: None,
+                    },
+                    AiWorkerObjectiveResult {
+                        objective_id: "objective-2".to_string(),
+                        completion_status: AiWorkerCompletionStatus::Blocked,
+                        evidence: Vec::new(),
+                        blocked_reason: Some("operator input required".to_string()),
                     },
                 ],
             })
@@ -2520,6 +2679,85 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.payload["type"] == "objective_checkpointed"));
+    }
+
+    #[test]
+    fn continuation_rejects_identical_mutation_from_checkpoint_receipt() {
+        let directory = tempdir().expect("temp directory");
+        let contract = json!({
+            "contract": "mutation-replay-test",
+            "semantic_plan": {
+                "status": "fallback",
+                "planner_version": "agent-semantic-plan-v1",
+                "objectives": [
+                    {
+                        "id": "objective-1",
+                        "summary": "Trigger Bamboo build",
+                        "success_evidence": "successful build",
+                        "mutation_expected": true
+                    },
+                    { "id": "objective-2", "summary": "Deploy rollout", "success_evidence": "healthy rollout", "mutation_expected": true }
+                ]
+            }
+        });
+        let mut envelope = test_envelope();
+        let TaskSessionEnvelope::V1(session_envelope) = &mut envelope else {
+            unreachable!();
+        };
+        session_envelope.context_digest = execution_contract_digest(&contract).expect("digest");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(CheckpointResolver { contract }),
+            Arc::new(MutationCheckpointReplayRunner {
+                executions: executions.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "mutation-replay-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let blocked = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("first attempt blocks after checkpoint");
+        assert_eq!(blocked.state, TaskSessionState::Blocked);
+
+        let first_events = engine.events_after(session.id, 0).expect("events replayed");
+        let checkpoint = first_events
+            .iter()
+            .find(|event| event.payload["type"] == "objective_checkpointed")
+            .expect("checkpoint event retained");
+        assert_eq!(checkpoint.payload["tool_receipt_count"], 1);
+        assert_eq!(
+            checkpoint.payload["tool_receipts"][0]["arguments_digest"],
+            argument_digest(&json!({ "plan_key": "QCASH-BUILD" })).expect("digest")
+        );
+
+        engine
+            .continue_interrupted_session(
+                session.id,
+                "mutation-replay-agent-continued",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+            )
+            .expect("task continued");
+        let failed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("replayed mutation fails");
+
+        assert_eq!(failed.state, TaskSessionState::Failed);
+        assert!(failed.error.as_deref().is_some_and(|error| {
+            error.contains("replays completed objective 'objective-1' with identical arguments")
+        }));
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
     }
 
     #[test]

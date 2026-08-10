@@ -56,12 +56,15 @@ export function projectAgentTaskSessionEvent(
     const evidence = Array.isArray(payload.evidence)
       ? payload.evidence.filter((item): item is string => typeof item === "string")
       : [];
+    const receiptCount =
+      typeof payload.tool_receipt_count === "number" ? payload.tool_receipt_count : 0;
     const newlySaved = payload.new_checkpoint !== false;
     summary = newlySaved
       ? `Objective checkpoint saved: ${objectiveId}.`
       : `Objective checkpoint already retained: ${objectiveId}.`;
     details.push(
       "- This verified objective will not be repeated if the task continues.",
+      `- Bound successful tool calls: ${receiptCount}`,
       ...(evidence.length > 0 ? [`- Evidence: ${evidence[0]}`] : []),
     );
   } else if (event.kind === "runtime" && eventType === "runtime_recovery_decision") {

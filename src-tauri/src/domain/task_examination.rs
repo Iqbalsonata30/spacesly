@@ -213,6 +213,7 @@ impl TaskExaminationRecord {
         }
         let mut checkpoint_ids = HashSet::new();
         if self.objective_checkpoints.iter().any(|checkpoint| {
+            let mut tool_call_ids = HashSet::new();
             !canonical_inventory_name(&checkpoint.objective_id, true)
                 || !checkpoint_ids.insert(checkpoint.objective_id.as_str())
                 || checkpoint.evidence.is_empty()
@@ -221,6 +222,26 @@ impl TaskExaminationRecord {
                     .evidence
                     .iter()
                     .any(|evidence| evidence.trim().is_empty() || evidence.len() > 2_000)
+                || checkpoint.tool_receipts.len() > 32
+                || checkpoint.tool_receipts.iter().any(|receipt| {
+                    receipt.tool_call_id.trim().is_empty()
+                        || receipt.tool_call_id.len() > 256
+                        || !tool_call_ids.insert(receipt.tool_call_id.as_str())
+                        || !canonical_inventory_name(&receipt.tool_name, true)
+                        || !matches!(
+                            receipt.risk.as_str(),
+                            "read"
+                                | "mutation"
+                                | "destructive"
+                                | "credential_sensitive"
+                                | "unknown"
+                        )
+                        || receipt.arguments_digest.len() != 64
+                        || !receipt
+                            .arguments_digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                })
                 || checkpoint.source_attempt_id == 0
                 || checkpoint.recorded_at == 0
         }) {
