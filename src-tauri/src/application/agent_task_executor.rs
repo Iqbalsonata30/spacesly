@@ -5,9 +5,9 @@ use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelCo
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_examination::examine_task;
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, AgentTaskResult, TaskExecutionOutput, TaskMcpConnectorContext,
-    TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionEventKind,
-    TaskSessionKind,
+    AgentTaskCompletionStatus, AgentTaskObjectiveResult, AgentTaskResult, TaskExecutionOutput,
+    TaskMcpConnectorContext, TaskProgress, TaskSessionEnvelope, TaskSessionEnvelopeV1,
+    TaskSessionEventKind, TaskSessionKind,
 };
 use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
@@ -448,6 +448,19 @@ impl TaskExecutor for AgentTaskExecutor {
             next: result.next,
             completion_status,
             blocked_reason: result.blocked_reason,
+            objective_results: result
+                .objective_results
+                .into_iter()
+                .map(|objective| AgentTaskObjectiveResult {
+                    objective_id: objective.objective_id,
+                    completion_status: match objective.completion_status {
+                        AiWorkerCompletionStatus::Completed => AgentTaskCompletionStatus::Completed,
+                        AiWorkerCompletionStatus::Blocked => AgentTaskCompletionStatus::Blocked,
+                    },
+                    evidence: objective.evidence,
+                    blocked_reason: objective.blocked_reason,
+                })
+                .collect(),
         }))
     }
 }
@@ -807,6 +820,7 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Blocked,
                 blocked_reason: Some("operator approval required".to_string()),
+                objective_results: Vec::new(),
             })
         }
     }
@@ -853,6 +867,7 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
+                objective_results: Vec::new(),
             })
         }
     }
@@ -890,6 +905,7 @@ mod tests {
                     AiWorkerCompletionStatus::Completed
                 },
                 blocked_reason: (execution == 0).then(|| "operator input required".to_string()),
+                objective_results: Vec::new(),
             })
         }
     }
@@ -916,6 +932,7 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
+                objective_results: Vec::new(),
             })
         }
     }
@@ -956,6 +973,7 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
+                objective_results: Vec::new(),
             })
         }
     }
@@ -1025,6 +1043,7 @@ mod tests {
                 next: Vec::new(),
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
+                objective_results: Vec::new(),
             })
         }
     }

@@ -7128,6 +7128,17 @@
       ...(result.details.length > 0 ? result.details.map((line) => `- ${line}`) : ["- none"]),
     ];
 
+    if (result.objective_results.length > 0) {
+      sections.push(
+        "OBJECTIVES:",
+        ...result.objective_results.map((objective) => {
+          const evidence = objective.evidence.length > 0 ? ` — ${objective.evidence.join("; ")}` : "";
+          const blocker = objective.blocked_reason ? ` — ${objective.blocked_reason}` : "";
+          return `- ${objective.objective_id}: ${objective.completion_status.toUpperCase()}${evidence}${blocker}`;
+        }),
+      );
+    }
+
     if (result.next.length > 0) {
       sections.push("NEXT:", ...result.next.map((line) => `- ${line}`));
     }
@@ -8272,7 +8283,11 @@
           `Completion status: ${result.completion_status}`,
           `Blocked reason: ${result.blocked_reason ?? "none"}`,
         ],
-        [`Evidence lines: ${result.evidence.length}`, `Detail lines: ${result.details.length}`],
+        [
+          `Evidence lines: ${result.evidence.length}`,
+          `Detail lines: ${result.details.length}`,
+          `Objectives covered: ${result.objective_results.length}`,
+        ],
         result.completion_status === "completed"
           ? ["Review the result, then write back to board and Jira."]
           : ["Inspect the blocker, add notes if needed, and continue."],

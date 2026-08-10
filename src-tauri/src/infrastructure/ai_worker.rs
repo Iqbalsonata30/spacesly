@@ -324,6 +324,18 @@ pub struct AiWorkerTaskResult {
     pub next: Vec<String>,
     pub completion_status: AiWorkerCompletionStatus,
     pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub objective_results: Vec<AiWorkerObjectiveResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AiWorkerObjectiveResult {
+    pub objective_id: String,
+    pub completion_status: AiWorkerCompletionStatus,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +349,19 @@ struct StructuredAiWorkerTaskResult {
     next: Vec<String>,
     #[serde(alias = "status")]
     completion_status: String,
+    #[serde(default)]
+    blocked_reason: Option<String>,
+    #[serde(default)]
+    objective_results: Vec<StructuredAiWorkerObjectiveResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StructuredAiWorkerObjectiveResult {
+    objective_id: String,
+    #[serde(alias = "status")]
+    completion_status: String,
+    #[serde(default)]
+    evidence: Vec<String>,
     #[serde(default)]
     blocked_reason: Option<String>,
 }
@@ -572,7 +597,7 @@ pub fn execute_ai_worker_task(
     let user_prompt = context.agent_api_user_prompt(&task);
 
     check_cancelled(&cancellation)?;
-    let response = call_model(&config, &system_prompt, &user_prompt, 700)?;
+    let response = call_model(&config, &system_prompt, &user_prompt, 1_800)?;
     check_cancelled(&cancellation)?;
     Ok(result_from_structured_response(response, Some(&task)))
 }
@@ -1163,14 +1188,14 @@ impl<'a> ContextBuilder<'a> {
 
     fn agent_api_user_prompt(&self, task: &AiWorkerTask) -> String {
         format!(
-            "Execution Contract (authoritative, immutable):\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually executed and verified for the contract current_step\"],\n  \"details\": [\"concise execution notes; include contract_id/current_step if relevant\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\"\n}}",
+            "Execution Contract (authoritative, immutable):\n{}\n\nReturn exactly one JSON object with this schema:\n{{\n  \"completion_status\": \"completed\" | \"blocked\",\n  \"summary\": \"one sentence\",\n  \"evidence\": [\"what was actually executed and verified for the contract current_step\"],\n  \"details\": [\"concise execution notes; include contract_id/current_step if relevant\"],\n  \"next\": [\"operator follow-up steps, empty if none\"],\n  \"blocked_reason\": \"required when completion_status is blocked, otherwise null\",\n  \"objective_results\": [{{\"objective_id\": \"exact semantic_plan objective id\", \"completion_status\": \"completed\" | \"blocked\", \"evidence\": [\"objective-specific verification\"], \"blocked_reason\": \"required when this objective is blocked, otherwise null\"}}]\n}}\nReturn exactly one objective_results entry for every semantic_plan objective. Never invent or omit an objective id. A completed objective requires concrete evidence; a blocked objective requires blocked_reason. The overall result must be blocked when any objective is blocked.",
             execution_contract_context(task),
         )
     }
 
     fn opencode_agent_prompt(&self, task: &AiWorkerTask) -> String {
         format!(
-            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, or regenerate the workflow. Do not rediscover the repository when constraints.must_not_rediscover_repository is true; when it is false and the current step requires local work, locate the requested repository only inside the assigned workspace. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful",
+            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, or regenerate the workflow. Do not rediscover the repository when constraints.must_not_rediscover_repository is true; when it is false and the current step requires local work, locate the requested repository only inside the assigned workspace. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful\nOBJECTIVE_RESULTS_JSON: a single-line JSON array with exactly one object per semantic_plan objective, using {{\"objective_id\":\"exact id\",\"completion_status\":\"completed or blocked\",\"evidence\":[\"objective-specific verification\"],\"blocked_reason\":null}}. Never invent or omit an objective id. Completed objectives require evidence; blocked objectives require blocked_reason. STATUS must be BLOCKED when any objective is blocked.",
             governance_context(self.config, true),
             execution_contract_context(task),
         )
@@ -1736,14 +1761,20 @@ fn result_from_response(response: String, task: Option<&AiWorkerTask>) -> AiWork
         None
     };
 
-    AiWorkerTaskResult {
+    let objective_results = labelled_value(&response, "OBJECTIVE_RESULTS_JSON")
+        .and_then(|value| parse_objective_results(&value).ok())
+        .unwrap_or_default();
+    let mut result = AiWorkerTaskResult {
         summary,
         evidence,
         details,
         next,
         completion_status,
         blocked_reason,
-    }
+        objective_results,
+    };
+    enforce_objective_coverage(&mut result, task);
+    result
 }
 
 fn result_from_structured_response(
@@ -1757,6 +1788,7 @@ fn result_from_structured_response(
             {
                 block_result(&mut result, completion_guard_reason(task));
             }
+            enforce_objective_coverage(&mut result, task);
             result
         }
         Err(error) => invalid_structured_result(response, error),
@@ -1768,11 +1800,7 @@ fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String>
         .ok_or_else(|| "response did not contain a JSON object".to_string())?;
     let parsed: StructuredAiWorkerTaskResult = serde_json::from_str(raw)
         .map_err(|error| format!("failed to parse JSON result: {error}"))?;
-    let completion_status = match parsed.completion_status.trim().to_lowercase().as_str() {
-        "completed" | "complete" => AiWorkerCompletionStatus::Completed,
-        "blocked" | "block" => AiWorkerCompletionStatus::Blocked,
-        other => return Err(format!("invalid completion_status: {other}")),
-    };
+    let completion_status = parse_completion_status(&parsed.completion_status)?;
     let summary = parsed.summary.trim().to_string();
     if summary.is_empty() {
         return Err("summary is required".to_string());
@@ -1788,6 +1816,8 @@ fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String>
         return Err("blocked_reason is required when completion_status is blocked".to_string());
     }
 
+    let objective_results = parse_structured_objective_results(parsed.objective_results)?;
+
     Ok(AiWorkerTaskResult {
         summary,
         evidence: clean_result_lines(parsed.evidence),
@@ -1798,7 +1828,143 @@ fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String>
             .blocked_reason
             .map(|reason| reason.trim().to_string())
             .filter(|reason| !reason.is_empty()),
+        objective_results,
     })
+}
+
+fn parse_completion_status(value: &str) -> Result<AiWorkerCompletionStatus, String> {
+    match value.trim().to_lowercase().as_str() {
+        "completed" | "complete" => Ok(AiWorkerCompletionStatus::Completed),
+        "blocked" | "block" => Ok(AiWorkerCompletionStatus::Blocked),
+        other => Err(format!("invalid completion_status: {other}")),
+    }
+}
+
+fn parse_objective_results(value: &str) -> Result<Vec<AiWorkerObjectiveResult>, String> {
+    let parsed: Vec<StructuredAiWorkerObjectiveResult> = serde_json::from_str(value)
+        .map_err(|error| format!("failed to parse objective results: {error}"))?;
+    parse_structured_objective_results(parsed)
+}
+
+fn parse_structured_objective_results(
+    values: Vec<StructuredAiWorkerObjectiveResult>,
+) -> Result<Vec<AiWorkerObjectiveResult>, String> {
+    if values.len() > 8 {
+        return Err("objective_results must not contain more than 8 entries".to_string());
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let objective_id = value.objective_id.trim().to_string();
+            if objective_id.is_empty() {
+                return Err("objective_id is required".to_string());
+            }
+            let completion_status = parse_completion_status(&value.completion_status)?;
+            let evidence = clean_result_lines(value.evidence);
+            let blocked_reason = value
+                .blocked_reason
+                .map(|reason| reason.trim().to_string())
+                .filter(|reason| !reason.is_empty());
+            if completion_status == AiWorkerCompletionStatus::Completed && evidence.is_empty() {
+                return Err(format!(
+                    "completed objective {objective_id} requires evidence"
+                ));
+            }
+            if completion_status == AiWorkerCompletionStatus::Blocked && blocked_reason.is_none() {
+                return Err(format!(
+                    "blocked objective {objective_id} requires blocked_reason"
+                ));
+            }
+            Ok(AiWorkerObjectiveResult {
+                objective_id,
+                completion_status,
+                evidence,
+                blocked_reason,
+            })
+        })
+        .collect()
+}
+
+fn expected_objective_ids(task: Option<&AiWorkerTask>) -> Vec<String> {
+    task.and_then(|task| task.execution_contract.as_ref())
+        .and_then(|contract| contract.get("semantic_plan"))
+        .and_then(|plan| plan.get("objectives"))
+        .and_then(serde_json::Value::as_array)
+        .map(|objectives| {
+            objectives
+                .iter()
+                .take(8)
+                .filter_map(|objective| objective.get("id").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn enforce_objective_coverage(result: &mut AiWorkerTaskResult, task: Option<&AiWorkerTask>) {
+    let expected = expected_objective_ids(task);
+    if expected.is_empty() {
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    let unknown_or_duplicate = result.objective_results.iter().find_map(|objective| {
+        if !expected.contains(&objective.objective_id) {
+            Some(format!("unknown objective id {}", objective.objective_id))
+        } else if !seen.insert(objective.objective_id.clone()) {
+            Some(format!("duplicate objective id {}", objective.objective_id))
+        } else {
+            None
+        }
+    });
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|id| !seen.contains(*id))
+        .cloned()
+        .collect();
+    let invalid =
+        result
+            .objective_results
+            .iter()
+            .find_map(|objective| match objective.completion_status {
+                AiWorkerCompletionStatus::Completed if objective.evidence.is_empty() => {
+                    Some(format!(
+                        "completed objective {} has no evidence",
+                        objective.objective_id
+                    ))
+                }
+                AiWorkerCompletionStatus::Blocked if objective.blocked_reason.is_none() => {
+                    Some(format!(
+                        "blocked objective {} has no blocked_reason",
+                        objective.objective_id
+                    ))
+                }
+                _ => None,
+            });
+
+    if let Some(reason) = unknown_or_duplicate.or(invalid).or_else(|| {
+        (!missing.is_empty()).then(|| format!("missing objective results: {}", missing.join(", ")))
+    }) {
+        block_result(
+            result,
+            format!("Agent objective evidence did not cover the execution plan: {reason}."),
+        );
+        return;
+    }
+
+    if let Some(objective) = result
+        .objective_results
+        .iter()
+        .find(|objective| objective.completion_status == AiWorkerCompletionStatus::Blocked)
+    {
+        let reason = objective
+            .blocked_reason
+            .clone()
+            .unwrap_or_else(|| format!("Objective {} is blocked.", objective.objective_id));
+        block_result(result, reason);
+    }
 }
 
 fn extract_json_object(response: &str) -> Option<&str> {
@@ -1841,6 +2007,7 @@ fn invalid_structured_result(response: String, error: String) -> AiWorkerTaskRes
         ],
         completion_status: AiWorkerCompletionStatus::Blocked,
         blocked_reason: Some(error),
+        objective_results: Vec::new(),
     }
 }
 
@@ -2466,7 +2633,7 @@ fn labelled_values(response: &str, label: &str) -> Vec<String> {
         if let Some((name, _)) = line.split_once(':') {
             if matches!(
                 name.trim().to_uppercase().as_str(),
-                "STATUS" | "SUMMARY" | "EVIDENCE" | "DETAILS" | "NEXT"
+                "STATUS" | "SUMMARY" | "EVIDENCE" | "DETAILS" | "NEXT" | "OBJECTIVE_RESULTS_JSON"
             ) {
                 break;
             }
@@ -3769,6 +3936,7 @@ mod tests {
             next: Vec::new(),
             completion_status: AiWorkerCompletionStatus::Completed,
             blocked_reason: None,
+            objective_results: Vec::new(),
         })
         .expect("serialize task result");
 
@@ -3797,6 +3965,73 @@ mod tests {
         assert_eq!(result.summary, "Queue summarized.");
         assert_eq!(result.evidence, vec!["Read visible board state"]);
         assert_eq!(result.blocked_reason, None);
+    }
+
+    #[test]
+    fn structured_result_requires_evidence_for_every_semantic_objective() {
+        let task = AiWorkerTask {
+            execution_contract: Some(serde_json::json!({
+                "semantic_plan": {
+                    "objectives": [
+                        { "id": "objective-1" },
+                        { "id": "objective-2" }
+                    ]
+                }
+            })),
+            task_examination: None,
+            session_key: None,
+            opencode_session_id: None,
+        };
+        let result = result_from_structured_response(
+            r#"{
+              "completion_status": "completed",
+              "summary": "Only one objective was verified.",
+              "evidence": ["partial verification"],
+              "details": [],
+              "next": [],
+              "blocked_reason": null,
+              "objective_results": [{
+                "objective_id": "objective-1",
+                "completion_status": "completed",
+                "evidence": ["build 42 passed"],
+                "blocked_reason": null
+              }]
+            }"#
+            .to_string(),
+            Some(&task),
+        );
+
+        assert_eq!(result.completion_status, AiWorkerCompletionStatus::Blocked);
+        assert!(result
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing objective results: objective-2"));
+    }
+
+    #[test]
+    fn opencode_result_cannot_complete_when_an_objective_is_blocked() {
+        let task = AiWorkerTask {
+            execution_contract: Some(serde_json::json!({
+                "semantic_plan": {
+                    "objectives": [{ "id": "objective-1" }]
+                }
+            })),
+            task_examination: None,
+            session_key: None,
+            opencode_session_id: None,
+        };
+        let result = result_from_response(
+            "STATUS: COMPLETE\nSUMMARY: Finished\nEVIDENCE: checked\nDETAILS: done\nOBJECTIVE_RESULTS_JSON: [{\"objective_id\":\"objective-1\",\"completion_status\":\"blocked\",\"evidence\":[],\"blocked_reason\":\"Bamboo was unavailable\"}]".to_string(),
+            Some(&task),
+        );
+
+        assert_eq!(result.completion_status, AiWorkerCompletionStatus::Blocked);
+        assert_eq!(
+            result.blocked_reason.as_deref(),
+            Some("Bamboo was unavailable")
+        );
+        assert_eq!(result.objective_results.len(), 1);
     }
 
     #[test]

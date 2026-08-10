@@ -844,6 +844,18 @@ pub struct AgentTaskResult {
     pub next: Vec<String>,
     pub completion_status: AgentTaskCompletionStatus,
     pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub objective_results: Vec<AgentTaskObjectiveResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskObjectiveResult {
+    pub objective_id: String,
+    pub completion_status: AgentTaskCompletionStatus,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
 }
 
 /// Authoritative assistant response produced by a Chat Task Session.

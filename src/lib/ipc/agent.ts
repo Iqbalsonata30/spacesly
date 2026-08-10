@@ -166,6 +166,14 @@ export interface AiWorkerTaskResult {
   next: string[];
   completion_status: "completed" | "blocked";
   blocked_reason: string | null;
+  objective_results: AiWorkerObjectiveResult[];
+}
+
+export interface AiWorkerObjectiveResult {
+  objective_id: string;
+  completion_status: "completed" | "blocked";
+  evidence: string[];
+  blocked_reason: string | null;
 }
 
 export interface AiWorkerChatResult {
@@ -535,13 +543,28 @@ function validateAiWorkerTaskResult(result: unknown): AiWorkerTaskResult {
     value.evidence.every((line) => typeof line === "string") &&
     value.details.every((line) => typeof line === "string") &&
     value.next.every((line) => typeof line === "string") &&
-    (value.blocked_reason === null || typeof value.blocked_reason === "string");
+    (value.blocked_reason === null || typeof value.blocked_reason === "string") &&
+    (value.objective_results === undefined ||
+      (Array.isArray(value.objective_results) &&
+        value.objective_results.every(isAiWorkerObjectiveResult)));
 
   if (!validStatus || !validShape) {
     return invalidAiWorkerTaskResult("Agent returned an invalid structured result.");
   }
 
-  return value as AiWorkerTaskResult;
+  return { ...value, objective_results: value.objective_results ?? [] } as AiWorkerTaskResult;
+}
+
+function isAiWorkerObjectiveResult(value: unknown): value is AiWorkerObjectiveResult {
+  if (typeof value !== "object" || value === null) return false;
+  const objective = value as Partial<AiWorkerObjectiveResult>;
+  return (
+    typeof objective.objective_id === "string" &&
+    (objective.completion_status === "completed" || objective.completion_status === "blocked") &&
+    Array.isArray(objective.evidence) &&
+    objective.evidence.every((line) => typeof line === "string") &&
+    (objective.blocked_reason === null || typeof objective.blocked_reason === "string")
+  );
 }
 
 function invalidAiWorkerTaskResult(reason: string): AiWorkerTaskResult {
@@ -552,5 +575,6 @@ function invalidAiWorkerTaskResult(reason: string): AiWorkerTaskResult {
     next: ["Retry the Agent or switch to a runtime that returns the required structured result."],
     completion_status: "blocked",
     blocked_reason: reason,
+    objective_results: [],
   };
 }

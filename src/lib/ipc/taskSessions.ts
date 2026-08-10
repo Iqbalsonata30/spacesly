@@ -36,6 +36,12 @@ export type AgentTaskResult = {
   next: string[];
   completion_status: "completed" | "blocked";
   blocked_reason: string | null;
+  objective_results: Array<{
+    objective_id: string;
+    completion_status: "completed" | "blocked";
+    evidence: string[];
+    blocked_reason: string | null;
+  }>;
 };
 
 export type ChatTaskResult = { conversation_id: string; message: string };

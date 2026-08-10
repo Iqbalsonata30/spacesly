@@ -2843,6 +2843,7 @@ mod tests {
                     completion_status:
                         crate::domain::task_session::AgentTaskCompletionStatus::Completed,
                     blocked_reason: None,
+                    objective_results: Vec::new(),
                 },
             ))
         }
@@ -3002,6 +3003,7 @@ mod tests {
                             completion_status:
                                 crate::domain::task_session::AgentTaskCompletionStatus::Completed,
                             blocked_reason: None,
+                            objective_results: Vec::new(),
                         },
                     )),
                 )

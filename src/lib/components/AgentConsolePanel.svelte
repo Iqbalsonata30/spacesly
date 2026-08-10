@@ -126,6 +126,7 @@
   let resultItems = $derived(
     result ? usefulResultLines([...result.details, ...result.evidence]).slice(0, 8) : [],
   );
+  let objectiveResults = $derived(result?.objective_results ?? []);
   let warnings = $derived(
     (result?.details ?? [])
       .filter((line) =>
@@ -636,6 +637,19 @@
                 >
               </div>
             </div>{/if}
+        </div>
+      {/if}
+      {#if objectiveResults.length > 0}
+        <div class="result-grid" aria-label="Objective verification">
+          {#each objectiveResults as objective (objective.objective_id)}
+            <div class:warning={objective.completion_status === "blocked"} class="result-item">
+              <div>
+                <span>{objective.completion_status === "completed" ? "Verified objective" : "Blocked objective"}</span>
+                <strong>{objective.objective_id}</strong>
+                <small>{objective.evidence[0] ?? objective.blocked_reason ?? "No evidence supplied"}</small>
+              </div>
+            </div>
+          {/each}
         </div>
       {/if}
     </section>

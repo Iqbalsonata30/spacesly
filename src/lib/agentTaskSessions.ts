@@ -918,7 +918,19 @@ function isAgentTaskResult(value: unknown): value is AiWorkerTaskResult {
     isStringArray(value.details) &&
     isStringArray(value.next) &&
     (value.completion_status === "completed" || value.completion_status === "blocked") &&
-    (value.blocked_reason === null || typeof value.blocked_reason === "string")
+    (value.blocked_reason === null || typeof value.blocked_reason === "string") &&
+    (value.objective_results === undefined ||
+      (Array.isArray(value.objective_results) &&
+        value.objective_results.every(
+          (objective) =>
+            isRecord(objective) &&
+            typeof objective.objective_id === "string" &&
+            (objective.completion_status === "completed" ||
+              objective.completion_status === "blocked") &&
+            isStringArray(objective.evidence) &&
+            (objective.blocked_reason === null ||
+              typeof objective.blocked_reason === "string"),
+        )))
   );
 }
 

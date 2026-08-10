@@ -303,6 +303,7 @@ const authoritativeResult: import("../src/lib/ipc/agent").AiWorkerTaskResult = {
   next: [],
   completion_status: "completed",
   blocked_reason: null,
+  objective_results: [],
 };
 
 const intentConfig: AiWorkerConfig = {

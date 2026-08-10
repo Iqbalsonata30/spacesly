@@ -5815,6 +5815,7 @@ mod tests {
             completion_status: status,
             blocked_reason: (status == AgentTaskCompletionStatus::Blocked)
                 .then(|| "approval required".to_string()),
+            objective_results: Vec::new(),
         })
     }
 }
