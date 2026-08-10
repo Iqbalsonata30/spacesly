@@ -12,6 +12,7 @@ import {
   agentTaskNeedsBuiltinCapabilities,
   agentTaskRequestsLocalWorkspace,
   canonicalAgentApprovalOperation,
+  capabilityPlanForAgentTask,
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
   executionRepositoryContext,
@@ -277,6 +278,12 @@ const contract = {
   current_step: "worker.execute",
   remaining_steps: [],
   repository: { root_path: "/workspace", branch: "main", head_commit: "abc" },
+  capability_plan: {
+    schema_version: 1,
+    planner_version: "agent-capability-plan-v1",
+    connectors: [],
+    unresolved_domains: [],
+  },
   constraints: {
     execution_only: true,
     planning_completed: true,
@@ -412,6 +419,30 @@ assertEqual(
   planAgentTaskConnectors(intentConfig, contractFor("Publish the generated artifact")).connectorIds,
   ["artifact-vault"],
   "a live operation catalog should route an unknown connector without hard-coded product terms",
+);
+assertEqual(
+  capabilityPlanForAgentTask(
+    intentConfig,
+    contractFor("Publish the generated artifact"),
+  ).connectors,
+  [
+    {
+      connector_id: "artifact-vault",
+      reason: "live_operation",
+      matched_domains: [],
+      matched_intents: [],
+      matched_tools: ["publish_artifact"],
+    },
+  ],
+  "the immutable capability plan should explain the live operation used for routing",
+);
+assertEqual(
+  capabilityPlanForAgentTask(
+    { ...intentConfig, mcp_servers: [] },
+    contractFor("Update the linked issue", "jira"),
+  ).unresolved_domains,
+  ["jira"],
+  "structured connector requirements should remain explicit when no connector can satisfy them",
 );
 
 assertEqual(

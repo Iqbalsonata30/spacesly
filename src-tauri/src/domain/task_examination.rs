@@ -64,6 +64,15 @@ pub struct ConnectorCapabilitySnapshot {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConnectorCapabilityMapping {
+    pub connector_id: String,
+    pub reason: String,
+    pub planned_tools: Vec<String>,
+    pub verified_tools: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
     pub examiner_version: String,
@@ -74,6 +83,8 @@ pub struct TaskExaminationRecord {
     pub capability_catalog: Vec<TaskCapabilityRecord>,
     #[serde(default)]
     pub connector_capabilities: Vec<ConnectorCapabilitySnapshot>,
+    #[serde(default)]
+    pub capability_mappings: Vec<ConnectorCapabilityMapping>,
     pub required_capabilities: Vec<String>,
     pub unresolved_requirements: Vec<String>,
     pub mutations: Vec<String>,
@@ -98,6 +109,7 @@ impl TaskExaminationRecord {
             self.resources.len(),
             self.capability_catalog.len(),
             self.connector_capabilities.len(),
+            self.capability_mappings.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
             self.mutations.len(),
@@ -108,6 +120,29 @@ impl TaskExaminationRecord {
         .any(|count| count > MAX_EXAMINATION_ITEMS)
         {
             return Err("Task Examination exceeds its bounded limits.".to_string());
+        }
+        if self.capability_mappings.iter().any(|mapping| {
+            !canonical_inventory_name(&mapping.connector_id, false)
+                || mapping.planned_tools.len() > MAX_EXAMINATION_ITEMS
+                || mapping.verified_tools.len() > MAX_EXAMINATION_ITEMS
+                || !matches!(
+                    mapping.reason.as_str(),
+                    "explicit_domain"
+                        | "live_operation"
+                        | "configured_intent"
+                        | "structured_constraint"
+                )
+                || !matches!(
+                    mapping.status.as_str(),
+                    "declared" | "connector_verified" | "tools_verified" | "stale"
+                )
+                || mapping
+                    .planned_tools
+                    .iter()
+                    .chain(mapping.verified_tools.iter())
+                    .any(|tool| !canonical_inventory_name(tool, true))
+        }) {
+            return Err("Task Examination capability mapping is invalid.".to_string());
         }
         if self
             .connector_capabilities
@@ -241,6 +276,11 @@ pub fn examine_task(
     );
     unresolved_requirements.sort();
     unresolved_requirements.dedup();
+    let (capability_mappings, mapping_requirements) =
+        capability_mappings(contract, envelope, connector_capabilities);
+    unresolved_requirements.extend(mapping_requirements);
+    unresolved_requirements.sort();
+    unresolved_requirements.dedup();
 
     let mut mutations = BTreeSet::new();
     if contract_bool(contract, &["constraints", "may_modify_files"]) {
@@ -292,12 +332,121 @@ pub fn examine_task(
         resources,
         capability_catalog,
         connector_capabilities: connector_capabilities.to_vec(),
+        capability_mappings,
         required_capabilities,
         unresolved_requirements,
         mutations: mutations.into_iter().collect(),
         approval_boundaries: approval_boundaries.into_iter().collect(),
         warnings: warnings.into_iter().take(MAX_EXAMINATION_ITEMS).collect(),
     }
+}
+
+fn capability_mappings(
+    contract: &Value,
+    envelope: &TaskSessionEnvelopeV1,
+    snapshots: &[ConnectorCapabilitySnapshot],
+) -> (Vec<ConnectorCapabilityMapping>, Vec<String>) {
+    let Some(plan) = contract.get("capability_plan") else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut unresolved = plan
+        .get("unresolved_domains")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|domain| canonical_inventory_name(domain, true).then_some(domain))
+        .map(|domain| format!("No configured connector satisfies domain '{domain}'."))
+        .collect::<Vec<_>>();
+    let mappings = plan
+        .get("connectors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_EXAMINATION_ITEMS)
+        .filter_map(|entry| {
+            let connector_id = entry.get("connector_id")?.as_str()?;
+            let reason = entry.get("reason")?.as_str()?;
+            if !canonical_inventory_name(connector_id, false)
+                || !matches!(
+                    reason,
+                    "explicit_domain"
+                        | "live_operation"
+                        | "configured_intent"
+                        | "structured_constraint"
+                )
+            {
+                return None;
+            }
+            let mut planned_tools = entry
+                .get("matched_tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|tool| canonical_inventory_name(tool, true))
+                .map(str::to_string)
+                .take(MAX_EXAMINATION_ITEMS)
+                .collect::<Vec<_>>();
+            planned_tools.sort();
+            planned_tools.dedup();
+            if !envelope.connector_ids.iter().any(|id| id == connector_id) {
+                unresolved.push(format!(
+                    "Capability plan references unassigned connector '{connector_id}'."
+                ));
+            }
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot.connector_id == connector_id);
+            let live_tools = snapshot
+                .filter(|snapshot| snapshot.status == ConnectorDiscoveryStatus::Available)
+                .map(|snapshot| {
+                    snapshot
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<HashSet<_>>()
+                });
+            let verified_tools = planned_tools
+                .iter()
+                .filter(|tool| {
+                    live_tools
+                        .as_ref()
+                        .is_some_and(|live| live.contains(tool.as_str()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for missing in planned_tools
+                .iter()
+                .filter(|tool| !verified_tools.contains(tool))
+            {
+                if snapshot.is_some() {
+                    unresolved.push(format!(
+                        "Connector '{connector_id}' no longer exposes planned tool '{missing}'."
+                    ));
+                }
+            }
+            let status = match snapshot {
+                None => "declared",
+                Some(snapshot) if snapshot.status != ConnectorDiscoveryStatus::Available => "stale",
+                Some(_)
+                    if planned_tools.len() == verified_tools.len() && !planned_tools.is_empty() =>
+                {
+                    "tools_verified"
+                }
+                Some(_) if planned_tools.is_empty() => "connector_verified",
+                Some(_) => "stale",
+            };
+            Some(ConnectorCapabilityMapping {
+                connector_id: connector_id.to_string(),
+                reason: reason.to_string(),
+                planned_tools,
+                verified_tools,
+                status: status.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (mappings, unresolved)
 }
 
 fn contract_path<'a>(contract: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -465,6 +614,18 @@ mod tests {
             },
             "workflow": [{ "title": "Inspect item", "status": "current" }],
             "repository": { "root_path": null, "branch": null },
+            "capability_plan": {
+                "schema_version": 1,
+                "planner_version": "agent-capability-plan-v1",
+                "connectors": [{
+                    "connector_id": "future-system",
+                    "reason": "live_operation",
+                    "matched_domains": [],
+                    "matched_intents": [],
+                    "matched_tools": ["future_search"]
+                }],
+                "unresolved_domains": []
+            },
             "constraints": { "may_modify_files": false, "may_update_jira": false }
         });
         let granted = HashSet::from(["external_tools:future-system", "workspace_read"]);
@@ -495,6 +656,11 @@ mod tests {
                 && capability.discovery == "live"
         }));
         assert_eq!(examined.connector_capabilities[0].tools.len(), 1);
+        assert_eq!(examined.capability_mappings[0].status, "tools_verified");
+        assert_eq!(
+            examined.capability_mappings[0].verified_tools,
+            vec!["future_search"]
+        );
         assert!(examined
             .resources
             .iter()
@@ -536,5 +702,46 @@ mod tests {
             vec!["protected_branch:eks-green"]
         );
         assert_eq!(examined.unresolved_requirements.len(), 1);
+    }
+
+    #[test]
+    fn blocks_when_persisted_tool_plan_is_stale_against_live_inventory() {
+        let contract = serde_json::json!({
+            "objective": { "summary": "Publish artifact", "success_criteria": [] },
+            "workflow": [],
+            "repository": { "root_path": null, "branch": null },
+            "constraints": { "may_modify_files": false, "may_update_jira": false },
+            "capability_plan": {
+                "connectors": [{
+                    "connector_id": "future-system",
+                    "reason": "live_operation",
+                    "matched_tools": ["publish_artifact"]
+                }],
+                "unresolved_domains": []
+            }
+        });
+        let snapshots = vec![ConnectorCapabilitySnapshot {
+            connector_id: "future-system".to_string(),
+            status: ConnectorDiscoveryStatus::Available,
+            tools: vec![DiscoveredToolCapability {
+                name: "read_artifact".to_string(),
+                risk: "read".to_string(),
+                argument_names: Vec::new(),
+            }],
+            error: None,
+            warnings: Vec::new(),
+        }];
+        let examined = examine_task(
+            &contract,
+            "sha256:contract",
+            &envelope(),
+            &HashSet::from(["external_tools:future-system", "workspace_read"]),
+            &RuleFactsRecord::default(),
+            &snapshots,
+        );
+
+        assert_eq!(examined.status, TaskExaminationStatus::Blocked);
+        assert_eq!(examined.capability_mappings[0].status, "stale");
+        assert!(examined.unresolved_requirements[0].contains("no longer exposes"));
     }
 }

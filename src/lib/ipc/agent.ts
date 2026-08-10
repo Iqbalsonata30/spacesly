@@ -86,6 +86,18 @@ export interface ExecutionContract {
     branch: string | null;
     head_commit: string | null;
   };
+  capability_plan: {
+    schema_version: 1;
+    planner_version: "agent-capability-plan-v1";
+    connectors: Array<{
+      connector_id: string;
+      reason: "explicit_domain" | "live_operation" | "configured_intent" | "structured_constraint";
+      matched_domains: string[];
+      matched_intents: string[];
+      matched_tools: string[];
+    }>;
+    unresolved_domains: string[];
+  };
   constraints: {
     execution_only: true;
     planning_completed: true;

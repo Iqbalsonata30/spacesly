@@ -55,6 +55,13 @@ export type AgentConnectorPlan = {
   connectorIds: string[];
   requiredDomains: string[];
   unresolvedDomains: string[];
+  evidence: Array<{
+    connector_id: string;
+    reason: "explicit_domain" | "live_operation" | "configured_intent" | "structured_constraint";
+    matched_domains: string[];
+    matched_intents: string[];
+    matched_tools: string[];
+  }>;
 };
 
 /** Durable conversation context and envelope prepared before scheduler submission. */
@@ -216,6 +223,7 @@ export function planAgentTaskConnectors(
     domains: normalizedTerms(server.domains),
     intentTerms: normalizedTerms(server.intent_terms),
     operationSignals: connectorOperationSignals(server.capability_tools),
+    tools: server.capability_tools ?? [],
   }));
   const requiredDomains = new Set<string>();
   if (contract.constraints.may_update_jira) requiredDomains.add("jira");
@@ -268,21 +276,78 @@ export function planAgentTaskConnectors(
     }
     const selected = [...new Set(operationSelected)];
     selectConnectorsForDomains(descriptors, uncovered, selected);
-    return {
-      connectorIds: selected.sort(),
-      requiredDomains: [...requiredDomains].sort(),
-      unresolvedDomains: [...uncovered].sort(),
-    };
+    return connectorPlanResult(descriptors, selected, requiredDomains, uncovered, intent);
   }
 
   const uncovered = new Set(requiredDomains);
   const selected: string[] = [];
   selectConnectorsForDomains(descriptors, uncovered, selected);
 
+  return connectorPlanResult(descriptors, selected, requiredDomains, uncovered, intent);
+}
+
+export function capabilityPlanForAgentTask(
+  config: AiWorkerConfig,
+  contract: ExecutionContract,
+): ExecutionContract["capability_plan"] {
+  const plan = planAgentTaskConnectors(config, contract);
   return {
-    connectorIds: selected.sort(),
+    schema_version: 1,
+    planner_version: "agent-capability-plan-v1",
+    connectors: plan.evidence,
+    unresolved_domains: plan.unresolvedDomains,
+  };
+}
+
+function connectorPlanResult<
+  T extends {
+    id: string;
+    domains: string[];
+    intentTerms: string[];
+    operationSignals: string[];
+    tools: NonNullable<AiWorkerConfig["mcp_servers"][number]["capability_tools"]>;
+  },
+>(
+  descriptors: T[],
+  selected: string[],
+  requiredDomains: Set<string>,
+  uncovered: Set<string>,
+  intent: string,
+): AgentConnectorPlan {
+  const intentTokens = new Set(intent.split(" ").filter(Boolean));
+  const connectorIds = [...new Set(selected)].sort();
+  return {
+    connectorIds,
     requiredDomains: [...requiredDomains].sort(),
     unresolvedDomains: [...uncovered].sort(),
+    evidence: connectorIds.flatMap((connectorId) => {
+      const descriptor = descriptors.find((candidate) => candidate.id === connectorId);
+      if (!descriptor) return [];
+      const matched_domains = descriptor.domains.filter((domain) => intentIncludes(intent, domain));
+      const matched_intents = descriptor.intentTerms.filter((term) => intentIncludes(intent, term));
+      const matched_tools = descriptor.tools
+        .filter((tool) =>
+          connectorOperationSignals([tool]).some((token) => intentTokens.has(token)),
+        )
+        .map((tool) => tool.name)
+        .sort();
+      const reason = matched_domains.length
+        ? "explicit_domain"
+        : matched_tools.length
+          ? "live_operation"
+          : matched_intents.length
+            ? "configured_intent"
+            : "structured_constraint";
+      return [
+        {
+          connector_id: connectorId,
+          reason,
+          matched_domains,
+          matched_intents,
+          matched_tools,
+        },
+      ];
+    }),
   };
 }
 

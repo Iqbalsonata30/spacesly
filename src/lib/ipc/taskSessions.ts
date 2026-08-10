@@ -427,6 +427,13 @@ export type TaskExecutionManifest = {
       error: string | null;
       warnings: string[];
     }>;
+    capability_mappings: Array<{
+      connector_id: string;
+      reason: string;
+      planned_tools: string[];
+      verified_tools: string[];
+      status: "declared" | "connector_verified" | "tools_verified" | "stale";
+    }>;
     required_capabilities: string[];
     unresolved_requirements: string[];
     mutations: string[];

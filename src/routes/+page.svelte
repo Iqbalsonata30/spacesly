@@ -141,6 +141,7 @@
     agentEnvelopeFromSnapshot,
     agentTaskRequestsLocalWorkspace,
     canonicalAgentApprovalOperation,
+    capabilityPlanForAgentTask,
     executionRepositoryContext,
     continueAgentTaskSession,
     executeAgentTaskSession,
@@ -6537,6 +6538,7 @@
     previousOutput: string | null,
     jiraTransitionCompleted: boolean,
     repository: ExecutionContract["repository"],
+    config: AiWorkerConfig,
   ): ExecutionContract {
     const completedSteps = jiraTransitionCompleted ? ["jira.transition.in_progress"] : [];
     const workflow: ExecutionContract["workflow"] = [
@@ -6601,6 +6603,12 @@
         .filter((step) => step.status === "remaining")
         .map((step) => step.step_id),
       repository,
+      capability_plan: {
+        schema_version: 1,
+        planner_version: "agent-capability-plan-v1",
+        connectors: [],
+        unresolved_domains: [],
+      },
       constraints: {
         execution_only: true,
         planning_completed: true,
@@ -6621,6 +6629,7 @@
     contract.constraints.may_modify_files = repositoryAssigned || localWorkspaceRequired;
     contract.constraints.must_not_rediscover_repository =
       repositoryAssigned || !localWorkspaceRequired;
+    contract.capability_plan = capabilityPlanForAgentTask(config, contract);
     return contract;
   }
 
@@ -7762,6 +7771,7 @@
                   previousOutput,
                   jiraTransitionCompleted,
                   executionRepositoryContext(config, executionGitInfo, workspaceRoot),
+                  config,
                 ),
               );
       const retainedRulesSnapshot =

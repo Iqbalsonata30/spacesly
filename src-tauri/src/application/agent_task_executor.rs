@@ -240,7 +240,7 @@ impl TaskExecutor for AgentTaskExecutor {
                     .sum::<usize>(),
             }),
         )?;
-        let connector_preflight_blockers = examination
+        let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
             .filter(|connector| {
@@ -258,6 +258,15 @@ impl TaskExecutor for AgentTaskExecutor {
                 )
             })
             .collect::<Vec<_>>();
+        connector_preflight_blockers.extend(
+            examination
+                .unresolved_requirements
+                .iter()
+                .filter(|requirement| !requirement.starts_with("Capability '"))
+                .cloned(),
+        );
+        connector_preflight_blockers.sort();
+        connector_preflight_blockers.dedup();
         resolved.task.task_examination = Some(examination.clone());
         context.bind_execution_manifest(&ExecutionManifestDraft {
             kind: envelope.kind,

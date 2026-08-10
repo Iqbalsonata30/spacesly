@@ -1201,6 +1201,20 @@
                       {/each}
                     </ul>
                   {/if}
+                  {#if executionManifest.task_examination.capability_mappings.length > 0}
+                    <ul class="manifest-unknowns">
+                      {#each executionManifest.task_examination.capability_mappings as mapping (mapping.connector_id)}
+                        <li>
+                          {mapping.connector_id}: {mapping.status} via {mapping.reason.replaceAll(
+                            "_",
+                            " ",
+                          )}{mapping.planned_tools.length
+                            ? ` — ${mapping.verified_tools.length}/${mapping.planned_tools.length} planned tools verified`
+                            : ""}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
                 </section>
 
                 <section class="context-section" aria-label="Manifest unknown fields">
