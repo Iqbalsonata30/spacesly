@@ -1145,6 +1145,14 @@
                       <dd>{executionManifest.task_examination.objectives.length}</dd>
                     </div>
                     <div>
+                      <dt>Semantic planner</dt>
+                      <dd>
+                        {executionManifest.task_examination.semantic_planner
+                          ? `${executionManifest.task_examination.semantic_planner.status} · ${executionManifest.task_examination.semantic_planner.model ?? executionManifest.task_examination.semantic_planner.planner_version}`
+                          : "Not captured"}
+                      </dd>
+                    </div>
+                    <div>
                       <dt>Resources</dt>
                       <dd>{executionManifest.task_examination.resources.length}</dd>
                     </div>

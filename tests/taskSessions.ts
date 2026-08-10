@@ -436,6 +436,36 @@ assertEqual(
   ],
   "the immutable capability plan should explain the live operation used for routing",
 );
+const semanticRoutingContract: ExecutionContract = {
+  ...contractFor("Handle the release output"),
+  semantic_plan: {
+    schema_version: 1,
+    status: "model",
+    planner_version: "agent-semantic-planner-v1",
+    model: "openai/test",
+    objectives: [
+      {
+        id: "objective-1",
+        summary: "Publish the generated artifact",
+        success_evidence: "Artifact publication is verified",
+        operation_hints: ["publish artifact", "modify file"],
+        resource_hints: ["artifact"],
+        mutation_expected: true,
+      },
+    ],
+    warning: null,
+  },
+};
+assertEqual(
+  planAgentTaskConnectors(intentConfig, semanticRoutingContract).connectorIds,
+  ["artifact-vault"],
+  "validated semantic operation hints should participate in connector routing",
+);
+assertEqual(
+  agentTaskRequestsLocalWorkspace(semanticRoutingContract),
+  false,
+  "model-generated hints must not grant local file, shell, or Git capabilities",
+);
 assertEqual(
   capabilityPlanForAgentTask(
     { ...intentConfig, mcp_servers: [] },

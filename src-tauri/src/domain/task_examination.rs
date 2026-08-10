@@ -73,6 +73,14 @@ pub struct ConnectorCapabilityMapping {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SemanticPlannerEvidence {
+    pub status: String,
+    pub planner_version: String,
+    pub model: Option<String>,
+    pub objective_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
     pub examiner_version: String,
@@ -85,6 +93,8 @@ pub struct TaskExaminationRecord {
     pub connector_capabilities: Vec<ConnectorCapabilitySnapshot>,
     #[serde(default)]
     pub capability_mappings: Vec<ConnectorCapabilityMapping>,
+    #[serde(default)]
+    pub semantic_planner: Option<SemanticPlannerEvidence>,
     pub required_capabilities: Vec<String>,
     pub unresolved_requirements: Vec<String>,
     pub mutations: Vec<String>,
@@ -143,6 +153,20 @@ impl TaskExaminationRecord {
                     .any(|tool| !canonical_inventory_name(tool, true))
         }) {
             return Err("Task Examination capability mapping is invalid.".to_string());
+        }
+        if self.semantic_planner.as_ref().is_some_and(|planner| {
+            !matches!(planner.status.as_str(), "model" | "fallback")
+                || planner.planner_version.trim().is_empty()
+                || planner.planner_version.len() > 128
+                || planner.model.as_ref().is_some_and(|model| {
+                    model.trim().is_empty()
+                        || model.len() > 256
+                        || model.chars().any(char::is_control)
+                })
+                || planner.objective_count == 0
+                || planner.objective_count > 8
+        }) {
+            return Err("Task Examination semantic planner evidence is invalid.".to_string());
         }
         if self
             .connector_capabilities
@@ -211,6 +235,16 @@ pub fn examine_task(
         &["objective", "success_criteria"],
         &mut objectives,
     );
+    if let Some(semantic_objectives) = contract
+        .get("semantic_plan")
+        .and_then(|plan| plan.get("objectives"))
+        .and_then(Value::as_array)
+    {
+        for objective in semantic_objectives.iter().take(8) {
+            insert_path_string(objective, &["summary"], &mut objectives);
+            insert_path_string(objective, &["success_evidence"], &mut objectives);
+        }
+    }
     if let Some(steps) = contract.get("workflow").and_then(Value::as_array) {
         for step in steps
             .iter()
@@ -318,6 +352,7 @@ pub fn examine_task(
             .iter()
             .flat_map(|connector| connector.warnings.iter().cloned()),
     );
+    let semantic_planner = semantic_planner_evidence(contract);
 
     TaskExaminationRecord {
         schema_version: TASK_EXAMINATION_SCHEMA_VERSION,
@@ -333,12 +368,32 @@ pub fn examine_task(
         capability_catalog,
         connector_capabilities: connector_capabilities.to_vec(),
         capability_mappings,
+        semantic_planner,
         required_capabilities,
         unresolved_requirements,
         mutations: mutations.into_iter().collect(),
         approval_boundaries: approval_boundaries.into_iter().collect(),
         warnings: warnings.into_iter().take(MAX_EXAMINATION_ITEMS).collect(),
     }
+}
+
+fn semantic_planner_evidence(contract: &Value) -> Option<SemanticPlannerEvidence> {
+    let plan = contract.get("semantic_plan")?;
+    let status = plan.get("status")?.as_str()?;
+    let planner_version = plan.get("planner_version")?.as_str()?;
+    let objectives = plan.get("objectives")?.as_array()?;
+    if !matches!(status, "model" | "fallback") || objectives.is_empty() || objectives.len() > 8 {
+        return None;
+    }
+    Some(SemanticPlannerEvidence {
+        status: status.to_string(),
+        planner_version: planner_version.to_string(),
+        model: plan
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        objective_count: objectives.len(),
+    })
 }
 
 fn capability_mappings(
@@ -614,6 +669,18 @@ mod tests {
             },
             "workflow": [{ "title": "Inspect item", "status": "current" }],
             "repository": { "root_path": null, "branch": null },
+            "semantic_plan": {
+                "status": "model",
+                "planner_version": "agent-semantic-planner-v1",
+                "model": "openai/test",
+                "objectives": [{
+                    "summary": "Inspect the future system item",
+                    "success_evidence": "The item is returned",
+                    "operation_hints": ["search item"],
+                    "resource_hints": ["item"],
+                    "mutation_expected": false
+                }]
+            },
             "capability_plan": {
                 "schema_version": 1,
                 "planner_version": "agent-capability-plan-v1",
@@ -657,6 +724,13 @@ mod tests {
         }));
         assert_eq!(examined.connector_capabilities[0].tools.len(), 1);
         assert_eq!(examined.capability_mappings[0].status, "tools_verified");
+        assert_eq!(
+            examined
+                .semantic_planner
+                .as_ref()
+                .map(|planner| planner.status.as_str()),
+            Some("model")
+        );
         assert_eq!(
             examined.capability_mappings[0].verified_tools,
             vec!["future_search"]

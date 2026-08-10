@@ -98,6 +98,14 @@ export interface ExecutionContract {
     }>;
     unresolved_domains: string[];
   };
+  semantic_plan?: {
+    schema_version: 1;
+    status: "model" | "fallback";
+    planner_version: string;
+    model: string | null;
+    objectives: AgentTaskPlanningProposal["objectives"];
+    warning: string | null;
+  };
   constraints: {
     execution_only: true;
     planning_completed: true;
@@ -163,6 +171,32 @@ export interface AiWorkerTaskResult {
 export interface AiWorkerChatResult {
   run_id: string;
   message: string;
+}
+
+export interface AgentTaskPlanningRequest {
+  objective: string;
+  description: string;
+  labels: string[];
+  connector_catalog: Array<{
+    connector_id: string;
+    domains: string[];
+    intent_terms: string[];
+    tools: string[];
+  }>;
+}
+
+export interface AgentTaskPlanningProposal {
+  schema_version: 1;
+  planner_version: "agent-semantic-planner-v1";
+  model: string;
+  objectives: Array<{
+    id: string;
+    summary: string;
+    success_evidence: string;
+    operation_hints: string[];
+    resource_hints: string[];
+    mutation_expected: boolean;
+  }>;
 }
 
 export type ToolOperationRisk =
@@ -430,6 +464,17 @@ export async function executeAiWorkerTask(
     IPC_POLICIES.aiExecution,
   );
   return validateAiWorkerTaskResult(result);
+}
+
+export async function planAgentTask(
+  config: AiWorkerConfig,
+  request: AgentTaskPlanningRequest,
+): Promise<AgentTaskPlanningProposal> {
+  return invokeWithPolicy<AgentTaskPlanningProposal>(
+    "plan_agent_task",
+    { config, request },
+    IPC_POLICIES.aiChat,
+  );
 }
 
 export async function reserveAiWorkerRun(runId: string, config: AiWorkerConfig): Promise<void> {

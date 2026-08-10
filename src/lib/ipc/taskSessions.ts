@@ -434,6 +434,12 @@ export type TaskExecutionManifest = {
       verified_tools: string[];
       status: "declared" | "connector_verified" | "tools_verified" | "stale";
     }>;
+    semantic_planner: {
+      status: "model" | "fallback";
+      planner_version: string;
+      model: string | null;
+      objective_count: number;
+    } | null;
     required_capabilities: string[];
     unresolved_requirements: string[];
     mutations: string[];

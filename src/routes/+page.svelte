@@ -164,6 +164,7 @@
     proposeAiEdit,
     pruneConversations,
     executeAiWorkerTask,
+    planAgentTask,
     getJiraBoards,
     getAiRun,
     getTaskSession,
@@ -6530,6 +6531,57 @@
     ].join("\n");
   }
 
+  function fallbackSemanticPlan(
+    card: CardProjection,
+  ): NonNullable<ExecutionContract["semantic_plan"]> {
+    return {
+      schema_version: 1,
+      status: "fallback",
+      planner_version: "deterministic-fallback-v1",
+      model: null,
+      objectives: [
+        {
+          id: "objective-1",
+          summary: card.title.trim() || "Execute the requested task",
+          success_evidence: "Concrete evidence demonstrates that the requested task was completed.",
+          operation_hints: [],
+          resource_hints: [],
+          mutation_expected: false,
+        },
+      ],
+      warning: "Model-assisted planning was unavailable; deterministic fallback was used.",
+    };
+  }
+
+  async function requestAgentSemanticPlan(
+    config: AiWorkerConfig,
+    card: CardProjection,
+  ): Promise<NonNullable<ExecutionContract["semantic_plan"]>> {
+    try {
+      const proposal = await planAgentTask(config, {
+        objective: card.title,
+        description: card.description,
+        labels: card.labels,
+        connector_catalog: config.mcp_servers.map((server) => ({
+          connector_id: server.secret_id,
+          domains: server.domains ?? [],
+          intent_terms: server.intent_terms ?? [],
+          tools: (server.capability_tools ?? []).map((tool) => tool.name),
+        })),
+      });
+      return {
+        schema_version: 1,
+        status: "model",
+        planner_version: proposal.planner_version,
+        model: proposal.model,
+        objectives: proposal.objectives,
+        warning: null,
+      };
+    } catch {
+      return fallbackSemanticPlan(card);
+    }
+  }
+
   function buildExecutionContract(
     runId: string,
     card: CardProjection,
@@ -6539,6 +6591,7 @@
     jiraTransitionCompleted: boolean,
     repository: ExecutionContract["repository"],
     config: AiWorkerConfig,
+    semanticPlan: NonNullable<ExecutionContract["semantic_plan"]>,
   ): ExecutionContract {
     const completedSteps = jiraTransitionCompleted ? ["jira.transition.in_progress"] : [];
     const workflow: ExecutionContract["workflow"] = [
@@ -6603,6 +6656,7 @@
         .filter((step) => step.status === "remaining")
         .map((step) => step.step_id),
       repository,
+      semantic_plan: semanticPlan,
       capability_plan: {
         schema_version: 1,
         planner_version: "agent-capability-plan-v1",
@@ -7750,6 +7804,23 @@
         ],
         ["Pass the exported context to the runtime and wait for evidence."],
       );
+      const semanticPlan = isContinuation
+        ? (existingSession?.executionRun?.contract.semantic_plan ?? fallbackSemanticPlan(card))
+        : await requestAgentSemanticPlan(config, card);
+      appendStructuredAgentLogForCard(
+        cardId,
+        semanticPlan.status === "model" ? "success" : "info",
+        "planning",
+        semanticPlan.status === "model"
+          ? `Semantic task plan accepted from ${semanticPlan.model ?? "the configured model"}.`
+          : "Semantic planner unavailable; using deterministic task plan.",
+        [`Objectives: ${semanticPlan.objectives.length}`],
+        [
+          `Planner: ${semanticPlan.planner_version}`,
+          `Connector grants are still selected and validated by Spacesly.`,
+        ],
+        ["Continue with deterministic capability routing and live MCP verification."],
+      );
       let executionRun =
         resumeAuthoritativeResult && existingSession?.executionRun
           ? existingSession.executionRun
@@ -7772,6 +7843,7 @@
                   jiraTransitionCompleted,
                   executionRepositoryContext(config, executionGitInfo, workspaceRoot),
                   config,
+                  semanticPlan,
                 ),
               );
       const retainedRulesSnapshot =

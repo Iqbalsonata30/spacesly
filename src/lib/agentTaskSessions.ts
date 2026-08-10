@@ -193,7 +193,7 @@ export function agentTaskNeedsBuiltinCapabilities(
 
 /** Detects an explicit repository/file deliverable in an otherwise external-tool task. */
 export function agentTaskRequestsLocalWorkspace(contract: ExecutionContract): boolean {
-  const intent = normalizedIntentText(contract);
+  const intent = normalizedAuthorizationIntentText(contract);
   return [
     "helm",
     "values yaml",
@@ -388,6 +388,20 @@ export function selectAgentTaskConnectors(
 }
 
 function normalizedIntentText(contract: ExecutionContract): string {
+  return normalizeIntent(
+    [
+      normalizedAuthorizationIntentText(contract),
+      ...(contract.semantic_plan?.objectives.flatMap((objective) => [
+        objective.summary,
+        objective.success_evidence,
+        ...objective.operation_hints,
+        ...objective.resource_hints,
+      ]) ?? []),
+    ].join(" "),
+  );
+}
+
+function normalizedAuthorizationIntentText(contract: ExecutionContract): string {
   const activeWorkflow = contract.workflow.filter((step) => step.status !== "completed");
   return normalizeIntent(
     [

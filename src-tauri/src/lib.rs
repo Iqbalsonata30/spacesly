@@ -45,10 +45,11 @@ use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
 use infrastructure::ai_worker::{
     chat_ai_worker as chat_ai_worker_impl,
     chat_ai_worker_streaming as chat_ai_worker_streaming_impl, close_all_opencode_servers,
-    execute_ai_worker_task as execute_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
-    test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AiEditRequest, AiEditResult,
-    AiWorkerChatRequest, AiWorkerChatResult, AiWorkerConfig, AiWorkerStatus, AiWorkerStreamEvent,
-    AiWorkerTask, AiWorkerTaskResult,
+    execute_ai_worker_task as execute_ai_worker_task_impl,
+    plan_ai_worker_task as plan_ai_worker_task_impl, propose_ai_edit as propose_ai_edit_impl,
+    test_ai_worker as test_ai_worker_impl, AgentRunRegistry, AgentTaskPlanningProposal,
+    AgentTaskPlanningRequest, AiEditRequest, AiEditResult, AiWorkerChatRequest, AiWorkerChatResult,
+    AiWorkerConfig, AiWorkerStatus, AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
 };
 use infrastructure::execution_store::{
     ConversationImportInput, ConversationMessageInput, ExecutionStore,
@@ -113,7 +114,7 @@ use infrastructure::workspace_search::{
 use infrastructure::workspace_trust::{WorkspaceTrustRegistry, WorkspaceTrustStatus};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -526,6 +527,26 @@ async fn test_ai_worker(
     tauri::async_runtime::spawn_blocking(move || test_ai_worker_impl(config))
         .await
         .map_err(|error| format!("Agent diagnostic task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn plan_agent_task(
+    mut config: AiWorkerConfig,
+    request: AgentTaskPlanningRequest,
+    workspace_root: State<'_, WorkspaceRoot>,
+    workspace_trust: State<'_, WorkspaceTrustRegistry>,
+    secrets: State<'_, AppSecretsStore>,
+) -> Result<AgentTaskPlanningProposal, String> {
+    bind_tool_capable_ai_workspace(&mut config, &workspace_root, &workspace_trust)?;
+    // Planner input carries only the caller's secret-free connector catalog. Connector processes
+    // and connector credentials are not resolved for this no-tool model pass.
+    config.mcp_servers.clear();
+    resolve_ai_secrets(&mut config, secrets.inner())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_ai_worker_task_impl(config, request, Arc::new(AtomicBool::new(false)))
+    })
+    .await
+    .map_err(|error| format!("Agent planning task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -3256,6 +3277,7 @@ pub fn run() {
             assign_jira_issue,
             add_jira_comment,
             test_ai_worker,
+            plan_agent_task,
             reserve_ai_worker_run,
             get_ai_run,
             grant_ai_run_capabilities,
