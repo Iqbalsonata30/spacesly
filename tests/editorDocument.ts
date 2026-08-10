@@ -609,6 +609,32 @@ assertEqual(
   true,
   "runtime recovery should explain the bounded retry",
 );
+const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
+  {
+    id: 124,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 124,
+    kind: "runtime",
+    payload: {
+      type: "objective_checkpointed",
+      objective_id: "deploy-bamboo-build",
+      evidence: ["Bamboo build 842 completed successfully."],
+    },
+    progress: null,
+    created_at: 124,
+  },
+  "checkpoint-124",
+  "04:30:10 AM",
+);
+assertEqual(
+  (objectiveCheckpointProjection.logs[0]?.message ?? "").includes(
+    "will not be repeated if the task continues",
+  ),
+  true,
+  "objective checkpoints should explain continuation behavior",
+);
 const capabilityRepairProjection = projectAgentTaskSessionEvent(
   {
     id: 123,

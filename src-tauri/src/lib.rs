@@ -1215,9 +1215,24 @@ fn emit_worker_stream_event(
         }
         return;
     }
+    if let AiWorkerStreamEvent::ObjectiveCheckpoint {
+        objective_id,
+        evidence,
+    } = &event
+    {
+        if let Some(store) = audit_store {
+            let payload = serde_json::json!({
+                "objective_id": objective_id,
+                "evidence": evidence,
+            });
+            let _ = store.record_ai_audit(Some(run_id), "objective_checkpoint_candidate", &payload);
+        }
+        return;
+    }
     let sequence = sequence.fetch_add(1, Ordering::Relaxed);
     let runtime_event = match event {
-        AiWorkerStreamEvent::OpenCodeSession { .. } => unreachable!(),
+        AiWorkerStreamEvent::OpenCodeSession { .. }
+        | AiWorkerStreamEvent::ObjectiveCheckpoint { .. } => unreachable!(),
         AiWorkerStreamEvent::TextDelta(delta) => AiRuntimeEvent::TextDelta {
             run_id: run_id.to_string(),
             sequence,

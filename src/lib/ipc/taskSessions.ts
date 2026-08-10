@@ -446,6 +446,12 @@ export type TaskExecutionManifest = {
       model: string | null;
       objective_count: number;
     } | null;
+    objective_checkpoints?: Array<{
+      objective_id: string;
+      evidence: string[];
+      source_attempt_id: number;
+      recorded_at: number;
+    }>;
     required_capabilities: string[];
     unresolved_requirements: string[];
     mutations: string[];

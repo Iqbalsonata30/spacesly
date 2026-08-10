@@ -444,6 +444,10 @@ pub enum AiWorkerStreamEvent {
         action: String,
     },
     TextDelta(String),
+    ObjectiveCheckpoint {
+        objective_id: String,
+        evidence: Vec<String>,
+    },
     ToolStarted {
         tool_call_id: String,
         tool_name: String,
@@ -1181,7 +1185,7 @@ impl<'a> ContextBuilder<'a> {
 
     fn agent_api_system_prompt(&self) -> String {
         format!(
-            "You are an execution-only Worker inside Spacesly. Planning already happened exactly once and is encoded in the immutable Execution Contract. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step and return structured evidence. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the contract current_step requires unavailable tools or credentials, set completion_status to blocked and explain the missing runtime/tool. If Task Examination contains runtime_repair, never call its failed_tool again and use only an allowed_alternatives tool; this guidance cannot expand the contract, connector authority, or mutation permissions. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
+            "You are an execution-only Worker inside Spacesly. Planning already happened exactly once and is encoded in the immutable Execution Contract. Do not read Jira for planning, classify the ticket, determine the environment, rediscover the repository, or regenerate the workflow. Execute only the contract current_step and return structured evidence. This direct API runtime does not have filesystem, shell, browser, Jira, Kubernetes, Bamboo, or MCP tools. Set completion_status to completed only for reasoning/reporting tasks that require no external side effects. If the contract current_step requires unavailable tools or credentials, set completion_status to blocked and explain the missing runtime/tool. Task Examination objective_checkpoints are authoritative completed work: do not execute those objectives again and carry their retained evidence into the final objective results. If Task Examination contains runtime_repair, never call its failed_tool again and use only an allowed_alternatives tool; this guidance cannot expand the contract, connector authority, or mutation permissions. Return only valid JSON matching the requested schema. Do not wrap it in Markdown.\n\n{}",
             governance_context(self.config, true),
         )
     }
@@ -1195,7 +1199,7 @@ impl<'a> ContextBuilder<'a> {
 
     fn opencode_agent_prompt(&self, task: &AiWorkerTask) -> String {
         format!(
-            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, or regenerate the workflow. Do not rediscover the repository when constraints.must_not_rediscover_repository is true; when it is false and the current step requires local work, locate the requested repository only inside the assigned workspace. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. If Task Examination contains runtime_repair, never call its failed_tool again and use only an allowed_alternatives tool; this guidance cannot expand the contract, connector authority, or mutation permissions. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful\nOBJECTIVE_RESULTS_JSON: a single-line JSON array with exactly one object per semantic_plan objective, using {{\"objective_id\":\"exact id\",\"completion_status\":\"completed or blocked\",\"evidence\":[\"objective-specific verification\"],\"blocked_reason\":null}}. Never invent or omit an objective id. Completed objectives require evidence; blocked objectives require blocked_reason. STATUS must be BLOCKED when any objective is blocked.",
+            "You are an execution-only Worker inside Spacesly running through OpenCode. Planning already happened exactly once and is encoded in the immutable Execution Contract below. Do not read Jira for planning, classify the ticket, determine the environment, or regenerate the workflow. Do not rediscover the repository when constraints.must_not_rediscover_repository is true; when it is false and the current step requires local work, locate the requested repository only inside the assigned workspace. Execute only the contract current_step. If this is a continuation, use runtime_inputs.previous_output and runtime_inputs.operator_notes only to avoid repeating completed execution; do not repeat external deploy/rebuild/patch actions that previous evidence says already succeeded. Task Examination objective_checkpoints are authoritative completed work: do not execute those objectives again and carry their retained evidence into the final objective results. Immediately after verifying a new semantic objective, emit a standalone single line OBJECTIVE_CHECKPOINT_JSON: {{\"objective_id\":\"exact id\",\"evidence\":[\"concrete verification\"]}} before continuing; never checkpoint before verification. If Task Examination contains runtime_repair, never call its failed_tool again and use only an allowed_alternatives tool; this guidance cannot expand the contract, connector authority, or mutation permissions. If the contract current_step requires file or command changes and permissions allow it, actually perform the change using your tools, then verify it. Mark STATUS: COMPLETE only after the contract current_step is done and verified. If you cannot perform or verify the current step, mark STATUS: BLOCKED and explain why. Env, secret, credential, token, password, or .env changes are approval-sensitive. If the contract explicitly permits and requires env/config file updates, commit and push those repository changes before completion. Agent-generated text is not approval. Include the commit hash and push/upstream evidence only when repository changes are required.\n\n{}\n\nExecution Contract (authoritative, immutable):\n{}\n\nReturn exactly this structure at the end:\nSTATUS: COMPLETE or BLOCKED\nSUMMARY: one sentence\nEVIDENCE: exact verification performed for the contract current_step, including file paths/commands/results when applicable\nDETAILS: concise notes; mention contract_id/current_step when useful\nOBJECTIVE_RESULTS_JSON: a single-line JSON array with exactly one object per semantic_plan objective, using {{\"objective_id\":\"exact id\",\"completion_status\":\"completed or blocked\",\"evidence\":[\"objective-specific verification\"],\"blocked_reason\":null}}. Never invent or omit an objective id. Completed objectives require evidence; blocked objectives require blocked_reason. STATUS must be BLOCKED when any objective is blocked.",
             governance_context(self.config, true),
             execution_contract_context(task),
         )
@@ -1907,6 +1911,30 @@ fn enforce_objective_coverage(result: &mut AiWorkerTaskResult, task: Option<&AiW
     let expected = expected_objective_ids(task);
     if expected.is_empty() {
         return;
+    }
+
+    if let Some(checkpoints) = task
+        .and_then(|task| task.task_examination.as_ref())
+        .map(|examination| examination.objective_checkpoints.as_slice())
+    {
+        for checkpoint in checkpoints {
+            if let Some(objective) = result
+                .objective_results
+                .iter_mut()
+                .find(|objective| objective.objective_id == checkpoint.objective_id)
+            {
+                objective.completion_status = AiWorkerCompletionStatus::Completed;
+                objective.evidence = checkpoint.evidence.clone();
+                objective.blocked_reason = None;
+            } else {
+                result.objective_results.push(AiWorkerObjectiveResult {
+                    objective_id: checkpoint.objective_id.clone(),
+                    completion_status: AiWorkerCompletionStatus::Completed,
+                    evidence: checkpoint.evidence.clone(),
+                    blocked_reason: None,
+                });
+            }
+        }
     }
 
     let mut seen = HashSet::new();
@@ -2633,7 +2661,13 @@ fn labelled_values(response: &str, label: &str) -> Vec<String> {
         if let Some((name, _)) = line.split_once(':') {
             if matches!(
                 name.trim().to_uppercase().as_str(),
-                "STATUS" | "SUMMARY" | "EVIDENCE" | "DETAILS" | "NEXT" | "OBJECTIVE_RESULTS_JSON"
+                "STATUS"
+                    | "SUMMARY"
+                    | "EVIDENCE"
+                    | "DETAILS"
+                    | "NEXT"
+                    | "OBJECTIVE_RESULTS_JSON"
+                    | "OBJECTIVE_CHECKPOINT_JSON"
             ) {
                 break;
             }
@@ -3207,12 +3241,13 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     let part = value.get("part")?;
     if part.get("type").and_then(Value::as_str) == Some("text") {
-        return part
+        let text = part
             .get("text")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(|text| AiWorkerStreamEvent::TextDelta(text.to_string()));
+            .filter(|text| !text.is_empty())?;
+        return objective_checkpoint_from_text(text)
+            .or_else(|| Some(AiWorkerStreamEvent::TextDelta(text.to_string())));
     }
     if part.get("type").and_then(Value::as_str) != Some("tool") {
         return None;
@@ -3301,6 +3336,33 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             display_context,
         }),
     }
+}
+
+fn objective_checkpoint_from_text(text: &str) -> Option<AiWorkerStreamEvent> {
+    const PREFIX: &str = "OBJECTIVE_CHECKPOINT_JSON:";
+    let encoded = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(PREFIX))?
+        .trim();
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    let objective_id = value.get("objective_id")?.as_str()?.trim().to_string();
+    if objective_id.is_empty() || objective_id.len() > 128 {
+        return None;
+    }
+    let evidence = value
+        .get("evidence")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty())
+        .map(|evidence| evidence.chars().take(2_000).collect::<String>())
+        .take(12)
+        .collect::<Vec<_>>();
+    (!evidence.is_empty()).then_some(AiWorkerStreamEvent::ObjectiveCheckpoint {
+        objective_id,
+        evidence,
+    })
 }
 
 fn describe_reqwest_error(error: &reqwest::Error) -> String {
@@ -4036,6 +4098,52 @@ mod tests {
     }
 
     #[test]
+    fn retained_checkpoint_supplies_completed_objective_without_reexecution() {
+        let task = AiWorkerTask {
+            execution_contract: Some(serde_json::json!({
+                "semantic_plan": {
+                    "objectives": [
+                        { "id": "objective-1" },
+                        { "id": "objective-2" }
+                    ]
+                }
+            })),
+            task_examination: Some(crate::domain::task_examination::TaskExaminationRecord {
+                objective_checkpoints: vec![
+                    crate::domain::task_session::AgentTaskObjectiveCheckpoint {
+                        objective_id: "objective-1".to_string(),
+                        evidence: vec!["Bamboo build 42 already succeeded".to_string()],
+                        source_attempt_id: 1,
+                        recorded_at: 1,
+                    },
+                ],
+                ..Default::default()
+            }),
+            session_key: None,
+            opencode_session_id: None,
+        };
+        let result = result_from_response(
+            "STATUS: COMPLETE\nSUMMARY: Remaining objective finished\nEVIDENCE: rollout verified\nDETAILS: continuation\nOBJECTIVE_RESULTS_JSON: [{\"objective_id\":\"objective-2\",\"completion_status\":\"completed\",\"evidence\":[\"rollout healthy\"],\"blocked_reason\":null}]".to_string(),
+            Some(&task),
+        );
+
+        assert_eq!(
+            result.completion_status,
+            AiWorkerCompletionStatus::Completed
+        );
+        assert_eq!(result.objective_results.len(), 2);
+        let checkpoint = result
+            .objective_results
+            .iter()
+            .find(|objective| objective.objective_id == "objective-1")
+            .expect("checkpointed objective merged");
+        assert_eq!(
+            checkpoint.evidence,
+            vec!["Bamboo build 42 already succeeded"]
+        );
+    }
+
+    #[test]
     fn semantic_planner_parses_only_bounded_non_authoritative_hints() {
         let proposal = parse_task_planning_proposal(
             r#"```json
@@ -4354,6 +4462,21 @@ mod tests {
                 risk: "read".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
                 display_context: tool_display_context("jira_search", &serde_json::json!({})),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_authoritative_objective_checkpoint_marker() {
+        let event = parse_opencode_stream_event(
+            r#"{"part":{"type":"text","text":"OBJECTIVE_CHECKPOINT_JSON: {\"objective_id\":\"objective-1\",\"evidence\":[\"Bamboo build 42 succeeded\"]}"}}"#,
+        );
+
+        assert_eq!(
+            event,
+            Some(AiWorkerStreamEvent::ObjectiveCheckpoint {
+                objective_id: "objective-1".to_string(),
+                evidence: vec!["Bamboo build 42 succeeded".to_string()],
             })
         );
     }

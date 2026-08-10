@@ -8,9 +8,10 @@
 use crate::domain::execution_manifest::{ExecutionManifest, ExecutionManifestDraft};
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::task_session::{
-    TaskCapabilityGrant, TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope,
-    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionId,
-    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskSessionUpdate,
+    AgentTaskObjectiveCheckpoint, TaskCapabilityGrant, TaskExecutionOutput, TaskProgress,
+    TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
+    TaskSessionEventKind, TaskSessionId, TaskSessionResult, TaskSessionSnapshot, TaskSessionState,
+    TaskSessionUpdate,
 };
 use crate::infrastructure::mcp::mcp_connector_binding_digest;
 use crate::infrastructure::scheduler_store::{
@@ -280,6 +281,17 @@ impl TaskExecutionContext {
             .map_err(TaskExecutionError::new)
     }
 
+    /// Loads completed semantic objectives retained across blocked-session continuation.
+    pub fn objective_checkpoints(
+        &self,
+    ) -> Result<Vec<AgentTaskObjectiveCheckpoint>, TaskExecutionError> {
+        self.ensure_current()?;
+        self.event_sink
+            .store
+            .objective_checkpoints(self.session_id)
+            .map_err(TaskExecutionError::new)
+    }
+
     /// Loads this Task Session's immutable Rules and Skills resolution, if already bound.
     pub fn governance_resolution(
         &self,
@@ -354,6 +366,23 @@ impl TaskEventReporter {
             .event_sink
             .store
             .bind_opencode_session(self.event_sink.fence, opencode_session_id)
+            .map_err(TaskExecutionError::new)?;
+        self.event_sink.notifier.publish(TaskSessionUpdate {
+            session_id: event.session_id,
+            latest_sequence: event.sequence,
+        });
+        Ok(event)
+    }
+
+    pub fn record_objective_checkpoint(
+        &self,
+        objective_id: &str,
+        evidence: &[String],
+    ) -> Result<TaskSessionEvent, TaskExecutionError> {
+        let event = self
+            .event_sink
+            .store
+            .record_objective_checkpoint(self.event_sink.fence, objective_id, evidence)
             .map_err(TaskExecutionError::new)?;
         self.event_sink.notifier.publish(TaskSessionUpdate {
             session_id: event.session_id,

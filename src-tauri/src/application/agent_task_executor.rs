@@ -19,7 +19,7 @@ use crate::infrastructure::ai_worker::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,7 @@ fn runtime_callback(
     reporter: TaskEventReporter,
     callback_gate: Arc<Mutex<bool>>,
     observation: Arc<Mutex<RuntimeAttemptObservation>>,
+    objective_mutations: Arc<HashMap<String, bool>>,
 ) -> AiWorkerEventCallback {
     Box::new(move |event| {
         let open = callback_gate.lock().map_err(|error| error.to_string())?;
@@ -64,6 +65,29 @@ fn runtime_callback(
                 .lock()
                 .map_err(|error| error.to_string())?
                 .opencode_session_id = Some(session_id.clone());
+            return Ok(());
+        }
+        if let AiWorkerStreamEvent::ObjectiveCheckpoint {
+            objective_id,
+            evidence,
+        } = &event
+        {
+            let mutation_expected = objective_mutations.get(objective_id).ok_or_else(|| {
+                format!("Agent checkpoint referenced unknown objective '{objective_id}'.")
+            })?;
+            if *mutation_expected
+                && !observation
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .successful_mutation_observed
+            {
+                return Err(format!(
+                    "Mutation objective '{objective_id}' cannot checkpoint before a successful mutation tool event."
+                ));
+            }
+            reporter
+                .record_objective_checkpoint(objective_id, evidence)
+                .map_err(|error| error.to_string())?;
             return Ok(());
         }
         if let AiWorkerStreamEvent::ToolCompleted {
@@ -284,7 +308,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 }
             })
             .collect::<Vec<_>>();
-        let examination = examine_task(
+        let mut examination = examine_task(
             resolved
                 .task
                 .execution_contract
@@ -296,6 +320,36 @@ impl TaskExecutor for AgentTaskExecutor {
             &resolved.governance.rules.facts,
             &resolved.connector_capabilities,
         );
+        let objective_checkpoints = context.objective_checkpoints()?;
+        let semantic_objective_mutations = resolved
+            .task
+            .execution_contract
+            .as_ref()
+            .and_then(|contract| contract.get("semantic_plan"))
+            .and_then(|plan| plan.get("objectives"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|objective| {
+                Some((
+                    objective.get("id")?.as_str()?.to_string(),
+                    objective
+                        .get("mutation_expected")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        if objective_checkpoints
+            .iter()
+            .any(|checkpoint| !semantic_objective_mutations.contains_key(&checkpoint.objective_id))
+        {
+            return Err(TaskExecutionError::new(
+                "Retained objective checkpoint does not belong to the immutable semantic plan.",
+            ));
+        }
+        examination.objective_checkpoints = objective_checkpoints;
+        let semantic_objective_mutations = Arc::new(semantic_objective_mutations);
         examination
             .validate(&envelope.context_digest)
             .map_err(TaskExecutionError::new)?;
@@ -309,6 +363,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 "required_capability_count": examination.required_capabilities.len(),
                 "unresolved_requirement_count": examination.unresolved_requirements.len(),
                 "approval_boundary_count": examination.approval_boundaries.len(),
+                "objective_checkpoint_count": examination.objective_checkpoints.len(),
                 "live_connector_count": examination.connector_capabilities.iter()
                     .filter(|connector| connector.status == crate::domain::task_examination::ConnectorDiscoveryStatus::Available)
                     .count(),
@@ -447,8 +502,12 @@ impl TaskExecutor for AgentTaskExecutor {
             let callback_guard = RuntimeCallbackGate {
                 open: callback_open.clone(),
             };
-            let callback =
-                runtime_callback(context.event_reporter(), callback_open, observation.clone());
+            let callback = runtime_callback(
+                context.event_reporter(),
+                callback_open,
+                observation.clone(),
+                semantic_objective_mutations.clone(),
+            );
             let attempt_result = self.runner.execute(
                 retry_config.clone(),
                 retry_task.clone(),
@@ -786,6 +845,18 @@ pub(crate) fn emit_runtime_event(
             json!({ "type": "text_delta", "text": text }),
             None,
         ),
+        AiWorkerStreamEvent::ObjectiveCheckpoint {
+            objective_id,
+            evidence,
+        } => (
+            TaskSessionEventKind::Runtime,
+            json!({
+                "type": "objective_checkpoint_candidate",
+                "objective_id": objective_id,
+                "evidence": evidence,
+            }),
+            None,
+        ),
         AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
             tool_name,
@@ -862,6 +933,7 @@ mod tests {
     use crate::domain::execution::{ExecutionRun, StepRun};
     use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState, TaskToolState};
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
+    use crate::infrastructure::ai_worker::AiWorkerObjectiveResult;
     use crate::infrastructure::tool_broker::ToolDisplayContext;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -877,6 +949,10 @@ mod tests {
     struct UnavailableConnectorResolver;
 
     struct CapabilityRepairResolver;
+
+    struct CheckpointResolver {
+        contract: serde_json::Value,
+    }
 
     impl AgentRuntimeResolver for UnavailableConnectorResolver {
         fn resolve(
@@ -973,6 +1049,31 @@ mod tests {
         }
     }
 
+    impl AgentRuntimeResolver for CheckpointResolver {
+        fn resolve(
+            &self,
+            task_session_id: u64,
+            envelope: &TaskSessionEnvelopeV1,
+            _runtime_attempt_id: &str,
+            retained_governance: Option<&GovernanceResolutionRecord>,
+        ) -> Result<ResolvedAgentTask, String> {
+            Ok(ResolvedAgentTask {
+                runtime_profile_id: envelope.runtime_profile_id.clone(),
+                config: test_config(),
+                task: AiWorkerTask {
+                    execution_contract: Some(self.contract.clone()),
+                    task_examination: None,
+                    session_key: None,
+                    opencode_session_id: None,
+                },
+                governance: retained_governance
+                    .cloned()
+                    .unwrap_or_else(|| test_governance(task_session_id)),
+                connector_capabilities: Vec::new(),
+            })
+        }
+    }
+
     struct FakeRunner {
         executions: Arc<AtomicUsize>,
     }
@@ -1014,6 +1115,11 @@ mod tests {
     struct CapabilityDriftThenCompleteRunner {
         executions: Arc<AtomicUsize>,
         observed_alternatives: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    struct CheckpointThenCompleteRunner {
+        executions: Arc<AtomicUsize>,
+        observed_checkpoints: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl AgentRuntimeRunner for ToolFailureRunner {
@@ -1176,6 +1282,87 @@ mod tests {
                 completion_status: AiWorkerCompletionStatus::Completed,
                 blocked_reason: None,
                 objective_results: Vec::new(),
+            })
+        }
+    }
+
+    impl AgentRuntimeRunner for CheckpointThenCompleteRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+            self.observed_checkpoints
+                .lock()
+                .expect("checkpoint observations lock")
+                .push(
+                    task.task_examination
+                        .as_ref()
+                        .map(|examination| {
+                            examination
+                                .objective_checkpoints
+                                .iter()
+                                .map(|checkpoint| checkpoint.objective_id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            if execution == 0 {
+                on_event(AiWorkerStreamEvent::OpenCodeSession {
+                    session_id: "opencode-checkpoint-session".to_string(),
+                    action: "created".to_string(),
+                })?;
+                on_event(AiWorkerStreamEvent::ObjectiveCheckpoint {
+                    objective_id: "objective-1".to_string(),
+                    evidence: vec!["Bamboo build 42 succeeded".to_string()],
+                })?;
+                return Ok(AiWorkerTaskResult {
+                    summary: "Rollout still needs operator input".to_string(),
+                    evidence: vec!["Bamboo build 42 succeeded".to_string()],
+                    details: Vec::new(),
+                    next: vec!["Continue rollout".to_string()],
+                    completion_status: AiWorkerCompletionStatus::Blocked,
+                    blocked_reason: Some("operator input required".to_string()),
+                    objective_results: vec![
+                        AiWorkerObjectiveResult {
+                            objective_id: "objective-1".to_string(),
+                            completion_status: AiWorkerCompletionStatus::Completed,
+                            evidence: vec!["Bamboo build 42 succeeded".to_string()],
+                            blocked_reason: None,
+                        },
+                        AiWorkerObjectiveResult {
+                            objective_id: "objective-2".to_string(),
+                            completion_status: AiWorkerCompletionStatus::Blocked,
+                            evidence: Vec::new(),
+                            blocked_reason: Some("operator input required".to_string()),
+                        },
+                    ],
+                });
+            }
+            Ok(AiWorkerTaskResult {
+                summary: "Rollout completed without rebuilding".to_string(),
+                evidence: vec!["Existing build 42 deployed successfully".to_string()],
+                details: Vec::new(),
+                next: Vec::new(),
+                completion_status: AiWorkerCompletionStatus::Completed,
+                blocked_reason: None,
+                objective_results: vec![
+                    AiWorkerObjectiveResult {
+                        objective_id: "objective-1".to_string(),
+                        completion_status: AiWorkerCompletionStatus::Completed,
+                        evidence: vec!["Bamboo build 42 succeeded".to_string()],
+                        blocked_reason: None,
+                    },
+                    AiWorkerObjectiveResult {
+                        objective_id: "objective-2".to_string(),
+                        completion_status: AiWorkerCompletionStatus::Completed,
+                        evidence: vec!["Rollout healthy".to_string()],
+                        blocked_reason: None,
+                    },
+                ],
             })
         }
     }
@@ -2196,6 +2383,143 @@ mod tests {
                     progress.phase == "repairing_capability_plan" && progress.completed == 1
                 })
         }));
+    }
+
+    #[test]
+    fn blocked_continuation_retains_completed_objective_checkpoint() {
+        let directory = tempdir().expect("temp directory");
+        let contract = json!({
+            "contract": "checkpoint-test",
+            "semantic_plan": {
+                "status": "fallback",
+                "planner_version": "agent-semantic-plan-v1",
+                "objectives": [
+                    { "id": "objective-1", "summary": "Trigger Bamboo build", "success_evidence": "successful build" },
+                    { "id": "objective-2", "summary": "Deploy rollout", "success_evidence": "healthy rollout" }
+                ]
+            }
+        });
+        let mut envelope = test_envelope();
+        let TaskSessionEnvelope::V1(session_envelope) = &mut envelope else {
+            unreachable!();
+        };
+        session_envelope.context_digest = execution_contract_digest(&contract).expect("digest");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed_checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let executor = AgentTaskExecutor::new(
+            Arc::new(CheckpointResolver { contract }),
+            Arc::new(CheckpointThenCompleteRunner {
+                executions: executions.clone(),
+                observed_checkpoints: observed_checkpoints.clone(),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "checkpoint-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let blocked = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task blocks with partial completion");
+        assert_eq!(blocked.state, TaskSessionState::Blocked);
+
+        engine
+            .continue_interrupted_session(
+                session.id,
+                "checkpoint-agent-continued",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+            )
+            .expect("task continued");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("continued task completes");
+
+        assert_eq!(completed.state, TaskSessionState::Succeeded);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_checkpoints
+                .lock()
+                .expect("checkpoint observations lock")
+                .as_slice(),
+            &[Vec::<String>::new(), vec!["objective-1".to_string()]]
+        );
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        assert!(events.iter().any(|event| {
+            event.payload["type"] == "objective_checkpointed"
+                && event.payload["objective_id"] == "objective-1"
+                && event.payload["new_checkpoint"] == true
+        }));
+        assert!(events.iter().any(|event| {
+            event.payload["type"] == "task_examined"
+                && event.payload["objective_checkpoint_count"] == 1
+        }));
+    }
+
+    #[test]
+    fn mutation_objective_rejects_checkpoint_without_successful_mutation_event() {
+        let directory = tempdir().expect("temp directory");
+        let contract = json!({
+            "contract": "mutation-checkpoint-test",
+            "semantic_plan": {
+                "status": "fallback",
+                "planner_version": "agent-semantic-plan-v1",
+                "objectives": [
+                    {
+                        "id": "objective-1",
+                        "summary": "Trigger Bamboo build",
+                        "success_evidence": "successful build",
+                        "mutation_expected": true
+                    },
+                    { "id": "objective-2", "summary": "Deploy rollout", "success_evidence": "healthy rollout" }
+                ]
+            }
+        });
+        let mut envelope = test_envelope();
+        let TaskSessionEnvelope::V1(session_envelope) = &mut envelope else {
+            unreachable!();
+        };
+        session_envelope.context_digest = execution_contract_digest(&contract).expect("digest");
+        let executor = AgentTaskExecutor::new(
+            Arc::new(CheckpointResolver { contract }),
+            Arc::new(CheckpointThenCompleteRunner {
+                executions: Arc::new(AtomicUsize::new(0)),
+                observed_checkpoints: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "mutation-checkpoint-agent",
+                &envelope,
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let failed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("invalid mutation checkpoint fails");
+
+        assert_eq!(failed.state, TaskSessionState::Failed);
+        assert!(failed.error.as_deref().is_some_and(
+            |error| error.contains("cannot checkpoint before a successful mutation tool event")
+        ));
+        let events = engine.events_after(session.id, 0).expect("events replayed");
+        assert!(!events
+            .iter()
+            .any(|event| event.payload["type"] == "objective_checkpointed"));
     }
 
     #[test]

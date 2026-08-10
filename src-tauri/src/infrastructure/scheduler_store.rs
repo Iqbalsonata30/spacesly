@@ -13,11 +13,11 @@ use crate::domain::governance::GovernanceResolutionRecord;
 #[cfg(test)]
 use crate::domain::task_session::TaskMcpConnectorContext;
 use crate::domain::task_session::{
-    AgentTaskCompletionStatus, TaskCapabilityGrant, TaskExecutionOutput, TaskExecutionTraceEntry,
-    TaskExecutionTracePage, TaskMcpContext, TaskProgress, TaskRequest, TaskSessionEnvelope,
-    TaskSessionEvent, TaskSessionEventInput, TaskSessionEventKind, TaskSessionEventPage,
-    TaskSessionId, TaskSessionInputV2, TaskSessionKind, TaskSessionResult, TaskSessionSnapshot,
-    TaskSessionState, TaskToolState,
+    AgentTaskCompletionStatus, AgentTaskObjectiveCheckpoint, TaskCapabilityGrant,
+    TaskExecutionOutput, TaskExecutionTraceEntry, TaskExecutionTracePage, TaskMcpContext,
+    TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent, TaskSessionEventInput,
+    TaskSessionEventKind, TaskSessionEventPage, TaskSessionId, TaskSessionInputV2, TaskSessionKind,
+    TaskSessionResult, TaskSessionSnapshot, TaskSessionState, TaskToolState,
 };
 use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -395,7 +395,22 @@ impl SchedulerStore {
                       ON DELETE CASCADE
                   );
                   CREATE INDEX IF NOT EXISTS idx_scheduler_completion_pending
-                    ON scheduler_task_completions(projected_at, finalized_at, staged_at);",
+                    ON scheduler_task_completions(projected_at, finalized_at, staged_at);
+                  CREATE TABLE IF NOT EXISTS scheduler_task_objective_checkpoints (
+                    session_id INTEGER NOT NULL,
+                    objective_id TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    source_attempt_id INTEGER NOT NULL,
+                    source_fencing_token INTEGER NOT NULL,
+                    recorded_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, objective_id),
+                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                      ON DELETE CASCADE,
+                    FOREIGN KEY(source_attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_objective_checkpoints_session
+                    ON scheduler_task_objective_checkpoints(session_id, recorded_at);",
         )
         .map_err(|error| format!("Failed to initialize scheduler database: {error}"))?;
         // Serialize non-destructive migrations across concurrently starting Scheduler processes.
@@ -505,12 +520,14 @@ impl SchedulerStore {
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_active_execution_run
                    ON scheduler_task_sessions(workspace_id, execution_run_id)
                   WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
-                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace_v3
+                 DROP INDEX IF EXISTS idx_scheduler_events_trace_v3;
+                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace_v4
                    ON scheduler_task_events(session_id, sequence)
                   WHERE event_type IN (
                     'lifecycle', 'tool_started', 'tool_completed',
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
                     'approval_requested', 'runtime_recovery_decision',
+                    'objective_checkpointed',
                     'capability_repair_decision'
                   );
                  CREATE INDEX IF NOT EXISTS idx_scheduler_events_tool_state
@@ -532,6 +549,7 @@ impl SchedulerStore {
                           AND json_extract(NEW.payload_json, '$.type') IN (
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
                             'approval_requested', 'runtime_recovery_decision',
+                            'objective_checkpointed',
                             'capability_repair_decision'
                           ) THEN json_extract(NEW.payload_json, '$.type')
                         ELSE NULL
@@ -547,7 +565,7 @@ impl SchedulerStore {
                 |row| row.get(0),
             )
             .map_err(|error| format!("Failed to inspect trace event migration: {error}"))?;
-        if event_type_backfill_version < 3 {
+        if event_type_backfill_version < 4 {
             migration
                 .execute_batch(
                     "UPDATE scheduler_task_events
@@ -563,6 +581,7 @@ impl SchedulerStore {
                             AND json_extract(payload_json, '$.type') IN (
                               'execution_trace_stage', 'usage_updated', 'opencode_session',
                               'approval_requested', 'runtime_recovery_decision',
+                              'objective_checkpointed',
                               'capability_repair_decision'
                             ) THEN json_extract(payload_json, '$.type')
                           ELSE NULL
@@ -573,10 +592,11 @@ impl SchedulerStore {
                           AND json_extract(payload_json, '$.type') IN (
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
                             'approval_requested', 'runtime_recovery_decision',
+                            'objective_checkpointed',
                             'capability_repair_decision'
                           ))
                       );
-                     UPDATE scheduler_metadata SET event_type_backfill_version = 3
+                     UPDATE scheduler_metadata SET event_type_backfill_version = 4
                       WHERE singleton = 1;",
                 )
                 .map_err(|error| format!("Failed to backfill trace event types: {error}"))?;
@@ -1123,6 +1143,75 @@ impl SchedulerStore {
         self.append_assignment_event_at(fence, input, now_millis())
     }
 
+    pub(crate) fn record_objective_checkpoint(
+        &self,
+        fence: AssignmentFence,
+        objective_id: &str,
+        evidence: &[String],
+    ) -> Result<TaskSessionEvent, String> {
+        if objective_id.trim() != objective_id
+            || objective_id.is_empty()
+            || objective_id.len() > 128
+            || evidence.is_empty()
+            || evidence.len() > 12
+            || evidence
+                .iter()
+                .any(|item| item.trim().is_empty() || item.len() > 2_000)
+        {
+            return Err("Objective checkpoint payload is invalid.".to_string());
+        }
+        let now = now_millis();
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("Failed to start objective checkpoint transaction: {error}")
+            })?;
+        if !assignment_is_current_on(&transaction, fence, now)? {
+            return Err("Objective checkpoint assignment fence is stale.".to_string());
+        }
+        let evidence_json = serde_json::to_string(evidence)
+            .map_err(|error| format!("Failed to encode objective checkpoint: {error}"))?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO scheduler_task_objective_checkpoints
+                   (session_id, objective_id, evidence_json, source_attempt_id,
+                    source_fencing_token, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    to_i64(fence.session_id.0)?,
+                    objective_id,
+                    evidence_json,
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.fencing_token)?,
+                    to_i64(now)?,
+                ],
+            )
+            .map_err(|error| format!("Failed to persist objective checkpoint: {error}"))?;
+        let event = append_event_in_transaction(
+            &transaction,
+            fence.session_id,
+            Some(fence.attempt_id),
+            fence.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Runtime,
+                payload: json!({
+                    "type": "objective_checkpointed",
+                    "schema_version": 1,
+                    "objective_id": objective_id,
+                    "evidence": evidence,
+                    "new_checkpoint": inserted == 1,
+                }),
+                progress: None,
+            },
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit objective checkpoint: {error}"))?;
+        Ok(event)
+    }
+
     fn append_assignment_event_at(
         &self,
         fence: AssignmentFence,
@@ -1335,6 +1424,7 @@ impl SchedulerStore {
                       'lifecycle', 'tool_started', 'tool_completed',
                       'execution_trace_stage', 'usage_updated', 'opencode_session',
                       'approval_requested', 'runtime_recovery_decision',
+                      'objective_checkpointed',
                       'capability_repair_decision'
                     )
                  ORDER BY sequence
@@ -2268,6 +2358,34 @@ impl SchedulerStore {
             TaskExecutionOutput::None => unreachable!(),
         };
         let terminal_state_text = state_text(terminal_state);
+        if let TaskExecutionOutput::Agent(result) = &output {
+            for objective in result.objective_results.iter().filter(|objective| {
+                objective.completion_status == AgentTaskCompletionStatus::Completed
+                    && !objective.objective_id.trim().is_empty()
+                    && !objective.evidence.is_empty()
+            }) {
+                let evidence_json =
+                    serde_json::to_string(&objective.evidence).map_err(|error| {
+                        format!("Failed to encode objective checkpoint evidence: {error}")
+                    })?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO scheduler_task_objective_checkpoints
+                           (session_id, objective_id, evidence_json, source_attempt_id,
+                            source_fencing_token, recorded_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            to_i64(fence.session_id.0)?,
+                            objective.objective_id,
+                            evidence_json,
+                            to_i64(fence.attempt_id)?,
+                            to_i64(fence.fencing_token)?,
+                            to_i64(now)?,
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to persist objective checkpoint: {error}"))?;
+            }
+        }
         let output_json = serde_json::to_string(&output)
             .map_err(|error| format!("Failed to encode staged task result: {error}"))?;
         let workspace_id = workspace_id
@@ -2478,6 +2596,45 @@ impl SchedulerStore {
                 },
             )
             .transpose()
+    }
+
+    pub(crate) fn objective_checkpoints(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Vec<AgentTaskObjectiveCheckpoint>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT objective_id, evidence_json, source_attempt_id, recorded_at
+                   FROM scheduler_task_objective_checkpoints
+                  WHERE session_id = ?1
+                  ORDER BY recorded_at, objective_id",
+            )
+            .map_err(|error| format!("Failed to prepare objective checkpoint query: {error}"))?;
+        let checkpoints = statement
+            .query_map(params![to_i64(session_id.0)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| format!("Failed to query objective checkpoints: {error}"))?
+            .map(|row| {
+                let (objective_id, evidence, source_attempt_id, recorded_at) =
+                    row.map_err(|error| format!("Failed to read objective checkpoint: {error}"))?;
+                Ok(AgentTaskObjectiveCheckpoint {
+                    objective_id,
+                    evidence: serde_json::from_str(&evidence).map_err(|error| {
+                        format!("Failed to decode objective checkpoint evidence: {error}")
+                    })?,
+                    source_attempt_id: from_i64(source_attempt_id, "checkpoint attempt ID")?,
+                    recorded_at: from_i64(recorded_at, "checkpoint timestamp")?,
+                })
+            })
+            .collect();
+        checkpoints
     }
 
     pub(crate) fn record_completion_error(
@@ -3466,6 +3623,7 @@ fn indexed_event_type(kind: TaskSessionEventKind, payload: &serde_json::Value) -
         (TaskSessionEventKind::Runtime, Some("runtime_recovery_decision")) => {
             "runtime_recovery_decision"
         }
+        (TaskSessionEventKind::Runtime, Some("objective_checkpointed")) => "objective_checkpointed",
         (TaskSessionEventKind::Runtime, Some("capability_repair_decision")) => {
             "capability_repair_decision"
         }
@@ -4581,6 +4739,7 @@ mod tests {
                     'lifecycle', 'tool_started', 'tool_completed',
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
                     'approval_requested', 'runtime_recovery_decision',
+                    'objective_checkpointed',
                     'capability_repair_decision'
                   ) ORDER BY sequence LIMIT 100",
             )

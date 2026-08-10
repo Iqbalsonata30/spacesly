@@ -858,6 +858,15 @@ pub struct AgentTaskObjectiveResult {
     pub blocked_reason: Option<String>,
 }
 
+/// Durable evidence that one semantic objective completed in an earlier assignment attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskObjectiveCheckpoint {
+    pub objective_id: String,
+    pub evidence: Vec<String>,
+    pub source_attempt_id: u64,
+    pub recorded_at: u64,
+}
+
 /// Authoritative assistant response produced by a Chat Task Session.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChatTaskResult {

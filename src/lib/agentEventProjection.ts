@@ -50,6 +50,20 @@ export function projectAgentTaskSessionEvent(
     summary = `${payload.type === "tool_completed" ? (failed ? "Tool failed" : "Tool completed; task still running") : "Tool started"}: ${String(label ?? "Agent tool")}.`;
   } else if (event.kind === "runtime" && eventType === "agent_result_candidate") {
     summary = "Agent result staged for authoritative Task Session commit.";
+  } else if (event.kind === "runtime" && eventType === "objective_checkpointed") {
+    const objectiveId =
+      typeof payload.objective_id === "string" ? payload.objective_id : "unknown objective";
+    const evidence = Array.isArray(payload.evidence)
+      ? payload.evidence.filter((item): item is string => typeof item === "string")
+      : [];
+    const newlySaved = payload.new_checkpoint !== false;
+    summary = newlySaved
+      ? `Objective checkpoint saved: ${objectiveId}.`
+      : `Objective checkpoint already retained: ${objectiveId}.`;
+    details.push(
+      "- This verified objective will not be repeated if the task continues.",
+      ...(evidence.length > 0 ? [`- Evidence: ${evidence[0]}`] : []),
+    );
   } else if (event.kind === "runtime" && eventType === "runtime_recovery_decision") {
     const action = typeof payload.action === "string" ? payload.action : "stop_failed";
     const failureClass =

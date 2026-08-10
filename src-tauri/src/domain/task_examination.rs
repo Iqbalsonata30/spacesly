@@ -1,7 +1,7 @@
 //! Deterministic, secret-free examination of an Agent task before worker execution.
 
 use crate::domain::governance::RuleFactsRecord;
-use crate::domain::task_session::TaskSessionEnvelopeV1;
+use crate::domain::task_session::{AgentTaskObjectiveCheckpoint, TaskSessionEnvelopeV1};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +97,8 @@ pub struct TaskExaminationRecord {
     pub semantic_planner: Option<SemanticPlannerEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objective_checkpoints: Vec<AgentTaskObjectiveCheckpoint>,
     pub required_capabilities: Vec<String>,
     pub unresolved_requirements: Vec<String>,
     pub mutations: Vec<String>,
@@ -131,6 +133,7 @@ impl TaskExaminationRecord {
             self.capability_catalog.len(),
             self.connector_capabilities.len(),
             self.capability_mappings.len(),
+            self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
             self.mutations.len(),
@@ -207,6 +210,21 @@ impl TaskExaminationRecord {
                 || repair.reason.len() > 256
         }) {
             return Err("Task Examination runtime repair guidance is invalid.".to_string());
+        }
+        let mut checkpoint_ids = HashSet::new();
+        if self.objective_checkpoints.iter().any(|checkpoint| {
+            !canonical_inventory_name(&checkpoint.objective_id, true)
+                || !checkpoint_ids.insert(checkpoint.objective_id.as_str())
+                || checkpoint.evidence.is_empty()
+                || checkpoint.evidence.len() > 12
+                || checkpoint
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.trim().is_empty() || evidence.len() > 2_000)
+                || checkpoint.source_attempt_id == 0
+                || checkpoint.recorded_at == 0
+        }) {
+            return Err("Task Examination objective checkpoints are invalid.".to_string());
         }
         if self
             .connector_capabilities
@@ -410,6 +428,7 @@ pub fn examine_task(
         capability_mappings,
         semantic_planner,
         runtime_repair: None,
+        objective_checkpoints: Vec::new(),
         required_capabilities,
         unresolved_requirements,
         mutations: mutations.into_iter().collect(),
