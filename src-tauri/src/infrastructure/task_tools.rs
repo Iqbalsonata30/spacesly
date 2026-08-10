@@ -9,8 +9,9 @@ use super::files::{
 use super::git::{
     checkout_workspace_git_branch, commit_workspace_git_changes, merge_workspace_git_branch,
     pull_workspace_git_changes, push_workspace_git_changes, rebase_workspace_git_branch,
-    stage_all_workspace_git_files, stage_workspace_git_file, unstage_all_workspace_git_files,
-    unstage_workspace_git_file, workspace_git_info, workspace_git_status,
+    repository_root_at, stage_all_workspace_git_files, stage_workspace_git_file,
+    unstage_all_workspace_git_files, unstage_workspace_git_file, workspace_git_info,
+    workspace_git_status,
 };
 use super::mcp::{read_stdout_message, write_proxy_message};
 use super::scheduler_store::{SchedulerStore, TaskToolAuthority};
@@ -145,6 +146,7 @@ fn tool_definitions(authority: &TaskToolAuthority) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "operation": { "type": "string", "enum": ["info", "status", "stage_file", "stage_all", "unstage_file", "unstage_all", "checkout", "pull", "commit", "push", "merge", "rebase"] },
+                    "workdir": { "type": "string", "description": "Repository directory inside the assigned workspace. Required when the workspace root is not itself a Git repository." },
                     "path": { "type": "string" },
                     "branch": { "type": "string" },
                     "message": { "type": "string" }
@@ -258,56 +260,62 @@ fn call_tool(
 
 fn call_git(
     authority: &TaskToolAuthority,
-    roots: &WorkspaceRoot,
+    _roots: &WorkspaceRoot,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Value, String> {
     let workspace = authority.workspace_id.clone();
-    let info = workspace_git_info(roots, workspace.clone())?;
-    let repo_root = info
-        .repo_root
-        .as_deref()
-        .ok_or_else(|| "Assigned workspace is not a Git repository.".to_string())?;
-    let repo_root = PathBuf::from(repo_root)
+    let workdir = resolve_workdir(
+        &authority.workspace_root,
+        arguments.get("workdir").and_then(Value::as_str),
+    )?;
+    let repo_root = repository_root_at(&workdir)?.ok_or_else(|| {
+        "Git workdir is not inside a repository. Provide a repository directory within the assigned workspace using 'workdir'.".to_string()
+    })?;
+    let repo_root = repo_root
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Git repository root: {error}"))?;
-    if repo_root != authority.workspace_root {
+    if !repo_root.starts_with(&authority.workspace_root) {
         return Err("Git repository root escapes the assigned workspace root.".to_string());
     }
+    let repo_roots = WorkspaceRoot::scoped(&workspace, &repo_root)?;
+    let info = workspace_git_info(&repo_roots, workspace.clone())?;
     authorize(authority, "git")?;
     let value = match string_argument(arguments, "operation")? {
         "info" => serde_json::to_value(info),
-        "status" => serde_json::to_value(workspace_git_status(roots, workspace)?),
+        "status" => serde_json::to_value(workspace_git_status(&repo_roots, workspace)?),
         "stage_file" => serde_json::to_value(stage_workspace_git_file(
-            roots,
+            &repo_roots,
             workspace,
             validate_relative_path(string_argument(arguments, "path")?)?,
         )?),
-        "stage_all" => serde_json::to_value(stage_all_workspace_git_files(roots, workspace)?),
+        "stage_all" => serde_json::to_value(stage_all_workspace_git_files(&repo_roots, workspace)?),
         "unstage_file" => serde_json::to_value(unstage_workspace_git_file(
-            roots,
+            &repo_roots,
             workspace,
             validate_relative_path(string_argument(arguments, "path")?)?,
         )?),
-        "unstage_all" => serde_json::to_value(unstage_all_workspace_git_files(roots, workspace)?),
+        "unstage_all" => {
+            serde_json::to_value(unstage_all_workspace_git_files(&repo_roots, workspace)?)
+        }
         "checkout" => serde_json::to_value(checkout_workspace_git_branch(
-            roots,
+            &repo_roots,
             workspace,
             string_argument(arguments, "branch")?.to_string(),
         )?),
-        "pull" => serde_json::to_value(pull_workspace_git_changes(roots, workspace)?),
+        "pull" => serde_json::to_value(pull_workspace_git_changes(&repo_roots, workspace)?),
         "commit" => serde_json::to_value(commit_workspace_git_changes(
-            roots,
+            &repo_roots,
             workspace,
             string_argument(arguments, "message")?.to_string(),
         )?),
-        "push" => serde_json::to_value(push_workspace_git_changes(roots, workspace)?),
+        "push" => serde_json::to_value(push_workspace_git_changes(&repo_roots, workspace)?),
         "merge" => serde_json::to_value(merge_workspace_git_branch(
-            roots,
+            &repo_roots,
             workspace,
             string_argument(arguments, "branch")?.to_string(),
         )?),
         "rebase" => serde_json::to_value(rebase_workspace_git_branch(
-            roots,
+            &repo_roots,
             workspace,
             string_argument(arguments, "branch")?.to_string(),
         )?),
@@ -385,7 +393,7 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
             )
         })
     {
-        return Err("Shell workdir must remain inside the assigned workspace.".to_string());
+        return Err("Workdir must remain inside the assigned workspace.".to_string());
     }
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -394,9 +402,9 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
     };
     let resolved = candidate
         .canonicalize()
-        .map_err(|error| format!("Failed to resolve shell workdir: {error}"))?;
+        .map_err(|error| format!("Failed to resolve workdir: {error}"))?;
     if !resolved.starts_with(root) || !resolved.is_dir() {
-        return Err("Shell workdir escapes the assigned workspace.".to_string());
+        return Err("Workdir escapes the assigned workspace.".to_string());
     }
     Ok(resolved)
 }
@@ -572,6 +580,104 @@ mod tests {
             validate_relative_path("src/main.rs").unwrap(),
             "src/main.rs"
         );
+    }
+
+    #[test]
+    fn git_tool_operates_on_nested_repository_within_assigned_workspace() {
+        let directory = tempdir().expect("test directory");
+        let workspace = directory.path().join("workspace");
+        let repository = workspace.join("BRI").join("qcash-deployment");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        let git = crate::infrastructure::git::git_executable().expect("git executable");
+        let initialized = std::process::Command::new(git)
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .expect("git init runs");
+        assert!(initialized.success());
+
+        let root = workspace.canonicalize().expect("workspace root");
+        let store = SchedulerStore::open_at(directory.path().join("scheduler.db"))
+            .expect("scheduler store");
+        let owner = store.register_owner().expect("scheduler owner");
+        store
+            .enqueue_with_grants(
+                &TaskRequest {
+                    label: "nested-git".to_string(),
+                    payload: serde_json::to_string(&TaskSessionEnvelope::V1(
+                        TaskSessionEnvelopeV1 {
+                            workspace_id: "workspace-test".to_string(),
+                            kind: TaskSessionKind::Agent,
+                            subject_id: Some("card-git".to_string()),
+                            conversation_id: Some("conversation-git".to_string()),
+                            execution_run_id: Some("run-git".to_string()),
+                            context_digest: "digest".to_string(),
+                            runtime_profile_id: "profile-git".to_string(),
+                            model: "openai/test".to_string(),
+                            connector_ids: Vec::new(),
+                            requested_capabilities: vec!["git".to_string()],
+                            prompt_template_version: "agent-v1".to_string(),
+                            context_revision: Some("1".to_string()),
+                            rules_revision: Some("rules".to_string()),
+                            skills_revision: Some("skills".to_string()),
+                        },
+                    ))
+                    .expect("task envelope"),
+                },
+                &["git".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 1)
+            .expect("claim succeeds")
+            .expect("assignment");
+        let authority = store
+            .task_tool_authority(
+                assignment.fence,
+                "workspace-test",
+                root.clone(),
+                &["git".to_string()],
+            )
+            .expect("tool authority");
+        let roots = WorkspaceRoot::scoped("workspace-test", &root).expect("workspace registered");
+
+        let response = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": {
+                        "operation": "info",
+                        "workdir": "BRI/qcash-deployment"
+                    }
+                }
+            }),
+        )
+        .expect("nested repository inspected");
+
+        assert_eq!(response["is_git_repo"], true);
+        assert_eq!(
+            response["repo_root"],
+            repository
+                .canonicalize()
+                .expect("repository root")
+                .to_string_lossy()
+                .as_ref()
+        );
+        let missing_workdir = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": { "operation": "info" }
+                }
+            }),
+        )
+        .expect_err("workspace root itself is not a repository");
+        assert!(missing_workdir.contains("Provide a repository directory"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
@@ -15,6 +16,30 @@ pub fn inject_shell_env(command: &mut Command) {
             .filter(|(key, _)| is_safe_runtime_env_key(key)),
     );
     inject_global_environment(command);
+    inject_git_directory(command);
+}
+
+fn inject_git_directory(command: &mut Command) {
+    let Ok(git) = super::git::git_executable() else {
+        return;
+    };
+    let Some(git_directory) = git.parent() else {
+        return;
+    };
+    let configured_path = command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("PATH"))
+        .and_then(|(_, value)| value)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("PATH").map(PathBuf::from));
+    let mut directories = vec![git_directory.to_path_buf()];
+    if let Some(path) = configured_path {
+        directories
+            .extend(std::env::split_paths(&path).filter(|directory| directory != git_directory));
+    }
+    if let Ok(path) = std::env::join_paths(directories) {
+        command.env("PATH", path);
+    }
 }
 
 fn is_safe_runtime_env_key(key: &str) -> bool {
@@ -109,7 +134,9 @@ fn parse_env_output(stdout: &str, delimiter: &str) -> Option<HashMap<String, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_runtime_env_key, login_shell_command};
+    use super::{inject_shell_env, is_safe_runtime_env_key, login_shell_command};
+    use std::ffi::OsStr;
+    use std::process::Command;
 
     #[test]
     fn shell_environment_allowlist_excludes_credentials() {
@@ -129,5 +156,21 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(arguments, ["-lc", "env"]);
+    }
+
+    #[test]
+    fn injected_path_contains_resolved_git_directory() {
+        let git = crate::infrastructure::git::git_executable().expect("git resolves");
+        let mut command = Command::new("true");
+        inject_shell_env(&mut command);
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("PATH injected");
+
+        assert!(
+            std::env::split_paths(path).any(|directory| Some(directory.as_path()) == git.parent())
+        );
     }
 }

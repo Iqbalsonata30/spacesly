@@ -77,6 +77,20 @@ impl WorkspaceRoot {
         })
     }
 
+    pub(crate) fn scoped(workspace_id: &str, path: &Path) -> Result<Self, String> {
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("Failed to canonicalize workspace directory: {error}"))?;
+        if !path.is_dir() {
+            return Err("Workspace directory is not a directory.".to_string());
+        }
+        let mut paths = HashMap::new();
+        paths.insert(workspace_id.to_string(), RootEntry { path, revision: 1 });
+        Ok(Self {
+            paths: Arc::new(Mutex::new(paths)),
+        })
+    }
+
     pub fn path(&self, workspace_id: &str) -> Result<PathBuf, String> {
         let _metric =
             crate::infrastructure::performance::span("workspace_config_lookup_ms", "workspace");

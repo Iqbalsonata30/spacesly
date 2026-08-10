@@ -17,6 +17,7 @@ use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
     AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
 };
+use crate::infrastructure::git::repository_root_at;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -436,6 +437,59 @@ impl TaskExecutor for AgentTaskExecutor {
             ));
         }
         examination.objective_checkpoints = objective_checkpoints;
+        let workspace_git_preflight = if envelope
+            .requested_capabilities
+            .iter()
+            .any(|capability| capability == "git")
+        {
+            resolved.config.opencode_workdir.as_deref().map(|workdir| {
+                let configured = std::path::PathBuf::from(workdir);
+                let canonical = configured.canonicalize().ok();
+                let (status, repository_root, guidance) = match canonical.as_deref() {
+                    None => (
+                        "invalid_workspace",
+                        None,
+                        "Configure an existing trusted workspace directory before using Git.",
+                    ),
+                    Some(root) => match repository_root_at(root) {
+                        Ok(Some(repository_root)) if repository_root == root => {
+                            ("workspace_repository", Some(repository_root), "")
+                        }
+                        Ok(Some(repository_root)) => (
+                            "repository_outside_scope",
+                            Some(repository_root),
+                            "Configure the repository root or one of its parent directories as the trusted workspace.",
+                        ),
+                        Ok(None) => (
+                            "nested_repository_required",
+                            None,
+                            "The workspace root is not a repository. Pass the repository directory using the Git tool 'workdir' argument.",
+                        ),
+                        Err(_) => (
+                            "git_unavailable",
+                            None,
+                            "Install Git or expose it through PATH or a standard package-manager profile.",
+                        ),
+                    },
+                };
+                if !guidance.is_empty()
+                    && examination.warnings.len() < 64
+                    && !examination.warnings.iter().any(|warning| warning == guidance)
+                {
+                    examination.warnings.push(guidance.to_string());
+                }
+                json!({
+                    "type": "workspace_git_preflight",
+                    "schema_version": 1,
+                    "status": status,
+                    "workspace_root": canonical,
+                    "repository_root": repository_root,
+                    "guidance": guidance,
+                })
+            })
+        } else {
+            None
+        };
         let semantic_objective_mutations = Arc::new(semantic_objective_mutations);
         examination
             .validate(&envelope.context_digest)
@@ -459,6 +513,9 @@ impl TaskExecutor for AgentTaskExecutor {
                     .sum::<usize>(),
             }),
         )?;
+        if let Some(preflight) = workspace_git_preflight {
+            context.emit_event(TaskSessionEventKind::Runtime, preflight)?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()

@@ -28,14 +28,19 @@ struct GitStatusCacheState {
 
 static GIT_STATUS_CACHE: OnceLock<GitStatusCache> = OnceLock::new();
 
-static GIT_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static GIT_EXECUTABLE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
-/// Resolves the git executable once, searching the process PATH first and then
-/// common installation locations (including the Nix profile) so the tool works
-/// even when launched outside an interactive shell.
-pub(crate) fn git_executable() -> Result<&'static PathBuf, String> {
-    let resolved = GIT_EXECUTABLE.get_or_init(resolve_git_executable);
-    resolved.as_ref().ok_or_else(|| {
+/// Resolves Git from the current environment and common package-manager profiles.
+/// Successful paths are cached only while they remain executable; failures are
+/// retried so installing Git does not require restarting Spacesly.
+pub(crate) fn git_executable() -> Result<PathBuf, String> {
+    let cache = GIT_EXECUTABLE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().map_err(|error| error.to_string())?;
+    if cached.as_ref().is_some_and(|path| is_executable_file(path)) {
+        return Ok(cached.as_ref().expect("executable was checked").clone());
+    }
+    *cached = resolve_git_executable();
+    cached.clone().ok_or_else(|| {
         "git executable was not found on PATH or common installation locations. Install git or make it available to the application.".to_string()
     })
 }
@@ -63,6 +68,8 @@ fn resolve_git_executable() -> Option<PathBuf> {
         );
     }
     candidates.push(PathBuf::from("/nix/var/nix/profiles/default/bin/git"));
+    candidates.push(PathBuf::from("/opt/homebrew/bin/git"));
+    candidates.push(PathBuf::from("/opt/local/bin/git"));
     candidates.push(PathBuf::from("/usr/local/bin/git"));
     candidates.push(PathBuf::from("/usr/bin/git"));
     candidates.push(PathBuf::from("/bin/git"));
@@ -130,7 +137,7 @@ pub fn workspace_git_info(
 pub fn git_info_for_path(path: &Path) -> Result<GitWorkspaceInfo, String> {
     let _metric =
         crate::infrastructure::performance::span("workspace_repository_context_ms", "workspace");
-    let Some(repo_root) = git_repo_root(path)? else {
+    let Some(repo_root) = repository_root_at(path)? else {
         return Ok(GitWorkspaceInfo {
             is_git_repo: false,
             repo_root: None,
@@ -204,7 +211,7 @@ pub fn checkout_workspace_git_branch(
     branch: String,
 ) -> Result<GitWorkspaceInfo, String> {
     let workspace_root = root.path(&workspace_id)?;
-    let Some(repo_root) = git_repo_root(&workspace_root)? else {
+    let Some(repo_root) = repository_root_at(&workspace_root)? else {
         return Err("Workspace root is not inside a git repository.".to_string());
     };
     let branch = validated_branch_name(&repo_root, &branch)?;
@@ -450,7 +457,7 @@ pub fn rebase_workspace_git_branch(
     workspace_git_info(root, workspace_id)
 }
 
-fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, String> {
+pub(crate) fn repository_root_at(path: &Path) -> Result<Option<PathBuf>, String> {
     let _metric =
         crate::infrastructure::performance::span("workspace_repository_discovery_ms", "workspace");
     let mut command = Command::new(git_executable()?);
@@ -565,7 +572,7 @@ fn normalize_git_status(status: char) -> String {
 
 fn workspace_repo_root(root: &WorkspaceRoot, workspace_id: &str) -> Result<PathBuf, String> {
     let workspace_root = root.path(workspace_id)?;
-    git_repo_root(&workspace_root)?
+    repository_root_at(&workspace_root)?
         .ok_or_else(|| "Workspace root is not inside a git repository.".to_string())
 }
 
@@ -645,7 +652,8 @@ mod tests {
     #[test]
     fn git_executable_resolves_to_a_real_binary() {
         let git = super::git_executable().expect("git should resolve");
-        assert!(is_executable_file(git), "resolved git is not executable");
+        assert!(is_executable_file(&git), "resolved git is not executable");
+        assert_eq!(super::git_executable().expect("git should re-resolve"), git);
     }
 
     #[test]
