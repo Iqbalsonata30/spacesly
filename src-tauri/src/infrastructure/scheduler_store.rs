@@ -84,7 +84,6 @@ pub struct ExternalAssignmentAuthority {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
 pub enum ResourceMutationState {
     Reserved,
     Succeeded,
@@ -93,7 +92,6 @@ pub enum ResourceMutationState {
     Superseded,
 }
 
-#[allow(dead_code)]
 impl ResourceMutationState {
     fn as_str(self) -> &'static str {
         match self {
@@ -118,7 +116,6 @@ impl ResourceMutationState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[allow(dead_code)]
 pub struct ResourceMutationRecord {
     pub mutation_id: u64,
     pub operation_key: String,
@@ -141,14 +138,12 @@ pub struct ResourceMutationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum ResourceMutationReservation {
     Reserved(ResourceMutationRecord),
     Blocked(ResourceMutationRecord),
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum ResourceMutationResolution {
     Succeeded(ResourceMutationEvidence),
     Failed {
@@ -938,7 +933,6 @@ impl SchedulerStore {
             .map_err(|error| format!("Failed to validate external assignment authority: {error}"))
     }
 
-    #[allow(dead_code)]
     pub fn reserve_external_resource_mutation(
         authority: &ExternalAssignmentAuthority,
         tool_name: &str,
@@ -966,11 +960,28 @@ impl SchedulerStore {
                     .to_string(),
             );
         }
+        let mut reconciled_mutation_id = None;
         if let Some(record) = resource_mutation_by_active_key_on(&transaction, &identity.key)? {
-            transaction
-                .commit()
-                .map_err(|error| format!("Failed to commit resource mutation lookup: {error}"))?;
-            return Ok(ResourceMutationReservation::Blocked(record));
+            if record.state == ResourceMutationState::Succeeded {
+                transaction
+                    .execute(
+                        "UPDATE scheduler_resource_mutations
+                            SET state = 'superseded', revision = revision + 1,
+                                superseded_at = ?2,
+                                supersede_reason = 'automatic_state_reconciliation'
+                          WHERE mutation_id = ?1 AND state = 'succeeded'",
+                        params![to_i64(record.mutation_id)?, to_i64(now_millis())?],
+                    )
+                    .map_err(|error| {
+                        format!("Failed to begin resource mutation reconciliation: {error}")
+                    })?;
+                reconciled_mutation_id = Some(record.mutation_id);
+            } else {
+                transaction.commit().map_err(|error| {
+                    format!("Failed to commit resource mutation lookup: {error}")
+                })?;
+                return Ok(ResourceMutationReservation::Blocked(record));
+            }
         }
         let identity_json = serde_json::to_string(identity)
             .map_err(|error| format!("Failed to encode resource operation identity: {error}"))?;
@@ -1008,7 +1019,8 @@ impl SchedulerStore {
                     "operation_key": identity.key,
                     "connector_id": authority.connector_id,
                     "tool_name": tool_name,
-                    "state": "reserved"
+                    "state": "reserved",
+                    "reconciles_mutation_id": reconciled_mutation_id
                 }),
                 progress: None,
             },
@@ -1022,7 +1034,6 @@ impl SchedulerStore {
         Ok(ResourceMutationReservation::Reserved(record))
     }
 
-    #[allow(dead_code)]
     pub fn resolve_external_resource_mutation(
         authority: &ExternalAssignmentAuthority,
         mutation_id: u64,
@@ -1248,7 +1259,6 @@ impl SchedulerStore {
         Ok(record)
     }
 
-    #[allow(dead_code)]
     fn open_authority_store(authority: &ExternalAssignmentAuthority) -> Result<Self, String> {
         let canonical_path = fs::canonicalize(&authority.scheduler_database)
             .map_err(|error| format!("Failed to resolve scheduler authority database: {error}"))?;
@@ -3820,7 +3830,6 @@ fn assignment_is_current_on(
         .map_err(|error| format!("Failed to validate assignment authority: {error}"))
 }
 
-#[allow(dead_code)]
 type RawResourceMutation = (
     i64,
     String,
@@ -3842,7 +3851,6 @@ type RawResourceMutation = (
     Option<String>,
 );
 
-#[allow(dead_code)]
 fn decode_resource_mutation_row(row: &Row<'_>) -> rusqlite::Result<RawResourceMutation> {
     Ok((
         row.get(0)?,
@@ -3866,7 +3874,6 @@ fn decode_resource_mutation_row(row: &Row<'_>) -> rusqlite::Result<RawResourceMu
     ))
 }
 
-#[allow(dead_code)]
 fn decode_resource_mutation(raw: RawResourceMutation) -> Result<ResourceMutationRecord, String> {
     let (
         mutation_id,
@@ -3930,7 +3937,6 @@ fn decode_resource_mutation(raw: RawResourceMutation) -> Result<ResourceMutation
     })
 }
 
-#[allow(dead_code)]
 fn resource_mutation_on(
     connection: &Connection,
     mutation_id: u64,
@@ -3951,7 +3957,6 @@ fn resource_mutation_on(
         .transpose()
 }
 
-#[allow(dead_code)]
 fn resource_mutation_by_active_key_on(
     connection: &Connection,
     operation_key: &str,
@@ -3974,7 +3979,6 @@ fn resource_mutation_by_active_key_on(
         .transpose()
 }
 
-#[allow(dead_code)]
 fn validate_external_authority_shape(
     authority: &ExternalAssignmentAuthority,
 ) -> Result<(), String> {
@@ -3992,7 +3996,6 @@ fn validate_external_authority_shape(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn external_authority_is_current_on(
     connection: &Connection,
     authority: &ExternalAssignmentAuthority,
@@ -4028,7 +4031,6 @@ fn external_authority_is_current_on(
         .map_err(|error| format!("Failed to validate resource mutation authority: {error}"))
 }
 
-#[allow(dead_code)]
 fn validate_resolution_evidence(
     record: &ResourceMutationRecord,
     evidence: &ResourceMutationEvidence,
@@ -4042,7 +4044,6 @@ fn validate_resolution_evidence(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_failure_identity(
     record: &ResourceMutationRecord,
     evidence: Option<&ResourceMutationEvidence>,
@@ -6823,7 +6824,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_mutation_success_blocks_until_exact_audited_supersede() {
+    fn succeeded_resource_mutation_starts_single_state_reconciliation() {
         let directory = tempdir().expect("temp directory");
         let (store, session_id, authority) =
             external_mutation_assignment(directory.path().join("scheduler.db"), 1);
@@ -6846,61 +6847,41 @@ mod tests {
         .expect("mutation succeeded");
         assert_eq!(succeeded.state, ResourceMutationState::Succeeded);
         assert_eq!(succeeded.revision, 2);
-        let blocked = SchedulerStore::reserve_external_resource_mutation(
+        let reconciled = SchedulerStore::reserve_external_resource_mutation(
             &authority,
             "ocp_scale_deployment",
             &identity,
         )
-        .expect("retained fence checked");
+        .expect("state reconciliation reserved");
         assert!(matches!(
-            blocked,
-            ResourceMutationReservation::Blocked(ResourceMutationRecord {
-                state: ResourceMutationState::Succeeded,
+            reconciled,
+            ResourceMutationReservation::Reserved(ResourceMutationRecord {
+                state: ResourceMutationState::Reserved,
                 ..
             })
         ));
-        assert!(store
-            .supersede_resource_mutation(
-                TaskSessionId(session_id.0 + 1),
-                succeeded.mutation_id,
-                &identity.key,
-                succeeded.revision,
-                "wrong session"
-            )
-            .is_err());
-        assert!(store
-            .supersede_resource_mutation(
-                session_id,
-                succeeded.mutation_id,
-                &identity.key,
-                succeeded.revision + 1,
-                "stale revision"
-            )
-            .is_err());
         let superseded = store
-            .supersede_resource_mutation(
-                session_id,
-                succeeded.mutation_id,
-                &identity.key,
-                succeeded.revision,
-                "Operator verified a deliberate second scale request.",
-            )
-            .expect("mutation superseded");
+            .resource_mutation(succeeded.mutation_id)
+            .expect("prior mutation read")
+            .expect("prior mutation retained");
         assert_eq!(superseded.state, ResourceMutationState::Superseded);
         assert_eq!(superseded.revision, 3);
-        assert!(matches!(
-            SchedulerStore::reserve_external_resource_mutation(
-                &authority,
-                "ocp_scale_deployment",
-                &identity
-            )
-            .expect("new reservation allowed"),
-            ResourceMutationReservation::Reserved(_)
-        ));
+        assert_eq!(
+            superseded.supersede_reason.as_deref(),
+            Some("automatic_state_reconciliation")
+        );
         let events = store.events_after(session_id, 0).expect("events read");
-        assert!(events
-            .iter()
-            .any(|event| event.payload["type"] == "resource_mutation_superseded"));
+        assert!(events.iter().any(|event| {
+            event.payload["type"] == "resource_mutation_reserved"
+                && event.payload["reconciles_mutation_id"] == succeeded.mutation_id
+        }));
+        assert_eq!(
+            store
+                .resource_mutations_for_session(session_id)
+                .expect("mutation history read")
+                .len(),
+            2
+        );
     }
 
     #[test]

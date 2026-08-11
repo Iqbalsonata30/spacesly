@@ -3286,26 +3286,37 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let approval_required = part
+    let blocked_tool_result = part
         .get("state")
         .and_then(|state| state.get("output").or_else(|| state.get("result")))
         .map(|output| match output {
             Value::String(value) => value.clone(),
             value => value.to_string(),
         })
-        .filter(|output| {
-            output.contains("\"status\":\"approval_required\"")
+        .and_then(|output| {
+            let marker = if output.contains("\"status\":\"approval_required\"")
                 || output.contains("\"status\": \"approval_required\"")
+            {
+                "config[approval_required]"
+            } else if output.contains("\"status\":\"resource_mutation_blocked\"")
+                || output.contains("\"status\": \"resource_mutation_blocked\"")
+            {
+                "conflict[resource_mutation_blocked]"
+            } else if output.contains("\"status\":\"resource_mutation_uncertain\"")
+                || output.contains("\"status\": \"resource_mutation_uncertain\"")
+            {
+                "conflict[resource_mutation_uncertain]"
+            } else {
+                return None;
+            };
+            Some(format!("{marker}: {output}"))
         });
     match status {
-        "completed" if approval_required.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
+        "completed" if blocked_tool_result.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
             success: false,
-            error: Some(format!(
-                "config[approval_required]: {}",
-                approval_required.unwrap_or_default()
-            )),
+            error: blocked_tool_result,
             risk,
             arguments_digest,
             display_context,
@@ -4453,6 +4464,25 @@ mod tests {
                 ..
             }) if error.contains("[approval_required]")
         ));
+        for (status, marker) in [
+            ("resource_mutation_blocked", "[resource_mutation_blocked]"),
+            (
+                "resource_mutation_uncertain",
+                "[resource_mutation_uncertain]",
+            ),
+        ] {
+            let event = parse_opencode_stream_event(&format!(
+                r#"{{"part":{{"type":"tool","callID":"call-ledger","tool":"ocp_scale_deployment","state":{{"status":"completed","output":"{{\"status\":\"{status}\"}}"}}}}}}"#
+            ));
+            assert!(matches!(
+                event,
+                Some(AiWorkerStreamEvent::ToolCompleted {
+                    success: false,
+                    error: Some(ref error),
+                    ..
+                }) if error.contains(marker)
+            ));
+        }
         assert_eq!(
             failed,
             Some(AiWorkerStreamEvent::ToolCompleted {

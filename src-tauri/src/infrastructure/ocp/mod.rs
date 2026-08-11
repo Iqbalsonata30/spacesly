@@ -35,7 +35,10 @@ use config::{
 use errors::OcpResult;
 use preflight::run_preflight;
 use retry::{with_retry, RetryPolicy};
-use tools::{execute_tool, resource_operation_identity, tool_metadata, OcpTool};
+use tools::{
+    execute_tool, resource_operation_identity, scale_resource_operation_identity, tool_metadata,
+    OcpTool,
+};
 
 pub const ENV_MODE: &str = "SPACESLY_OCP_MODE";
 pub const ENV_KUBECONFIG: &str = "SPACESLY_OCP_KUBECONFIG";
@@ -599,7 +602,7 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
                             Some(&audit_detail),
                             latency_ms,
                         );
-                        write_proxy_error(&mut writer, id.as_ref(), &redacted.to_string())?;
+                        write_ocp_error(&mut writer, id.as_ref(), &redacted)?;
                     }
                 }
             }
@@ -698,6 +701,27 @@ fn write_proxy_error(
         "jsonrpc": "2.0",
         "id": id.cloned().unwrap_or(Value::Null),
         "error": { "code": -32000, "message": message },
+    });
+    write_proxy_message(stdout, &response)
+}
+
+fn write_ocp_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&Value>,
+    error: &OcpError,
+) -> Result<(), String> {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id.cloned().unwrap_or(Value::Null),
+        "error": {
+            "code": -32000,
+            "message": error.to_string(),
+            "data": {
+                "kind": error.kind.as_str(),
+                "code": error.code,
+                "resource_mutation": error.resource_mutation
+            }
+        },
     });
     write_proxy_message(stdout, &response)
 }
@@ -1002,6 +1026,32 @@ pub fn ocp_worker_command() -> Result<Vec<String>, String> {
             .to_string(),
         CONNECTOR_ARG.to_string(),
     ])
+}
+
+pub(crate) fn trusted_resource_operation_identity_from_environment(
+    command: &[String],
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Option<crate::domain::resource_idempotency::ResourceOperationIdentity>, String> {
+    if tool_name != OcpTool::ScaleDeployment.as_str() || command.len() != 2 {
+        return Ok(None);
+    }
+    let expected = ocp_worker_command()?;
+    let command_executable = Path::new(&command[0])
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve MCP connector executable: {error}"))?;
+    let expected_executable = Path::new(&expected[0])
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve Spacesly executable: {error}"))?;
+    if command_executable != expected_executable || command[1] != CONNECTOR_ARG {
+        return Ok(None);
+    }
+    let env = OcpConnectorEnv::from_env()?;
+    let cluster = resolve_cluster(&env).map_err(|error| error.to_string())?;
+    let namespace = cluster.default_namespace.as_deref().unwrap_or("default");
+    scale_resource_operation_identity(&cluster.server, namespace, arguments)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn ocp_mode_from_env(env: &HashMap<String, String>) -> OcpAuthMode {
@@ -1511,6 +1561,15 @@ mod tests {
         assert!(!detail.contains(secret));
         assert!(detail.contains("[REDACTED]"));
         assert!(detail.contains("scale_deployment"));
+        let mut response = Vec::new();
+        write_ocp_error(&mut response, Some(&json!(9)), &redacted).unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["error"]["data"]["kind"], "connect");
+        assert_eq!(
+            response["error"]["data"]["resource_mutation"]["identity"]["operation"],
+            "scale_deployment"
+        );
+        assert!(!response.to_string().contains(secret));
 
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLog::new(dir.path().to_path_buf());

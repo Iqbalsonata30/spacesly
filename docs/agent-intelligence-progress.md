@@ -41,6 +41,12 @@ Implemented behavior:
 - Reservation validates the exact live assignment, lease, fencing token, connector capability grant, and supported operation in one immediate transaction.
 - Resolution requires the exact reservation authority and identity. Assignment completion, cancellation, lease recovery, or owner shutdown changes unresolved reservations to `uncertain` rather than making them replayable.
 - Supersede requires exact session ownership, operation key, revision, bounded reason, and a retained succeeded/uncertain state; the transition is recorded in the scheduler event journal.
+- The MCP proxy recognizes only the trusted embedded OCP connector command for identity derivation; generic or model-provided identities cannot reserve the ledger.
+- Scale calls reserve before upstream dispatch and require string or numeric JSON-RPC IDs with one pending mutation per ID.
+- Connector responses are correlated and resolved durably before they are forwarded to OpenCode.
+- Valid executed/skipped evidence succeeds; matching approval and definitive precondition/conflict rejection release the reservation; malformed, mismatched, transport, write, and EOF outcomes become uncertain.
+- A confirmed previous success starts one new reconciliation reservation instead of returning stale success, preserving GET-before-PATCH behavior while concurrent and uncertain calls remain fenced.
+- OpenCode ledger-blocked and uncertain content results are projected as failed tool events rather than successful mutations.
 
 Regression evidence:
 
@@ -50,7 +56,8 @@ Regression evidence:
 - Structured mutation approval regression: passed.
 - `cargo check`: passed.
 - Focused scheduler mutation ledger tests: 6 passed.
-- Full Rust suite: 406 passed, 3 ignored, 0 failed.
+- Focused proxy identity/response tests: 3 passed, with existing proxy authority and protocol tests retained.
+- Full Rust suite: 409 passed, 3 ignored, 0 failed.
 - Frontend unit tests: 7 passed, 0 failed.
 - `svelte-check`: 0 errors and 0 warnings.
 - Full clippy reaches only three pre-existing findings in `governance.rs` and `task_examination.rs`; Phase 9 introduces no clippy finding.
@@ -104,15 +111,14 @@ Scheduler ledger foundation delivered:
 - Added the scheduler-owned resource mutation ledger and its fenced lifecycle.
 - Unresolved reservations become uncertain when an assignment terminates or is recovered.
 - Exact-session, exact-key, revision-checked supersede is audited.
-- MCP proxy dispatch integration remains deferred until duplex response correlation and EOF uncertainty are covered end to end.
+- Trusted OCP scale proxy reservation, response correlation, and conservative EOF/protocol uncertainty are now connected to the ledger.
 
 Planned scope:
 
-1. Bind trusted OCP scale identities at the MCP proxy before dispatch and correlate the exact response before forwarding it.
-2. Convert proxy EOF, malformed/mismatched evidence, and unresolved requests to uncertainty without reporting success.
-3. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
+1. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
+2. Expose inspectable identity, outcome evidence, and exact supersede controls through IPC and the operator UI.
+3. Add a subprocess-level proxy harness for request-thread termination and malformed/EOF transport cases.
 4. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
-5. Expose inspectable identity, outcome evidence, and exact supersede controls in the operator UI.
 
 Required safety properties:
 

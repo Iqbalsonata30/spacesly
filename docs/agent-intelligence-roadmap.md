@@ -223,11 +223,13 @@ Implemented foundation:
 - `ocp_scale_deployment` is the first supported vertical slice. It reads the Deployment before mutation, skips an already-satisfied desired replica count, and applies drift with the observed Kubernetes `resourceVersion`.
 - Successful, skipped, blocked, and conflicting scale outcomes retain secret-free evidence in the private OCP audit log.
 - The scheduler now owns a transactional mutation ledger with globally unique active operation keys, fenced reservation and resolution, conservative uncertainty on interrupted assignments, and exact-session/key/revision audited supersede semantics.
+- The fenced MCP proxy independently derives trusted scale identities, reserves before dispatch, correlates responses by JSON-RPC ID, and resolves the ledger before forwarding results to the runtime.
+- Confirmed prior success starts a single fresh state reconciliation so Kubernetes is read again; reserved and uncertain outcomes remain hard replay fences.
 
 Current limitations:
 
 - Other Kubernetes mutations, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
-- The OCP MCP proxy is not yet bound to the scheduler ledger. Objective binding, duplex response correlation, automatic uncertainty on proxy EOF, and operator UI controls remain to be implemented before the ledger can enforce live connector dispatch.
+- Objective binding and operator query/supersede UI controls remain to be implemented. Other connector operations still require their own trusted identity and response adapters.
 
 Benefits:
 

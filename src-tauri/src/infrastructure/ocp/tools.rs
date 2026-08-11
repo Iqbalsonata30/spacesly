@@ -556,9 +556,27 @@ pub(super) fn resource_operation_identity(
     if OcpTool::parse(name) != Some(OcpTool::ScaleDeployment) {
         return Ok(None);
     }
-    let namespace = namespace_argument(client, arguments)?.ok_or_else(|| {
-        OcpError::internal("Deployment scale namespace resolution returned no namespace.")
-    })?;
+    scale_resource_operation_identity(
+        client.idempotency_environment(),
+        client.default_namespace(),
+        arguments,
+    )
+    .map(Some)
+}
+
+pub(super) fn scale_resource_operation_identity(
+    environment: &str,
+    default_namespace: &str,
+    arguments: &Value,
+) -> OcpResult<ResourceOperationIdentity> {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_namespace)
+        .to_string();
+    validate_identifier(&namespace, "namespace")?;
     let name = required_string(arguments, "name")?;
     let replicas = required_u32(arguments, "replicas", 1000)?;
     ResourceOperationIdentity::new(
@@ -570,10 +588,9 @@ pub(super) fn resource_operation_identity(
             namespace: Some(namespace),
             name,
         },
-        client.idempotency_environment(),
+        environment,
         &json!({ "replicas": replicas }),
     )
-    .map(Some)
     .map_err(|error| OcpError::internal(format!("Could not identify Deployment scale: {error}")))
 }
 
