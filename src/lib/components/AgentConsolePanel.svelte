@@ -4,13 +4,16 @@
   import {
     getTaskSessionContextInspection,
     getTaskSessionExecutionManifest,
+    listTaskSessionResourceMutations,
     listTaskSessionExecutionTrace,
+    supersedeTaskSessionResourceMutation,
     type AiWorkerTaskResult,
     type ContextContributionKind,
     type TaskContextInspection,
     type TaskExecutionManifest,
     type TaskExecutionTraceEntry,
     type TaskExecutionTracePage,
+    type ResourceMutationRecord,
   } from "$lib/ipc";
   import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
@@ -102,6 +105,15 @@
   let manifestError = $state<string | null>(null);
   let manifestSessionId: number | null | undefined = undefined;
   let manifestGeneration = 0;
+  let mutationsOpen = $state(false);
+  let mutationsState = $state<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
+  let resourceMutations = $state<ResourceMutationRecord[]>([]);
+  let mutationsError = $state<string | null>(null);
+  let mutationsNotice = $state<string | null>(null);
+  let mutationReasons = $state<Record<number, string>>({});
+  let supersedingMutationId = $state<number | null>(null);
+  let mutationsSessionId: number | null | undefined = undefined;
+  let mutationsGeneration = 0;
 
   let isWorking = $derived(runStatus === "running");
   let isBlocked = $derived(runStatus === "blocked" || runStatus === "timeout");
@@ -183,10 +195,24 @@
     void loadTracePage(taskSessionId, 0, true);
   });
 
+  $effect(() => {
+    const sessionId = taskSessionId;
+    if (mutationsSessionId === sessionId) return;
+    mutationsSessionId = sessionId;
+    resetResourceMutations(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    if (!technicalOpen || !mutationsOpen || taskSessionId === null || mutationsState !== "idle")
+      return;
+    void loadResourceMutations(taskSessionId);
+  });
+
   onDestroy(() => {
     traceGeneration += 1;
     contextGeneration += 1;
     manifestGeneration += 1;
+    mutationsGeneration += 1;
   });
 
   function resetTrace(state: typeof traceState = "idle") {
@@ -268,6 +294,69 @@
       manifestError = reason instanceof Error ? reason.message : String(reason);
       manifestState = "error";
     }
+  }
+
+  function resetResourceMutations(state: typeof mutationsState = "idle") {
+    mutationsGeneration += 1;
+    resourceMutations = [];
+    mutationsError = null;
+    mutationsNotice = null;
+    mutationReasons = {};
+    supersedingMutationId = null;
+    mutationsState = state;
+  }
+
+  async function loadResourceMutations(sessionId: number) {
+    if (mutationsState === "loading") return;
+    const generation = mutationsGeneration;
+    mutationsState = "loading";
+    mutationsError = null;
+    try {
+      const records = await listTaskSessionResourceMutations(sessionId);
+      if (generation !== mutationsGeneration || taskSessionId !== sessionId) return;
+      resourceMutations = records;
+      mutationsState = "ready";
+    } catch (reason) {
+      if (generation !== mutationsGeneration || taskSessionId !== sessionId) return;
+      mutationsError = reason instanceof Error ? reason.message : String(reason);
+      mutationsState = "error";
+    }
+  }
+
+  async function supersedeResourceMutation(record: ResourceMutationRecord) {
+    if (taskSessionId === null || supersedingMutationId !== null) return;
+    const reason = mutationReasons[record.mutation_id]?.trim() ?? "";
+    if (!reason) {
+      mutationsError = "Enter a reason before releasing this mutation fence.";
+      return;
+    }
+    mutationsError = null;
+    mutationsNotice = null;
+    supersedingMutationId = record.mutation_id;
+    try {
+      const updated = await supersedeTaskSessionResourceMutation(
+        taskSessionId,
+        record.mutation_id,
+        record.operation_key,
+        record.revision,
+        reason,
+      );
+      if (taskSessionId !== updated.session_id) return;
+      resourceMutations = resourceMutations.map((candidate) =>
+        candidate.mutation_id === updated.mutation_id ? updated : candidate,
+      );
+      mutationReasons = { ...mutationReasons, [updated.mutation_id]: "" };
+      mutationsNotice = `Mutation fence #${updated.mutation_id} was released. No task was retried.`;
+    } catch (reason) {
+      mutationsError = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      supersedingMutationId = null;
+    }
+  }
+
+  function mutationTarget(record: ResourceMutationRecord): string {
+    const resource = record.identity.resource;
+    return [resource.namespace, resource.name].filter(Boolean).join("/");
   }
 
   function manifestValue(value: string | number | null): string {
@@ -644,9 +733,17 @@
           {#each objectiveResults as objective (objective.objective_id)}
             <div class:warning={objective.completion_status === "blocked"} class="result-item">
               <div>
-                <span>{objective.completion_status === "completed" ? "Verified objective" : "Blocked objective"}</span>
+                <span
+                  >{objective.completion_status === "completed"
+                    ? "Verified objective"
+                    : "Blocked objective"}</span
+                >
                 <strong>{objective.objective_id}</strong>
-                <small>{objective.evidence[0] ?? objective.blocked_reason ?? "No evidence supplied"}</small>
+                <small
+                  >{objective.evidence[0] ??
+                    objective.blocked_reason ??
+                    "No evidence supplied"}</small
+                >
               </div>
             </div>
           {/each}
@@ -739,6 +836,136 @@
     >
     {#if technicalOpen}
       <div class="technical-body">
+        <section class="trace-disclosure mutation-disclosure">
+          <button
+            class="trace-heading"
+            type="button"
+            aria-expanded={mutationsOpen}
+            aria-controls="resource-mutations-body"
+            onclick={() => (mutationsOpen = !mutationsOpen)}
+          >
+            <span>Resource mutations</span>
+            <ChevronDown size={14} aria-hidden="true" class={mutationsOpen ? "rotated" : ""} />
+          </button>
+          {#if mutationsOpen}
+            <div
+              id="resource-mutations-body"
+              class="trace-body mutation-body"
+              aria-busy={mutationsState === "loading"}
+            >
+              {#if taskSessionId === null}
+                <p class="trace-empty">Resource mutation history is unavailable for this run.</p>
+              {:else if mutationsState === "loading" && resourceMutations.length === 0}
+                <p class="trace-empty">Loading resource mutation history…</p>
+              {:else if mutationsState === "error" && resourceMutations.length === 0}
+                <p class="trace-error" role="alert">
+                  {mutationsError ?? "Resource mutation history could not be loaded."}
+                </p>
+                <button class="trace-action" type="button" onclick={() => resetResourceMutations()}
+                  >Retry</button
+                >
+              {:else}
+                <div class="context-notice">
+                  This ledger currently covers Deployment scaling only. Releasing a fence does not
+                  retry, undo, approve, or authorize an operation, but it may permit a later task to
+                  perform the same mutation.
+                </div>
+                {#if mutationsError}<p class="trace-error" role="alert">{mutationsError}</p>{/if}
+                {#if mutationsNotice}<p class="mutation-notice" aria-live="polite">
+                    {mutationsNotice}
+                  </p>{/if}
+                {#if resourceMutations.length === 0}
+                  <p class="trace-empty">No resource-level mutation records were retained.</p>
+                {:else}
+                  <ol class="mutation-list">
+                    {#each resourceMutations as record (record.mutation_id)}
+                      <li class="mutation-record">
+                        <div class="mutation-record-heading">
+                          <strong
+                            >#{record.mutation_id} · {record.identity.operation.replaceAll(
+                              "_",
+                              " ",
+                            )}</strong
+                          >
+                          <span class={`mutation-state ${record.state}`}>{record.state}</span>
+                        </div>
+                        <dl class="mutation-grid">
+                          <div>
+                            <dt>Resource</dt>
+                            <dd>{record.identity.resource.kind} {mutationTarget(record)}</dd>
+                          </div>
+                          <div>
+                            <dt>Connector</dt>
+                            <dd>{record.connector_id}</dd>
+                          </div>
+                          <div>
+                            <dt>Attempt</dt>
+                            <dd>{record.attempt}</dd>
+                          </div>
+                          <div>
+                            <dt>Revision</dt>
+                            <dd>{record.revision}</dd>
+                          </div>
+                          <div>
+                            <dt>Lookup</dt>
+                            <dd>{record.evidence?.lookup.status ?? "Unknown"}</dd>
+                          </div>
+                          <div>
+                            <dt>Execution</dt>
+                            <dd>
+                              {record.evidence?.execution.status ??
+                                record.failure_code ??
+                                "Pending"}
+                            </dd>
+                          </div>
+                        </dl>
+                        {#if record.supersede_reason}<p class="mutation-reason">
+                            Released because: {record.supersede_reason}
+                          </p>{/if}
+                        {#if record.state === "succeeded" || record.state === "uncertain"}
+                          <div class="mutation-supersede">
+                            <label for={`mutation-reason-${record.mutation_id}`}
+                              >Reason for releasing this fence</label
+                            >
+                            <textarea
+                              id={`mutation-reason-${record.mutation_id}`}
+                              rows="2"
+                              maxlength="500"
+                              value={mutationReasons[record.mutation_id] ?? ""}
+                              oninput={(event) => {
+                                mutationReasons = {
+                                  ...mutationReasons,
+                                  [record.mutation_id]: event.currentTarget.value,
+                                };
+                              }}
+                              disabled={supersedingMutationId !== null}></textarea>
+                            <button
+                              class="mutation-release"
+                              type="button"
+                              disabled={supersedingMutationId !== null}
+                              onclick={() => void supersedeResourceMutation(record)}
+                            >
+                              {supersedingMutationId === record.mutation_id
+                                ? "Releasing…"
+                                : "Release fence"}
+                            </button>
+                          </div>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+                <div class="trace-actions">
+                  <button
+                    class="trace-action"
+                    type="button"
+                    onclick={() => resetResourceMutations()}>Refresh</button
+                  >
+                </div>
+              {/if}
+            </div>
+          {/if}
+        </section>
         <section class="trace-disclosure">
           <button
             class="trace-heading"
@@ -2078,6 +2305,109 @@
     color: var(--text-secondary);
     font-size: 9px;
     font-weight: 800;
+  }
+  .mutation-body {
+    display: grid;
+    gap: 9px;
+  }
+  .mutation-list {
+    display: grid;
+    gap: 8px;
+    max-height: 430px;
+    margin: 0;
+    padding: 0;
+    overflow: auto;
+    list-style: none;
+  }
+  .mutation-record {
+    display: grid;
+    gap: 8px;
+    padding: 9px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 9px;
+    background: var(--code-block-bg);
+  }
+  .mutation-record-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--code-text);
+    font-size: 10px;
+    text-transform: capitalize;
+  }
+  .mutation-state {
+    border-radius: 999px;
+    padding: 2px 6px;
+    background: var(--surface-inset);
+    color: var(--text-dim);
+    font-size: 8px;
+    font-weight: 850;
+    text-transform: uppercase;
+  }
+  .mutation-state.uncertain {
+    color: var(--warning);
+  }
+  .mutation-state.succeeded {
+    color: var(--success);
+  }
+  .mutation-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 10px;
+    margin: 0;
+  }
+  .mutation-grid div {
+    min-width: 0;
+  }
+  .mutation-grid dt,
+  .mutation-grid dd,
+  .mutation-reason,
+  .mutation-notice,
+  .mutation-supersede label {
+    margin: 0;
+    color: var(--text-dim);
+    font:
+      9px/1.4 ui-monospace,
+      SFMono-Regular,
+      monospace;
+    overflow-wrap: anywhere;
+  }
+  .mutation-grid dd {
+    color: var(--text-secondary);
+  }
+  .mutation-notice {
+    color: var(--success);
+  }
+  .mutation-supersede {
+    display: grid;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .mutation-supersede textarea {
+    resize: vertical;
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    padding: 7px;
+    background: var(--surface);
+    color: var(--text-primary);
+    font-size: 10px;
+  }
+  .mutation-release {
+    justify-self: start;
+    border: 1px solid var(--danger);
+    border-radius: 7px;
+    padding: 5px 8px;
+    background: transparent;
+    color: var(--danger);
+    font-size: 9px;
+    font-weight: 850;
+  }
+  .mutation-release:disabled,
+  .mutation-supersede textarea:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
   .context-disclosure {
     padding-top: 0;

@@ -53,6 +53,10 @@ export type {
   AgentTaskResult,
   SchedulerHealth,
   SchedulerHealthStatus,
+  ResourceMutationEvidence,
+  ResourceMutationRecord,
+  ResourceMutationState,
+  ResourceOperationIdentity,
   TaskChatInputV2,
   TaskEditInputV2,
   TaskExecutionTraceEntry,
@@ -94,6 +98,7 @@ export {
   listAgentRuntimeProfiles,
   listTaskSessionExecutionTrace,
   listTaskSessionEvents,
+  listTaskSessionResourceMutations,
   listTaskSessions,
   onTaskSessionUpdated,
   onTaskSessionActivity,
@@ -102,6 +107,7 @@ export {
   saveImmutableAgentRuntimeProfile,
   submitTaskSession,
   subscribeTaskSessionReplay,
+  supersedeTaskSessionResourceMutation,
 } from "$lib/ipc/taskSessions";
 export type { FileEntry, LineEnding, TextEncoding, WorkspaceFileChange } from "$lib/ipc/files";
 export {

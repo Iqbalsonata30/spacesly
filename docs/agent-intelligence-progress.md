@@ -47,6 +47,9 @@ Implemented behavior:
 - Valid executed/skipped evidence succeeds; matching approval and definitive precondition/conflict rejection release the reservation; malformed, mismatched, transport, write, and EOF outcomes become uncertain.
 - A confirmed previous success starts one new reconciliation reservation instead of returning stale success, preserving GET-before-PATCH behavior while concurrent and uncertain calls remain fenced.
 - OpenCode ledger-blocked and uncertain content results are projected as failed tool events rather than successful mutations.
+- Session-scoped Tauri IPC exposes the ordered secret-free ledger projection and routes supersede through the scheduler command thread.
+- The Agent technical console displays supported operation/resource/outcome metadata and offers release only for succeeded or uncertain records.
+- Fence release requires a reason plus the exact session, operation key, and revision. It updates the returned row and explicitly does not retry, approve, undo, or authorize a task.
 
 Regression evidence:
 
@@ -60,6 +63,7 @@ Regression evidence:
 - Full Rust suite: 409 passed, 3 ignored, 0 failed.
 - Frontend unit tests: 7 passed, 0 failed.
 - `svelte-check`: 0 errors and 0 warnings.
+- Scoped frontend lint reaches only the pre-existing mutable `Map` finding in `AgentConsolePanel.svelte`; the resource mutation controls introduce no lint finding.
 - Full clippy reaches only three pre-existing findings in `governance.rs` and `task_examination.rs`; Phase 9 introduces no clippy finding.
 
 ## Completed Increments
@@ -102,7 +106,7 @@ Regression evidence recorded so far:
 3. Some connector configuration errors are discovered only when the connector is called.
 4. Objective evidence is structurally required, but not every connector has an independent state verifier.
 5. Dynamic tasks lack a release-grade evaluation corpus and safety scorecard.
-6. The operator UI does not yet expose resource mutation evidence or an explicit idempotency supersede action.
+6. Resource mutation evidence is visible for the supported scale slice, but objective/receipt binding and broader connector coverage remain incomplete.
 
 ## Phase 9 Remaining Work
 
@@ -116,9 +120,8 @@ Scheduler ledger foundation delivered:
 Planned scope:
 
 1. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
-2. Expose inspectable identity, outcome evidence, and exact supersede controls through IPC and the operator UI.
-3. Add a subprocess-level proxy harness for request-thread termination and malformed/EOF transport cases.
-4. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
+2. Add a subprocess-level proxy harness for request-thread termination and malformed/EOF transport cases.
+3. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
 
 Required safety properties:
 

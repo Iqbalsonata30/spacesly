@@ -222,6 +222,66 @@ export type TaskSessionSnapshot = {
   completed_at: number | null;
 };
 
+export type ResourceMutationState =
+  "reserved" | "succeeded" | "failed" | "uncertain" | "superseded";
+
+export type ResourceOperationIdentity = {
+  schema_version: number;
+  connector: string;
+  operation: string;
+  resource: {
+    api_version: string;
+    kind: string;
+    namespace: string | null;
+    name: string;
+  };
+  environment_fingerprint: string;
+  mutation_fingerprint: string;
+  key: string;
+};
+
+export type ResourceMutationEvidence = {
+  identity: ResourceOperationIdentity;
+  lookup: {
+    status: "already_satisfied" | "drift_detected" | "incompatible" | "unavailable";
+    observed_fingerprint: string | null;
+    observed_version: string | null;
+  };
+  execution: {
+    status: "executed" | "skipped" | "blocked" | "conflict";
+    resulting_fingerprint: string | null;
+    resulting_version: string | null;
+  };
+  retry_resume_status:
+    | "first_execution"
+    | "already_complete"
+    | "reconciled_after_drift"
+    | "awaiting_approval"
+    | "awaiting_operator"
+    | "conflict";
+};
+
+export type ResourceMutationRecord = {
+  mutation_id: number;
+  operation_key: string;
+  identity: ResourceOperationIdentity;
+  connector_id: string;
+  tool_name: string;
+  state: ResourceMutationState;
+  session_id: number;
+  attempt_id: number;
+  attempt: number;
+  fencing_token: number;
+  evidence: ResourceMutationEvidence | null;
+  failure_kind: string | null;
+  failure_code: string | null;
+  revision: number;
+  reserved_at: number;
+  resolved_at: number | null;
+  superseded_at: number | null;
+  supersede_reason: string | null;
+};
+
 export type TaskSessionEvent = {
   id: number;
   session_id: number;
@@ -646,6 +706,32 @@ export function cancelTaskSession(sessionId: number): Promise<boolean> {
 /** Removes a retained Task Session projection after terminal completion. */
 export function removeTaskSession(sessionId: number): Promise<boolean> {
   return invokeWithPolicy("remove_task_session", { sessionId }, IPC_POLICIES.taskSessionMutation);
+}
+
+/** Returns secret-free resource mutation ledger history for one Task Session. */
+export function listTaskSessionResourceMutations(
+  sessionId: number,
+): Promise<ResourceMutationRecord[]> {
+  return invokeWithPolicy(
+    "list_task_session_resource_mutations",
+    { sessionId },
+    IPC_POLICIES.taskSessionRead,
+  );
+}
+
+/** Explicitly releases one retained fence; this mutation is never retried automatically. */
+export function supersedeTaskSessionResourceMutation(
+  sessionId: number,
+  mutationId: number,
+  expectedKey: string,
+  expectedRevision: number,
+  reason: string,
+): Promise<ResourceMutationRecord> {
+  return invokeWithPolicy(
+    "supersede_task_session_resource_mutation",
+    { sessionId, mutationId, expectedKey, expectedRevision, reason },
+    IPC_POLICIES.taskSessionMutation,
+  );
 }
 
 /** Returns the latest durable projection for one Task Session, if it is still retained. */

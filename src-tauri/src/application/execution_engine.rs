@@ -16,7 +16,7 @@ use crate::domain::task_session::{
 use crate::infrastructure::mcp::mcp_connector_binding_digest;
 use crate::infrastructure::scheduler_store::{
     AssignmentFence, DurableAssignment, DurableOutcome, ExternalAssignmentAuthority, FinishResult,
-    SchedulerStore, StagedCompletion, TaskToolAuthority,
+    ResourceMutationRecord, SchedulerStore, StagedCompletion, TaskToolAuthority,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -1040,6 +1040,27 @@ impl ExecutionEngine {
         receive(response)?
     }
 
+    /// Explicitly releases one retained mutation fence using exact optimistic-lock identity.
+    pub fn supersede_resource_mutation(
+        &self,
+        session_id: TaskSessionId,
+        mutation_id: u64,
+        expected_key: String,
+        expected_revision: u64,
+        reason: String,
+    ) -> Result<ResourceMutationRecord, ExecutionEngineError> {
+        let (reply, response) = mpsc::channel();
+        self.send(SchedulerCommand::SupersedeResourceMutation {
+            session_id,
+            mutation_id,
+            expected_key,
+            expected_revision,
+            reason,
+            reply,
+        })?;
+        receive(response)?
+    }
+
     /// Waits until a session reaches a terminal state or the timeout expires.
     pub fn wait_for_terminal(
         &self,
@@ -1181,6 +1202,14 @@ enum SchedulerCommand {
     RemoveSession {
         id: TaskSessionId,
         reply: mpsc::Sender<Result<bool, ExecutionEngineError>>,
+    },
+    SupersedeResourceMutation {
+        session_id: TaskSessionId,
+        mutation_id: u64,
+        expected_key: String,
+        expected_revision: u64,
+        reason: String,
+        reply: mpsc::Sender<Result<ResourceMutationRecord, ExecutionEngineError>>,
     },
     Shutdown {
         reply: mpsc::Sender<()>,
@@ -1425,6 +1454,29 @@ fn run_scheduler(
                 }
                 SchedulerMessage::Command(SchedulerCommand::RemoveSession { id, reply }) => {
                     let result = scheduler.remove_session(id);
+                    let _ = reply.send(result);
+                }
+                SchedulerMessage::Command(SchedulerCommand::SupersedeResourceMutation {
+                    session_id,
+                    mutation_id,
+                    expected_key,
+                    expected_revision,
+                    reason,
+                    reply,
+                }) => {
+                    let result = scheduler
+                        .store
+                        .supersede_resource_mutation(
+                            session_id,
+                            mutation_id,
+                            &expected_key,
+                            expected_revision,
+                            &reason,
+                        )
+                        .map_err(ExecutionEngineError::Persistence);
+                    if result.is_ok() {
+                        scheduler.publish_current(session_id);
+                    }
                     let _ = reply.send(result);
                 }
                 SchedulerMessage::Command(SchedulerCommand::Shutdown { reply }) => {

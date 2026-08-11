@@ -1155,7 +1155,6 @@ impl SchedulerStore {
         resource_mutation_on(&connection, mutation_id)
     }
 
-    #[allow(dead_code)]
     pub fn resource_mutations_for_session(
         &self,
         session_id: TaskSessionId,
@@ -1182,7 +1181,6 @@ impl SchedulerStore {
         .collect()
     }
 
-    #[allow(dead_code)]
     pub fn supersede_resource_mutation(
         &self,
         session_id: TaskSessionId,
@@ -4069,7 +4067,6 @@ fn validate_ledger_token(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_operation_key(value: &str) -> Result<(), String> {
     if value.strip_prefix("sha256:").is_none_or(|digest| {
         digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -4079,7 +4076,6 @@ fn validate_operation_key(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_supersede_reason(value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() || value.len() > 500 || value.chars().any(char::is_control) {

@@ -93,7 +93,7 @@ use infrastructure::pty::{
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
 use infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
-use infrastructure::scheduler_store::SchedulerStore;
+use infrastructure::scheduler_store::{ResourceMutationRecord, SchedulerStore};
 use infrastructure::secrets::{AppSecrets, AppSecretsStore, JiraConnectionProfile};
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
@@ -2409,6 +2409,44 @@ async fn remove_task_session(
 }
 
 #[tauri::command]
+async fn list_task_session_resource_mutations(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Vec<ResourceMutationRecord>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.resource_mutations_for_session(TaskSessionId(session_id))
+    })
+    .await
+    .map_err(|error| format!("List Task Session resource mutations task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn supersede_task_session_resource_mutation(
+    session_id: u64,
+    mutation_id: u64,
+    expected_key: String,
+    expected_revision: u64,
+    reason: String,
+    execution_engine: State<'_, Arc<ExecutionEngine>>,
+) -> Result<ResourceMutationRecord, String> {
+    let engine = execution_engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .supersede_resource_mutation(
+                TaskSessionId(session_id),
+                mutation_id,
+                expected_key,
+                expected_revision,
+                reason,
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Supersede Task Session resource mutation task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn get_task_session(
     session_id: u64,
     scheduler_store: State<'_, SchedulerStore>,
@@ -3354,6 +3392,7 @@ pub fn run() {
             get_task_session,
             get_task_session_result,
             list_task_session_events,
+            list_task_session_resource_mutations,
             list_task_session_execution_trace,
             get_task_session_tool_state,
             get_task_session_mcp_context,
@@ -3370,6 +3409,7 @@ pub fn run() {
             digest_agent_execution_contract,
             cancel_task_session,
             remove_task_session,
+            supersede_task_session_resource_mutation,
             format_code,
             get_workspace_git_info,
             get_path_git_info,

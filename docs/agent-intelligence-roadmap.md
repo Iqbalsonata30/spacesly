@@ -225,11 +225,12 @@ Implemented foundation:
 - The scheduler now owns a transactional mutation ledger with globally unique active operation keys, fenced reservation and resolution, conservative uncertainty on interrupted assignments, and exact-session/key/revision audited supersede semantics.
 - The fenced MCP proxy independently derives trusted scale identities, reserves before dispatch, correlates responses by JSON-RPC ID, and resolves the ledger before forwarding results to the runtime.
 - Confirmed prior success starts a single fresh state reconciliation so Kubernetes is read again; reserved and uncertain outcomes remain hard replay fences.
+- Session-scoped IPC and the Agent technical console expose secret-free mutation history and exact session/key/revision supersede controls. Supersede records an operator reason but never retries, approves, or expands authority.
 
 Current limitations:
 
 - Other Kubernetes mutations, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
-- Objective binding and operator query/supersede UI controls remain to be implemented. Other connector operations still require their own trusted identity and response adapters.
+- Objective/receipt binding remains to be implemented. Other connector operations still require their own trusted identity and response adapters, and the proxy needs a subprocess-level malformed/EOF harness.
 
 Benefits:
 
