@@ -10,6 +10,7 @@ use crate::domain::execution_manifest::{
     ExecutionManifest, ExecutionManifestDraft, EXECUTION_MANIFEST_SCHEMA_VERSION,
 };
 use crate::domain::governance::GovernanceResolutionRecord;
+use crate::domain::resource_idempotency::{ResourceMutationEvidence, ResourceOperationIdentity};
 #[cfg(test)]
 use crate::domain::task_session::TaskMcpConnectorContext;
 use crate::domain::task_session::{
@@ -21,7 +22,8 @@ use crate::domain::task_session::{
     TaskToolState,
 };
 use rusqlite::{
-    params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    params, Connection, ErrorCode, OpenFlags, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -78,6 +80,87 @@ pub struct ExternalAssignmentAuthority {
     pub connector_binding_digest: String,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum ResourceMutationState {
+    Reserved,
+    Succeeded,
+    Failed,
+    Uncertain,
+    Superseded,
+}
+
+#[allow(dead_code)]
+impl ResourceMutationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "uncertain" => Ok(Self::Uncertain),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(format!("Unknown resource mutation state '{value}'.")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(dead_code)]
+pub struct ResourceMutationRecord {
+    pub mutation_id: u64,
+    pub operation_key: String,
+    pub identity: ResourceOperationIdentity,
+    pub connector_id: String,
+    pub tool_name: String,
+    pub state: ResourceMutationState,
+    pub session_id: TaskSessionId,
+    pub attempt_id: u64,
+    pub attempt: u32,
+    pub fencing_token: u64,
+    pub evidence: Option<ResourceMutationEvidence>,
+    pub failure_kind: Option<String>,
+    pub failure_code: Option<String>,
+    pub revision: u64,
+    pub reserved_at: u64,
+    pub resolved_at: Option<u64>,
+    pub superseded_at: Option<u64>,
+    pub supersede_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum ResourceMutationReservation {
+    Reserved(ResourceMutationRecord),
+    Blocked(ResourceMutationRecord),
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum ResourceMutationResolution {
+    Succeeded(ResourceMutationEvidence),
+    Failed {
+        evidence: Option<ResourceMutationEvidence>,
+        kind: String,
+        code: String,
+    },
+    Uncertain {
+        evidence: Option<ResourceMutationEvidence>,
+        kind: String,
+        code: String,
+    },
 }
 
 /// Non-secret authority used by the assignment-local workspace tool MCP server.
@@ -228,6 +311,9 @@ impl SchedulerStore {
                    FROM scheduler_task_events LIMIT 1",
             )
             .map_err(|error| format!("Task Session event schema is not ready: {error}"))?;
+        connection
+            .prepare("SELECT mutation_id FROM scheduler_resource_mutations LIMIT 1")
+            .map_err(|error| format!("Resource mutation query schema is not ready: {error}"))?;
         let instance_id = connection
             .query_row(
                 "SELECT instance_id FROM scheduler_metadata WHERE singleton = 1",
@@ -411,8 +497,39 @@ impl SchedulerStore {
                     FOREIGN KEY(source_attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
                       ON DELETE CASCADE
                   );
-                  CREATE INDEX IF NOT EXISTS idx_scheduler_objective_checkpoints_session
-                    ON scheduler_task_objective_checkpoints(session_id, recorded_at);",
+                   CREATE INDEX IF NOT EXISTS idx_scheduler_objective_checkpoints_session
+                     ON scheduler_task_objective_checkpoints(session_id, recorded_at);
+                   CREATE TABLE IF NOT EXISTS scheduler_resource_mutations (
+                     mutation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     operation_key TEXT NOT NULL,
+                     identity_json TEXT NOT NULL,
+                     connector_id TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK (
+                       state IN ('reserved', 'succeeded', 'failed', 'uncertain', 'superseded')
+                     ),
+                     session_id INTEGER NOT NULL,
+                     attempt_id INTEGER NOT NULL,
+                     attempt_number INTEGER NOT NULL,
+                     fencing_token INTEGER NOT NULL,
+                     evidence_json TEXT,
+                     failure_kind TEXT,
+                     failure_code TEXT,
+                     revision INTEGER NOT NULL DEFAULT 1,
+                     reserved_at INTEGER NOT NULL,
+                     resolved_at INTEGER,
+                     superseded_at INTEGER,
+                     supersede_reason TEXT,
+                     FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                       ON DELETE CASCADE,
+                     FOREIGN KEY(attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
+                       ON DELETE CASCADE
+                   );
+                   CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_resource_mutation_active_key
+                     ON scheduler_resource_mutations(operation_key)
+                     WHERE state IN ('reserved', 'succeeded', 'uncertain');
+                   CREATE INDEX IF NOT EXISTS idx_scheduler_resource_mutations_session
+                     ON scheduler_resource_mutations(session_id, mutation_id);",
         )
         .map_err(|error| format!("Failed to initialize scheduler database: {error}"))?;
         // Serialize non-destructive migrations across concurrently starting Scheduler processes.
@@ -819,6 +936,357 @@ impl SchedulerStore {
             .optional()
             .map(|current| current.is_some())
             .map_err(|error| format!("Failed to validate external assignment authority: {error}"))
+    }
+
+    #[allow(dead_code)]
+    pub fn reserve_external_resource_mutation(
+        authority: &ExternalAssignmentAuthority,
+        tool_name: &str,
+        identity: &ResourceOperationIdentity,
+    ) -> Result<ResourceMutationReservation, String> {
+        identity.validate()?;
+        validate_external_authority_shape(authority)?;
+        validate_ledger_token(tool_name, "tool name")?;
+        if tool_name != "ocp_scale_deployment"
+            || identity.connector != "openshift_kubernetes"
+            || identity.operation != "scale_deployment"
+        {
+            return Err(
+                "Resource mutation ledger does not support this connector operation.".to_string(),
+            );
+        }
+        let store = Self::open_authority_store(authority)?;
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start resource mutation reservation: {error}"))?;
+        if !external_authority_is_current_on(&transaction, authority, now_millis())? {
+            return Err(
+                "Resource mutation assignment authority is stale, expired, or ungranted."
+                    .to_string(),
+            );
+        }
+        if let Some(record) = resource_mutation_by_active_key_on(&transaction, &identity.key)? {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit resource mutation lookup: {error}"))?;
+            return Ok(ResourceMutationReservation::Blocked(record));
+        }
+        let identity_json = serde_json::to_string(identity)
+            .map_err(|error| format!("Failed to encode resource operation identity: {error}"))?;
+        let now = now_millis();
+        transaction
+            .execute(
+                "INSERT INTO scheduler_resource_mutations
+                   (operation_key, identity_json, connector_id, tool_name, state, session_id,
+                    attempt_id, attempt_number, fencing_token, revision, reserved_at)
+                 VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7, ?8, 1, ?9)",
+                params![
+                    identity.key,
+                    identity_json,
+                    authority.connector_id,
+                    tool_name,
+                    to_i64(authority.session_id.0)?,
+                    to_i64(authority.attempt_id)?,
+                    i64::from(authority.attempt),
+                    to_i64(authority.fencing_token)?,
+                    to_i64(now)?
+                ],
+            )
+            .map_err(|error| format!("Failed to reserve resource mutation: {error}"))?;
+        let mutation_id = from_i64(transaction.last_insert_rowid(), "resource mutation ID")?;
+        append_event_in_transaction(
+            &transaction,
+            authority.session_id,
+            Some(authority.attempt_id),
+            authority.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Runtime,
+                payload: json!({
+                    "type": "resource_mutation_reserved",
+                    "mutation_id": mutation_id,
+                    "operation_key": identity.key,
+                    "connector_id": authority.connector_id,
+                    "tool_name": tool_name,
+                    "state": "reserved"
+                }),
+                progress: None,
+            },
+            now,
+        )?;
+        let record = resource_mutation_on(&transaction, mutation_id)?
+            .ok_or_else(|| "Reserved resource mutation could not be reloaded.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit resource mutation reservation: {error}"))?;
+        Ok(ResourceMutationReservation::Reserved(record))
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_external_resource_mutation(
+        authority: &ExternalAssignmentAuthority,
+        mutation_id: u64,
+        resolution: ResourceMutationResolution,
+    ) -> Result<ResourceMutationRecord, String> {
+        validate_external_authority_shape(authority)?;
+        let store = Self::open_authority_store(authority)?;
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start resource mutation resolution: {error}"))?;
+        let current = resource_mutation_on(&transaction, mutation_id)?
+            .ok_or_else(|| format!("Resource mutation {mutation_id} was not found."))?;
+        if current.state != ResourceMutationState::Reserved
+            || current.session_id != authority.session_id
+            || current.attempt_id != authority.attempt_id
+            || current.attempt != authority.attempt
+            || current.fencing_token != authority.fencing_token
+            || current.connector_id != authority.connector_id
+        {
+            return Err(
+                "Resource mutation resolution did not match its reservation authority.".to_string(),
+            );
+        }
+        let (state, evidence, failure_kind, failure_code) = match resolution {
+            ResourceMutationResolution::Succeeded(evidence) => {
+                validate_resolution_evidence(&current, &evidence)?;
+                (ResourceMutationState::Succeeded, Some(evidence), None, None)
+            }
+            ResourceMutationResolution::Failed {
+                evidence,
+                kind,
+                code,
+            } => {
+                validate_failure_identity(&current, evidence.as_ref(), &kind, &code)?;
+                (
+                    ResourceMutationState::Failed,
+                    evidence,
+                    Some(kind),
+                    Some(code),
+                )
+            }
+            ResourceMutationResolution::Uncertain {
+                evidence,
+                kind,
+                code,
+            } => {
+                validate_failure_identity(&current, evidence.as_ref(), &kind, &code)?;
+                (
+                    ResourceMutationState::Uncertain,
+                    evidence,
+                    Some(kind),
+                    Some(code),
+                )
+            }
+        };
+        let evidence_json = evidence
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| format!("Failed to encode resource mutation evidence: {error}"))?;
+        let now = now_millis();
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_resource_mutations
+                    SET state = ?2, evidence_json = ?3, failure_kind = ?4, failure_code = ?5,
+                        revision = revision + 1, resolved_at = ?6
+                  WHERE mutation_id = ?1 AND state = 'reserved' AND session_id = ?7
+                    AND attempt_id = ?8 AND fencing_token = ?9",
+                params![
+                    to_i64(mutation_id)?,
+                    state.as_str(),
+                    evidence_json,
+                    failure_kind,
+                    failure_code,
+                    to_i64(now)?,
+                    to_i64(authority.session_id.0)?,
+                    to_i64(authority.attempt_id)?,
+                    to_i64(authority.fencing_token)?
+                ],
+            )
+            .map_err(|error| format!("Failed to resolve resource mutation: {error}"))?;
+        if updated != 1 {
+            return Err("Resource mutation resolution lost its reservation fence.".to_string());
+        }
+        append_event_in_transaction(
+            &transaction,
+            authority.session_id,
+            Some(authority.attempt_id),
+            authority.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Runtime,
+                payload: json!({
+                    "type": "resource_mutation_resolved",
+                    "mutation_id": mutation_id,
+                    "operation_key": current.operation_key,
+                    "state": state.as_str(),
+                    "failure_kind": failure_kind,
+                    "failure_code": failure_code
+                }),
+                progress: None,
+            },
+            now,
+        )?;
+        let record = resource_mutation_on(&transaction, mutation_id)?
+            .ok_or_else(|| "Resolved resource mutation could not be reloaded.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit resource mutation resolution: {error}"))?;
+        Ok(record)
+    }
+
+    #[allow(dead_code)]
+    pub fn resource_mutation(
+        &self,
+        mutation_id: u64,
+    ) -> Result<Option<ResourceMutationRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        resource_mutation_on(&connection, mutation_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn resource_mutations_for_session(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Vec<ResourceMutationRecord>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
+                        state, session_id, attempt_id, attempt_number, fencing_token,
+                        evidence_json, failure_kind, failure_code, revision, reserved_at,
+                        resolved_at, superseded_at, supersede_reason
+                   FROM scheduler_resource_mutations
+                  WHERE session_id = ?1 ORDER BY mutation_id",
+            )
+            .map_err(|error| format!("Failed to prepare resource mutation query: {error}"))?;
+        let rows = statement
+            .query_map(params![to_i64(session_id.0)?], decode_resource_mutation_row)
+            .map_err(|error| format!("Failed to query resource mutations: {error}"))?;
+        rows.map(|row| {
+            let raw =
+                row.map_err(|error| format!("Failed to decode resource mutation: {error}"))?;
+            decode_resource_mutation(raw)
+        })
+        .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn supersede_resource_mutation(
+        &self,
+        session_id: TaskSessionId,
+        mutation_id: u64,
+        expected_key: &str,
+        expected_revision: u64,
+        reason: &str,
+    ) -> Result<ResourceMutationRecord, String> {
+        validate_operation_key(expected_key)?;
+        validate_supersede_reason(reason)?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start resource mutation supersede: {error}"))?;
+        let current = resource_mutation_on(&transaction, mutation_id)?
+            .ok_or_else(|| format!("Resource mutation {mutation_id} was not found."))?;
+        if current.session_id != session_id
+            || current.operation_key != expected_key
+            || current.revision != expected_revision
+            || !matches!(
+                current.state,
+                ResourceMutationState::Succeeded | ResourceMutationState::Uncertain
+            )
+        {
+            return Err(
+                "Resource mutation supersede did not match the retained fence.".to_string(),
+            );
+        }
+        let now = now_millis();
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_resource_mutations
+                    SET state = 'superseded', revision = revision + 1,
+                        superseded_at = ?2, supersede_reason = ?3
+                  WHERE mutation_id = ?1 AND session_id = ?4 AND operation_key = ?5
+                    AND revision = ?6 AND state IN ('succeeded', 'uncertain')",
+                params![
+                    to_i64(mutation_id)?,
+                    to_i64(now)?,
+                    reason,
+                    to_i64(session_id.0)?,
+                    expected_key,
+                    to_i64(expected_revision)?
+                ],
+            )
+            .map_err(|error| format!("Failed to supersede resource mutation: {error}"))?;
+        if updated != 1 {
+            return Err("Resource mutation supersede lost its revision fence.".to_string());
+        }
+        append_event_in_transaction(
+            &transaction,
+            session_id,
+            Some(current.attempt_id),
+            current.fencing_token,
+            &TaskSessionEventInput {
+                kind: TaskSessionEventKind::Runtime,
+                payload: json!({
+                    "type": "resource_mutation_superseded",
+                    "mutation_id": mutation_id,
+                    "operation_key": expected_key,
+                    "previous_state": current.state.as_str(),
+                    "reason": reason,
+                    "source": "local_operator"
+                }),
+                progress: None,
+            },
+            now,
+        )?;
+        let record = resource_mutation_on(&transaction, mutation_id)?
+            .ok_or_else(|| "Superseded resource mutation could not be reloaded.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit resource mutation supersede: {error}"))?;
+        Ok(record)
+    }
+
+    #[allow(dead_code)]
+    fn open_authority_store(authority: &ExternalAssignmentAuthority) -> Result<Self, String> {
+        let canonical_path = fs::canonicalize(&authority.scheduler_database)
+            .map_err(|error| format!("Failed to resolve scheduler authority database: {error}"))?;
+        let connection = Connection::open_with_flags(
+            &canonical_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Failed to open scheduler authority database: {error}"))?;
+        connection
+            .busy_timeout(STORE_BUSY_TIMEOUT)
+            .map_err(|error| format!("Failed to configure scheduler authority timeout: {error}"))?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|error| {
+                format!("Failed to configure scheduler authority database: {error}")
+            })?;
+        connection
+            .prepare("SELECT mutation_id FROM scheduler_resource_mutations LIMIT 1")
+            .map_err(|error| format!("Resource mutation ledger schema is not ready: {error}"))?;
+        let instance_id = connection
+            .query_row(
+                "SELECT instance_id FROM scheduler_metadata WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Failed to read scheduler authority instance: {error}"))?;
+        if instance_id != authority.scheduler_instance_id {
+            return Err(
+                "Resource mutation authority belongs to another scheduler instance.".to_string(),
+            );
+        }
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            instance_id: Arc::from(instance_id),
+            database_path: Some(Arc::new(canonical_path)),
+            #[cfg(test)]
+            resolution_failures: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub(crate) fn register_owner(&self) -> Result<u64, String> {
@@ -2355,6 +2823,13 @@ impl SchedulerStore {
             return Ok(FinishResult::Stale);
         }
 
+        mark_attempt_resource_mutations_uncertain(
+            &transaction,
+            fence.attempt_id,
+            now,
+            "assignment_finished_without_resolution",
+        )?;
+
         if session_state == "cancelling" {
             terminalize_assignment(&transaction, fence, "cancelled", None, now)?;
             transaction
@@ -2977,7 +3452,12 @@ impl SchedulerStore {
         connection
             .execute(
                 "DELETE FROM scheduler_task_sessions
-                  WHERE session_id = ?1 AND state IN ('succeeded', 'failed', 'blocked', 'cancelled')",
+                  WHERE session_id = ?1 AND state IN ('succeeded', 'failed', 'blocked', 'cancelled')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM scheduler_resource_mutations mutations
+                       WHERE mutations.session_id = scheduler_task_sessions.session_id
+                         AND mutations.state IN ('reserved', 'succeeded', 'uncertain')
+                    )",
                 params![to_i64(id.0)?],
             )
             .map(|updated| updated == 1)
@@ -3340,6 +3820,291 @@ fn assignment_is_current_on(
         .map_err(|error| format!("Failed to validate assignment authority: {error}"))
 }
 
+#[allow(dead_code)]
+type RawResourceMutation = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+#[allow(dead_code)]
+fn decode_resource_mutation_row(row: &Row<'_>) -> rusqlite::Result<RawResourceMutation> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+    ))
+}
+
+#[allow(dead_code)]
+fn decode_resource_mutation(raw: RawResourceMutation) -> Result<ResourceMutationRecord, String> {
+    let (
+        mutation_id,
+        operation_key,
+        identity_json,
+        connector_id,
+        tool_name,
+        state,
+        session_id,
+        attempt_id,
+        attempt,
+        fencing_token,
+        evidence_json,
+        failure_kind,
+        failure_code,
+        revision,
+        reserved_at,
+        resolved_at,
+        superseded_at,
+        supersede_reason,
+    ) = raw;
+    let identity: ResourceOperationIdentity = serde_json::from_str(&identity_json)
+        .map_err(|error| format!("Stored resource operation identity is invalid: {error}"))?;
+    identity.validate()?;
+    let evidence = evidence_json
+        .map(|value| {
+            serde_json::from_str::<ResourceMutationEvidence>(&value)
+                .map_err(|error| format!("Stored resource mutation evidence is invalid: {error}"))
+        })
+        .transpose()?;
+    if let Some(evidence) = &evidence {
+        evidence.validate()?;
+        if evidence.identity != identity {
+            return Err("Stored resource mutation evidence identity does not match.".to_string());
+        }
+    }
+    Ok(ResourceMutationRecord {
+        mutation_id: from_i64(mutation_id, "resource mutation ID")?,
+        operation_key,
+        identity,
+        connector_id,
+        tool_name,
+        state: ResourceMutationState::parse(&state)?,
+        session_id: TaskSessionId(from_i64(session_id, "resource mutation session ID")?),
+        attempt_id: from_i64(attempt_id, "resource mutation attempt ID")?,
+        attempt: u32::try_from(attempt)
+            .map_err(|_| "Stored resource mutation attempt number is invalid.".to_string())?,
+        fencing_token: from_i64(fencing_token, "resource mutation fencing token")?,
+        evidence,
+        failure_kind,
+        failure_code,
+        revision: from_i64(revision, "resource mutation revision")?,
+        reserved_at: from_i64(reserved_at, "resource mutation reservation timestamp")?,
+        resolved_at: resolved_at
+            .map(|value| from_i64(value, "resource mutation resolution timestamp"))
+            .transpose()?,
+        superseded_at: superseded_at
+            .map(|value| from_i64(value, "resource mutation supersede timestamp"))
+            .transpose()?,
+        supersede_reason,
+    })
+}
+
+#[allow(dead_code)]
+fn resource_mutation_on(
+    connection: &Connection,
+    mutation_id: u64,
+) -> Result<Option<ResourceMutationRecord>, String> {
+    connection
+        .query_row(
+            "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
+                    state, session_id, attempt_id, attempt_number, fencing_token,
+                    evidence_json, failure_kind, failure_code, revision, reserved_at,
+                    resolved_at, superseded_at, supersede_reason
+               FROM scheduler_resource_mutations WHERE mutation_id = ?1",
+            params![to_i64(mutation_id)?],
+            decode_resource_mutation_row,
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read resource mutation: {error}"))?
+        .map(decode_resource_mutation)
+        .transpose()
+}
+
+#[allow(dead_code)]
+fn resource_mutation_by_active_key_on(
+    connection: &Connection,
+    operation_key: &str,
+) -> Result<Option<ResourceMutationRecord>, String> {
+    connection
+        .query_row(
+            "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
+                    state, session_id, attempt_id, attempt_number, fencing_token,
+                    evidence_json, failure_kind, failure_code, revision, reserved_at,
+                    resolved_at, superseded_at, supersede_reason
+               FROM scheduler_resource_mutations
+              WHERE operation_key = ?1 AND state IN ('reserved', 'succeeded', 'uncertain')
+              ORDER BY mutation_id DESC LIMIT 1",
+            params![operation_key],
+            decode_resource_mutation_row,
+        )
+        .optional()
+        .map_err(|error| format!("Failed to look up active resource mutation: {error}"))?
+        .map(decode_resource_mutation)
+        .transpose()
+}
+
+#[allow(dead_code)]
+fn validate_external_authority_shape(
+    authority: &ExternalAssignmentAuthority,
+) -> Result<(), String> {
+    if authority.connector_id.trim().is_empty()
+        || authority.connector_id != authority.connector_id.trim()
+        || authority.capability != format!("external_tools:{}", authority.connector_id)
+        || authority.connector_binding_digest.len() != 64
+        || !authority
+            .connector_binding_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("Resource mutation external authority is invalid.".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn external_authority_is_current_on(
+    connection: &Connection,
+    authority: &ExternalAssignmentAuthority,
+    now: u64,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1
+               FROM scheduler_task_sessions sessions
+               JOIN scheduler_task_attempts attempts
+                 ON attempts.attempt_id = sessions.active_attempt_id
+               JOIN scheduler_task_grants grants ON grants.session_id = sessions.session_id
+              WHERE sessions.session_id = ?1 AND sessions.state = 'running'
+                AND sessions.active_attempt_id = ?2 AND sessions.fencing_token = ?3
+                AND sessions.lease_expires_at > ?4
+                AND attempts.session_id = sessions.session_id
+                AND attempts.attempt_number = ?5 AND attempts.owner_id = ?6
+                AND attempts.fencing_token = ?3 AND attempts.state = 'running'
+                AND attempts.lease_expires_at > ?4 AND grants.capability = ?7",
+            params![
+                to_i64(authority.session_id.0)?,
+                to_i64(authority.attempt_id)?,
+                to_i64(authority.fencing_token)?,
+                to_i64(now)?,
+                i64::from(authority.attempt),
+                to_i64(authority.owner_id)?,
+                authority.capability
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|error| format!("Failed to validate resource mutation authority: {error}"))
+}
+
+#[allow(dead_code)]
+fn validate_resolution_evidence(
+    record: &ResourceMutationRecord,
+    evidence: &ResourceMutationEvidence,
+) -> Result<(), String> {
+    evidence.validate()?;
+    if evidence.identity != record.identity {
+        return Err(
+            "Resource mutation evidence did not match its reservation identity.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_failure_identity(
+    record: &ResourceMutationRecord,
+    evidence: Option<&ResourceMutationEvidence>,
+    kind: &str,
+    code: &str,
+) -> Result<(), String> {
+    if let Some(evidence) = evidence {
+        validate_resolution_evidence(record, evidence)?;
+    }
+    validate_ledger_token(kind, "failure kind")?;
+    validate_ledger_token(code, "failure code")
+}
+
+fn validate_ledger_token(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+        })
+    {
+        return Err(format!("Resource mutation {field} is invalid."));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_operation_key(value: &str) -> Result<(), String> {
+    if value.strip_prefix("sha256:").is_none_or(|digest| {
+        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err("Resource mutation operation key is invalid.".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_supersede_reason(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 500 || value.chars().any(char::is_control) {
+        return Err("Resource mutation supersede reason is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn mark_attempt_resource_mutations_uncertain(
+    transaction: &Transaction<'_>,
+    attempt_id: u64,
+    now: u64,
+    code: &str,
+) -> Result<usize, String> {
+    validate_ledger_token(code, "uncertainty code")?;
+    transaction
+        .execute(
+            "UPDATE scheduler_resource_mutations
+                SET state = 'uncertain', failure_kind = 'lifecycle', failure_code = ?2,
+                    revision = revision + 1, resolved_at = ?3
+              WHERE attempt_id = ?1 AND state = 'reserved'",
+            params![to_i64(attempt_id)?, code, to_i64(now)?],
+        )
+        .map_err(|error| format!("Failed to retain uncertain resource mutations: {error}"))
+}
+
 fn validate_capability_grants(
     capabilities: &[String],
     grant_source: &str,
@@ -3427,6 +4192,12 @@ fn recover_matching_attempts<P: rusqlite::Params>(
     for (attempt_id, session_id, fencing_token, label, payload, previous_state, opencode_id) in
         &attempts
     {
+        mark_attempt_resource_mutations_uncertain(
+            transaction,
+            from_i64(*attempt_id, "task attempt ID")?,
+            now,
+            event_reason,
+        )?;
         let request = TaskRequest::with_payload(label, payload);
         let is_agent = request_is_agent_envelope(&request)?;
         let missing_runtime_identity = previous_state != "cancelling"
@@ -3898,6 +4669,10 @@ fn request_ownership(request: &TaskRequest) -> TaskOwnership {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::resource_idempotency::{
+        ResourceExecutionResult, ResourceExecutionStatus, ResourceIdentity, ResourceLookupResult,
+        ResourceLookupStatus, ResourceRetryResumeStatus,
+    };
     use crate::domain::task_session::{TaskSessionEnvelopeV1, TaskSessionKind};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -5984,6 +6759,386 @@ mod tests {
         session.subject_id = Some(subject_id.to_string());
         session.execution_run_id = Some(format!("run-{label}"));
         TaskRequest::from_envelope(label, &envelope).expect("owned request")
+    }
+
+    fn scale_identity(replicas: u32) -> ResourceOperationIdentity {
+        ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "scale_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("default".to_string()),
+                name: "api".to_string(),
+            },
+            "https://cluster.example:6443",
+            &json!({ "replicas": replicas }),
+        )
+        .expect("scale identity")
+    }
+
+    fn scale_evidence(identity: &ResourceOperationIdentity) -> ResourceMutationEvidence {
+        ResourceMutationEvidence {
+            identity: identity.clone(),
+            lookup: ResourceLookupResult {
+                status: ResourceLookupStatus::DriftDetected,
+                observed_fingerprint: Some(identity.mutation_fingerprint.clone()),
+                observed_version: Some("10".to_string()),
+            },
+            execution: ResourceExecutionResult {
+                status: ResourceExecutionStatus::Executed,
+                resulting_fingerprint: Some(identity.mutation_fingerprint.clone()),
+                resulting_version: Some("11".to_string()),
+            },
+            retry_resume_status: ResourceRetryResumeStatus::ReconciledAfterDrift,
+        }
+    }
+
+    fn external_mutation_assignment(
+        path: PathBuf,
+        worker_id: usize,
+    ) -> (SchedulerStore, TaskSessionId, ExternalAssignmentAuthority) {
+        let store = SchedulerStore::open_at(path).expect("persistent store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::new(format!("resource-mutation-{worker_id}")),
+                &["external_tools:ocp".to_string()],
+                "test-approval",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, worker_id, Duration::from_secs(30), 5)
+            .expect("task claimed")
+            .expect("assignment exists");
+        let authority = store
+            .external_authority(
+                assignment.fence,
+                "external_tools:ocp",
+                "ocp",
+                &"a".repeat(64),
+            )
+            .expect("external authority");
+        (store, session.id, authority)
+    }
+
+    #[test]
+    fn resource_mutation_success_blocks_until_exact_audited_supersede() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = scale_identity(3);
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("first mutation was blocked"),
+        };
+        let succeeded = SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(scale_evidence(&identity)),
+        )
+        .expect("mutation succeeded");
+        assert_eq!(succeeded.state, ResourceMutationState::Succeeded);
+        assert_eq!(succeeded.revision, 2);
+        let blocked = SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("retained fence checked");
+        assert!(matches!(
+            blocked,
+            ResourceMutationReservation::Blocked(ResourceMutationRecord {
+                state: ResourceMutationState::Succeeded,
+                ..
+            })
+        ));
+        assert!(store
+            .supersede_resource_mutation(
+                TaskSessionId(session_id.0 + 1),
+                succeeded.mutation_id,
+                &identity.key,
+                succeeded.revision,
+                "wrong session"
+            )
+            .is_err());
+        assert!(store
+            .supersede_resource_mutation(
+                session_id,
+                succeeded.mutation_id,
+                &identity.key,
+                succeeded.revision + 1,
+                "stale revision"
+            )
+            .is_err());
+        let superseded = store
+            .supersede_resource_mutation(
+                session_id,
+                succeeded.mutation_id,
+                &identity.key,
+                succeeded.revision,
+                "Operator verified a deliberate second scale request.",
+            )
+            .expect("mutation superseded");
+        assert_eq!(superseded.state, ResourceMutationState::Superseded);
+        assert_eq!(superseded.revision, 3);
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "ocp_scale_deployment",
+                &identity
+            )
+            .expect("new reservation allowed"),
+            ResourceMutationReservation::Reserved(_)
+        ));
+        let events = store.events_after(session_id, 0).expect("events read");
+        assert!(events
+            .iter()
+            .any(|event| event.payload["type"] == "resource_mutation_superseded"));
+    }
+
+    #[test]
+    fn failed_resource_mutation_releases_fence_but_stale_authority_is_rejected() {
+        let directory = tempdir().expect("temp directory");
+        let (_store, _session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = scale_identity(3);
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("first mutation was blocked"),
+        };
+        let failed = SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Failed {
+                evidence: None,
+                kind: "forbidden".to_string(),
+                code: "rbac_denied".to_string(),
+            },
+        )
+        .expect("failure recorded");
+        assert_eq!(failed.state, ResourceMutationState::Failed);
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "ocp_scale_deployment",
+                &identity
+            )
+            .expect("retry reservation allowed"),
+            ResourceMutationReservation::Reserved(_)
+        ));
+        let stale = ExternalAssignmentAuthority {
+            fencing_token: authority.fencing_token + 1,
+            ..authority
+        };
+        assert!(SchedulerStore::reserve_external_resource_mutation(
+            &stale,
+            "ocp_scale_deployment",
+            &scale_identity(4)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unresolved_resource_mutation_becomes_uncertain_during_recovery() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = scale_identity(3);
+        let mutation_id = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record.mutation_id,
+            ResourceMutationReservation::Blocked(_) => panic!("first mutation was blocked"),
+        };
+        assert_eq!(
+            store
+                .abandon_owner(authority.owner_id)
+                .expect("owner abandoned"),
+            1
+        );
+        let record = store
+            .resource_mutation(mutation_id)
+            .expect("mutation read")
+            .expect("mutation exists");
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert_eq!(record.failure_kind.as_deref(), Some("lifecycle"));
+        assert_eq!(
+            record.failure_code.as_deref(),
+            Some("scheduler_owner_shutdown")
+        );
+        assert_eq!(
+            store
+                .resource_mutations_for_session(session_id)
+                .expect("session mutations read")
+                .len(),
+            1
+        );
+        let next_owner = store
+            .register_owner()
+            .expect("replacement owner registered");
+        let next = store
+            .claim_next(next_owner, 2, Duration::from_secs(30), 5)
+            .expect("recovered task claimed")
+            .expect("recovered assignment");
+        let next_authority = store
+            .external_authority(next.fence, "external_tools:ocp", "ocp", &"a".repeat(64))
+            .expect("replacement authority");
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &next_authority,
+                "ocp_scale_deployment",
+                &identity
+            )
+            .expect("uncertain fence checked"),
+            ResourceMutationReservation::Blocked(ResourceMutationRecord {
+                state: ResourceMutationState::Uncertain,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn concurrent_equivalent_reservations_create_one_active_fence() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let (_first_store, _first_session, first) = external_mutation_assignment(path.clone(), 1);
+        let (_second_store, _second_session, second) = external_mutation_assignment(path, 2);
+        let identity = scale_identity(3);
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [first, second].map(|authority| {
+            let barrier = barrier.clone();
+            let identity = identity.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                SchedulerStore::reserve_external_resource_mutation(
+                    &authority,
+                    "ocp_scale_deployment",
+                    &identity,
+                )
+                .expect("reservation completes")
+            })
+        });
+        let results = handles.map(|handle| handle.join().expect("reservation thread joins"));
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ResourceMutationReservation::Reserved(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, ResourceMutationReservation::Blocked(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resource_mutation_storage_contains_only_fingerprints_and_safe_metadata() {
+        let directory = tempdir().expect("temp directory");
+        let (store, _session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let secret = "sensitive-cluster-token";
+        let identity = ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "scale_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("default".to_string()),
+                name: "api".to_string(),
+            },
+            secret,
+            &json!({ "replicas": 3, "token": secret }),
+        )
+        .expect("secret-free identity");
+        SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("mutation reserved");
+        let connection = store.connection.lock().expect("store lock");
+        let encoded: String = connection
+            .query_row(
+                "SELECT identity_json FROM scheduler_resource_mutations LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("identity read");
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("cluster.example"));
+        assert!(encoded.contains("sha256:"));
+    }
+
+    #[test]
+    fn terminal_session_removal_cannot_silently_erase_retained_mutation_fence() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = scale_identity(3);
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &identity,
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("first mutation was blocked"),
+        };
+        let succeeded = SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(scale_evidence(&identity)),
+        )
+        .expect("mutation succeeded");
+        store
+            .resolve_assignment(
+                AssignmentFence {
+                    session_id,
+                    attempt_id: authority.attempt_id,
+                    attempt: authority.attempt,
+                    owner_id: authority.owner_id,
+                    fencing_token: authority.fencing_token,
+                },
+                DurableOutcome::Succeeded(TaskExecutionOutput::None),
+            )
+            .expect("assignment completed");
+        assert!(!store
+            .remove_terminal(session_id)
+            .expect("retained session removal checked"));
+        store
+            .supersede_resource_mutation(
+                session_id,
+                succeeded.mutation_id,
+                &identity.key,
+                succeeded.revision,
+                "Operator explicitly released the retained fence.",
+            )
+            .expect("retained fence superseded");
+        assert!(store
+            .remove_terminal(session_id)
+            .expect("superseded session removed"));
     }
 
     #[test]

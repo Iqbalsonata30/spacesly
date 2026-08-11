@@ -36,6 +36,11 @@ Implemented behavior:
 - Kubernetes 409 and RBAC failures retain redacted lookup/execution evidence and are not retried as mutations.
 - Missing approval returns a secret-free operation identity and reaches no cluster mutation path.
 - Scale identity and outcome evidence are persisted in the private OCP audit log independently of model-generated objective evidence.
+- The scheduler mutation ledger persists `reserved`, `succeeded`, `failed`, `uncertain`, and `superseded` records separately from objective evidence.
+- Active `reserved`, `succeeded`, and `uncertain` operation keys are globally unique; failed and explicitly superseded records permit a new reservation.
+- Reservation validates the exact live assignment, lease, fencing token, connector capability grant, and supported operation in one immediate transaction.
+- Resolution requires the exact reservation authority and identity. Assignment completion, cancellation, lease recovery, or owner shutdown changes unresolved reservations to `uncertain` rather than making them replayable.
+- Supersede requires exact session ownership, operation key, revision, bounded reason, and a retained succeeded/uncertain state; the transition is recorded in the scheduler event journal.
 
 Regression evidence:
 
@@ -44,7 +49,8 @@ Regression evidence:
 - Focused audit redaction/persistence test: passed.
 - Structured mutation approval regression: passed.
 - `cargo check`: passed.
-- Full Rust suite: 400 passed, 3 ignored, 0 failed.
+- Focused scheduler mutation ledger tests: 6 passed.
+- Full Rust suite: 406 passed, 3 ignored, 0 failed.
 - Frontend unit tests: 7 passed, 0 failed.
 - `svelte-check`: 0 errors and 0 warnings.
 - Full clippy reaches only three pre-existing findings in `governance.rs` and `task_examination.rs`; Phase 9 introduces no clippy finding.
@@ -93,14 +99,20 @@ Regression evidence recorded so far:
 
 ## Phase 9 Remaining Work
 
+Scheduler ledger foundation delivered:
+
+- Added the scheduler-owned resource mutation ledger and its fenced lifecycle.
+- Unresolved reservations become uncertain when an assignment terminates or is recovered.
+- Exact-session, exact-key, revision-checked supersede is audited.
+- MCP proxy dispatch integration remains deferred until duplex response correlation and EOF uncertainty are covered end to end.
+
 Planned scope:
 
-1. Add a scheduler-owned mutation identity ledger with atomic reservation, completion, uncertainty, and supersede transitions.
-2. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
-3. Fence equivalent retained mutations before dispatch when authoritative state lookup cannot safely reconcile them.
-4. Provide an explicit, audited operator supersede path instead of silent bypass.
-5. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
-6. Expose inspectable identity and outcome evidence in the operator UI.
+1. Bind trusted OCP scale identities at the MCP proxy before dispatch and correlate the exact response before forwarding it.
+2. Convert proxy EOF, malformed/mismatched evidence, and unresolved requests to uncertainty without reporting success.
+3. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
+4. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
+5. Expose inspectable identity, outcome evidence, and exact supersede controls in the operator UI.
 
 Required safety properties:
 

@@ -222,11 +222,12 @@ Implemented foundation:
 - Mutation evidence records the lookup/precondition result, execution result, and retry/resume disposition without retaining raw environment or desired-state values.
 - `ocp_scale_deployment` is the first supported vertical slice. It reads the Deployment before mutation, skips an already-satisfied desired replica count, and applies drift with the observed Kubernetes `resourceVersion`.
 - Successful, skipped, blocked, and conflicting scale outcomes retain secret-free evidence in the private OCP audit log.
+- The scheduler now owns a transactional mutation ledger with globally unique active operation keys, fenced reservation and resolution, conservative uncertainty on interrupted assignments, and exact-session/key/revision audited supersede semantics.
 
 Current limitations:
 
 - Other Kubernetes mutations, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
-- The initial slice reconciles retries from observed Kubernetes state; objective binding, a scheduler-wide identity ledger, and an explicit operator supersede path remain to be implemented.
+- The OCP MCP proxy is not yet bound to the scheduler ledger. Objective binding, duplex response correlation, automatic uncertainty on proxy EOF, and operator UI controls remain to be implemented before the ledger can enforce live connector dispatch.
 
 Benefits:
 
