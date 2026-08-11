@@ -144,6 +144,7 @@ fn runtime_callback(
                             normalized => normalized.to_string(),
                         },
                         arguments_digest: arguments_digest.clone(),
+                        resource_operation_key: None,
                     },
                 );
         }
@@ -154,27 +155,42 @@ fn runtime_callback(
             error,
             risk,
             arguments_digest,
+            arguments_observed,
+            resource_operation_key,
             ..
         } = &event
         {
             if *success {
                 let mut observation = observation.lock().map_err(|error| error.to_string())?;
-                observation.successful_tool_calls =
-                    observation.successful_tool_calls.saturating_add(1);
-                if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
-                    observation.successful_mutation_observed = true;
-                }
-                let receipt = observation.in_flight_tools.remove(tool_call_id).unwrap_or(
-                    AgentTaskObjectiveToolReceipt {
+                let normalized_tool_name = tool_name.trim().to_ascii_lowercase();
+                let mut receipt = match observation.in_flight_tools.remove(tool_call_id) {
+                    Some(receipt)
+                        if receipt.tool_name != normalized_tool_name
+                            || (*arguments_observed
+                                && receipt.arguments_digest != *arguments_digest) =>
+                    {
+                        return Err(format!(
+                            "Tool completion '{tool_call_id}' did not match its started tool identity."
+                        ));
+                    }
+                    Some(receipt) => receipt,
+                    None => AgentTaskObjectiveToolReceipt {
                         tool_call_id: tool_call_id.clone(),
-                        tool_name: tool_name.trim().to_ascii_lowercase(),
+                        tool_name: normalized_tool_name,
                         risk: match risk.trim().to_ascii_lowercase().as_str() {
                             "low" => "read".to_string(),
                             normalized => normalized.to_string(),
                         },
                         arguments_digest: arguments_digest.clone(),
+                        resource_operation_key: None,
                     },
-                );
+                };
+                receipt.resource_operation_key = resource_operation_key.clone();
+                observation.successful_tool_calls =
+                    observation.successful_tool_calls.saturating_add(1);
+                if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
+                    observation.successful_mutation_observed = true;
+                }
                 observation.uncheckpointed_tool_receipts.push(receipt);
             } else {
                 let mut attempt = observation.lock().map_err(|error| error.to_string())?;
@@ -1027,7 +1043,9 @@ pub(crate) fn emit_runtime_event(
             error,
             risk,
             arguments_digest,
+            arguments_observed: _,
             display_context,
+            resource_operation_key,
         } => {
             let failure = (!success).then(|| {
                 format!(
@@ -1048,6 +1066,7 @@ pub(crate) fn emit_runtime_event(
                     "risk": risk,
                     "arguments_digest": arguments_digest,
                     "display_context": display_context,
+                    "resource_operation_key": resource_operation_key,
                 }),
                 failure,
             )
@@ -1248,6 +1267,8 @@ mod tests {
 
     struct ToolFailureRunner;
 
+    struct MismatchedToolCompletionRunner;
+
     struct TransientThenCompleteRunner {
         executions: Arc<AtomicUsize>,
         resumed_session_ids: Arc<Mutex<Vec<Option<String>>>>,
@@ -1286,13 +1307,53 @@ mod tests {
                 error: Some("Connection refused while reading stdout.".to_string()),
                 risk: "read".to_string(),
                 arguments_digest: "digest".to_string(),
+                arguments_observed: false,
                 display_context: ToolDisplayContext {
                     label: "Reading from external tool".to_string(),
                     category: "external".to_string(),
                     target: None,
                 },
+                resource_operation_key: None,
             })?;
             unreachable!("failed tool callback must terminate execution")
+        }
+    }
+
+    impl AgentRuntimeRunner for MismatchedToolCompletionRunner {
+        fn execute(
+            &self,
+            _config: AiWorkerConfig,
+            _task: AiWorkerTask,
+            _cancellation: Arc<AtomicBool>,
+            mut on_event: AiWorkerEventCallback,
+        ) -> Result<AiWorkerTaskResult, String> {
+            on_event(AiWorkerStreamEvent::ToolStarted {
+                tool_call_id: "call-mismatch".to_string(),
+                tool_name: "bamboo_trigger_build".to_string(),
+                risk: "mutation".to_string(),
+                arguments_digest: "a".repeat(64),
+                display_context: ToolDisplayContext {
+                    label: "Trigger Bamboo build".to_string(),
+                    category: "bamboo".to_string(),
+                    target: Some("QCASH-BUILD".to_string()),
+                },
+            })?;
+            on_event(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id: "call-mismatch".to_string(),
+                tool_name: "bamboo_trigger_build".to_string(),
+                success: true,
+                error: None,
+                risk: "mutation".to_string(),
+                arguments_digest: "b".repeat(64),
+                arguments_observed: true,
+                display_context: ToolDisplayContext {
+                    label: "Trigger Bamboo build".to_string(),
+                    category: "bamboo".to_string(),
+                    target: Some("QCASH-BUILD".to_string()),
+                },
+                resource_operation_key: None,
+            })?;
+            unreachable!("mismatched completion callback must terminate execution")
         }
     }
 
@@ -1321,11 +1382,13 @@ mod tests {
                     error: Some("HTTP 503 service unavailable".to_string()),
                     risk: "read".to_string(),
                     arguments_digest: "digest-read".to_string(),
+                    arguments_observed: false,
                     display_context: ToolDisplayContext {
                         label: "Read Confluence page".to_string(),
                         category: "external".to_string(),
                         target: None,
                     },
+                    resource_operation_key: None,
                 })?;
                 unreachable!("failed tool callback must terminate the first execution")
             }
@@ -1357,11 +1420,13 @@ mod tests {
                 error: None,
                 risk: "mutation".to_string(),
                 arguments_digest: "digest-mutation".to_string(),
+                arguments_observed: false,
                 display_context: ToolDisplayContext {
                     label: "Trigger Bamboo build".to_string(),
                     category: "external".to_string(),
                     target: None,
                 },
+                resource_operation_key: None,
             })?;
             on_event(AiWorkerStreamEvent::ToolCompleted {
                 tool_call_id: "call-follow-up".to_string(),
@@ -1370,11 +1435,13 @@ mod tests {
                 error: Some("gateway timeout".to_string()),
                 risk: "read".to_string(),
                 arguments_digest: "digest-follow-up".to_string(),
+                arguments_observed: false,
                 display_context: ToolDisplayContext {
                     label: "Inspect Bamboo build".to_string(),
                     category: "external".to_string(),
                     target: None,
                 },
+                resource_operation_key: None,
             })?;
             unreachable!("failed follow-up callback must terminate execution")
         }
@@ -1407,11 +1474,13 @@ mod tests {
                     error: Some("unknown tool jira_get_issue".to_string()),
                     risk: "read".to_string(),
                     arguments_digest: "digest-stale".to_string(),
+                    arguments_observed: false,
                     display_context: ToolDisplayContext {
                         label: "Read Jira issue".to_string(),
                         category: "jira".to_string(),
                         target: None,
                     },
+                    resource_operation_key: None,
                 })?;
                 unreachable!("missing tool callback must terminate the first execution")
             }
@@ -1548,11 +1617,13 @@ mod tests {
                 error: None,
                 risk: "mutation".to_string(),
                 arguments_digest: argument_digest(&json!({}))?,
+                arguments_observed: false,
                 display_context: ToolDisplayContext {
                     label: "Triggering QCASH-BUILD".to_string(),
                     category: "bamboo".to_string(),
                     target: Some("QCASH-BUILD".to_string()),
                 },
+                resource_operation_key: None,
             })?;
             on_event(AiWorkerStreamEvent::ObjectiveCheckpoint {
                 objective_id: "objective-1".to_string(),
@@ -1630,11 +1701,13 @@ mod tests {
                     error: Some(approval_error.to_string()),
                     risk: "write".to_string(),
                     arguments_digest: "approval-digest".to_string(),
+                    arguments_observed: false,
                     display_context: ToolDisplayContext {
                         label: "Restart deployment".to_string(),
                         category: "external".to_string(),
                         target: Some("deployment/clbo".to_string()),
                     },
+                    resource_operation_key: None,
                 })?;
                 return Err(approval_error.to_string());
             }
@@ -1796,11 +1869,13 @@ mod tests {
                 error: None,
                 risk: "low".to_string(),
                 arguments_digest: "abc".to_string(),
+                arguments_observed: true,
                 display_context: ToolDisplayContext {
                     label: "jira_search".to_string(),
                     category: "external".to_string(),
                     target: Some(authority.session_id.0.to_string()),
                 },
+                resource_operation_key: None,
             })?;
             on_event(AiWorkerStreamEvent::TextDelta(format!(
                 "session:{}",
@@ -2448,6 +2523,40 @@ mod tests {
         assert_eq!(recovery.len(), 2);
         assert_eq!(recovery[0].payload["action"], "retry_current_assignment");
         assert_eq!(recovery[1].payload["action"], "stop_failed");
+    }
+
+    #[test]
+    fn scheduler_agent_executor_rejects_mismatched_tool_completion_identity() {
+        let directory = tempdir().expect("temp directory");
+        let executor = AgentTaskExecutor::new(
+            Arc::new(FakeResolver {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                runtime_profile_id: "profile-1".to_string(),
+            }),
+            Arc::new(MismatchedToolCompletionRunner),
+        );
+        let engine = ExecutionEngine::open_persistent_at_with_executor(
+            Arc::new(executor),
+            directory.path().join("scheduler.db"),
+        )
+        .expect("engine starts");
+        let session = engine
+            .submit_envelope_with_grants(
+                "mismatched-tool-agent",
+                &test_envelope(),
+                vec!["external_tools:jira".to_string()],
+                "test-approval",
+            )
+            .expect("task submitted");
+        let completed = engine
+            .wait_for_terminal(session.id, Duration::from_secs(5))
+            .expect("task fails");
+
+        assert_eq!(completed.state, TaskSessionState::Failed);
+        assert!(completed
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("did not match its started tool identity") }));
     }
 
     #[test]

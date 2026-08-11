@@ -135,6 +135,9 @@ pub struct ResourceMutationRecord {
     pub resolved_at: Option<u64>,
     pub superseded_at: Option<u64>,
     pub supersede_reason: Option<String>,
+    pub checkpoint_objective_id: Option<String>,
+    pub checkpoint_tool_call_id: Option<String>,
+    pub checkpoint_recorded_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -512,9 +515,12 @@ impl SchedulerStore {
                      failure_code TEXT,
                      revision INTEGER NOT NULL DEFAULT 1,
                      reserved_at INTEGER NOT NULL,
-                     resolved_at INTEGER,
-                     superseded_at INTEGER,
-                     supersede_reason TEXT,
+                      resolved_at INTEGER,
+                      superseded_at INTEGER,
+                      supersede_reason TEXT,
+                      checkpoint_objective_id TEXT,
+                      checkpoint_tool_call_id TEXT,
+                      checkpoint_recorded_at INTEGER,
                      FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
                        ON DELETE CASCADE,
                      FOREIGN KEY(attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
@@ -626,6 +632,24 @@ impl SchedulerStore {
             "scheduler_task_objective_checkpoints",
             "tool_receipts_json",
             "tool_receipts_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_resource_mutations",
+            "checkpoint_objective_id",
+            "checkpoint_objective_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_resource_mutations",
+            "checkpoint_tool_call_id",
+            "checkpoint_tool_call_id TEXT",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_resource_mutations",
+            "checkpoint_recorded_at",
+            "checkpoint_recorded_at INTEGER",
         )?;
         migration
             .execute_batch(
@@ -941,10 +965,13 @@ impl SchedulerStore {
         identity.validate()?;
         validate_external_authority_shape(authority)?;
         validate_ledger_token(tool_name, "tool name")?;
-        if tool_name != "ocp_scale_deployment"
-            || identity.connector != "openshift_kubernetes"
-            || identity.operation != "scale_deployment"
-        {
+        let supported_operation = identity.connector == "openshift_kubernetes"
+            && matches!(
+                (tool_name, identity.operation.as_str()),
+                ("ocp_restart_deployment", "restart_deployment")
+                    | ("ocp_scale_deployment", "scale_deployment")
+            );
+        if !supported_operation {
             return Err(
                 "Resource mutation ledger does not support this connector operation.".to_string(),
             );
@@ -963,6 +990,12 @@ impl SchedulerStore {
         let mut reconciled_mutation_id = None;
         if let Some(record) = resource_mutation_by_active_key_on(&transaction, &identity.key)? {
             if record.state == ResourceMutationState::Succeeded {
+                if record.checkpoint_objective_id.is_some() {
+                    transaction.commit().map_err(|error| {
+                        format!("Failed to commit resource mutation lookup: {error}")
+                    })?;
+                    return Ok(ResourceMutationReservation::Blocked(record));
+                }
                 transaction
                     .execute(
                         "UPDATE scheduler_resource_mutations
@@ -1165,7 +1198,9 @@ impl SchedulerStore {
                 "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
                         state, session_id, attempt_id, attempt_number, fencing_token,
                         evidence_json, failure_kind, failure_code, revision, reserved_at,
-                        resolved_at, superseded_at, supersede_reason
+                        resolved_at, superseded_at, supersede_reason,
+                        checkpoint_objective_id, checkpoint_tool_call_id,
+                        checkpoint_recorded_at
                    FROM scheduler_resource_mutations
                   WHERE session_id = ?1 ORDER BY mutation_id",
             )
@@ -1664,6 +1699,19 @@ impl SchedulerStore {
                         .arguments_digest
                         .bytes()
                         .all(|byte| byte.is_ascii_hexdigit())
+                    || receipt
+                        .resource_operation_key
+                        .as_deref()
+                        .is_some_and(|key| validate_operation_key(key).is_err())
+                    || (matches!(
+                        receipt.tool_name.as_str(),
+                        "ocp_restart_deployment" | "ocp_scale_deployment"
+                    ) && receipt.resource_operation_key.is_none())
+                    || (receipt.resource_operation_key.is_some()
+                        && !matches!(
+                            receipt.tool_name.as_str(),
+                            "ocp_restart_deployment" | "ocp_scale_deployment"
+                        ))
             })
         {
             return Err("Objective checkpoint payload is invalid.".to_string());
@@ -1699,6 +1747,54 @@ impl SchedulerStore {
                 ],
             )
             .map_err(|error| format!("Failed to persist objective checkpoint: {error}"))?;
+        if inserted == 0 {
+            let existing = transaction
+                .query_row(
+                    "SELECT evidence_json, tool_receipts_json, source_attempt_id,
+                            source_fencing_token
+                       FROM scheduler_task_objective_checkpoints
+                      WHERE session_id = ?1 AND objective_id = ?2",
+                    params![to_i64(fence.session_id.0)?, objective_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(|error| {
+                    format!("Failed to verify objective checkpoint replay: {error}")
+                })?;
+            if existing
+                != (
+                    evidence_json.clone(),
+                    tool_receipts_json.clone(),
+                    to_i64(fence.attempt_id)?,
+                    to_i64(fence.fencing_token)?,
+                )
+            {
+                return Err(
+                    "Objective checkpoint replay did not match the immutable checkpoint."
+                        .to_string(),
+                );
+            }
+        }
+        if inserted == 1 {
+            for receipt in tool_receipts {
+                if let Some(operation_key) = receipt.resource_operation_key.as_deref() {
+                    bind_resource_mutation_checkpoint_on(
+                        &transaction,
+                        fence,
+                        objective_id,
+                        receipt,
+                        operation_key,
+                        now,
+                    )?;
+                }
+            }
+        }
         let event = append_event_in_transaction(
             &transaction,
             fence.session_id,
@@ -3847,6 +3943,9 @@ type RawResourceMutation = (
     Option<i64>,
     Option<i64>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
 );
 
 fn decode_resource_mutation_row(row: &Row<'_>) -> rusqlite::Result<RawResourceMutation> {
@@ -3869,6 +3968,9 @@ fn decode_resource_mutation_row(row: &Row<'_>) -> rusqlite::Result<RawResourceMu
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
     ))
 }
 
@@ -3892,6 +3994,9 @@ fn decode_resource_mutation(raw: RawResourceMutation) -> Result<ResourceMutation
         resolved_at,
         superseded_at,
         supersede_reason,
+        checkpoint_objective_id,
+        checkpoint_tool_call_id,
+        checkpoint_recorded_at,
     ) = raw;
     let identity: ResourceOperationIdentity = serde_json::from_str(&identity_json)
         .map_err(|error| format!("Stored resource operation identity is invalid: {error}"))?;
@@ -3932,6 +4037,11 @@ fn decode_resource_mutation(raw: RawResourceMutation) -> Result<ResourceMutation
             .map(|value| from_i64(value, "resource mutation supersede timestamp"))
             .transpose()?,
         supersede_reason,
+        checkpoint_objective_id,
+        checkpoint_tool_call_id,
+        checkpoint_recorded_at: checkpoint_recorded_at
+            .map(|value| from_i64(value, "resource mutation checkpoint timestamp"))
+            .transpose()?,
     })
 }
 
@@ -3944,7 +4054,9 @@ fn resource_mutation_on(
             "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
                     state, session_id, attempt_id, attempt_number, fencing_token,
                     evidence_json, failure_kind, failure_code, revision, reserved_at,
-                    resolved_at, superseded_at, supersede_reason
+                    resolved_at, superseded_at, supersede_reason,
+                    checkpoint_objective_id, checkpoint_tool_call_id,
+                    checkpoint_recorded_at
                FROM scheduler_resource_mutations WHERE mutation_id = ?1",
             params![to_i64(mutation_id)?],
             decode_resource_mutation_row,
@@ -3964,7 +4076,9 @@ fn resource_mutation_by_active_key_on(
             "SELECT mutation_id, operation_key, identity_json, connector_id, tool_name,
                     state, session_id, attempt_id, attempt_number, fencing_token,
                     evidence_json, failure_kind, failure_code, revision, reserved_at,
-                    resolved_at, superseded_at, supersede_reason
+                    resolved_at, superseded_at, supersede_reason,
+                    checkpoint_objective_id, checkpoint_tool_call_id,
+                    checkpoint_recorded_at
                FROM scheduler_resource_mutations
               WHERE operation_key = ?1 AND state IN ('reserved', 'succeeded', 'uncertain')
               ORDER BY mutation_id DESC LIMIT 1",
@@ -3975,6 +4089,80 @@ fn resource_mutation_by_active_key_on(
         .map_err(|error| format!("Failed to look up active resource mutation: {error}"))?
         .map(decode_resource_mutation)
         .transpose()
+}
+
+fn bind_resource_mutation_checkpoint_on(
+    connection: &Connection,
+    fence: AssignmentFence,
+    objective_id: &str,
+    receipt: &AgentTaskObjectiveToolReceipt,
+    operation_key: &str,
+    recorded_at: u64,
+) -> Result<(), String> {
+    let record =
+        resource_mutation_by_active_key_on(connection, operation_key)?.ok_or_else(|| {
+            "Objective checkpoint resource mutation receipt has no active ledger record."
+                .to_string()
+        })?;
+    if record.state != ResourceMutationState::Succeeded
+        || record.session_id != fence.session_id
+        || record.attempt_id != fence.attempt_id
+        || record.attempt != fence.attempt
+        || record.fencing_token != fence.fencing_token
+        || record.tool_name != receipt.tool_name
+    {
+        return Err(
+            "Objective checkpoint resource mutation receipt did not match a succeeded ledger record."
+                .to_string(),
+        );
+    }
+    match (
+        record.checkpoint_objective_id.as_deref(),
+        record.checkpoint_tool_call_id.as_deref(),
+        record.checkpoint_recorded_at,
+    ) {
+        (None, None, None) => {}
+        (Some(bound_objective), Some(bound_tool_call), Some(_))
+            if bound_objective == objective_id && bound_tool_call == receipt.tool_call_id =>
+        {
+            return Ok(());
+        }
+        _ => {
+            return Err(
+                "Resource mutation ledger record is already bound to a different checkpoint receipt."
+                    .to_string(),
+            );
+        }
+    }
+    let updated = connection
+        .execute(
+            "UPDATE scheduler_resource_mutations
+                SET checkpoint_objective_id = ?2, checkpoint_tool_call_id = ?3,
+                    checkpoint_recorded_at = ?4, revision = revision + 1
+              WHERE mutation_id = ?1 AND operation_key = ?5 AND state = 'succeeded'
+                AND session_id = ?6 AND attempt_id = ?7 AND attempt_number = ?8
+                AND fencing_token = ?9 AND tool_name = ?10
+                AND checkpoint_objective_id IS NULL
+                AND checkpoint_tool_call_id IS NULL
+                AND checkpoint_recorded_at IS NULL",
+            params![
+                to_i64(record.mutation_id)?,
+                objective_id,
+                receipt.tool_call_id,
+                to_i64(recorded_at)?,
+                operation_key,
+                to_i64(fence.session_id.0)?,
+                to_i64(fence.attempt_id)?,
+                i64::from(fence.attempt),
+                to_i64(fence.fencing_token)?,
+                receipt.tool_name,
+            ],
+        )
+        .map_err(|error| format!("Failed to bind resource mutation checkpoint: {error}"))?;
+    if updated != 1 {
+        return Err("Resource mutation checkpoint binding lost its ledger fence.".to_string());
+    }
+    Ok(())
 }
 
 fn validate_external_authority_shape(
@@ -4709,15 +4897,35 @@ mod tests {
                    started_at INTEGER,
                    completed_at INTEGER
                  );
-                 CREATE TABLE scheduler_task_objective_checkpoints (
+                  CREATE TABLE scheduler_task_objective_checkpoints (
                    session_id INTEGER NOT NULL,
                    objective_id TEXT NOT NULL,
                    evidence_json TEXT NOT NULL,
                    source_attempt_id INTEGER NOT NULL,
                    source_fencing_token INTEGER NOT NULL,
-                   recorded_at INTEGER NOT NULL,
-                   PRIMARY KEY(session_id, objective_id)
-                 );",
+                    recorded_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, objective_id)
+                  );
+                  CREATE TABLE scheduler_resource_mutations (
+                    mutation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_key TEXT NOT NULL,
+                    identity_json TEXT NOT NULL,
+                    connector_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    session_id INTEGER NOT NULL,
+                    attempt_id INTEGER NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    evidence_json TEXT,
+                    failure_kind TEXT,
+                    failure_code TEXT,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    reserved_at INTEGER NOT NULL,
+                    resolved_at INTEGER,
+                    superseded_at INTEGER,
+                    supersede_reason TEXT
+                  );",
             )
             .expect("legacy schema created");
         drop(connection);
@@ -4775,6 +4983,23 @@ mod tests {
         assert!(checkpoint_columns
             .iter()
             .any(|column| column == "tool_receipts_json"));
+        let mutation_columns = store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .prepare("PRAGMA table_info(scheduler_resource_mutations)")
+            .expect("mutation columns prepared")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("mutation columns queried")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("mutation columns read");
+        for expected in [
+            "checkpoint_objective_id",
+            "checkpoint_tool_call_id",
+            "checkpoint_recorded_at",
+        ] {
+            assert!(mutation_columns.iter().any(|column| column == expected));
+        }
     }
 
     #[test]
@@ -6774,6 +6999,22 @@ mod tests {
         .expect("scale identity")
     }
 
+    fn restart_identity(token: &str) -> ResourceOperationIdentity {
+        ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "restart_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("default".to_string()),
+                name: "api".to_string(),
+            },
+            "https://cluster.example:6443",
+            &json!({ "restart_token": token }),
+        )
+        .expect("restart identity")
+    }
+
     fn scale_evidence(identity: &ResourceOperationIdentity) -> ResourceMutationEvidence {
         ResourceMutationEvidence {
             identity: identity.clone(),
@@ -6817,6 +7058,238 @@ mod tests {
             )
             .expect("external authority");
         (store, session.id, authority)
+    }
+
+    fn assignment_fence(authority: &ExternalAssignmentAuthority) -> AssignmentFence {
+        AssignmentFence {
+            session_id: authority.session_id,
+            attempt_id: authority.attempt_id,
+            attempt: authority.attempt,
+            owner_id: authority.owner_id,
+            fencing_token: authority.fencing_token,
+        }
+    }
+
+    fn resource_mutation_receipt(
+        tool_call_id: &str,
+        operation_key: &str,
+    ) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "ocp_scale_deployment".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "a".repeat(64),
+            resource_operation_key: Some(operation_key.to_string()),
+        }
+    }
+
+    fn restart_mutation_receipt(
+        tool_call_id: &str,
+        operation_key: &str,
+    ) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "ocp_restart_deployment".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "b".repeat(64),
+            resource_operation_key: Some(operation_key.to_string()),
+        }
+    }
+
+    fn succeeded_scale_mutation(
+        authority: &ExternalAssignmentAuthority,
+        identity: &ResourceOperationIdentity,
+    ) -> ResourceMutationRecord {
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            authority,
+            "ocp_scale_deployment",
+            identity,
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("mutation was unexpectedly blocked"),
+        };
+        SchedulerStore::resolve_external_resource_mutation(
+            authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(scale_evidence(identity)),
+        )
+        .expect("mutation succeeded")
+    }
+
+    #[test]
+    fn objective_checkpoint_atomically_binds_succeeded_resource_receipt_and_replays_exactly() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = scale_identity(3);
+        let succeeded = succeeded_scale_mutation(&authority, &identity);
+        let fence = assignment_fence(&authority);
+        let receipt = resource_mutation_receipt("scale-call-1", &identity.key);
+        let evidence = vec!["Deployment api has three replicas".to_string()];
+
+        let checkpoint = store
+            .record_objective_checkpoint(
+                fence,
+                "objective-1",
+                &evidence,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("checkpoint recorded");
+        assert_eq!(checkpoint.payload["new_checkpoint"], true);
+        let bound = store
+            .resource_mutation(succeeded.mutation_id)
+            .expect("mutation read")
+            .expect("mutation exists");
+        assert_eq!(
+            bound.checkpoint_objective_id.as_deref(),
+            Some("objective-1")
+        );
+        assert_eq!(
+            bound.checkpoint_tool_call_id.as_deref(),
+            Some("scale-call-1")
+        );
+        assert!(bound.checkpoint_recorded_at.is_some());
+        assert_eq!(bound.revision, 3);
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "ocp_scale_deployment",
+                &identity,
+            )
+            .expect("bound mutation fence checked"),
+            ResourceMutationReservation::Blocked(ResourceMutationRecord {
+                mutation_id,
+                checkpoint_objective_id: Some(_),
+                ..
+            }) if mutation_id == succeeded.mutation_id
+        ));
+
+        let replay = store
+            .record_objective_checkpoint(
+                fence,
+                "objective-1",
+                &evidence,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("exact checkpoint replay accepted");
+        assert_eq!(replay.payload["new_checkpoint"], false);
+        assert_eq!(
+            store
+                .resource_mutation(succeeded.mutation_id)
+                .expect("mutation read")
+                .expect("mutation exists")
+                .revision,
+            3
+        );
+        assert!(store
+            .record_objective_checkpoint(fence, "objective-2", &evidence, &[receipt])
+            .expect_err("different objective binding rejected")
+            .contains("already bound"));
+        assert_eq!(
+            store
+                .objective_checkpoints(session_id)
+                .expect("checkpoints read")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn restart_mutation_uses_distinct_token_identity_and_binds_checkpoint() {
+        let directory = tempdir().expect("temp directory");
+        let (store, _session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let identity = restart_identity("11111111-1111-4111-8111-111111111111");
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_restart_deployment",
+            &identity,
+        )
+        .expect("restart reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("restart unexpectedly blocked"),
+        };
+        SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(scale_evidence(&identity)),
+        )
+        .expect("restart succeeded");
+        store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-1",
+                &["Deployment restart token observed".to_string()],
+                &[restart_mutation_receipt("restart-call-1", &identity.key)],
+            )
+            .expect("restart checkpoint bound");
+
+        let bound = store
+            .resource_mutation(reserved.mutation_id)
+            .expect("restart mutation read")
+            .expect("restart mutation exists");
+        assert_eq!(
+            bound.checkpoint_objective_id.as_deref(),
+            Some("objective-1")
+        );
+        assert_eq!(bound.tool_name, "ocp_restart_deployment");
+        assert_ne!(
+            identity.key,
+            restart_identity("22222222-2222-4222-8222-222222222222").key
+        );
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "ocp_restart_deployment",
+                &identity,
+            )
+            .expect("bound restart fence checked"),
+            ResourceMutationReservation::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn objective_checkpoint_rejects_cross_session_or_non_succeeded_resource_receipts() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let (_first_store, _first_session, first_authority) =
+            external_mutation_assignment(path.clone(), 1);
+        let (second_store, _second_session, second_authority) =
+            external_mutation_assignment(path, 2);
+        let succeeded_identity = scale_identity(3);
+        succeeded_scale_mutation(&first_authority, &succeeded_identity);
+        let evidence = vec!["Deployment state verified".to_string()];
+        let cross_session = resource_mutation_receipt("scale-call-cross", &succeeded_identity.key);
+        assert!(second_store
+            .record_objective_checkpoint(
+                assignment_fence(&second_authority),
+                "objective-cross",
+                &evidence,
+                &[cross_session],
+            )
+            .expect_err("cross-session binding rejected")
+            .contains("did not match a succeeded ledger record"));
+
+        let reserved_identity = scale_identity(4);
+        SchedulerStore::reserve_external_resource_mutation(
+            &second_authority,
+            "ocp_scale_deployment",
+            &reserved_identity,
+        )
+        .expect("second mutation reserved");
+        let reserved = resource_mutation_receipt("scale-call-reserved", &reserved_identity.key);
+        assert!(second_store
+            .record_objective_checkpoint(
+                assignment_fence(&second_authority),
+                "objective-reserved",
+                &evidence,
+                &[reserved],
+            )
+            .expect_err("reserved binding rejected")
+            .contains("did not match a succeeded ledger record"));
     }
 
     #[test]
@@ -7048,20 +7521,50 @@ mod tests {
             &json!({ "replicas": 3, "token": secret }),
         )
         .expect("secret-free identity");
-        SchedulerStore::reserve_external_resource_mutation(
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
             &authority,
             "ocp_scale_deployment",
             &identity,
         )
-        .expect("mutation reserved");
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            ResourceMutationReservation::Blocked(_) => panic!("mutation was unexpectedly blocked"),
+        };
+        SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(scale_evidence(&identity)),
+        )
+        .expect("mutation succeeded");
+        store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-secret-free",
+                &["Deployment scale verified".to_string()],
+                &[resource_mutation_receipt(
+                    "scale-call-secret-free",
+                    &identity.key,
+                )],
+            )
+            .expect("checkpoint bound");
         let connection = store.connection.lock().expect("store lock");
-        let encoded: String = connection
+        let (identity_json, objective_id, tool_call_id): (String, String, String) = connection
             .query_row(
-                "SELECT identity_json FROM scheduler_resource_mutations LIMIT 1",
+                "SELECT identity_json, checkpoint_objective_id, checkpoint_tool_call_id
+                   FROM scheduler_resource_mutations LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("mutation binding read");
+        let receipts_json: String = connection
+            .query_row(
+                "SELECT tool_receipts_json FROM scheduler_task_objective_checkpoints LIMIT 1",
                 [],
                 |row| row.get(0),
             )
-            .expect("identity read");
+            .expect("checkpoint receipts read");
+        let encoded = format!("{identity_json}{objective_id}{tool_call_id}{receipts_json}");
         assert!(!encoded.contains(secret));
         assert!(!encoded.contains("cluster.example"));
         assert!(encoded.contains("sha256:"));

@@ -36,8 +36,8 @@ use errors::OcpResult;
 use preflight::run_preflight;
 use retry::{with_retry, RetryPolicy};
 use tools::{
-    execute_tool, resource_operation_identity, scale_resource_operation_identity, tool_metadata,
-    OcpTool,
+    execute_tool, resource_operation_identity, restart_resource_operation_identity,
+    scale_resource_operation_identity, tool_metadata, OcpTool,
 };
 
 pub const ENV_MODE: &str = "SPACESLY_OCP_MODE";
@@ -638,9 +638,7 @@ fn call_tool(
             // Report approval as a successful MCP tool result. OpenCode retries JSON-RPC
             // errors internally, which can issue the same mutation repeatedly and flood the
             // console. Spacesly recognizes this structured result and pauses the run itself.
-            let operation_identity = resource_operation_identity(client, tool_name, arguments)
-                .ok()
-                .flatten();
+            let operation_identity = resource_operation_identity(client, tool_name, arguments)?;
             return Ok(json!({
                 "status": "approval_required",
                 "operation": tool.as_str(),
@@ -1033,7 +1031,9 @@ pub(crate) fn trusted_resource_operation_identity_from_environment(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<Option<crate::domain::resource_idempotency::ResourceOperationIdentity>, String> {
-    if tool_name != OcpTool::ScaleDeployment.as_str() || command.len() != 2 {
+    let supported_tool = OcpTool::parse(tool_name)
+        .filter(|tool| matches!(tool, OcpTool::RestartDeployment | OcpTool::ScaleDeployment));
+    if supported_tool.is_none() || command.len() != 2 {
         return Ok(None);
     }
     let expected = ocp_worker_command()?;
@@ -1049,9 +1049,17 @@ pub(crate) fn trusted_resource_operation_identity_from_environment(
     let env = OcpConnectorEnv::from_env()?;
     let cluster = resolve_cluster(&env).map_err(|error| error.to_string())?;
     let namespace = cluster.default_namespace.as_deref().unwrap_or("default");
-    scale_resource_operation_identity(&cluster.server, namespace, arguments)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    match supported_tool {
+        Some(OcpTool::RestartDeployment) => {
+            restart_resource_operation_identity(&cluster.server, namespace, arguments)
+        }
+        Some(OcpTool::ScaleDeployment) => {
+            scale_resource_operation_identity(&cluster.server, namespace, arguments)
+        }
+        _ => unreachable!(),
+    }
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 fn ocp_mode_from_env(env: &HashMap<String, String>) -> OcpAuthMode {
@@ -1471,7 +1479,7 @@ mod tests {
     #[test]
     fn mcp_protocol_mutation_requires_explicit_approval() {
         let responses = serve_protocol(
-            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"ocp_restart_deployment\",\"arguments\":{\"namespace\":\"default\",\"name\":\"api\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"ocp_restart_deployment\",\"arguments\":{\"namespace\":\"default\",\"name\":\"api\",\"restart_token\":\"11111111-1111-4111-8111-111111111111\"}}}\n",
         );
         let content = responses[0]["result"]["content"][0]["text"]
             .as_str()
@@ -1479,7 +1487,14 @@ mod tests {
         let approval: Value = serde_json::from_str(content).unwrap();
         assert_eq!(approval["status"], json!("approval_required"));
         assert_eq!(approval["operation"], json!("ocp_restart_deployment"));
-        assert!(approval["operation_identity"].is_null());
+        assert_eq!(
+            approval["operation_identity"]["operation"],
+            "restart_deployment"
+        );
+        assert!(approval["operation_identity"]["key"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
         assert_eq!(
             approval["message"]
                 .as_str()
@@ -1487,6 +1502,14 @@ mod tests {
                 .matches("retry")
                 .count(),
             1
+        );
+
+        let legacy_restart = serve_protocol(
+            "{\"jsonrpc\":\"2.0\",\"id\":66,\"method\":\"tools/call\",\"params\":{\"name\":\"ocp_restart_deployment\",\"arguments\":{\"namespace\":\"default\",\"name\":\"api\"}}}\n",
+        );
+        assert_eq!(
+            legacy_restart[0]["error"]["data"]["code"],
+            "restart_token_required"
         );
 
         let responses = serve_protocol(

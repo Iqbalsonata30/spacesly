@@ -865,6 +865,8 @@ pub struct AgentTaskObjectiveToolReceipt {
     pub tool_name: String,
     pub risk: String,
     pub arguments_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_operation_key: Option<String>,
 }
 
 /// Durable evidence that one semantic objective completed in an earlier assignment attempt.

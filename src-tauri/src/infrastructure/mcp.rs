@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,17 +53,74 @@ struct PendingResourceMutation {
     request_id: Value,
 }
 
+struct UnansweredMutationResolution {
+    resolved: Vec<(Value, ResourceMutationRecord)>,
+    error: Option<String>,
+}
+
+struct ProxyChildGuard {
+    child: Arc<Mutex<Child>>,
+    armed: bool,
+}
+
+impl ProxyChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Arc::new(Mutex::new(child)),
+            armed: true,
+        }
+    }
+
+    fn child(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
+    }
+
+    fn terminate_and_wait(mut self) -> Result<std::process::ExitStatus, String> {
+        let mut child = self.child.lock().map_err(|error| error.to_string())?;
+        terminate_proxy_process(&mut child);
+        let status = child
+            .wait()
+            .map_err(|error| format!("Failed to wait for proxied MCP connector: {error}"))?;
+        drop(child);
+        self.armed = false;
+        Ok(status)
+    }
+}
+
+impl Drop for ProxyChildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut child) = self.child.lock() {
+            terminate_proxy_process(&mut child);
+            let _ = child.wait();
+        }
+    }
+}
+
+fn terminate_proxy_process(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 pub fn run_mcp_proxy_from_env() -> Result<(), String> {
     let command_json = std::env::var(MCP_PROXY_COMMAND_ENV)
         .map_err(|_| "MCP proxy connector command was not provided.".to_string())?;
     let command_parts: Vec<String> = serde_json::from_str(&command_json)
         .map_err(|error| format!("Invalid MCP proxy connector command: {error}"))?;
-    let (executable, args) = command_parts
-        .split_first()
-        .ok_or_else(|| "MCP proxy connector command is empty.".to_string())?;
-    if executable.trim().is_empty() {
-        return Err("MCP proxy connector executable is empty.".to_string());
-    }
     let authority_mode = optional_unicode_environment(MCP_PROXY_AUTHORITY_MODE_ENV)?;
     let authority_json = optional_unicode_environment(MCP_PROXY_AUTHORITY_ENV)?;
     let authority =
@@ -72,7 +129,47 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
     let connector_binding = required_unicode_environment(MCP_PROXY_CONNECTOR_BINDING_ENV)?;
     validate_connector_binding_value(&connector_binding)?;
 
+    run_mcp_proxy_with_io(
+        command_parts,
+        authority,
+        connector_id,
+        connector_binding,
+        std::io::stdin(),
+        std::io::stdout(),
+        trusted_resource_operation_identity_from_environment,
+    )
+}
+
+fn run_mcp_proxy_with_io<R, W, F>(
+    command_parts: Vec<String>,
+    authority: ProxyAssignmentAuthority,
+    connector_id: String,
+    connector_binding: String,
+    client_input: R,
+    client_output: W,
+    identity_resolver: F,
+) -> Result<(), String>
+where
+    R: std::io::Read + Send + 'static,
+    W: Write + Send + 'static,
+    F: Fn(&[String], &str, &Value) -> Result<Option<ResourceOperationIdentity>, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let (executable, args) = command_parts
+        .split_first()
+        .ok_or_else(|| "MCP proxy connector command is empty.".to_string())?;
+    if executable.trim().is_empty() {
+        return Err("MCP proxy connector executable is empty.".to_string());
+    }
+
     let mut command = Command::new(executable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command
         .args(args)
         .env_remove(MCP_PROXY_COMMAND_ENV)
@@ -94,147 +191,227 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
         .stdout
         .take()
         .ok_or_else(|| "Failed to open proxied MCP stdout.".to_string())?;
+    let child = ProxyChildGuard::new(child);
     let exposed_tools = Arc::new(Mutex::new(Vec::<String>::new()));
     let pending_tool_lists = Arc::new(Mutex::new(HashSet::<String>::new()));
     let pending_resource_mutations =
         Arc::new(Mutex::new(HashMap::<String, PendingResourceMutation>::new()));
-    let client_stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let client_stdout = Arc::new(Mutex::new(client_output));
     let request_tools = Arc::clone(&exposed_tools);
     let request_lists = Arc::clone(&pending_tool_lists);
     let request_stdout = Arc::clone(&client_stdout);
     let request_mutations = Arc::clone(&pending_resource_mutations);
+    let proxy_stopping = Arc::new(AtomicBool::new(false));
+    let request_stopping = Arc::clone(&proxy_stopping);
+    let request_activity = Arc::new(Mutex::new(()));
+    let request_activity_thread = Arc::clone(&request_activity);
+    let request_child = child.child();
     let request_command = command_parts.clone();
 
-    std::thread::spawn(move || -> Result<(), String> {
-        let mut client_reader = BufReader::new(std::io::stdin());
-        let mut upstream_writer = upstream_stdin;
-        while let Some(message) = read_stdout_message(&mut client_reader)? {
-            let method = message.get("method").and_then(Value::as_str);
-            if method == Some("tools/list") {
-                if let Some(id) = message.get("id") {
-                    request_lists
-                        .lock()
-                        .map_err(|error| error.to_string())?
-                        .insert(id.to_string());
+    let (request_result_sender, request_result_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut result = (|| -> Result<(), String> {
+            let mut client_reader = BufReader::new(client_input);
+            let mut upstream_writer = upstream_stdin;
+            while let Some(message) = read_stdout_message(&mut client_reader)? {
+                let activity = request_activity_thread
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                if request_stopping.load(Ordering::SeqCst) {
+                    return Ok(());
                 }
-            }
-            if method == Some("tools/call") {
-                if let Err(error) = validate_proxy_request(
-                    &message,
-                    &request_tools,
-                    &authority,
-                    &connector_id,
-                    &connector_binding,
-                ) {
-                    write_proxy_error(&request_stdout, message.get("id"), &error)?;
-                    continue;
+                let method = message.get("method").and_then(Value::as_str);
+                if method == Some("tools/list") {
+                    if let Some(id) = message.get("id") {
+                        request_lists
+                            .lock()
+                            .map_err(|error| error.to_string())?
+                            .insert(id.to_string());
+                    }
                 }
-                let ProxyAssignmentAuthority::Fenced(fenced_authority) = &authority else {
-                    write_proxy_message(&mut upstream_writer, &message)?;
-                    continue;
-                };
-                let params = message
-                    .get("params")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| "MCP tool call did not include object params.".to_string())?;
-                let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let arguments = params.get("arguments").unwrap_or(&Value::Null);
-                let trusted_identity = match trusted_resource_operation_identity_from_environment(
-                    &request_command,
-                    tool_name,
-                    arguments,
-                ) {
-                    Ok(identity) => identity,
-                    Err(error) => {
+                if method == Some("tools/call") {
+                    if let Err(error) = validate_proxy_request(
+                        &message,
+                        &request_tools,
+                        &authority,
+                        &connector_id,
+                        &connector_binding,
+                    ) {
+                        drop(activity);
                         write_proxy_error(&request_stdout, message.get("id"), &error)?;
                         continue;
                     }
-                };
-                if let Some(identity) = trusted_identity {
-                    let request_id = match validated_resource_mutation_request_id(&message) {
-                        Ok(id) => id,
-                        Err(error) => {
-                            write_proxy_error(&request_stdout, message.get("id"), &error)?;
-                            continue;
-                        }
+                    let ProxyAssignmentAuthority::Fenced(fenced_authority) = &authority else {
+                        drop(activity);
+                        write_proxy_message(&mut upstream_writer, &message)?;
+                        continue;
                     };
-                    let reservation = match SchedulerStore::reserve_external_resource_mutation(
-                        fenced_authority,
-                        tool_name,
-                        &identity,
-                    ) {
-                        Ok(reservation) => reservation,
-                        Err(error) => {
-                            write_proxy_error(&request_stdout, Some(&request_id), &error)?;
-                            continue;
-                        }
-                    };
-                    match reservation {
-                        ResourceMutationReservation::Blocked(record) => {
-                            write_resource_mutation_result(
-                                &request_stdout,
-                                &request_id,
-                                "resource_mutation_blocked",
-                                &record,
-                                "A retained resource mutation fence requires operator review or explicit supersede. Do not retry.",
-                            )?;
-                            continue;
-                        }
-                        ResourceMutationReservation::Reserved(record) => {
-                            let key = request_id.to_string();
-                            let mut pending = request_mutations
-                                .lock()
-                                .map_err(|error| error.to_string())?;
-                            if pending.contains_key(&key) {
-                                let _ = SchedulerStore::resolve_external_resource_mutation(
-                                    fenced_authority,
-                                    record.mutation_id,
-                                    uncertain_resolution("protocol", "duplicate_request_id"),
-                                );
-                                write_proxy_error(
+                    let params = message
+                        .get("params")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            "MCP tool call did not include object params.".to_string()
+                        })?;
+                    let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+                    let trusted_identity =
+                        match identity_resolver(&request_command, tool_name, arguments) {
+                            Ok(identity) => identity,
+                            Err(error) => {
+                                drop(activity);
+                                write_proxy_error(&request_stdout, message.get("id"), &error)?;
+                                continue;
+                            }
+                        };
+                    if let Some(identity) = trusted_identity {
+                        let request_id = match validated_resource_mutation_request_id(&message) {
+                            Ok(id) => id,
+                            Err(error) => {
+                                drop(activity);
+                                write_proxy_error(&request_stdout, message.get("id"), &error)?;
+                                continue;
+                            }
+                        };
+                        let reservation = match SchedulerStore::reserve_external_resource_mutation(
+                            fenced_authority,
+                            tool_name,
+                            &identity,
+                        ) {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                drop(activity);
+                                write_proxy_error(&request_stdout, Some(&request_id), &error)?;
+                                continue;
+                            }
+                        };
+                        match reservation {
+                            ResourceMutationReservation::Blocked(record) => {
+                                drop(activity);
+                                write_resource_mutation_result(
                                     &request_stdout,
-                                    Some(&request_id),
-                                    "Duplicate in-flight MCP request ID was rejected.",
+                                    &request_id,
+                                    "resource_mutation_blocked",
+                                    &record,
+                                    "A retained resource mutation fence requires operator review or explicit supersede. Do not retry.",
                                 )?;
                                 continue;
                             }
-                            pending.insert(
-                                key,
-                                PendingResourceMutation {
-                                    authority: fenced_authority.clone(),
-                                    record,
-                                    request_id,
-                                },
-                            );
+                            ResourceMutationReservation::Reserved(record) => {
+                                let key = request_id.to_string();
+                                let mut pending = request_mutations
+                                    .lock()
+                                    .map_err(|error| error.to_string())?;
+                                if request_stopping.load(Ordering::SeqCst) {
+                                    drop(pending);
+                                    SchedulerStore::resolve_external_resource_mutation(
+                                        fenced_authority,
+                                        record.mutation_id,
+                                        uncertain_resolution(
+                                            "lifecycle",
+                                            "proxy_terminated_before_dispatch",
+                                        ),
+                                    )
+                                    .map_err(|error| {
+                                        format!(
+                                            "Failed to durably fence a mutation reserved during proxy shutdown: {error}"
+                                        )
+                                    })?;
+                                    continue;
+                                }
+                                if pending.contains_key(&key) {
+                                    SchedulerStore::resolve_external_resource_mutation(
+                                        fenced_authority,
+                                        record.mutation_id,
+                                        uncertain_resolution("protocol", "duplicate_request_id"),
+                                    )
+                                    .map_err(|error| {
+                                        format!(
+                                            "Failed to durably fence a duplicate resource mutation request ID: {error}"
+                                        )
+                                    })?;
+                                    drop(pending);
+                                    drop(activity);
+                                    write_proxy_error(
+                                        &request_stdout,
+                                        Some(&request_id),
+                                        "Duplicate in-flight MCP request ID was rejected.",
+                                    )?;
+                                    continue;
+                                }
+                                pending.insert(
+                                    key,
+                                    PendingResourceMutation {
+                                        authority: fenced_authority.clone(),
+                                        record,
+                                        request_id,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
-            }
-            if let Err(error) = write_proxy_message(&mut upstream_writer, &message) {
-                if let Some(id) = message.get("id") {
-                    if let Some(pending) = request_mutations
-                        .lock()
-                        .map_err(|lock_error| lock_error.to_string())?
-                        .remove(&id.to_string())
-                    {
-                        let _ = SchedulerStore::resolve_external_resource_mutation(
-                            &pending.authority,
-                            pending.record.mutation_id,
-                            uncertain_resolution("transport", "upstream_write_failed"),
-                        );
-                        write_resource_mutation_result(
-                            &request_stdout,
-                            &pending.request_id,
-                            "resource_mutation_uncertain",
-                            &pending.record,
-                            "The connector request could not be confirmed. Operator review is required. Do not retry.",
-                        )?;
+                drop(activity);
+                if let Err(error) = write_proxy_message(&mut upstream_writer, &message) {
+                    if let Some(id) = message.get("id") {
+                        if let Some(pending) = request_mutations
+                            .lock()
+                            .map_err(|lock_error| lock_error.to_string())?
+                            .remove(&id.to_string())
+                        {
+                            let record = SchedulerStore::resolve_external_resource_mutation(
+                                &pending.authority,
+                                pending.record.mutation_id,
+                                uncertain_resolution("transport", "upstream_write_failed"),
+                            )
+                            .map_err(|resolution_error| {
+                                format!(
+                                    "Failed to durably mark the unwritten resource mutation uncertain: {resolution_error}. Upstream write failure: {error}"
+                                )
+                            })?;
+                            write_resource_mutation_result(
+                                &request_stdout,
+                                &pending.request_id,
+                                "resource_mutation_uncertain",
+                                &record,
+                                "The connector request could not be confirmed. Operator review is required. Do not retry.",
+                            )?;
+                        }
                     }
+                    return Err(error);
                 }
-                return Err(error);
             }
+            Ok(())
+        })();
+        let unresolved = if result.is_err() {
+            request_stopping.store(true, Ordering::SeqCst);
+            match resolve_unanswered_resource_mutations(&request_mutations, "client_request_error")
+            {
+                Ok(resolution) => {
+                    if let Some(error) = resolution.error {
+                        result = Err(error);
+                    }
+                    resolution.resolved
+                }
+                Err(error) => {
+                    result = Err(error);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let failed = result.is_err();
+        let _ = request_result_sender.send(result);
+        if failed {
+            if let Ok(mut child) = request_child.lock() {
+                terminate_proxy_process(&mut child);
+            }
+            let _ = write_uncertain_resource_mutation_results(
+                Arc::clone(&request_stdout),
+                unresolved,
+                "The proxy request stream terminated before the connector response was confirmed. Operator review is required. Do not retry.",
+            );
         }
-        Ok(())
     });
 
     let mut upstream_reader = BufReader::new(upstream_stdout);
@@ -243,12 +420,25 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {
-                resolve_unanswered_resource_mutations(
+                proxy_stopping.store(true, Ordering::SeqCst);
+                let _activity = request_activity.lock().map_err(|error| error.to_string())?;
+                let resolution = resolve_unanswered_resource_mutations(
                     &pending_resource_mutations,
-                    &client_stdout,
                     "upstream_protocol_error",
+                )?;
+                if let Ok(mut child) = child.child.lock() {
+                    terminate_proxy_process(&mut child);
+                }
+                write_uncertain_resource_mutation_results(
+                    Arc::clone(&client_stdout),
+                    resolution.resolved,
                     "The connector response was malformed or unreadable. Operator review is required. Do not retry.",
                 )?;
+                if let Some(resolution_error) = resolution.error {
+                    return Err(format!(
+                        "{resolution_error} Upstream protocol failure: {error}"
+                    ));
+                }
                 return Err(error);
             }
         };
@@ -275,37 +465,77 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
                 .remove(&id.to_string())
             {
                 let resolution = classify_resource_mutation_response(&message, &pending.record);
-                if SchedulerStore::resolve_external_resource_mutation(
+                if let Err(resolution_error) = SchedulerStore::resolve_external_resource_mutation(
                     &pending.authority,
                     pending.record.mutation_id,
                     resolution,
-                )
-                .is_err()
-                {
-                    write_resource_mutation_result(
-                        &client_stdout,
-                        &pending.request_id,
-                        "resource_mutation_uncertain",
-                        &pending.record,
-                        "The connector response could not be committed to the mutation ledger. Operator review is required. Do not retry.",
+                ) {
+                    proxy_stopping.store(true, Ordering::SeqCst);
+                    let _activity = request_activity.lock().map_err(|error| error.to_string())?;
+                    let unresolved = resolve_unanswered_resource_mutations(
+                        &pending_resource_mutations,
+                        "ledger_resolution_failed",
                     )?;
-                    continue;
+                    if let Ok(mut child) = child.child.lock() {
+                        terminate_proxy_process(&mut child);
+                    }
+                    write_uncertain_resource_mutation_results(
+                        Arc::clone(&client_stdout),
+                        unresolved.resolved,
+                        "A connector response could not be committed to the mutation ledger. Operator review is required. Do not retry.",
+                    )?;
+                    if let Some(error) = unresolved.error {
+                        return Err(format!(
+                            "The connector response and additional pending mutations could not be committed to the mutation ledger: {resolution_error}. Additional failure: {error}"
+                        ));
+                    }
+                    return Err(format!(
+                        "The connector response could not be committed to the mutation ledger: {resolution_error}"
+                    ));
                 }
             }
         }
         let mut stdout = client_stdout.lock().map_err(|error| error.to_string())?;
-        write_proxy_message(&mut *stdout, &message)?;
+        if let Err(error) = write_proxy_message(&mut *stdout, &message) {
+            drop(stdout);
+            proxy_stopping.store(true, Ordering::SeqCst);
+            let _activity = request_activity.lock().map_err(|error| error.to_string())?;
+            let resolution = resolve_unanswered_resource_mutations(
+                &pending_resource_mutations,
+                "client_output_error",
+            )?;
+            if let Ok(mut child) = child.child.lock() {
+                terminate_proxy_process(&mut child);
+            }
+            write_uncertain_resource_mutation_results(
+                Arc::clone(&client_stdout),
+                resolution.resolved,
+                "The connector response could not be returned to the client. Operator review is required. Do not retry.",
+            )?;
+            if let Some(resolution_error) = resolution.error {
+                return Err(resolution_error);
+            }
+            return Err(error);
+        }
     }
-    resolve_unanswered_resource_mutations(
-        &pending_resource_mutations,
-        &client_stdout,
-        "upstream_eof",
+    proxy_stopping.store(true, Ordering::SeqCst);
+    let _activity = request_activity.lock().map_err(|error| error.to_string())?;
+    let resolution =
+        resolve_unanswered_resource_mutations(&pending_resource_mutations, "upstream_eof")?;
+    drop(_activity);
+    let status = child.terminate_and_wait()?;
+    write_uncertain_resource_mutation_results(
+        Arc::clone(&client_stdout),
+        resolution.resolved,
         "The connector exited without a confirmed mutation response. Operator review is required. Do not retry.",
     )?;
-    let status = child
-        .wait()
-        .map_err(|error| format!("Failed to wait for proxied MCP connector: {error}"))?;
-    if status.success() {
+    if let Some(error) = resolution.error {
+        return Err(error);
+    }
+    let request_result = request_result_receiver.try_recv().ok();
+    if let Some(Err(error)) = request_result {
+        Err(format!("MCP proxy request reader failed: {error}"))
+    } else if status.success() {
         Ok(())
     } else {
         Err(format!("Proxied MCP connector exited with {status}."))
@@ -450,8 +680,8 @@ fn validate_connector_binding_value(value: &str) -> Result<(), String> {
     }
 }
 
-fn write_proxy_error(
-    stdout: &Mutex<std::io::Stdout>,
+fn write_proxy_error<W: Write>(
+    stdout: &Mutex<W>,
     id: Option<&Value>,
     message: &str,
 ) -> Result<(), String> {
@@ -481,31 +711,68 @@ fn uncertain_resolution(kind: &str, code: &str) -> ResourceMutationResolution {
 
 fn resolve_unanswered_resource_mutations(
     pending: &Mutex<HashMap<String, PendingResourceMutation>>,
-    stdout: &Mutex<std::io::Stdout>,
     code: &str,
-    message: &str,
-) -> Result<(), String> {
+) -> Result<UnansweredMutationResolution, String> {
     let unresolved = pending
         .lock()
         .map_err(|error| error.to_string())?
         .drain()
         .map(|(_, pending)| pending)
         .collect::<Vec<_>>();
+    let mut resolved = Vec::with_capacity(unresolved.len());
+    let mut first_error = None;
+    let mut failed = 0usize;
     for pending in unresolved {
-        let _ = SchedulerStore::resolve_external_resource_mutation(
+        match SchedulerStore::resolve_external_resource_mutation(
             &pending.authority,
             pending.record.mutation_id,
             uncertain_resolution("transport", code),
-        );
-        write_resource_mutation_result(
-            stdout,
-            &pending.request_id,
-            "resource_mutation_uncertain",
-            &pending.record,
-            message,
-        )?;
+        ) {
+            Ok(record) => resolved.push((pending.request_id, record)),
+            Err(error) => {
+                failed = failed.saturating_add(1);
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    Ok(UnansweredMutationResolution {
+        resolved,
+        error: first_error.map(|error| {
+            format!(
+                "Failed to durably mark {failed} unanswered resource mutation(s) uncertain. First failure: {error}"
+            )
+        }),
+    })
+}
+
+fn write_uncertain_resource_mutation_results<W: Write + Send + 'static>(
+    stdout: Arc<Mutex<W>>,
+    unresolved: Vec<(Value, ResourceMutationRecord)>,
+    message: &'static str,
+) -> Result<(), String> {
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = unresolved.into_iter().try_for_each(|(request_id, record)| {
+            write_resource_mutation_result(
+                &stdout,
+                &request_id,
+                "resource_mutation_uncertain",
+                &record,
+                message,
+            )
+        });
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(Duration::from_millis(100)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("MCP proxy shutdown notification thread terminated unexpectedly.".to_string())
+        }
+    }
 }
 
 fn classify_resource_mutation_response(
@@ -533,7 +800,7 @@ fn classify_resource_mutation_response(
             .cloned()
             .and_then(|value| serde_json::from_value::<ResourceMutationEvidence>(value).ok())
         {
-            return classify_resource_mutation_evidence(evidence, expected, false);
+            return classify_resource_mutation_evidence(evidence, expected, false, false);
         }
     }
     if let Some(evidence) = message
@@ -541,7 +808,22 @@ fn classify_resource_mutation_response(
         .cloned()
         .and_then(|value| serde_json::from_value::<ResourceMutationEvidence>(value).ok())
     {
-        return classify_resource_mutation_evidence(evidence, expected, true);
+        let definitive_error = message
+            .pointer("/error/data/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "auth"
+                        | "config"
+                        | "conflict"
+                        | "discovery"
+                        | "forbidden"
+                        | "invalid_manifest"
+                        | "not_found"
+                )
+            });
+        return classify_resource_mutation_evidence(evidence, expected, true, definitive_error);
     }
     uncertain_resolution("protocol", "missing_resource_mutation_evidence")
 }
@@ -550,6 +832,7 @@ fn classify_resource_mutation_evidence(
     evidence: ResourceMutationEvidence,
     expected: &ResourceMutationRecord,
     response_is_error: bool,
+    definitive_error: bool,
 ) -> ResourceMutationResolution {
     if evidence.validate().is_err() || evidence.identity != expected.identity {
         return uncertain_resolution("protocol", "resource_mutation_identity_mismatch");
@@ -562,7 +845,8 @@ fn classify_resource_mutation_evidence(
     {
         return ResourceMutationResolution::Succeeded(evidence);
     }
-    if evidence.execution.status == ResourceExecutionStatus::Conflict
+    if definitive_error
+        || evidence.execution.status == ResourceExecutionStatus::Conflict
         || matches!(
             evidence.lookup.status,
             ResourceLookupStatus::Incompatible | ResourceLookupStatus::Unavailable
@@ -589,8 +873,8 @@ fn mcp_text_json_payload(message: &Value) -> Option<Value> {
     serde_json::from_str(content[0].get("text")?.as_str()?).ok()
 }
 
-fn write_resource_mutation_result(
-    stdout: &Mutex<std::io::Stdout>,
+fn write_resource_mutation_result<W: Write>(
+    stdout: &Mutex<W>,
     id: &Value,
     status: &str,
     record: &ResourceMutationRecord,
@@ -1988,6 +2272,27 @@ mod tests {
     };
     use crate::infrastructure::scheduler_store::ResourceMutationState;
 
+    #[cfg(unix)]
+    use std::net::Shutdown;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct SharedProxyOutput(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl Write for SharedProxyOutput {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn proxy_test_identity() -> ResourceOperationIdentity {
         ResourceOperationIdentity::new(
             "openshift_kubernetes",
@@ -2002,6 +2307,24 @@ mod tests {
             &json!({ "replicas": 3 }),
         )
         .expect("test identity")
+    }
+
+    fn proxy_test_restart_identity() -> ResourceOperationIdentity {
+        ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "restart_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("default".to_string()),
+                name: "api".to_string(),
+            },
+            "https://cluster.example:6443",
+            &json!({
+                "restart_token": "11111111-1111-4111-8111-111111111111"
+            }),
+        )
+        .expect("restart identity")
     }
 
     fn proxy_test_evidence(
@@ -2051,7 +2374,218 @@ mod tests {
             resolved_at: None,
             superseded_at: None,
             supersede_reason: None,
+            checkpoint_objective_id: None,
+            checkpoint_tool_call_id: None,
+            checkpoint_recorded_at: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_proxy_output(output: &SharedProxyOutput, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if String::from_utf8_lossy(&output.0.lock().unwrap()).contains(expected) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("proxy output did not contain '{expected}' before timeout");
+    }
+
+    #[cfg(unix)]
+    fn run_resource_proxy_failure_case(
+        behavior: &str,
+    ) -> (Result<(), String>, ResourceMutationRecord, String) {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ocp_scale_deployment","inputSchema":{"type":"object"}}]}}\n'
+      if [ "$1" = "blocked_write" ]; then
+        sleep 1
+        exec 1>&-
+        while :; do :; done
+      fi
+      ;;
+    *'"method":"tools/call"'*)
+      case "$1" in
+        malformed) printf 'not-json\n'; while :; do :; done ;;
+        eof) exit 0 ;;
+        eof_alive) exec 1>&-; while :; do :; done ;;
+        client_error) while :; do :; done ;;
+      esac
+      ;;
+  esac
+done
+"#;
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "proxy-fixture".to_string(),
+            behavior.to_string(),
+        ];
+        let connector_binding =
+            mcp_connector_binding_digest("ocp", &command, &HashMap::new()).expect("binding");
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = SchedulerStore::open_at(directory.path().join("scheduler.db"))
+            .expect("scheduler store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &crate::domain::task_session::TaskRequest::new("proxy-failure-harness"),
+                &["external_tools:ocp".to_string()],
+                "test-approval",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 5)
+            .expect("task claimed")
+            .expect("assignment");
+        let authority = store
+            .external_authority(
+                assignment.fence,
+                "external_tools:ocp",
+                "ocp",
+                &connector_binding,
+            )
+            .expect("authority created");
+        let identity = proxy_test_identity();
+        let resolved_identity = identity.clone();
+        let (mut client, proxy_input) = UnixStream::pair().expect("proxy input pair");
+        let output = SharedProxyOutput::default();
+        let captured_output = output.clone();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = run_mcp_proxy_with_io(
+                command,
+                ProxyAssignmentAuthority::Fenced(authority),
+                "ocp".to_string(),
+                connector_binding,
+                proxy_input,
+                output,
+                move |_, tool_name, _| {
+                    Ok((tool_name == "ocp_scale_deployment").then(|| resolved_identity.clone()))
+                },
+            );
+            let _ = result_sender.send(result);
+        });
+
+        write_proxy_message(
+            &mut client,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .expect("tool list requested");
+        wait_for_proxy_output(&captured_output, "ocp_scale_deployment");
+        let padding = (behavior == "blocked_write").then(|| "x".repeat(200 * 1024));
+        write_proxy_message(
+            &mut client,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "ocp_scale_deployment",
+                    "arguments": {
+                        "name": "api",
+                        "namespace": "default",
+                        "replicas": 3,
+                        "padding": padding
+                    }
+                }
+            }),
+        )
+        .expect("scale requested");
+        if behavior == "client_error" {
+            client
+                .write_all(b"not-json\n")
+                .expect("malformed request sent");
+            client.flush().expect("malformed request flushed");
+        }
+        client
+            .shutdown(Shutdown::Write)
+            .expect("proxy input closed");
+
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("proxy failure harness timed out");
+        let record = store
+            .resource_mutations_for_session(session.id)
+            .expect("resource mutations read")
+            .into_iter()
+            .next()
+            .expect("resource mutation recorded");
+        let output =
+            String::from_utf8(captured_output.0.lock().expect("proxy output lock").clone())
+                .expect("proxy output is UTF-8");
+        (result, record, output)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_proxy_malformed_upstream_response_becomes_uncertain() {
+        let (result, record, output) = run_resource_proxy_failure_case("malformed");
+
+        assert!(result
+            .expect_err("malformed response fails proxy")
+            .contains("Invalid JSON on MCP stdout"));
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert_eq!(
+            record.failure_code.as_deref(),
+            Some("upstream_protocol_error")
+        );
+        assert!(output.contains("resource_mutation_uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_proxy_upstream_eof_becomes_uncertain() {
+        let (result, record, output) = run_resource_proxy_failure_case("eof");
+
+        result.expect("clean connector exit is handled");
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert_eq!(record.failure_code.as_deref(), Some("upstream_eof"));
+        assert!(output.contains("resource_mutation_uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_proxy_reaps_connector_that_remains_alive_after_stdout_eof() {
+        let (result, record, output) = run_resource_proxy_failure_case("eof_alive");
+
+        assert!(result
+            .expect_err("live connector after EOF is terminated")
+            .contains("Proxied MCP connector exited"));
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert_eq!(record.failure_code.as_deref(), Some("upstream_eof"));
+        assert!(output.contains("resource_mutation_uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_proxy_shutdown_interrupts_blocked_connector_stdin_write() {
+        let (result, record, output) = run_resource_proxy_failure_case("blocked_write");
+
+        assert!(result.is_err());
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert!(matches!(
+            record.failure_code.as_deref(),
+            Some("upstream_eof" | "upstream_write_failed")
+        ));
+        assert!(output.contains("resource_mutation_uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_proxy_request_reader_termination_becomes_uncertain() {
+        let (result, record, output) = run_resource_proxy_failure_case("client_error");
+
+        assert!(result
+            .expect_err("malformed client request fails proxy")
+            .contains("MCP proxy request reader failed"));
+        assert_eq!(record.state, ResourceMutationState::Uncertain);
+        assert_eq!(record.failure_code.as_deref(), Some("client_request_error"));
+        assert!(output.contains("resource_mutation_uncertain"));
     }
 
     #[cfg(unix)]
@@ -2475,6 +3009,30 @@ done
     }
 
     #[test]
+    fn proxy_classifies_valid_restart_mutation_success_before_forwarding() {
+        let identity = proxy_test_restart_identity();
+        let evidence = proxy_test_evidence(
+            &identity,
+            ResourceLookupStatus::DriftDetected,
+            ResourceExecutionStatus::Executed,
+        );
+        let response = json!({
+            "id": 1,
+            "result": { "content": [{
+                "type": "text",
+                "text": json!({ "resource_mutation": evidence }).to_string()
+            }]}
+        });
+        let mut record = proxy_test_record(&identity);
+        record.tool_name = "ocp_restart_deployment".to_string();
+
+        assert!(matches!(
+            classify_resource_mutation_response(&response, &record),
+            ResourceMutationResolution::Succeeded(_)
+        ));
+    }
+
+    #[test]
     fn proxy_releases_approval_and_conflict_but_retains_ambiguous_outcomes() {
         let identity = proxy_test_identity();
         let record = proxy_test_record(&identity);
@@ -2505,6 +3063,42 @@ done
         assert!(matches!(
             classify_resource_mutation_response(&conflict, &record),
             ResourceMutationResolution::Failed { .. }
+        ));
+        let blocked_evidence = proxy_test_evidence(
+            &record.identity,
+            ResourceLookupStatus::DriftDetected,
+            ResourceExecutionStatus::Blocked,
+        );
+        let forbidden = json!({
+            "id": 1,
+            "error": {
+                "data": {
+                    "kind": "forbidden",
+                    "resource_mutation": blocked_evidence
+                }
+            }
+        });
+        assert!(matches!(
+            classify_resource_mutation_response(&forbidden, &record),
+            ResourceMutationResolution::Failed { .. }
+        ));
+        let ambiguous_evidence = proxy_test_evidence(
+            &record.identity,
+            ResourceLookupStatus::DriftDetected,
+            ResourceExecutionStatus::Blocked,
+        );
+        let transport = json!({
+            "id": 1,
+            "error": {
+                "data": {
+                    "kind": "connect",
+                    "resource_mutation": ambiguous_evidence
+                }
+            }
+        });
+        assert!(matches!(
+            classify_resource_mutation_response(&transport, &record),
+            ResourceMutationResolution::Uncertain { .. }
         ));
         assert!(matches!(
             classify_resource_mutation_response(&json!({ "id": 1, "result": {} }), &record),

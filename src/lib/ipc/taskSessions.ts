@@ -280,6 +280,9 @@ export type ResourceMutationRecord = {
   resolved_at: number | null;
   superseded_at: number | null;
   supersede_reason: string | null;
+  checkpoint_objective_id: string | null;
+  checkpoint_tool_call_id: string | null;
+  checkpoint_recorded_at: number | null;
 };
 
 export type TaskSessionEvent = {
@@ -514,6 +517,7 @@ export type TaskExecutionManifest = {
         tool_name: string;
         risk: string;
         arguments_digest: string;
+        resource_operation_key?: string;
       }>;
       source_attempt_id: number;
       recorded_at: number;

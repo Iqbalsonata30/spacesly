@@ -10,6 +10,7 @@ use super::shell_env::inject_shell_env;
 use super::task_tools::TASK_TOOLS_AUTHORITY_ENV;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use crate::domain::governance::AgentSkillDefinition;
+use crate::domain::resource_idempotency::{ResourceExecutionStatus, ResourceMutationEvidence};
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
@@ -462,7 +463,9 @@ pub enum AiWorkerStreamEvent {
         error: Option<String>,
         risk: String,
         arguments_digest: String,
+        arguments_observed: bool,
         display_context: ToolDisplayContext,
+        resource_operation_key: Option<String>,
     },
     UsageUpdated {
         input_tokens: u64,
@@ -3268,9 +3271,10 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .and_then(Value::as_str)
         .unwrap_or("pending");
     let risk = ToolBroker::risk_for_tool(&tool_name).as_str().to_string();
-    let arguments = part
-        .get("state")
-        .and_then(|state| state.get("input"))
+    let raw_arguments = part.get("state").and_then(|state| state.get("input"));
+    let arguments_observed = raw_arguments.is_some();
+    let arguments_valid = raw_arguments.is_none_or(Value::is_object);
+    let arguments = raw_arguments
         .filter(|input| input.is_object())
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
@@ -3286,9 +3290,10 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let blocked_tool_result = part
+    let tool_output = part
         .get("state")
-        .and_then(|state| state.get("output").or_else(|| state.get("result")))
+        .and_then(|state| state.get("output").or_else(|| state.get("result")));
+    let blocked_tool_result = tool_output
         .map(|output| match output {
             Value::String(value) => value.clone(),
             value => value.to_string(),
@@ -3311,6 +3316,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             };
             Some(format!("{marker}: {output}"))
         });
+    let resource_operation_key = successful_resource_operation_key(&tool_name, tool_output);
     match status {
         "completed" if blocked_tool_result.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3319,8 +3325,42 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             error: blocked_tool_result,
             risk,
             arguments_digest,
+            arguments_observed,
             display_context,
+            resource_operation_key: None,
         }),
+        "completed" if !arguments_valid => Some(AiWorkerStreamEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            success: false,
+            error: Some(
+                "protocol[malformed_tool_arguments]: completed tool input was not an object."
+                    .to_string(),
+            ),
+            risk,
+            arguments_digest,
+            arguments_observed,
+            display_context,
+            resource_operation_key: None,
+        }),
+        "completed"
+            if trusted_resource_mutation_tool(&tool_name) && resource_operation_key.is_none() =>
+        {
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id,
+                tool_name,
+                success: false,
+                error: Some(
+                    "protocol[missing_resource_operation_key]: trusted resource mutation result did not contain valid successful evidence."
+                        .to_string(),
+                ),
+                risk,
+                arguments_digest,
+                arguments_observed,
+                display_context,
+                resource_operation_key: None,
+            })
+        }
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
             tool_name,
@@ -3328,7 +3368,9 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             error: None,
             risk,
             arguments_digest,
+            arguments_observed,
             display_context,
+            resource_operation_key,
         }),
         "error" | "failed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3337,7 +3379,9 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             error,
             risk,
             arguments_digest,
+            arguments_observed,
             display_context,
+            resource_operation_key: None,
         }),
         _ => Some(AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
@@ -3347,6 +3391,31 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             display_context,
         }),
     }
+}
+
+fn successful_resource_operation_key(tool_name: &str, output: Option<&Value>) -> Option<String> {
+    if !trusted_resource_mutation_tool(tool_name) {
+        return None;
+    }
+    let payload = match output? {
+        Value::String(value) => serde_json::from_str::<Value>(value).ok()?,
+        value => value.clone(),
+    };
+    let evidence: ResourceMutationEvidence =
+        serde_json::from_value(payload.get("resource_mutation")?.clone()).ok()?;
+    if evidence.validate().is_err()
+        || !matches!(
+            evidence.execution.status,
+            ResourceExecutionStatus::Executed | ResourceExecutionStatus::Skipped
+        )
+    {
+        return None;
+    }
+    Some(evidence.identity.key)
+}
+
+fn trusted_resource_mutation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "ocp_restart_deployment" | "ocp_scale_deployment")
 }
 
 fn objective_checkpoint_from_text(text: &str) -> Option<AiWorkerStreamEvent> {
@@ -4445,7 +4514,9 @@ mod tests {
                 error: None,
                 risk: "mutation".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
+                arguments_observed: false,
                 display_context: tool_display_context("shell", &serde_json::json!({})),
+                resource_operation_key: None,
             })
         );
 
@@ -4492,7 +4563,9 @@ mod tests {
                 error: Some("Connection refused while reading stdout.".to_string()),
                 risk: "read".to_string(),
                 arguments_digest: argument_digest(&serde_json::json!({})).unwrap(),
+                arguments_observed: false,
                 display_context: tool_display_context("jira_search", &serde_json::json!({})),
+                resource_operation_key: None,
             })
         );
     }
@@ -4510,6 +4583,138 @@ mod tests {
                 evidence: vec!["Bamboo build 42 succeeded".to_string()],
             })
         );
+    }
+
+    #[test]
+    fn parses_only_valid_successful_resource_operation_keys() {
+        use crate::domain::resource_idempotency::{
+            ResourceExecutionResult, ResourceIdentity, ResourceLookupResult, ResourceLookupStatus,
+            ResourceOperationIdentity, ResourceRetryResumeStatus,
+        };
+
+        let identity = ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "scale_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("payments".to_string()),
+                name: "api".to_string(),
+            },
+            "https://cluster.example:6443",
+            &serde_json::json!({ "replicas": 3 }),
+        )
+        .expect("identity");
+        let evidence = ResourceMutationEvidence {
+            identity: identity.clone(),
+            lookup: ResourceLookupResult {
+                status: ResourceLookupStatus::DriftDetected,
+                observed_fingerprint: None,
+                observed_version: Some("10".to_string()),
+            },
+            execution: ResourceExecutionResult {
+                status: ResourceExecutionStatus::Executed,
+                resulting_fingerprint: Some(identity.mutation_fingerprint.clone()),
+                resulting_version: Some("11".to_string()),
+            },
+            retry_resume_status: ResourceRetryResumeStatus::FirstExecution,
+        };
+        let event = parse_opencode_stream_event(
+            &serde_json::json!({
+                "part": {
+                    "type": "tool",
+                    "callID": "scale-call",
+                    "tool": "ocp_scale_deployment",
+                    "state": {
+                        "status": "completed",
+                        "output": serde_json::json!({ "resource_mutation": evidence }).to_string()
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            event,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: true,
+                resource_operation_key: Some(ref key),
+                ..
+            }) if key == &identity.key
+        ));
+
+        let restart_identity = ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "restart_deployment",
+            identity.resource.clone(),
+            "https://cluster.example:6443",
+            &serde_json::json!({
+                "restart_token": "11111111-1111-4111-8111-111111111111"
+            }),
+        )
+        .expect("restart identity");
+        let restart_evidence = ResourceMutationEvidence {
+            identity: restart_identity.clone(),
+            lookup: ResourceLookupResult {
+                status: ResourceLookupStatus::DriftDetected,
+                observed_fingerprint: None,
+                observed_version: Some("11".to_string()),
+            },
+            execution: ResourceExecutionResult {
+                status: ResourceExecutionStatus::Executed,
+                resulting_fingerprint: Some(restart_identity.mutation_fingerprint.clone()),
+                resulting_version: Some("12".to_string()),
+            },
+            retry_resume_status: ResourceRetryResumeStatus::FirstExecution,
+        };
+        let restart = parse_opencode_stream_event(
+            &serde_json::json!({
+                "part": {
+                    "type": "tool",
+                    "callID": "restart-call",
+                    "tool": "ocp_restart_deployment",
+                    "state": {
+                        "status": "completed",
+                        "output": serde_json::json!({
+                            "resource_mutation": restart_evidence
+                        }).to_string()
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            restart,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: true,
+                resource_operation_key: Some(ref key),
+                ..
+            }) if key == &restart_identity.key
+        ));
+
+        let malformed = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"scale-call","tool":"ocp_scale_deployment","state":{"status":"completed","output":"{}"}}}"#,
+        );
+        assert!(matches!(
+            malformed,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: false,
+                error: Some(ref error),
+                resource_operation_key: None,
+                ..
+            }) if error.contains("missing_resource_operation_key")
+        ));
+
+        let malformed_arguments = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"bad-input","tool":"shell","state":{"status":"completed","input":"not-an-object"}}}"#,
+        );
+        assert!(matches!(
+            malformed_arguments,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: false,
+                error: Some(ref error),
+                ..
+            }) if error.contains("malformed_tool_arguments")
+        ));
     }
 
     #[test]

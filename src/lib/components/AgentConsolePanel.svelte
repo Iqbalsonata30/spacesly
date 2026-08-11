@@ -918,6 +918,18 @@
                                 "Pending"}
                             </dd>
                           </div>
+                          {#if record.checkpoint_objective_id}
+                            <div>
+                              <dt>Objective</dt>
+                              <dd>{record.checkpoint_objective_id}</dd>
+                            </div>
+                          {/if}
+                          {#if record.checkpoint_tool_call_id}
+                            <div>
+                              <dt>Receipt</dt>
+                              <dd>{record.checkpoint_tool_call_id}</dd>
+                            </div>
+                          {/if}
                         </dl>
                         {#if record.supersede_reason}<p class="mutation-reason">
                             Released because: {record.supersede_reason}

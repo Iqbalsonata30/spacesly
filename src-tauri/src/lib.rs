@@ -1282,7 +1282,9 @@ fn emit_worker_stream_event(
             error,
             risk,
             arguments_digest,
+            arguments_observed: _,
             display_context,
+            resource_operation_key: _,
         } => {
             let operation_id = operation_id(
                 run_id,
@@ -3067,11 +3069,13 @@ mod tests {
             error: Some("Connection refused while reading stdout.".to_string()),
             risk: "read".to_string(),
             arguments_digest: "digest".to_string(),
+            arguments_observed: false,
             display_context: ToolDisplayContext {
                 label: "Reading from external tool".to_string(),
                 category: "external".to_string(),
                 target: None,
             },
+            resource_operation_key: None,
         })
         .expect("failed tool must stop worker");
 

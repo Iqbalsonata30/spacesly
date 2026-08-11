@@ -212,7 +212,7 @@ Exit criteria:
 
 ### Phase 9 — Resource-Level Idempotency
 
-Status: in progress.
+Status: completed.
 
 Compile a canonical operation identity from the objective, connector, operation, target resource, environment, and normalized arguments. Persist idempotency keys separately from model-generated evidence.
 
@@ -221,16 +221,19 @@ Implemented foundation:
 - A versioned provider-neutral operation identity records the connector family, normalized operation, resource identity, environment fingerprint, mutation fingerprint, and canonical key.
 - Mutation evidence records the lookup/precondition result, execution result, and retry/resume disposition without retaining raw environment or desired-state values.
 - `ocp_scale_deployment` is the first supported vertical slice. It reads the Deployment before mutation, skips an already-satisfied desired replica count, and applies drift with the observed Kubernetes `resourceVersion`.
-- Successful, skipped, blocked, and conflicting scale outcomes retain secret-free evidence in the private OCP audit log.
+- `ocp_restart_deployment` reuses the same model with an explicit UUIDv4 semantic restart token. The connector stores only its fingerprint on the Deployment, so an identical retry is observable and does not issue a second restart patch.
+- Successful, skipped, blocked, and conflicting scale/restart outcomes retain secret-free evidence in the private OCP audit log.
 - The scheduler now owns a transactional mutation ledger with globally unique active operation keys, fenced reservation and resolution, conservative uncertainty on interrupted assignments, and exact-session/key/revision audited supersede semantics.
-- The fenced MCP proxy independently derives trusted scale identities, reserves before dispatch, correlates responses by JSON-RPC ID, and resolves the ledger before forwarding results to the runtime.
+- The fenced MCP proxy independently derives trusted scale and restart identities, reserves before dispatch, correlates responses by JSON-RPC ID, and resolves the ledger before forwarding results to the runtime.
 - Confirmed prior success starts a single fresh state reconciliation so Kubernetes is read again; reserved and uncertain outcomes remain hard replay fences.
 - Session-scoped IPC and the Agent technical console expose secret-free mutation history and exact session/key/revision supersede controls. Supersede records an operator reason but never retries, approves, or expands authority.
+- Valid successful scale or restart evidence contributes its trusted operation key to the tool receipt. Objective checkpoint persistence atomically binds the matching succeeded session/attempt ledger row to the immutable objective and tool call, while malformed, mismatched, or differently bound receipts fail closed. Bound successes remain hard fences and exact checkpoint replay does not re-resolve a potentially reused key.
+- The proxy subprocess harness exercises malformed connector output, clean and live-process stdout EOF, malformed client request termination, and connector-stdin backpressure. Shutdown durably resolves visible reservations before bounded client notification and terminates the connector process tree.
 
 Current limitations:
 
-- Other Kubernetes mutations, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
-- Objective/receipt binding remains to be implemented. Other connector operations still require their own trusted identity and response adapters, and the proxy needs a subprocess-level malformed/EOF harness.
+- Kubernetes mutations other than Deployment scale/restart, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
+- Other connector operations still require their own trusted identity and response adapters.
 
 Benefits:
 

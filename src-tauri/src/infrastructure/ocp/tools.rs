@@ -243,7 +243,11 @@ impl OcpTool {
             }),
             Self::RestartDeployment => json!({
                 "name": name_prop,
-                "namespace": namespace_prop
+                "namespace": namespace_prop,
+                "restart_token": {
+                    "type": "string",
+                    "description": "Globally unique lowercase UUIDv4 for this semantic restart objective. Reuse it on retries; use a new UUID for a later independent restart."
+                }
             }),
             Self::ScaleDeployment => json!({
                 "name": name_prop,
@@ -309,6 +313,7 @@ impl OcpTool {
             Self::KubernetesResourcesPatch => {
                 vec!["api_version", "name", "patch", "patch_type"]
             }
+            Self::RestartDeployment => vec!["name", "restart_token"],
             _ => Vec::new(),
         }
     }
@@ -493,36 +498,7 @@ pub fn execute_tool(client: &OcpClient, name: &str, arguments: &Value) -> OcpRes
             )?;
             Ok(json!({ "kind": "Log", "pod": pod, "logs": logs }))
         }
-        OcpTool::RestartDeployment => {
-            let namespace = namespace_argument(client, arguments)?;
-            let name = required_string(arguments, "name")?;
-            let restarted_at = chrono::Utc::now().to_rfc3339();
-            let item = client.patch_namespaced(
-                "apps",
-                "v1",
-                "deployments",
-                &name,
-                namespace.as_deref(),
-                &json!({
-                    "spec": {
-                        "template": {
-                            "metadata": {
-                                "annotations": {
-                                    "kubectl.kubernetes.io/restartedAt": restarted_at
-                                }
-                            }
-                        }
-                    }
-                }),
-            )?;
-            Ok(json!({
-                "kind": "DeploymentRestart",
-                "name": name,
-                "namespace": namespace,
-                "generation": item["metadata"]["generation"],
-                "restarted_at": restarted_at
-            }))
-        }
+        OcpTool::RestartDeployment => restart_deployment(client, arguments),
         OcpTool::ScaleDeployment => scale_deployment(client, arguments),
         OcpTool::DeleteManagedPod => {
             let namespace = namespace_argument(client, arguments)?;
@@ -553,15 +529,51 @@ pub(super) fn resource_operation_identity(
     name: &str,
     arguments: &Value,
 ) -> OcpResult<Option<ResourceOperationIdentity>> {
-    if OcpTool::parse(name) != Some(OcpTool::ScaleDeployment) {
-        return Ok(None);
+    match OcpTool::parse(name) {
+        Some(OcpTool::RestartDeployment) => restart_resource_operation_identity(
+            client.idempotency_environment(),
+            client.default_namespace(),
+            arguments,
+        )
+        .map(Some),
+        Some(OcpTool::ScaleDeployment) => scale_resource_operation_identity(
+            client.idempotency_environment(),
+            client.default_namespace(),
+            arguments,
+        )
+        .map(Some),
+        _ => Ok(None),
     }
-    scale_resource_operation_identity(
-        client.idempotency_environment(),
-        client.default_namespace(),
-        arguments,
+}
+
+pub(super) fn restart_resource_operation_identity(
+    environment: &str,
+    default_namespace: &str,
+    arguments: &Value,
+) -> OcpResult<ResourceOperationIdentity> {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_namespace)
+        .to_string();
+    validate_identifier(&namespace, "namespace")?;
+    let name = required_string(arguments, "name")?;
+    let restart_token = required_restart_token(arguments)?;
+    ResourceOperationIdentity::new(
+        "openshift_kubernetes",
+        "restart_deployment",
+        ResourceIdentity {
+            api_version: "apps/v1".to_string(),
+            kind: "Deployment".to_string(),
+            namespace: Some(namespace),
+            name,
+        },
+        environment,
+        &json!({ "restart_token": restart_token }),
     )
-    .map(Some)
+    .map_err(|error| OcpError::internal(format!("Could not identify Deployment restart: {error}")))
 }
 
 pub(super) fn scale_resource_operation_identity(
@@ -592,6 +604,223 @@ pub(super) fn scale_resource_operation_identity(
         &json!({ "replicas": replicas }),
     )
     .map_err(|error| OcpError::internal(format!("Could not identify Deployment scale: {error}")))
+}
+
+fn restart_deployment(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    const RESTART_ANNOTATION_POINTER: &str =
+        "/spec/template/metadata/annotations/spacesly.dev~1restart-token";
+    let identity =
+        resource_operation_identity(client, OcpTool::RestartDeployment.as_str(), arguments)?
+            .ok_or_else(|| OcpError::internal("Deployment restart identity was unavailable."))?;
+    let namespace = identity
+        .resource
+        .namespace
+        .clone()
+        .ok_or_else(|| OcpError::internal("Deployment restart namespace was unavailable."))?;
+    let name = identity.resource.name.clone();
+    let _restart_token = required_restart_token(arguments)?;
+    let desired_fingerprint = identity.mutation_fingerprint.clone();
+    let current = client
+        .get_namespaced("apps", "v1", "deployments", &name, Some(&namespace))
+        .map_err(|error| {
+            error.with_resource_mutation(ResourceMutationEvidence {
+                identity: identity.clone(),
+                lookup: ResourceLookupResult {
+                    status: ResourceLookupStatus::Unavailable,
+                    observed_fingerprint: None,
+                    observed_version: None,
+                },
+                execution: ResourceExecutionResult {
+                    status: ResourceExecutionStatus::Blocked,
+                    resulting_fingerprint: None,
+                    resulting_version: None,
+                },
+                retry_resume_status: ResourceRetryResumeStatus::AwaitingOperator,
+            })
+        })?;
+    let current_marker = current
+        .pointer(RESTART_ANNOTATION_POINTER)
+        .and_then(Value::as_str);
+    let observed_fingerprint = current_marker
+        .map(|marker| {
+            if marker.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                Ok(marker.to_string())
+            } else {
+                state_fingerprint(&json!({ "restart_marker": marker })).map_err(|error| {
+                    OcpError::internal(format!(
+                        "Could not fingerprint Deployment restart state: {error}"
+                    ))
+                })
+            }
+        })
+        .transpose()?;
+    let resource_version = current
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if current_marker == Some(desired_fingerprint.as_str()) {
+        let evidence = restart_evidence(
+            identity,
+            ResourceLookupStatus::AlreadySatisfied,
+            observed_fingerprint,
+            resource_version.clone(),
+            ResourceExecutionStatus::Skipped,
+            Some(desired_fingerprint),
+            resource_version,
+            ResourceRetryResumeStatus::AlreadyComplete,
+        )?;
+        return Ok(json!({
+            "kind": "DeploymentRestart",
+            "name": name,
+            "namespace": namespace,
+            "outcome": "already_satisfied",
+            "resource_mutation": evidence
+        }));
+    }
+    let Some(resource_version) = resource_version else {
+        let evidence = restart_evidence(
+            identity,
+            ResourceLookupStatus::Incompatible,
+            observed_fingerprint,
+            None,
+            ResourceExecutionStatus::Conflict,
+            None,
+            None,
+            ResourceRetryResumeStatus::Conflict,
+        )?;
+        return Err(OcpError::conflict(
+            "incompatible_existing_resource",
+            format!(
+                "Deployment '{namespace}/{name}' has no resourceVersion; restart was not attempted."
+            ),
+        )
+        .with_resource_mutation(evidence));
+    };
+    let patch = json!({
+        "metadata": { "resourceVersion": resource_version },
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "spacesly.dev/restart-token": desired_fingerprint.clone()
+                    }
+                }
+            }
+        }
+    });
+    let item =
+        match client.patch_namespaced("apps", "v1", "deployments", &name, Some(&namespace), &patch)
+        {
+            Ok(item) => item,
+            Err(error) => {
+                let conflict = error.kind == OcpErrorKind::Conflict;
+                let evidence = restart_evidence(
+                    identity.clone(),
+                    ResourceLookupStatus::DriftDetected,
+                    observed_fingerprint.clone(),
+                    Some(resource_version.clone()),
+                    if conflict {
+                        ResourceExecutionStatus::Conflict
+                    } else {
+                        ResourceExecutionStatus::Blocked
+                    },
+                    None,
+                    None,
+                    if conflict {
+                        ResourceRetryResumeStatus::Conflict
+                    } else {
+                        ResourceRetryResumeStatus::AwaitingOperator
+                    },
+                )?;
+                return Err(error.with_resource_mutation(evidence));
+            }
+        };
+    let resulting_marker = item
+        .pointer(RESTART_ANNOTATION_POINTER)
+        .and_then(Value::as_str);
+    if resulting_marker != Some(desired_fingerprint.as_str()) {
+        let evidence = restart_evidence(
+            identity,
+            ResourceLookupStatus::DriftDetected,
+            observed_fingerprint,
+            Some(resource_version),
+            ResourceExecutionStatus::Blocked,
+            resulting_marker
+                .map(|marker| state_fingerprint(&json!({ "restart_marker": marker })))
+                .transpose()
+                .map_err(|error| {
+                    OcpError::internal(format!(
+                        "Could not fingerprint Deployment restart result: {error}"
+                    ))
+                })?,
+            item.pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ResourceRetryResumeStatus::AwaitingOperator,
+        )?;
+        return Err(OcpError::api(
+            "restart_result_incompatible",
+            format!(
+                "Deployment '{namespace}/{name}' restart response did not confirm the requested token."
+            ),
+        )
+        .with_resource_mutation(evidence));
+    }
+    let evidence = restart_evidence(
+        identity,
+        ResourceLookupStatus::DriftDetected,
+        observed_fingerprint,
+        Some(resource_version),
+        ResourceExecutionStatus::Executed,
+        Some(desired_fingerprint),
+        item.pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ResourceRetryResumeStatus::ReconciledAfterDrift,
+    )?;
+    Ok(json!({
+        "kind": "DeploymentRestart",
+        "name": name,
+        "namespace": namespace,
+        "generation": item["metadata"]["generation"],
+        "outcome": "applied",
+        "resource_mutation": evidence
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart_evidence(
+    identity: ResourceOperationIdentity,
+    lookup_status: ResourceLookupStatus,
+    observed_fingerprint: Option<String>,
+    observed_version: Option<String>,
+    execution_status: ResourceExecutionStatus,
+    resulting_fingerprint: Option<String>,
+    resulting_version: Option<String>,
+    retry_resume_status: ResourceRetryResumeStatus,
+) -> OcpResult<ResourceMutationEvidence> {
+    let evidence = ResourceMutationEvidence {
+        identity,
+        lookup: ResourceLookupResult {
+            status: lookup_status,
+            observed_fingerprint,
+            observed_version,
+        },
+        execution: ResourceExecutionResult {
+            status: execution_status,
+            resulting_fingerprint,
+            resulting_version,
+        },
+        retry_resume_status,
+    };
+    evidence.validate().map_err(|error| {
+        OcpError::internal(format!("Deployment restart evidence was invalid: {error}"))
+    })?;
+    Ok(evidence)
 }
 
 fn scale_deployment(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
@@ -1532,6 +1761,35 @@ fn required_string(arguments: &Value, key: &str) -> OcpResult<String> {
     Ok(value)
 }
 
+fn required_restart_token(arguments: &Value) -> OcpResult<String> {
+    let token = arguments
+        .get("restart_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OcpError::config(
+                "restart_token_required",
+                "Deployment restart requires a new lowercase UUIDv4 restart_token. Renew any approval created before tokenized restart support.",
+            )
+        })?;
+    let bytes = token.as_bytes();
+    let valid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        })
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b');
+    if !valid {
+        return Err(OcpError::config(
+            "restart_token_invalid",
+            "Deployment restart_token must be a lowercase UUIDv4.",
+        ));
+    }
+    Ok(token.to_string())
+}
+
 fn optional_string(arguments: &Value, key: &str) -> Option<String> {
     arguments
         .get(key)
@@ -1613,6 +1871,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    const RESTART_TOKEN: &str = "11111111-1111-4111-8111-111111111111";
+    const NEXT_RESTART_TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 
     struct MockKubeServer {
         requests: Arc<Mutex<Vec<String>>>,
@@ -1756,6 +2017,15 @@ mod tests {
         value
     }
 
+    fn restarted_deployment(name: &str, namespace: &str, token: &str, version: &str) -> Value {
+        let mut value = deployment(name, namespace, Some(2), version);
+        let marker = state_fingerprint(&json!({ "restart_token": token })).expect("marker");
+        value["spec"]["template"]["metadata"]["annotations"] = json!({
+            "spacesly.dev/restart-token": marker
+        });
+        value
+    }
+
     #[test]
     fn every_registered_tool_parses_round_trip() {
         for tool in OcpTool::all() {
@@ -1791,6 +2061,133 @@ mod tests {
                 "ocp_delete_managed_pod"
             ]
         );
+    }
+
+    #[test]
+    fn restart_identity_is_stable_for_default_namespace_and_changes_with_token() {
+        let omitted = restart_resource_operation_identity(
+            "https://cluster.example:6443",
+            "default",
+            &json!({ "name": "api", "restart_token": RESTART_TOKEN }),
+        )
+        .expect("restart identity");
+        let explicit = restart_resource_operation_identity(
+            "https://cluster.example:6443",
+            "other",
+            &json!({
+                "name": "api",
+                "namespace": "default",
+                "restart_token": RESTART_TOKEN
+            }),
+        )
+        .expect("explicit identity");
+        let next = restart_resource_operation_identity(
+            "https://cluster.example:6443",
+            "default",
+            &json!({ "name": "api", "restart_token": NEXT_RESTART_TOKEN }),
+        )
+        .expect("next identity");
+
+        assert_eq!(omitted, explicit);
+        assert_ne!(omitted.key, next.key);
+        assert_eq!(omitted.operation, "restart_deployment");
+    }
+
+    #[test]
+    fn restart_identity_rejects_missing_or_non_uuid_tokens() {
+        let missing = restart_resource_operation_identity(
+            "https://cluster.example:6443",
+            "default",
+            &json!({ "name": "api" }),
+        )
+        .expect_err("missing token rejected");
+        let invalid = restart_resource_operation_identity(
+            "https://cluster.example:6443",
+            "default",
+            &json!({ "name": "api", "restart_token": "objective-1" }),
+        )
+        .expect_err("non-UUID token rejected");
+
+        assert_eq!(missing.code, "restart_token_required");
+        assert_eq!(invalid.code, "restart_token_invalid");
+    }
+
+    #[test]
+    fn restart_deployment_looks_up_state_and_applies_token_once() {
+        let restarted = restarted_deployment("api", "default", RESTART_TOKEN, "11");
+        let (client, server) = mock_client(vec![
+            (200, deployment("api", "default", Some(2), "10")),
+            (200, restarted),
+        ]);
+
+        let result = execute_tool(
+            &client,
+            "ocp_restart_deployment",
+            &json!({ "name": "api", "restart_token": RESTART_TOKEN }),
+        )
+        .expect("restart succeeds");
+        let requests = server.finish();
+
+        assert_eq!(result["outcome"], "applied");
+        assert_eq!(
+            result["resource_mutation"]["execution"]["status"],
+            "executed"
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /apis/apps/v1/namespaces/default/deployments/api"));
+        assert!(requests[1].starts_with("PATCH /apis/apps/v1/namespaces/default/deployments/api"));
+        assert!(requests[1].contains("\"resourceVersion\":\"10\""));
+        assert!(requests[1].contains("\"spacesly.dev/restart-token\":\"sha256:"));
+        assert!(!requests[1].contains(RESTART_TOKEN));
+    }
+
+    #[test]
+    fn restart_deployment_identical_retry_is_already_complete_without_patch() {
+        let (client, server) = mock_client(vec![(
+            200,
+            restarted_deployment("api", "default", RESTART_TOKEN, "11"),
+        )]);
+
+        let result = execute_tool(
+            &client,
+            "ocp_restart_deployment",
+            &json!({ "name": "api", "restart_token": RESTART_TOKEN }),
+        )
+        .expect("restart retry reconciles");
+        let requests = server.finish();
+
+        assert_eq!(result["outcome"], "already_satisfied");
+        assert_eq!(
+            result["resource_mutation"]["execution"]["status"],
+            "skipped"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET "));
+    }
+
+    #[test]
+    fn restart_deployment_preserves_resource_version_conflict_evidence() {
+        let (client, server) = mock_client(vec![
+            (200, deployment("api", "default", Some(2), "10")),
+            (
+                409,
+                status_error(409, "Conflict", "object was modified", "deployments"),
+            ),
+        ]);
+
+        let error = execute_tool(
+            &client,
+            "ocp_restart_deployment",
+            &json!({ "name": "api", "restart_token": RESTART_TOKEN }),
+        )
+        .expect_err("restart conflict retained");
+        let requests = server.finish();
+        let evidence = error.resource_mutation.expect("restart evidence");
+
+        assert_eq!(error.kind, OcpErrorKind::Conflict);
+        assert_eq!(evidence.execution.status, ResourceExecutionStatus::Conflict);
+        assert_eq!(evidence.lookup.observed_version.as_deref(), Some("10"));
+        assert!(requests[1].contains("\"resourceVersion\":\"10\""));
     }
 
     #[test]
