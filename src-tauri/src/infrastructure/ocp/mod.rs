@@ -35,7 +35,7 @@ use config::{
 use errors::OcpResult;
 use preflight::run_preflight;
 use retry::{with_retry, RetryPolicy};
-use tools::{execute_tool, tool_metadata, OcpTool};
+use tools::{execute_tool, resource_operation_identity, tool_metadata, OcpTool};
 
 pub const ENV_MODE: &str = "SPACESLY_OCP_MODE";
 pub const ENV_KUBECONFIG: &str = "SPACESLY_OCP_KUBECONFIG";
@@ -553,12 +553,20 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
                     Ok(value) => {
                         breaker.record_success();
                         persist_breaker_state(audit.dir(), breaker);
+                        let audit_detail = resource_audit_detail(&value);
+                        let audit_outcome = if value["status"] == "approval_required" {
+                            "blocked"
+                        } else if value["resource_mutation"]["execution"]["status"] == "skipped" {
+                            "skipped"
+                        } else {
+                            "success"
+                        };
                         audit.record_best_effort(
                             "tool_finished",
                             Some(&tool_name),
                             None,
-                            "success",
-                            None,
+                            audit_outcome,
+                            audit_detail.as_deref(),
                             latency_ms,
                         );
                         write_proxy_message(
@@ -582,12 +590,13 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
                             breaker.record_failure();
                         }
                         persist_breaker_state(audit.dir(), breaker);
+                        let audit_detail = resource_error_audit_detail(&redacted);
                         audit.record_best_effort(
                             "tool_failed",
                             Some(&tool_name),
                             None,
                             "failed",
-                            Some(&redacted.to_string()),
+                            Some(&audit_detail),
                             latency_ms,
                         );
                         write_proxy_error(&mut writer, id.as_ref(), &redacted.to_string())?;
@@ -626,10 +635,14 @@ fn call_tool(
             // Report approval as a successful MCP tool result. OpenCode retries JSON-RPC
             // errors internally, which can issue the same mutation repeatedly and flood the
             // console. Spacesly recognizes this structured result and pauses the run itself.
+            let operation_identity = resource_operation_identity(client, tool_name, arguments)
+                .ok()
+                .flatten();
             return Ok(json!({
                 "status": "approval_required",
                 "operation": tool.as_str(),
                 "arguments_digest": actual_digest,
+                "operation_identity": operation_identity,
                 "message": "This action is waiting for an operator decision in Spacesly. Do not retry it."
             }));
         }
@@ -651,6 +664,22 @@ fn call_tool(
     with_retry(RetryPolicy::default(), &cancelled, || {
         execute_tool(client, tool_name, arguments)
     })
+}
+
+fn resource_audit_detail(value: &Value) -> Option<String> {
+    value
+        .get("resource_mutation")
+        .or_else(|| value.get("operation_identity"))
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::to_string(value).ok())
+}
+
+fn resource_error_audit_detail(error: &OcpError) -> String {
+    serde_json::to_string(&json!({
+        "error": error.to_string(),
+        "resource_mutation": error.resource_mutation
+    }))
+    .unwrap_or_else(|_| error.to_string())
 }
 
 fn output_text(value: &Value) -> String {
@@ -1400,6 +1429,7 @@ mod tests {
         let approval: Value = serde_json::from_str(content).unwrap();
         assert_eq!(approval["status"], json!("approval_required"));
         assert_eq!(approval["operation"], json!("ocp_restart_deployment"));
+        assert!(approval["operation_identity"].is_null());
         assert_eq!(
             approval["message"]
                 .as_str()
@@ -1418,6 +1448,85 @@ mod tests {
         let approval: Value = serde_json::from_str(content).unwrap();
         assert_eq!(approval["status"], json!("approval_required"));
         assert_eq!(approval["operation"], json!("kubernetes_resources_delete"));
+    }
+
+    #[test]
+    fn scale_approval_exposes_only_secret_free_operation_identity() {
+        let responses = serve_protocol(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"ocp_scale_deployment\",\"arguments\":{\"name\":\"api\",\"replicas\":3}}}\n",
+        );
+        let content = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let approval: Value = serde_json::from_str(content).unwrap();
+        let identity = &approval["operation_identity"];
+        assert_eq!(approval["status"], "approval_required");
+        assert_eq!(identity["operation"], "scale_deployment");
+        assert_eq!(identity["resource"]["namespace"], "default");
+        assert_eq!(identity["resource"]["name"], "api");
+        assert!(identity["key"].as_str().unwrap().starts_with("sha256:"));
+        assert!(!content.contains("test-token"));
+        assert!(!content.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn resource_mutation_audit_evidence_is_persisted_without_sensitive_values() {
+        use crate::domain::resource_idempotency::{
+            ResourceIdentity, ResourceMutationEvidence, ResourceOperationIdentity,
+        };
+
+        let secret = "sensitive-cluster-token";
+        let identity = ResourceOperationIdentity::new(
+            "openshift_kubernetes",
+            "scale_deployment",
+            ResourceIdentity {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+                namespace: Some("default".to_string()),
+                name: "api".to_string(),
+            },
+            secret,
+            &json!({"replicas": 3, "token": secret}),
+        )
+        .unwrap();
+        let evidence: ResourceMutationEvidence = serde_json::from_value(json!({
+            "identity": identity,
+            "lookup": {
+                "status": "drift_detected",
+                "observed_fingerprint": null,
+                "observed_version": "10"
+            },
+            "execution": {
+                "status": "blocked",
+                "resulting_fingerprint": null,
+                "resulting_version": null
+            },
+            "retry_resume_status": "awaiting_operator"
+        }))
+        .unwrap();
+        let redacted = OcpError::connect("transport", format!("request failed with {secret}"))
+            .with_resource_mutation(evidence)
+            .redacted(&[secret]);
+        let detail = resource_error_audit_detail(&redacted);
+        assert!(!detail.contains(secret));
+        assert!(detail.contains("[REDACTED]"));
+        assert!(detail.contains("scale_deployment"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(dir.path().to_path_buf());
+        audit
+            .record(
+                "tool_failed",
+                Some("ocp_scale_deployment"),
+                None,
+                "failed",
+                Some(&detail),
+                1,
+            )
+            .unwrap();
+        let persisted = audit.entries(1).pop().unwrap().detail.unwrap();
+        assert_eq!(persisted, detail);
+        assert!(!persisted.contains(secret));
     }
 
     #[test]

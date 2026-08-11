@@ -9,7 +9,45 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 ## Current Position
 
 - Completed through Phase 8: portable workspace and Git resolution.
-- Next implementation phase: Phase 9, resource-level idempotency.
+- Phase 9 is in progress with a provider-neutral identity/evidence model and an initial `ocp_scale_deployment` vertical slice.
+
+## Phase 9 In Progress
+
+Implementation scope:
+
+1. Define versioned, secret-free operation identity and mutation evidence records.
+2. Normalize the OpenShift/Kubernetes Deployment scale resource and desired replica state.
+3. Read the Deployment before mutation, skip an already-satisfied scale, and use `resourceVersion` when applying detected drift.
+4. Preserve one-use approval, RBAC, connector, and retry boundaries.
+5. Persist redacted lookup and execution evidence in the existing private OCP audit log.
+6. Test first execution, equivalent retry, partial-completion reconciliation, conflict, unauthorized mutation, and redaction.
+
+This increment intentionally does not claim resource-level idempotency for other Kubernetes mutations, Git, Jira, Confluence, Bamboo, or generic MCP connectors.
+
+Implemented behavior:
+
+- `ResourceOperationIdentity` canonicalizes a connector family, operation, resource, environment fingerprint, desired-state fingerprint, and stable key.
+- `ResourceMutationEvidence` captures lookup status, observed fingerprint/version, execution status, resulting fingerprint/version, and retry/resume status.
+- Raw cluster URLs and desired-state values are hashed and are not serialized into identity or audit evidence.
+- `ocp_scale_deployment` normalizes omitted and explicit default namespaces to the same identity.
+- Deployment scaling performs GET before PATCH and includes the observed `resourceVersion` in the merge patch.
+- A matching replica count returns `already_satisfied` without a PATCH, including after a prior attempt applied the change but lost its response.
+- Missing or incompatible Deployment state returns an explicit conflict without mutation.
+- Kubernetes 409 and RBAC failures retain redacted lookup/execution evidence and are not retried as mutations.
+- Missing approval returns a secret-free operation identity and reaches no cluster mutation path.
+- Scale identity and outcome evidence are persisted in the private OCP audit log independently of model-generated objective evidence.
+
+Regression evidence:
+
+- Focused resource identity tests: 3 passed.
+- Focused Deployment scale tests: 6 passed.
+- Focused audit redaction/persistence test: passed.
+- Structured mutation approval regression: passed.
+- `cargo check`: passed.
+- Full Rust suite: 400 passed, 3 ignored, 0 failed.
+- Frontend unit tests: 7 passed, 0 failed.
+- `svelte-check`: 0 errors and 0 warnings.
+- Full clippy reaches only three pre-existing findings in `governance.rs` and `task_examination.rs`; Phase 9 introduces no clippy finding.
 
 ## Completed Increments
 
@@ -46,23 +84,23 @@ Regression evidence recorded so far:
 
 ## Known Gaps
 
-1. Replay fencing is exact tool name plus argument digest, not yet a connector-aware semantic idempotency key.
+1. Replay fencing remains exact tool name plus argument digest except for the state-reconciling `ocp_scale_deployment` slice.
 2. Rules can identify a local repository, but repository selection is not yet compiled into an authoritative task-tool default.
 3. Some connector configuration errors are discovered only when the connector is called.
 4. Objective evidence is structurally required, but not every connector has an independent state verifier.
 5. Dynamic tasks lack a release-grade evaluation corpus and safety scorecard.
-6. The operator UI does not yet expose every decision’s structured provenance or idempotency fence.
+6. The operator UI does not yet expose resource mutation evidence or an explicit idempotency supersede action.
 
-## Next Phase — Resource-Level Idempotency
+## Phase 9 Remaining Work
 
 Planned scope:
 
-1. Define a versioned `OperationIdentity` containing connector, operation, resource, environment, and canonical argument digest.
-2. Let connector adapters derive identities without exposing secrets.
-3. Persist mutation identities transactionally with successful tool receipts.
-4. Fence equivalent retained mutations before dispatch.
-5. Provide an explicit, audited operator supersede path instead of silent bypass.
-6. Add Bamboo, Jira, Kubernetes/OpenShift, Git, and generic fallback fixtures.
+1. Add a scheduler-owned mutation identity ledger with atomic reservation, completion, uncertainty, and supersede transitions.
+2. Bind durable scheduler identities to immutable objectives and transactionally to successful tool receipts.
+3. Fence equivalent retained mutations before dispatch when authoritative state lookup cannot safely reconcile them.
+4. Provide an explicit, audited operator supersede path instead of silent bypass.
+5. Add connector-specific adapters incrementally for operations with high-confidence lookup and resource identity semantics.
+6. Expose inspectable identity and outcome evidence in the operator UI.
 
 Required safety properties:
 
@@ -73,12 +111,12 @@ Required safety properties:
 
 ## Verification Checklist
 
-- [x] Focused nested Git repository test
+- [x] Focused resource identity, scale reconciliation, conflict, authorization, and redaction tests
 - [x] Rust compile check
 - [x] Full Rust test suite
 - [x] Frontend unit tests
 - [x] Svelte type and diagnostic check
-- [x] Changed-file lint
+- [x] Phase 9 code has no clippy finding
 - [x] Formatting and diff checks
 - [x] Clean phase commit with unrelated worktree changes kept separate
 

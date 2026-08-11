@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::domain::resource_idempotency::ResourceMutationEvidence;
+
 /// Fine-grained error kind for the OCP connector.
 ///
 /// `Config`, `Auth`, and `Forbidden` are permanent (no retry).
@@ -71,6 +73,8 @@ pub struct OcpError {
     pub code: String,
     /// Safe user-facing description (must not contain secrets).
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_mutation: Option<Box<ResourceMutationEvidence>>,
 }
 
 impl OcpError {
@@ -79,6 +83,7 @@ impl OcpError {
             kind,
             code: code.to_string(),
             message: message.into(),
+            resource_mutation: None,
         }
     }
 
@@ -142,6 +147,11 @@ impl OcpError {
         Self::new(OcpErrorKind::Internal, "internal", message)
     }
 
+    pub fn with_resource_mutation(mut self, evidence: ResourceMutationEvidence) -> Self {
+        self.resource_mutation = Some(Box::new(evidence));
+        self
+    }
+
     /// True when the operation that produced this error may succeed on a later attempt.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -176,6 +186,7 @@ impl OcpError {
             kind: self.kind,
             code: self.code.clone(),
             message: redact(&self.message, secrets),
+            resource_mutation: self.resource_mutation.clone(),
         }
     }
 }

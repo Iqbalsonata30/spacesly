@@ -1,7 +1,13 @@
 use serde_json::{json, Value};
 
+use crate::domain::resource_idempotency::{
+    state_fingerprint, ResourceExecutionResult, ResourceExecutionStatus, ResourceIdentity,
+    ResourceLookupResult, ResourceLookupStatus, ResourceMutationEvidence,
+    ResourceOperationIdentity, ResourceRetryResumeStatus,
+};
+
 use super::client::{DiscoveredResource, KubernetesPatchType, OcpClient};
-use super::errors::{OcpError, OcpResult};
+use super::errors::{OcpError, OcpErrorKind, OcpResult};
 
 pub const MAX_LIST_ITEMS: usize = 200;
 
@@ -517,26 +523,7 @@ pub fn execute_tool(client: &OcpClient, name: &str, arguments: &Value) -> OcpRes
                 "restarted_at": restarted_at
             }))
         }
-        OcpTool::ScaleDeployment => {
-            let namespace = namespace_argument(client, arguments)?;
-            let name = required_string(arguments, "name")?;
-            let replicas = required_u32(arguments, "replicas", 1000)?;
-            let item = client.patch_namespaced(
-                "apps",
-                "v1",
-                "deployments",
-                &name,
-                namespace.as_deref(),
-                &json!({ "spec": { "replicas": replicas } }),
-            )?;
-            Ok(json!({
-                "kind": "DeploymentScale",
-                "name": name,
-                "namespace": namespace,
-                "replicas": item["spec"]["replicas"],
-                "generation": item["metadata"]["generation"]
-            }))
-        }
+        OcpTool::ScaleDeployment => scale_deployment(client, arguments),
         OcpTool::DeleteManagedPod => {
             let namespace = namespace_argument(client, arguments)?;
             let name = required_string(arguments, "name")?;
@@ -559,6 +546,254 @@ pub fn execute_tool(client: &OcpClient, name: &str, arguments: &Value) -> OcpRes
             }))
         }
     }
+}
+
+pub(super) fn resource_operation_identity(
+    client: &OcpClient,
+    name: &str,
+    arguments: &Value,
+) -> OcpResult<Option<ResourceOperationIdentity>> {
+    if OcpTool::parse(name) != Some(OcpTool::ScaleDeployment) {
+        return Ok(None);
+    }
+    let namespace = namespace_argument(client, arguments)?.ok_or_else(|| {
+        OcpError::internal("Deployment scale namespace resolution returned no namespace.")
+    })?;
+    let name = required_string(arguments, "name")?;
+    let replicas = required_u32(arguments, "replicas", 1000)?;
+    ResourceOperationIdentity::new(
+        "openshift_kubernetes",
+        "scale_deployment",
+        ResourceIdentity {
+            api_version: "apps/v1".to_string(),
+            kind: "Deployment".to_string(),
+            namespace: Some(namespace),
+            name,
+        },
+        client.idempotency_environment(),
+        &json!({ "replicas": replicas }),
+    )
+    .map(Some)
+    .map_err(|error| OcpError::internal(format!("Could not identify Deployment scale: {error}")))
+}
+
+fn scale_deployment(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
+    let identity =
+        resource_operation_identity(client, OcpTool::ScaleDeployment.as_str(), arguments)?
+            .ok_or_else(|| OcpError::internal("Deployment scale identity was unavailable."))?;
+    let namespace = identity
+        .resource
+        .namespace
+        .clone()
+        .ok_or_else(|| OcpError::internal("Deployment scale namespace was unavailable."))?;
+    let name = identity.resource.name.clone();
+    let replicas = required_u32(arguments, "replicas", 1000)?;
+    let current = client
+        .get_namespaced("apps", "v1", "deployments", &name, Some(&namespace))
+        .map_err(|error| {
+            error.with_resource_mutation(ResourceMutationEvidence {
+                identity: identity.clone(),
+                lookup: ResourceLookupResult {
+                    status: ResourceLookupStatus::Unavailable,
+                    observed_fingerprint: None,
+                    observed_version: None,
+                },
+                execution: ResourceExecutionResult {
+                    status: ResourceExecutionStatus::Blocked,
+                    resulting_fingerprint: None,
+                    resulting_version: None,
+                },
+                retry_resume_status: ResourceRetryResumeStatus::AwaitingOperator,
+            })
+        })?;
+    let current_replicas = current
+        .pointer("/spec/replicas")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= u64::from(u32::MAX))
+        .map(|value| value as u32);
+    let resource_version = current
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(current_replicas) = current_replicas else {
+        let evidence = scale_evidence(
+            identity,
+            ResourceLookupStatus::Incompatible,
+            None,
+            resource_version,
+            ResourceExecutionStatus::Conflict,
+            None,
+            None,
+            ResourceRetryResumeStatus::Conflict,
+        )?;
+        return Err(OcpError::conflict(
+            "incompatible_existing_resource",
+            format!(
+                "Deployment '{namespace}/{name}' has no compatible spec.replicas value; scaling was not attempted."
+            ),
+        )
+        .with_resource_mutation(evidence));
+    };
+    let observed_fingerprint = replicas_fingerprint(current_replicas)?;
+    if current_replicas == replicas {
+        let evidence = scale_evidence(
+            identity,
+            ResourceLookupStatus::AlreadySatisfied,
+            Some(observed_fingerprint),
+            resource_version.clone(),
+            ResourceExecutionStatus::Skipped,
+            Some(replicas_fingerprint(replicas)?),
+            resource_version,
+            ResourceRetryResumeStatus::AlreadyComplete,
+        )?;
+        return Ok(json!({
+            "kind": "DeploymentScale",
+            "name": name,
+            "namespace": namespace,
+            "replicas": replicas,
+            "outcome": "already_satisfied",
+            "resource_mutation": evidence
+        }));
+    }
+    let Some(resource_version) = resource_version else {
+        let evidence = scale_evidence(
+            identity,
+            ResourceLookupStatus::Incompatible,
+            Some(observed_fingerprint),
+            None,
+            ResourceExecutionStatus::Conflict,
+            None,
+            None,
+            ResourceRetryResumeStatus::Conflict,
+        )?;
+        return Err(OcpError::conflict(
+            "incompatible_existing_resource",
+            format!(
+                "Deployment '{namespace}/{name}' has no resourceVersion; scaling detected drift but was not attempted."
+            ),
+        )
+        .with_resource_mutation(evidence));
+    };
+    let patch = json!({
+        "metadata": { "resourceVersion": resource_version },
+        "spec": { "replicas": replicas }
+    });
+    let item =
+        match client.patch_namespaced("apps", "v1", "deployments", &name, Some(&namespace), &patch)
+        {
+            Ok(item) => item,
+            Err(error) => {
+                let conflict = error.kind == OcpErrorKind::Conflict;
+                let evidence = scale_evidence(
+                    identity.clone(),
+                    ResourceLookupStatus::DriftDetected,
+                    Some(observed_fingerprint.clone()),
+                    Some(resource_version.clone()),
+                    if conflict {
+                        ResourceExecutionStatus::Conflict
+                    } else {
+                        ResourceExecutionStatus::Blocked
+                    },
+                    None,
+                    None,
+                    if conflict {
+                        ResourceRetryResumeStatus::Conflict
+                    } else {
+                        ResourceRetryResumeStatus::AwaitingOperator
+                    },
+                )?;
+                return Err(error.with_resource_mutation(evidence));
+            }
+        };
+    let resulting_replicas = item.pointer("/spec/replicas").and_then(Value::as_u64);
+    if resulting_replicas != Some(u64::from(replicas)) {
+        let evidence = scale_evidence(
+            identity,
+            ResourceLookupStatus::DriftDetected,
+            Some(observed_fingerprint),
+            Some(resource_version),
+            ResourceExecutionStatus::Blocked,
+            resulting_replicas
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .map(|value| replicas_fingerprint(value as u32))
+                .transpose()?,
+            item.pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ResourceRetryResumeStatus::AwaitingOperator,
+        )?;
+        return Err(OcpError::api(
+            "scale_result_incompatible",
+            format!(
+                "Deployment '{namespace}/{name}' scale response did not confirm the requested replica count."
+            ),
+        )
+        .with_resource_mutation(evidence));
+    }
+    let resulting_version = item
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let evidence = scale_evidence(
+        identity,
+        ResourceLookupStatus::DriftDetected,
+        Some(observed_fingerprint),
+        Some(resource_version),
+        ResourceExecutionStatus::Executed,
+        Some(replicas_fingerprint(replicas)?),
+        resulting_version,
+        ResourceRetryResumeStatus::ReconciledAfterDrift,
+    )?;
+    Ok(json!({
+        "kind": "DeploymentScale",
+        "name": name,
+        "namespace": namespace,
+        "replicas": replicas,
+        "generation": item["metadata"]["generation"],
+        "outcome": "applied",
+        "resource_mutation": evidence
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scale_evidence(
+    identity: ResourceOperationIdentity,
+    lookup_status: ResourceLookupStatus,
+    observed_fingerprint: Option<String>,
+    observed_version: Option<String>,
+    execution_status: ResourceExecutionStatus,
+    resulting_fingerprint: Option<String>,
+    resulting_version: Option<String>,
+    retry_resume_status: ResourceRetryResumeStatus,
+) -> OcpResult<ResourceMutationEvidence> {
+    let evidence = ResourceMutationEvidence {
+        identity,
+        lookup: ResourceLookupResult {
+            status: lookup_status,
+            observed_fingerprint,
+            observed_version,
+        },
+        execution: ResourceExecutionResult {
+            status: execution_status,
+            resulting_fingerprint,
+            resulting_version,
+        },
+        retry_resume_status,
+    };
+    evidence.validate().map_err(|error| {
+        OcpError::internal(format!("Deployment scale evidence was invalid: {error}"))
+    })?;
+    Ok(evidence)
+}
+
+fn replicas_fingerprint(replicas: u32) -> OcpResult<String> {
+    state_fingerprint(&json!({ "replicas": replicas })).map_err(|error| {
+        OcpError::internal(format!(
+            "Could not fingerprint Deployment replicas: {error}"
+        ))
+    })
 }
 
 fn generic_resource_list(client: &OcpClient, arguments: &Value) -> OcpResult<Value> {
@@ -1486,6 +1721,24 @@ mod tests {
         })
     }
 
+    fn deployment(name: &str, namespace: &str, replicas: Option<u32>, version: &str) -> Value {
+        let mut value = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "resourceVersion": version,
+                "generation": 1
+            },
+            "spec": {}
+        });
+        if let Some(replicas) = replicas {
+            value["spec"]["replicas"] = json!(replicas);
+        }
+        value
+    }
+
     #[test]
     fn every_registered_tool_parses_round_trip() {
         for tool in OcpTool::all() {
@@ -1521,6 +1774,173 @@ mod tests {
                 "ocp_delete_managed_pod"
             ]
         );
+    }
+
+    #[test]
+    fn scale_deployment_looks_up_state_and_applies_drift_once() {
+        let mut scaled = deployment("api", "default", Some(3), "11");
+        scaled["metadata"]["generation"] = json!(2);
+        let (client, server) = mock_client(vec![
+            (200, deployment("api", "default", Some(2), "10")),
+            (200, scaled),
+        ]);
+
+        let result = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"name":"api","replicas":3}),
+        )
+        .unwrap();
+
+        assert_eq!(result["outcome"], "applied");
+        assert_eq!(
+            result["resource_mutation"]["lookup"]["status"],
+            "drift_detected"
+        );
+        assert_eq!(
+            result["resource_mutation"]["execution"]["status"],
+            "executed"
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .starts_with("GET /apis/apps/v1/namespaces/default/deployments/api HTTP/1.1"));
+        assert!(requests[1]
+            .starts_with("PATCH /apis/apps/v1/namespaces/default/deployments/api HTTP/1.1"));
+        assert!(requests[1].contains("\"resourceVersion\":\"10\""));
+        assert!(requests[1].contains("\"replicas\":3"));
+    }
+
+    #[test]
+    fn scale_deployment_identical_retry_is_already_complete_without_patch() {
+        let (client, server) =
+            mock_client(vec![(200, deployment("api", "default", Some(3), "11"))]);
+        let implicit = resource_operation_identity(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"name":"api","replicas":3}),
+        )
+        .unwrap()
+        .unwrap();
+        let explicit = resource_operation_identity(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"namespace":"default","name":"api","replicas":3}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(implicit.key, explicit.key);
+
+        let result = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"namespace":"default","name":"api","replicas":3}),
+        )
+        .unwrap();
+        assert_eq!(result["outcome"], "already_satisfied");
+        assert_eq!(
+            result["resource_mutation"]["retry_resume_status"],
+            "already_complete"
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn scale_deployment_resume_reconciles_partial_completion_without_second_patch() {
+        let (client, server) =
+            mock_client(vec![(200, deployment("api", "payments", Some(4), "22"))]);
+
+        let result = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"namespace":"payments","name":"api","replicas":4}),
+        )
+        .unwrap();
+
+        assert_eq!(result["outcome"], "already_satisfied");
+        assert_eq!(
+            result["resource_mutation"]["execution"]["status"],
+            "skipped"
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .starts_with("GET /apis/apps/v1/namespaces/payments/deployments/api HTTP/1.1"));
+    }
+
+    #[test]
+    fn scale_deployment_rejects_incompatible_existing_resource() {
+        let (client, server) = mock_client(vec![(200, deployment("api", "default", None, "10"))]);
+
+        let error = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"name":"api","replicas":3}),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, OcpErrorKind::Conflict);
+        assert_eq!(error.code, "incompatible_existing_resource");
+        assert_eq!(
+            error.resource_mutation.unwrap().lookup.status,
+            ResourceLookupStatus::Incompatible
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn scale_deployment_preserves_resource_version_conflict_evidence() {
+        let (client, server) = mock_client(vec![
+            (200, deployment("api", "default", Some(2), "10")),
+            (
+                409,
+                status_error(
+                    409,
+                    "Conflict",
+                    "the object has been modified",
+                    "deployments",
+                ),
+            ),
+        ]);
+
+        let error = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"name":"api","replicas":3}),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, OcpErrorKind::Conflict);
+        assert_eq!(error.code, "resource_version_conflict");
+        let evidence = error.resource_mutation.unwrap();
+        assert_eq!(evidence.lookup.status, ResourceLookupStatus::DriftDetected);
+        assert_eq!(evidence.execution.status, ResourceExecutionStatus::Conflict);
+        assert_eq!(
+            evidence.retry_resume_status,
+            ResourceRetryResumeStatus::Conflict
+        );
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn scale_deployment_unauthorized_lookup_blocks_without_mutation() {
+        let (client, server) = mock_client(vec![(
+            403,
+            status_error(403, "Forbidden", "deployments is forbidden", "deployments"),
+        )]);
+
+        let error = execute_tool(
+            &client,
+            "ocp_scale_deployment",
+            &json!({"name":"api","replicas":3}),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, OcpErrorKind::Forbidden);
+        let evidence = error.resource_mutation.unwrap();
+        assert_eq!(evidence.lookup.status, ResourceLookupStatus::Unavailable);
+        assert_eq!(evidence.execution.status, ResourceExecutionStatus::Blocked);
+        assert_eq!(server.finish().len(), 1);
     }
 
     #[test]

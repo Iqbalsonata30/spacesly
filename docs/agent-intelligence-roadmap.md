@@ -212,9 +212,21 @@ Exit criteria:
 
 ### Phase 9 — Resource-Level Idempotency
 
-Status: next.
+Status: in progress.
 
 Compile a canonical operation identity from the objective, connector, operation, target resource, environment, and normalized arguments. Persist idempotency keys separately from model-generated evidence.
+
+Implemented foundation:
+
+- A versioned provider-neutral operation identity records the connector family, normalized operation, resource identity, environment fingerprint, mutation fingerprint, and canonical key.
+- Mutation evidence records the lookup/precondition result, execution result, and retry/resume disposition without retaining raw environment or desired-state values.
+- `ocp_scale_deployment` is the first supported vertical slice. It reads the Deployment before mutation, skips an already-satisfied desired replica count, and applies drift with the observed Kubernetes `resourceVersion`.
+- Successful, skipped, blocked, and conflicting scale outcomes retain secret-free evidence in the private OCP audit log.
+
+Current limitations:
+
+- Other Kubernetes mutations, Git, Jira, Confluence, Bamboo, and generic MCP connectors still use their existing replay behavior and do not have resource-level identities.
+- The initial slice reconciles retries from observed Kubernetes state; objective binding, a scheduler-wide identity ledger, and an explicit operator supersede path remain to be implemented.
 
 Benefits:
 

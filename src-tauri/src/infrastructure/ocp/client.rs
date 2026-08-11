@@ -186,6 +186,10 @@ impl OcpClient {
         &self.default_namespace
     }
 
+    pub fn idempotency_environment(&self) -> &str {
+        &self.server
+    }
+
     // ── Core request helpers ─────────────────────────────────────────────────
 
     pub fn get_json(&self, path: &str, query: &[(&str, &str)]) -> OcpResult<Value> {
