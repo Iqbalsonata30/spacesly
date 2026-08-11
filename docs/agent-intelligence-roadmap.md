@@ -266,10 +266,13 @@ Implemented repository-resolution increment:
 - Deployment table rows retain Rules provenance and exact ticket-label matching binds the environment, Git branch, and OpenShift namespace before execution.
 - Git mutations require the bound deployment branch. The trusted embedded OCP connector uses the bound namespace as its task-local default and rejects mutation payloads targeting a different namespace.
 - Multiple conflicting deployment labels block preflight rather than allowing the model to choose an environment.
+- User-defined Connector blocks bind a configured connector ID and type to a sanitized base URL plus required operations. Once Connector Rules are present, every requested connector must have a matching block.
+- Preflight compares the authoritative base URL with secret-backed connector configuration and verifies required operations against the live MCP inventory using exact, type-qualified, ID-qualified, then unique-suffix matching.
+- Missing/duplicate Rules, malformed or mismatched URLs, unavailable connectors, missing operations, and ambiguous tool matches block before model execution with secret-free diagnostics.
 
 Current limitations:
 
-- Connector configuration preflight and independently enforceable verification requirements remain planned.
+- Independently enforceable verification requirements remain planned.
 - Tasks without an exact deployment label do not receive an environment binding; broader explicit task-to-environment selectors remain planned.
 
 Benefits:

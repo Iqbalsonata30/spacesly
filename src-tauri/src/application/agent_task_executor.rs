@@ -3,10 +3,12 @@ use super::execution_engine::{
 };
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
 use crate::domain::governance::{
-    DeploymentTargetRuleFact, GovernanceResolutionRecord, RepositoryRuleFact, RuleFactsRecord,
+    ConnectorRuleFact, DeploymentTargetRuleFact, GovernanceResolutionRecord, RepositoryRuleFact,
+    RuleFactsRecord,
 };
 use crate::domain::task_examination::{
-    examine_task, DeploymentTargetResolutionRecord, RepositoryResolutionRecord,
+    examine_task, ConnectorConfigurationPreflightRecord, ConnectorDiscoveryStatus,
+    DeploymentTargetResolutionRecord, RepositoryResolutionRecord,
 };
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
@@ -19,7 +21,7 @@ use crate::domain::task_session::{
 };
 use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
-    AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
+    AiWorkerMcpServer, AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
 };
 use crate::infrastructure::git::repository_root_at;
 use serde_json::{json, Value};
@@ -43,6 +45,277 @@ struct DeploymentTargetPreflight {
     record: Option<DeploymentTargetResolutionRecord>,
     target: Option<DeploymentTargetRuleFact>,
     blocker: Option<String>,
+}
+
+fn resolve_connector_configuration_preflights(
+    connector_ids: &[String],
+    rule_facts: &RuleFactsRecord,
+    servers: &[AiWorkerMcpServer],
+    capabilities: &[crate::domain::task_examination::ConnectorCapabilitySnapshot],
+) -> (Vec<ConnectorConfigurationPreflightRecord>, Vec<String>) {
+    if rule_facts.connectors.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut records = Vec::new();
+    let mut blockers = Vec::new();
+    for connector_id in connector_ids {
+        let matching_rules = rule_facts
+            .connectors
+            .iter()
+            .filter(|rule| rule.id == *connector_id)
+            .collect::<Vec<_>>();
+        let (record, blocker) = match matching_rules.as_slice() {
+            [] => connector_preflight_failure(
+                connector_id,
+                None,
+                "missing_rule",
+                "Requested connector has no matching user-defined Connector Rule.",
+            ),
+            [rule] => resolve_connector_rule(rule, servers, capabilities),
+            _ => connector_preflight_failure(
+                connector_id,
+                None,
+                "invalid_rule",
+                "Multiple Connector Rules use the same connector ID.",
+            ),
+        };
+        if let Some(blocker) = blocker {
+            blockers.push(format!("{connector_id}: {blocker}"));
+        }
+        records.push(record);
+    }
+    records.sort_by(|left, right| left.connector_id.cmp(&right.connector_id));
+    blockers.sort();
+    blockers.dedup();
+    (records, blockers)
+}
+
+fn resolve_connector_rule(
+    rule: &ConnectorRuleFact,
+    servers: &[AiWorkerMcpServer],
+    capabilities: &[crate::domain::task_examination::ConnectorCapabilitySnapshot],
+) -> (ConnectorConfigurationPreflightRecord, Option<String>) {
+    if !canonical_connector_token(&rule.id)
+        || !canonical_connector_token(&rule.connector_type)
+        || rule.required_operations.is_empty()
+        || rule
+            .required_operations
+            .iter()
+            .any(|operation| !canonical_connector_operation(operation))
+    {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "invalid_rule",
+            "Connector Rule type and required operations must be non-empty canonical identifiers.",
+        );
+    }
+    let Some(rule_url) = normalized_connector_base_url(&rule.base_url) else {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "invalid_rule",
+            "Connector Rule Base URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
+        );
+    };
+    let Some(server) = servers.iter().find(|server| server.secret_id == rule.id) else {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "missing_configuration",
+            "Connector Rule has no configured MCP connector with the same ID.",
+        );
+    };
+    let configured_urls = server
+        .environment
+        .iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_uppercase();
+            key.contains("URL") || key.contains("SERVER") || key.contains("BASE")
+        })
+        .filter_map(|(_, value)| normalized_connector_base_url(value))
+        .collect::<Vec<_>>();
+    if configured_urls.is_empty() {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "missing_configuration",
+            "Configured connector does not expose a valid secret-free base URL setting.",
+        );
+    }
+    if !configured_urls.iter().any(|url| url == &rule_url) {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "url_mismatch",
+            "Configured connector Base URL does not match its authoritative Connector Rule.",
+        );
+    }
+    let Some(capability) = capabilities
+        .iter()
+        .find(|capability| capability.connector_id == rule.id)
+    else {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "connector_unavailable",
+            "Connector has no live capability snapshot.",
+        );
+    };
+    if capability.status != ConnectorDiscoveryStatus::Available {
+        return connector_preflight_failure(
+            &rule.id,
+            Some(rule),
+            "connector_unavailable",
+            "Connector did not expose a usable live tool inventory.",
+        );
+    }
+    let mut verified_tools = Vec::new();
+    for operation in &rule.required_operations {
+        let names = capability
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let exact = names
+            .iter()
+            .copied()
+            .filter(|name| *name == operation)
+            .collect::<Vec<_>>();
+        let typed_name = format!("{}_{}", rule.connector_type, operation);
+        let typed = names
+            .iter()
+            .copied()
+            .filter(|name| *name == typed_name)
+            .collect::<Vec<_>>();
+        let connector_name = format!("{}_{}", rule.id, operation);
+        let connector_scoped = names
+            .iter()
+            .copied()
+            .filter(|name| *name == connector_name)
+            .collect::<Vec<_>>();
+        let suffix = format!("_{operation}");
+        let fallback = names
+            .iter()
+            .copied()
+            .filter(|name| name.ends_with(&suffix))
+            .collect::<Vec<_>>();
+        let candidates = [exact, typed, connector_scoped, fallback]
+            .into_iter()
+            .find(|candidates| !candidates.is_empty())
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [tool] => verified_tools.push(tool.clone()),
+            [] => {
+                return connector_preflight_failure(
+                    &rule.id,
+                    Some(rule),
+                    "missing_operations",
+                    "Connector live inventory is missing one or more required operations.",
+                );
+            }
+            _ => {
+                return connector_preflight_failure(
+                    &rule.id,
+                    Some(rule),
+                    "ambiguous_operation",
+                    "A required operation matches multiple live tools; use the exact tool name in Rules.",
+                );
+            }
+        }
+    }
+    verified_tools.sort();
+    verified_tools.dedup();
+    (
+        ConnectorConfigurationPreflightRecord {
+            schema_version: 1,
+            connector_id: rule.id.clone(),
+            connector_type: Some(rule.connector_type.clone()),
+            status: "ready".to_string(),
+            base_url: Some(rule_url),
+            required_operations: rule.required_operations.clone(),
+            verified_tools,
+            source: rule.source.clone(),
+            source_line: rule.source_line,
+            reason:
+                "Connector configuration and required live operations match the authoritative Rule."
+                    .to_string(),
+        },
+        None,
+    )
+}
+
+fn connector_preflight_failure(
+    connector_id: &str,
+    rule: Option<&ConnectorRuleFact>,
+    status: &str,
+    reason: &str,
+) -> (ConnectorConfigurationPreflightRecord, Option<String>) {
+    (
+        ConnectorConfigurationPreflightRecord {
+            schema_version: 1,
+            connector_id: connector_id.to_string(),
+            connector_type: rule
+                .map(|rule| rule.connector_type.clone())
+                .filter(|value| !value.is_empty()),
+            status: status.to_string(),
+            base_url: rule.and_then(|rule| normalized_connector_base_url(&rule.base_url)),
+            required_operations: rule
+                .map(|rule| rule.required_operations.clone())
+                .unwrap_or_default(),
+            verified_tools: Vec::new(),
+            source: rule
+                .map(|rule| rule.source.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "global.agent_rules".to_string()),
+            source_line: rule.map(|rule| rule.source_line).unwrap_or(0),
+            reason: reason.to_string(),
+        },
+        Some(reason.to_string()),
+    )
+}
+
+fn canonical_connector_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn canonical_connector_operation(value: &str) -> bool {
+    canonical_connector_token(value)
+        || (!value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
+            }))
+}
+
+fn normalized_connector_base_url(value: &str) -> Option<String> {
+    if value != value.trim() {
+        return None;
+    }
+    let mut url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if normalized_path.is_empty() {
+        "/"
+    } else {
+        &normalized_path
+    });
+    Some(url.to_string())
 }
 
 fn resolve_deployment_target_preflight(
@@ -828,6 +1101,14 @@ impl TaskExecutor for AgentTaskExecutor {
             &resolved.governance.rules.facts,
             &resolved.connector_capabilities,
         );
+        let (connector_configuration_preflights, connector_configuration_blockers) =
+            resolve_connector_configuration_preflights(
+                &envelope.connector_ids,
+                &resolved.governance.rules.facts,
+                &resolved.config.mcp_servers,
+                &resolved.connector_capabilities,
+            );
+        examination.connector_configuration_preflights = connector_configuration_preflights;
         let objective_checkpoints = context.objective_checkpoints()?;
         let protected_mutations = Arc::new(Mutex::new(
             objective_checkpoints
@@ -1022,6 +1303,24 @@ impl TaskExecutor for AgentTaskExecutor {
                 }),
             )?;
         }
+        for record in &examination.connector_configuration_preflights {
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "connector_configuration_preflight",
+                    "schema_version": 1,
+                    "connector_id": record.connector_id,
+                    "status": record.status,
+                    "connector_type": record.connector_type,
+                    "base_url": record.base_url,
+                    "required_operations": record.required_operations,
+                    "verified_tools": record.verified_tools,
+                    "source": record.source,
+                    "source_line": record.source_line,
+                    "reason": record.reason,
+                }),
+            )?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
@@ -1097,6 +1396,21 @@ impl TaskExecutor for AgentTaskExecutor {
             );
             return Err(TaskExecutionError::blocked(format!(
                 "Deployment target preflight blocked execution. {blocker}"
+            )));
+        }
+        if !connector_configuration_blockers.is_empty() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Connector configuration preflight blocked execution. {}",
+                connector_configuration_blockers.join(" ")
             )));
         }
         if let Some(blocker) = repository_preflight_blocker {
@@ -3701,6 +4015,51 @@ mod tests {
         }
     }
 
+    fn connector_rule(base_url: &str, operations: &[&str]) -> ConnectorRuleFact {
+        ConnectorRuleFact {
+            id: "corporate-confluence".to_string(),
+            connector_type: "confluence".to_string(),
+            base_url: base_url.to_string(),
+            required_operations: operations
+                .iter()
+                .map(|operation| operation.to_string())
+                .collect(),
+            source: "global.agent_rules".to_string(),
+            source_line: 20,
+        }
+    }
+
+    fn confluence_server(base_url: &str) -> AiWorkerMcpServer {
+        AiWorkerMcpServer {
+            name: "corporate-confluence".to_string(),
+            secret_id: "corporate-confluence".to_string(),
+            command: vec!["confluence-mcp".to_string()],
+            environment: HashMap::from([("CONFLUENCE_URL".to_string(), base_url.to_string())]),
+            proxy_authority: None,
+        }
+    }
+
+    fn confluence_capabilities(
+        tools: &[&str],
+    ) -> crate::domain::task_examination::ConnectorCapabilitySnapshot {
+        crate::domain::task_examination::ConnectorCapabilitySnapshot {
+            connector_id: "corporate-confluence".to_string(),
+            status: ConnectorDiscoveryStatus::Available,
+            tools: tools
+                .iter()
+                .map(
+                    |name| crate::domain::task_examination::DiscoveredToolCapability {
+                        name: name.to_string(),
+                        risk: "read".to_string(),
+                        argument_names: Vec::new(),
+                    },
+                )
+                .collect(),
+            error: None,
+            warnings: Vec::new(),
+        }
+    }
+
     fn initialize_repository(path: &Path) {
         std::fs::create_dir_all(path).expect("repository directory");
         let status = std::process::Command::new(
@@ -3880,6 +4239,81 @@ mod tests {
         );
         assert_eq!(invalid.record.expect("invalid retained").status, "invalid");
         assert!(invalid.target.is_none());
+    }
+
+    #[test]
+    fn connector_configuration_preflight_verifies_url_and_live_operations() {
+        let facts = RuleFactsRecord {
+            connectors: vec![connector_rule(
+                "https://confluence.example",
+                &["search", "get_page"],
+            )],
+            ..Default::default()
+        };
+        let (records, blockers) = resolve_connector_configuration_preflights(
+            &["corporate-confluence".to_string()],
+            &facts,
+            &[confluence_server("https://confluence.example/")],
+            &[confluence_capabilities(&[
+                "confluence_search",
+                "confluence_get_page",
+            ])],
+        );
+
+        assert!(blockers.is_empty());
+        assert_eq!(records[0].status, "ready");
+        assert_eq!(
+            records[0].verified_tools,
+            vec!["confluence_get_page", "confluence_search"]
+        );
+        assert_eq!(records[0].source_line, 20);
+    }
+
+    #[test]
+    fn connector_configuration_preflight_blocks_mismatch_missing_and_ambiguous_tools() {
+        let facts = RuleFactsRecord {
+            connectors: vec![connector_rule("https://confluence.example", &["search"])],
+            ..Default::default()
+        };
+        let (mismatch, blockers) = resolve_connector_configuration_preflights(
+            &["corporate-confluence".to_string()],
+            &facts,
+            &[confluence_server("'https://wrong.example'")],
+            &[confluence_capabilities(&["confluence_search"])],
+        );
+        assert_eq!(mismatch[0].status, "missing_configuration");
+        assert_eq!(blockers.len(), 1);
+
+        let (wrong_url, _) = resolve_connector_configuration_preflights(
+            &["corporate-confluence".to_string()],
+            &facts,
+            &[confluence_server("https://wrong.example")],
+            &[confluence_capabilities(&["confluence_search"])],
+        );
+        assert_eq!(wrong_url[0].status, "url_mismatch");
+
+        let (missing, _) = resolve_connector_configuration_preflights(
+            &["corporate-confluence".to_string()],
+            &facts,
+            &[confluence_server("https://confluence.example")],
+            &[confluence_capabilities(&["confluence_get_page"])],
+        );
+        assert_eq!(missing[0].status, "missing_operations");
+
+        let (ambiguous, _) = resolve_connector_configuration_preflights(
+            &["corporate-confluence".to_string()],
+            &facts,
+            &[confluence_server("https://confluence.example")],
+            &[confluence_capabilities(&[
+                "legacy_search",
+                "alternate_search",
+            ])],
+        );
+        assert_eq!(ambiguous[0].status, "ambiguous_operation");
+
+        let (missing_rule, _) =
+            resolve_connector_configuration_preflights(&["bamboo".to_string()], &facts, &[], &[]);
+        assert_eq!(missing_rule[0].status, "missing_rule");
     }
 
     fn test_governance(task_session_id: u64) -> GovernanceResolutionRecord {

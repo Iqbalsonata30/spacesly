@@ -109,6 +109,21 @@ pub struct DeploymentTargetResolutionRecord {
     pub reason: String,
 }
 
+/// Secret-free connector configuration decision compiled before worker execution.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConnectorConfigurationPreflightRecord {
+    pub schema_version: u32,
+    pub connector_id: String,
+    pub connector_type: Option<String>,
+    pub status: String,
+    pub base_url: Option<String>,
+    pub required_operations: Vec<String>,
+    pub verified_tools: Vec<String>,
+    pub source: String,
+    pub source_line: u32,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -128,6 +143,8 @@ pub struct TaskExaminationRecord {
     pub repository_resolution: Option<RepositoryResolutionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_target_resolution: Option<DeploymentTargetResolutionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connector_configuration_preflights: Vec<ConnectorConfigurationPreflightRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,6 +185,7 @@ impl TaskExaminationRecord {
             self.capability_mappings.len(),
             usize::from(self.repository_resolution.is_some()),
             usize::from(self.deployment_target_resolution.is_some()),
+            self.connector_configuration_preflights.len(),
             self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
@@ -292,6 +310,49 @@ impl TaskExaminationRecord {
             })
         {
             return Err("Task Examination deployment target resolution is invalid.".to_string());
+        }
+        if self
+            .connector_configuration_preflights
+            .iter()
+            .any(|record| {
+                record.schema_version != 1
+                    || !canonical_inventory_name(&record.connector_id, false)
+                    || !matches!(
+                        record.status.as_str(),
+                        "ready"
+                            | "missing_rule"
+                            | "invalid_rule"
+                            | "missing_configuration"
+                            | "url_mismatch"
+                            | "connector_unavailable"
+                            | "missing_operations"
+                            | "ambiguous_operation"
+                    )
+                    || record
+                        .connector_type
+                        .as_ref()
+                        .is_some_and(|value| !canonical_inventory_name(value, false))
+                    || record.base_url.as_ref().is_some_and(|value| {
+                        value.is_empty()
+                            || value.len() > 2_000
+                            || value.chars().any(char::is_control)
+                    })
+                    || record.required_operations.len() > MAX_EXAMINATION_ITEMS
+                    || record.verified_tools.len() > MAX_EXAMINATION_ITEMS
+                    || record
+                        .required_operations
+                        .iter()
+                        .chain(record.verified_tools.iter())
+                        .any(|operation| !canonical_inventory_name(operation, true))
+                    || record.source.trim().is_empty()
+                    || record.source.len() > 128
+                    || record.reason.trim().is_empty()
+                    || record.reason.len() > 512
+            })
+        {
+            return Err(
+                "Task Examination connector configuration preflight is invalid.".to_string(),
+            );
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -561,6 +622,7 @@ pub fn examine_task(
         semantic_planner,
         repository_resolution: None,
         deployment_target_resolution: None,
+        connector_configuration_preflights: Vec::new(),
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,

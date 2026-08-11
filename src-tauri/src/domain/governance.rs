@@ -111,6 +111,18 @@ pub struct DeploymentTargetRuleFact {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConnectorRuleFact {
+    pub id: String,
+    pub connector_type: String,
+    pub base_url: String,
+    pub required_operations: Vec<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_line: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuleFactsRecord {
     pub schema_version: u32,
     pub compiler_version: String,
@@ -118,6 +130,8 @@ pub struct RuleFactsRecord {
     pub repositories: Vec<RepositoryRuleFact>,
     pub protected_branches: Vec<ProtectedBranchRulePolicy>,
     pub deployment_targets: Vec<DeploymentTargetRuleFact>,
+    #[serde(default)]
+    pub connectors: Vec<ConnectorRuleFact>,
     pub warnings: Vec<String>,
 }
 
@@ -170,6 +184,7 @@ impl GovernanceResolutionRecord {
             if self.rules.facts.repositories.len() > 32
                 || self.rules.facts.protected_branches.len() > 32
                 || self.rules.facts.deployment_targets.len() > 64
+                || self.rules.facts.connectors.len() > 32
                 || self.rules.facts.warnings.len() > 32
             {
                 return Err("Governance Rule facts exceed bounded limits.".to_string());
@@ -358,6 +373,7 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     let mut frontend_path = None;
     let mut protected_branches = Vec::new();
     let mut deployment_targets = Vec::new();
+    let connectors = compile_connector_rule_facts(snapshot);
 
     for (line_index, line) in snapshot.lines().enumerate() {
         for matched in url_pattern.find_iter(line) {
@@ -473,8 +489,97 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
             }]
         },
         deployment_targets,
+        connectors,
         warnings,
     }
+}
+
+fn compile_connector_rule_facts(snapshot: &str) -> Vec<ConnectorRuleFact> {
+    let heading = Regex::new(r"(?i)^#{1,6}\s+connector\s*:\s*([a-z0-9_.-]+)\s*$")
+        .expect("valid connector heading regex");
+    let field =
+        Regex::new(r"(?i)^(?:[-*]|\d+[.)])?\s*(type|base url|required operations)\s*:\s*(.*)$")
+            .expect("valid connector field regex");
+    let mut connectors = Vec::new();
+    let mut current: Option<ConnectorRuleFact> = None;
+    let mut collecting_operations = false;
+    for (line_index, line) in snapshot.lines().enumerate() {
+        if let Some(id) = heading.captures(line).and_then(|captures| captures.get(1)) {
+            if let Some(connector) = current.take() {
+                connectors.push(connector);
+            }
+            current = Some(ConnectorRuleFact {
+                id: id.as_str().to_ascii_lowercase(),
+                source: "global.agent_rules".to_string(),
+                source_line: (line_index + 1) as u32,
+                ..Default::default()
+            });
+            collecting_operations = false;
+            continue;
+        }
+        let Some(connector) = current.as_mut() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            connectors.push(current.take().expect("connector exists"));
+            collecting_operations = false;
+            continue;
+        }
+        if let Some(captures) = field.captures(line) {
+            let name = captures[1].to_ascii_lowercase();
+            let value = clean_rule_scalar(&captures[2]);
+            collecting_operations = name == "required operations";
+            match name.as_str() {
+                "type" => connector.connector_type = value.to_ascii_lowercase(),
+                "base url" => connector.base_url = value,
+                "required operations" => {
+                    connector
+                        .required_operations
+                        .extend(split_rule_operations(&value));
+                }
+                _ => unreachable!(),
+            }
+            continue;
+        }
+        if collecting_operations {
+            let value = line
+                .trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .trim_matches('`');
+            if !value.is_empty() && !value.contains(':') {
+                connector
+                    .required_operations
+                    .extend(split_rule_operations(value));
+            }
+        }
+    }
+    if let Some(connector) = current {
+        connectors.push(connector);
+    }
+    for connector in &mut connectors {
+        connector.required_operations.sort();
+        connector.required_operations.dedup();
+    }
+    connectors.sort_by(|left, right| left.id.cmp(&right.id));
+    connectors
+}
+
+fn clean_rule_scalar(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character| matches!(character, '`' | '\'' | '"'))
+        .trim()
+        .to_string()
+}
+
+fn split_rule_operations(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(clean_rule_scalar)
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn clean_rule_path(value: &str) -> String {
@@ -1075,6 +1180,31 @@ mod tests {
         );
         assert_eq!(facts.repositories.len(), 1);
         assert_eq!(facts.warnings.len(), 1);
+    }
+
+    #[test]
+    fn rule_compiler_extracts_generic_connector_configuration_with_provenance() {
+        let facts = compile_rule_facts(
+            r#"
+## Connector: corporate-confluence
+- Type: confluence
+- Base URL: `https://confluence.example`
+- Required operations:
+  - search
+  - get_page
+
+## Other Rules
+- Verify changes.
+"#,
+        );
+        assert_eq!(facts.connectors.len(), 1);
+        let connector = &facts.connectors[0];
+        assert_eq!(connector.id, "corporate-confluence");
+        assert_eq!(connector.connector_type, "confluence");
+        assert_eq!(connector.base_url, "https://confluence.example");
+        assert_eq!(connector.required_operations, vec!["get_page", "search"]);
+        assert_eq!(connector.source, "global.agent_rules");
+        assert_eq!(connector.source_line, 2);
     }
 
     #[test]

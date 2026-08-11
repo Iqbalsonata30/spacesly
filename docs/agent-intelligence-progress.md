@@ -33,6 +33,25 @@ Implemented deployment-target increment:
 - OCP mutation arguments, manifests, and patches that explicitly name another namespace fail with `task_namespace_conflict` before approval consumption or cluster access.
 - The binding and its provenance are retained in Task Examination and emitted as a secret-free `deployment_target_preflight` event.
 
+Implemented connector-configuration increment:
+
+```markdown
+## Connector: corporate-confluence
+
+- Type: confluence
+- Base URL: https://confluence.bri.co.id
+- Required operations:
+  - search
+  - get_page
+```
+
+- Rules support generic `## Connector: <configured-id>` blocks with `Type`, `Base URL`, and `Required operations` fields plus source-line provenance.
+- Connector Rules are opt-in for retained configurations; when at least one exists, every connector requested by the task must have exactly one matching Rule.
+- Base URLs must be absolute HTTP(S), contain no credentials/query/fragment, and match a valid URL-valued setting from the secret-backed MCP connector environment after safe normalization.
+- Required operations are checked against the live connector inventory by exact tool name, type-qualified name, connector-ID-qualified name, then unique suffix fallback.
+- Missing or duplicate Rules, malformed/quoted/mismatched configuration URLs, unavailable inventories, absent operations, and ambiguous fallback matches block before OpenCode starts.
+- Task Examination and runtime events retain only the sanitized authoritative URL, required operation names, verified tool names, provenance, status, and reason—never environment values or credentials.
+
 Regression evidence:
 
 - Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
@@ -40,14 +59,15 @@ Regression evidence:
 - Focused Rules v2 compilation/provenance and v1 compatibility tests: 2 passed.
 - Focused deployment target selection and ambiguity tests: 2 passed.
 - Focused Git branch and OCP namespace enforcement tests: 2 passed.
-- Full Rust suite: 432 passed, 3 ignored, 0 failed.
+- Focused connector Rule compilation/provenance test: passed.
+- Focused connector URL, live-operation, missing, mismatch, and ambiguity tests: 2 passed.
+- Full Rust suite: 435 passed, 3 ignored, 0 failed.
 
 Remaining Phase 10 scope:
 
-1. Preflight connector base URLs and required connector configuration with secret-free diagnostics.
-2. Compile required verification policies and their provenance.
-3. Detect cross-rule contradictions beyond repository path and deployment-label selection.
-4. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
+1. Compile required verification policies and their provenance.
+2. Detect cross-rule contradictions beyond repository path, deployment-label, and connector selection.
+3. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
 
 ## Phase 9 Completed
 
