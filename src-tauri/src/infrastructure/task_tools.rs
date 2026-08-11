@@ -45,6 +45,14 @@ pub fn run_task_tools_from_env() -> Result<(), String> {
             );
         }
     }
+    if authority.bound_branch.as_ref().is_some_and(|branch| {
+        branch.trim().is_empty()
+            || branch != branch.trim()
+            || branch.len() > 255
+            || branch.chars().any(char::is_control)
+    }) {
+        return Err("Task-bound Git branch is invalid.".to_string());
+    }
     let workspace_roots = WorkspaceRoot::home()?;
     workspace_roots.set_path(&authority.workspace_id, root)?;
 
@@ -308,7 +316,33 @@ fn call_git(
     let repo_roots = WorkspaceRoot::scoped(&workspace, &repo_root)?;
     let info = workspace_git_info(&repo_roots, workspace.clone())?;
     authorize(authority, "git")?;
-    let value = match string_argument(arguments, "operation")? {
+    let operation = string_argument(arguments, "operation")?;
+    if let Some(bound_branch) = authority.bound_branch.as_deref() {
+        if operation == "checkout" && string_argument(arguments, "branch")? != bound_branch {
+            return Err(format!(
+                "Git checkout branch conflicts with the task-bound deployment branch '{bound_branch}'."
+            ));
+        }
+        if matches!(
+            operation,
+            "stage_file"
+                | "stage_all"
+                | "unstage_file"
+                | "unstage_all"
+                | "pull"
+                | "commit"
+                | "push"
+                | "merge"
+                | "rebase"
+        ) && info.current_branch.as_deref() != Some(bound_branch)
+        {
+            return Err(format!(
+                "Git mutation requires the task-bound deployment branch '{bound_branch}', but the repository is on '{}'.",
+                info.current_branch.as_deref().unwrap_or("detached HEAD")
+            ));
+        }
+    }
+    let value = match operation {
         "info" => serde_json::to_value(info),
         "status" => serde_json::to_value(workspace_git_status(&repo_roots, workspace)?),
         "stage_file" => serde_json::to_value(stage_workspace_git_file(
@@ -735,6 +769,35 @@ mod tests {
         )
         .expect_err("resolved repository cannot be overridden");
         assert!(conflicting.contains("conflicts with the repository resolved"));
+
+        authority.bound_branch = Some("prerelease".to_string());
+        let wrong_checkout = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": {
+                        "operation": "checkout",
+                        "branch": "main"
+                    }
+                }
+            }),
+        )
+        .expect_err("different deployment branch rejected");
+        assert!(wrong_checkout.contains("task-bound deployment branch 'prerelease'"));
+        let wrong_current_branch = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": { "operation": "stage_all" }
+                }
+            }),
+        )
+        .expect_err("mutation on wrong branch rejected");
+        assert!(wrong_current_branch.contains("requires the task-bound deployment branch"));
     }
 
     #[test]
@@ -750,6 +813,7 @@ mod tests {
             workspace_id: "workspace".to_string(),
             workspace_root: PathBuf::from("/workspace"),
             default_repository_root: None,
+            bound_branch: None,
             capabilities: vec!["workspace_read".to_string()],
         };
         let names = tool_definitions(&authority)

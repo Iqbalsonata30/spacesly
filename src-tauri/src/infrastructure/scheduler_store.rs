@@ -175,6 +175,8 @@ pub struct TaskToolAuthority {
     pub workspace_root: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_repository_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_branch: Option<String>,
     pub capabilities: Vec<String>,
 }
 
@@ -858,6 +860,7 @@ impl SchedulerStore {
             workspace_id: workspace_id.to_string(),
             workspace_root,
             default_repository_root: None,
+            bound_branch: None,
             capabilities,
         })
     }

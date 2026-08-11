@@ -49,6 +49,7 @@ pub const ENV_CREDENTIALS_FILE: &str = "SPACESLY_OCP_CREDENTIALS_FILE";
 pub const ENV_CONNECTOR_DIR: &str = "SPACESLY_OCP_CONNECTOR_DIR";
 pub const ENV_APPROVED_OPERATION: &str = "SPACESLY_OCP_APPROVED_OPERATION";
 pub const ENV_APPROVED_ARGUMENTS_DIGEST: &str = "SPACESLY_OCP_APPROVED_ARGUMENTS_DIGEST";
+pub(crate) const TASK_BOUND_NAMESPACE_ENV: &str = "SPACESLY_OCP_TASK_BOUND_NAMESPACE";
 
 const CONNECTOR_ARG: &str = "--spacesly-ocp-connector";
 const BREAKER_THRESHOLD: u32 = 3;
@@ -346,6 +347,7 @@ pub struct OcpConnectorEnv {
     pub connector_dir: Option<PathBuf>,
     pub approved_operation: Option<String>,
     pub approved_arguments_digest: Option<String>,
+    pub bound_namespace: Option<String>,
 }
 
 impl OcpConnectorEnv {
@@ -363,6 +365,7 @@ impl OcpConnectorEnv {
             connector_dir: optional_env(ENV_CONNECTOR_DIR).map(PathBuf::from),
             approved_operation: optional_env(ENV_APPROVED_OPERATION),
             approved_arguments_digest: optional_env(ENV_APPROVED_ARGUMENTS_DIGEST),
+            bound_namespace: optional_env(TASK_BOUND_NAMESPACE_ENV),
         })
     }
 }
@@ -394,6 +397,7 @@ pub fn run_ocp_mcp_server() -> Result<(), String> {
         &audit,
         secrets,
         &mutation_approval,
+        env.bound_namespace.as_deref(),
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
     )
@@ -469,6 +473,9 @@ pub fn resolve_cluster(env: &OcpConnectorEnv) -> OcpResult<ResolvedCluster> {
                 )
             })?;
             let mut cluster = parse_kubeconfig(Path::new(path), env.context.as_deref())?;
+            if let Some(namespace) = env.default_namespace.as_deref() {
+                cluster.default_namespace = Some(namespace.to_string());
+            }
             if cluster.credentials.is_anonymous() {
                 if let Some(token) = credentials.token.filter(|value| !value.trim().is_empty()) {
                     cluster.credentials = cluster.credentials.bearer_token(token);
@@ -501,6 +508,7 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
     audit: &AuditLog,
     secrets: Vec<String>,
     mutation_approval: &MutationApproval<'_>,
+    bound_namespace: Option<&str>,
     mut reader: R,
     mut writer: W,
 ) -> Result<(), String> {
@@ -549,8 +557,14 @@ fn serve_stdio<R: std::io::BufRead, W: std::io::Write>(
                     None,
                     0,
                 );
-                let outcome =
-                    call_tool(&client, breaker, &tool_name, &arguments, mutation_approval);
+                let outcome = call_tool(
+                    &client,
+                    breaker,
+                    &tool_name,
+                    &arguments,
+                    mutation_approval,
+                    bound_namespace,
+                );
                 let latency_ms = started.elapsed().as_millis() as u64;
                 match outcome {
                     Ok(value) => {
@@ -621,11 +635,13 @@ fn call_tool(
     tool_name: &str,
     arguments: &Value,
     mutation_approval: &MutationApproval<'_>,
+    bound_namespace: Option<&str>,
 ) -> OcpResult<Value> {
     breaker.allow()?;
     let tool = OcpTool::parse(tool_name)
         .ok_or_else(|| OcpError::internal(format!("Unknown OCP tool '{tool_name}'.")))?;
     if tool.is_mutation() {
+        enforce_task_bound_namespace(arguments, bound_namespace)?;
         let actual_digest = argument_digest(arguments).map_err(|error| {
             OcpError::config(
                 "invalid_arguments",
@@ -665,6 +681,34 @@ fn call_tool(
     with_retry(RetryPolicy::default(), &cancelled, || {
         execute_tool(client, tool_name, arguments)
     })
+}
+
+fn enforce_task_bound_namespace(arguments: &Value, bound_namespace: Option<&str>) -> OcpResult<()> {
+    let Some(bound_namespace) = bound_namespace else {
+        return Ok(());
+    };
+    let conflicting = [
+        arguments.get("namespace").and_then(Value::as_str),
+        arguments
+            .pointer("/manifest/metadata/namespace")
+            .and_then(Value::as_str),
+        arguments
+            .pointer("/patch/metadata/namespace")
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .any(|namespace| namespace != bound_namespace);
+    if conflicting {
+        return Err(OcpError::config(
+            "task_namespace_conflict",
+            format!(
+                "OpenShift mutation namespace conflicts with the task-bound namespace '{bound_namespace}'."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn resource_audit_detail(value: &Value) -> Option<String> {
@@ -1398,6 +1442,7 @@ mod tests {
             &audit,
             vec![],
             &mutation_approval,
+            None,
             std::io::Cursor::new(input.as_bytes()),
             &mut output,
         )
@@ -1723,6 +1768,7 @@ mod tests {
             connector_dir: None,
             approved_operation: None,
             approved_arguments_digest: None,
+            bound_namespace: None,
         };
         let cluster = resolve_cluster(&env).unwrap();
         assert_eq!(cluster.server, "https://api.cluster.example:6443");
@@ -1731,5 +1777,24 @@ mod tests {
             Some("s3cr3t-token")
         );
         assert_eq!(cluster.default_namespace.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn task_bound_namespace_rejects_conflicting_mutation_scope() {
+        enforce_task_bound_namespace(
+            &json!({"name": "api", "namespace": "qcash-prerelease"}),
+            Some("qcash-prerelease"),
+        )
+        .expect("matching namespace accepted");
+        let error = enforce_task_bound_namespace(
+            &json!({
+                "manifest": {
+                    "metadata": { "name": "settings", "namespace": "production" }
+                }
+            }),
+            Some("qcash-prerelease"),
+        )
+        .expect_err("conflicting namespace rejected");
+        assert_eq!(error.code, "task_namespace_conflict");
     }
 }

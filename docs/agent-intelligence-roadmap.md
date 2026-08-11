@@ -263,11 +263,14 @@ Implemented repository-resolution increment:
 - When Rules omit a local checkout, bounded contained discovery can resolve a unique Git repository whose directory matches the Bitbucket repository ID.
 - The resolved exact repository root and Helm backend/frontend subpaths are persisted in Task Examination and installed as the assignment-local Git tool default.
 - Missing, ambiguous, conflicting, non-repository, and workspace-escaping checkout selections block before model execution with corrective guidance.
+- Deployment table rows retain Rules provenance and exact ticket-label matching binds the environment, Git branch, and OpenShift namespace before execution.
+- Git mutations require the bound deployment branch. The trusted embedded OCP connector uses the bound namespace as its task-local default and rejects mutation payloads targeting a different namespace.
+- Multiple conflicting deployment labels block preflight rather than allowing the model to choose an environment.
 
 Current limitations:
 
-- Deployment environment tables are compiled but are not yet resolved against task labels into authoritative branch/namespace defaults.
 - Connector configuration preflight and independently enforceable verification requirements remain planned.
+- Tasks without an exact deployment label do not receive an environment binding; broader explicit task-to-environment selectors remain planned.
 
 Benefits:
 

@@ -9,7 +9,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 ## Current Position
 
 - Completed through Phase 9: resource-level idempotency foundation.
-- Phase 10 is in progress with authoritative Helm repository resolution and Git-tool defaults.
+- Phase 10 is in progress with authoritative Helm repository and deployment-target resolution.
 
 ## Phase 10 In Progress
 
@@ -23,19 +23,31 @@ Implemented repository-resolution increment:
 - The assignment-local Git authority receives the resolved repository as its default; an explicit Git `workdir` must resolve to that same root and cannot redirect the task to another contained repository.
 - Ambiguous repository Rules or checkout matches, conflicting contract/Rules paths, missing/non-Git paths, and workspace escapes block before OpenCode starts.
 
+Implemented deployment-target increment:
+
+- Deployment table rows now retain their Rules source and line provenance.
+- Exact case-insensitive ticket-label matching selects one environment, Git branch, and OpenShift namespace.
+- Conflicting matching labels produce an `ambiguous` resolution, while unsafe Git branch or Kubernetes namespace values produce `invalid`; both block before OpenCode starts.
+- The selected branch is attached to task-tool authority: checkout cannot select another branch, and stage/pull/commit/push/merge/rebase operations require the repository to be on the bound branch.
+- The trusted embedded OCP connector receives the selected namespace through its assignment-specific environment and uses it as the kubeconfig/API default.
+- OCP mutation arguments, manifests, and patches that explicitly name another namespace fail with `task_namespace_conflict` before approval consumption or cluster access.
+- The binding and its provenance are retained in Task Examination and emitted as a secret-free `deployment_target_preflight` event.
+
 Regression evidence:
 
 - Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
 - Focused Git default-workdir test: passed.
 - Focused Rules v2 compilation/provenance and v1 compatibility tests: 2 passed.
-- Full Rust suite: 429 passed, 3 ignored, 0 failed.
+- Focused deployment target selection and ambiguity tests: 2 passed.
+- Focused Git branch and OCP namespace enforcement tests: 2 passed.
+- Full Rust suite: 432 passed, 3 ignored, 0 failed.
 
 Remaining Phase 10 scope:
 
-1. Resolve compiled deployment targets into authoritative environment, branch, and namespace selections.
-2. Preflight connector base URLs and required connector configuration with secret-free diagnostics.
-3. Compile required verification policies and their provenance.
-4. Detect cross-rule contradictions beyond repository path selection.
+1. Preflight connector base URLs and required connector configuration with secret-free diagnostics.
+2. Compile required verification policies and their provenance.
+3. Detect cross-rule contradictions beyond repository path and deployment-label selection.
+4. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
 
 ## Phase 9 Completed
 
@@ -140,7 +152,7 @@ Regression evidence recorded so far:
 ## Known Gaps
 
 1. Replay fencing remains exact tool name plus argument digest except for state-reconciling Deployment scale/restart operations.
-2. Deployment target Rules are compiled, but environment/branch/namespace selection is not yet authoritative at preflight.
+2. Environment binding currently requires an exact mapped ticket label; tasks without one need an explicit structured selector.
 3. Some connector configuration errors are discovered only when the connector is called.
 4. Objective evidence is structurally required, but not every connector has an independent state verifier.
 5. Dynamic tasks lack a release-grade evaluation corpus and safety scorecard.

@@ -2,8 +2,12 @@ use super::execution_engine::{
     TaskEventReporter, TaskExecutionContext, TaskExecutionError, TaskExecutor,
 };
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
-use crate::domain::governance::{GovernanceResolutionRecord, RepositoryRuleFact, RuleFactsRecord};
-use crate::domain::task_examination::{examine_task, RepositoryResolutionRecord};
+use crate::domain::governance::{
+    DeploymentTargetRuleFact, GovernanceResolutionRecord, RepositoryRuleFact, RuleFactsRecord,
+};
+use crate::domain::task_examination::{
+    examine_task, DeploymentTargetResolutionRecord, RepositoryResolutionRecord,
+};
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
     RuntimeRecoveryContext,
@@ -33,6 +37,146 @@ struct RepositoryPreflight {
     record: Option<RepositoryResolutionRecord>,
     repository_root: Option<PathBuf>,
     blocker: Option<String>,
+}
+
+struct DeploymentTargetPreflight {
+    record: Option<DeploymentTargetResolutionRecord>,
+    target: Option<DeploymentTargetRuleFact>,
+    blocker: Option<String>,
+}
+
+fn resolve_deployment_target_preflight(
+    contract: &Value,
+    rule_facts: &RuleFactsRecord,
+) -> DeploymentTargetPreflight {
+    let labels = contract
+        .pointer("/ticket/labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    let mut matching = rule_facts
+        .deployment_targets
+        .iter()
+        .filter(|target| {
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(&target.label))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| {
+        (&left.label, &left.target, &left.branch, &left.namespace).cmp(&(
+            &right.label,
+            &right.target,
+            &right.branch,
+            &right.namespace,
+        ))
+    });
+    matching.dedup_by(|left, right| {
+        left.label.eq_ignore_ascii_case(&right.label)
+            && left.target == right.target
+            && left.branch == right.branch
+            && left.namespace == right.namespace
+    });
+    match matching.as_slice() {
+        [] => DeploymentTargetPreflight {
+            record: None,
+            target: None,
+            blocker: None,
+        },
+        [target] => {
+            if !valid_rule_branch(&target.branch) || !valid_kubernetes_namespace(&target.namespace)
+            {
+                let reason = "The matched deployment target contains an invalid Git branch or Kubernetes namespace; correct the Rules table.";
+                return DeploymentTargetPreflight {
+                    record: Some(deployment_target_resolution_record(
+                        "invalid",
+                        Some(target),
+                        reason,
+                    )),
+                    target: None,
+                    blocker: Some(reason.to_string()),
+                };
+            }
+            DeploymentTargetPreflight {
+                record: Some(deployment_target_resolution_record(
+                    "resolved",
+                    Some(target),
+                    "An exact ticket label selected one user-defined deployment target.",
+                )),
+                target: Some(target.clone()),
+                blocker: None,
+            }
+        }
+        _ => {
+            let reason =
+                "Ticket labels select multiple conflicting deployment targets; keep exactly one environment label or correct the Rules table.";
+            DeploymentTargetPreflight {
+                record: Some(deployment_target_resolution_record(
+                    "ambiguous",
+                    None,
+                    reason,
+                )),
+                target: None,
+                blocker: Some(reason.to_string()),
+            }
+        }
+    }
+}
+
+fn valid_rule_branch(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('-')
+        && !value.ends_with(['.', '/'])
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("//")
+        && !value.contains("@{")
+        && !value.bytes().any(|byte| {
+            byte <= b' ' || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+}
+
+fn valid_kubernetes_namespace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn deployment_target_resolution_record(
+    status: &str,
+    target: Option<&DeploymentTargetRuleFact>,
+    reason: &str,
+) -> DeploymentTargetResolutionRecord {
+    DeploymentTargetResolutionRecord {
+        schema_version: 1,
+        status: status.to_string(),
+        matched_label: target.map(|value| value.label.clone()),
+        target: target.map(|value| value.target.clone()),
+        branch: target.map(|value| value.branch.clone()),
+        namespace: target.map(|value| value.namespace.clone()),
+        source: target
+            .map(|value| value.source.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "global.agent_rules".to_string()),
+        source_line: target.map(|value| value.source_line).unwrap_or(0),
+        reason: reason.to_string(),
+    }
 }
 
 fn resolve_repository_preflight(
@@ -730,6 +874,31 @@ impl TaskExecutor for AgentTaskExecutor {
             ));
         }
         examination.objective_checkpoints = objective_checkpoints;
+        let deployment_target_preflight = resolve_deployment_target_preflight(
+            resolved
+                .task
+                .execution_contract
+                .as_ref()
+                .expect("validated execution contract"),
+            &resolved.governance.rules.facts,
+        );
+        examination.deployment_target_resolution = deployment_target_preflight.record.clone();
+        if let Some(target) = deployment_target_preflight.target.as_ref() {
+            for policy in &resolved.governance.rules.facts.protected_branches {
+                if policy.approval_required
+                    && policy
+                        .branches
+                        .iter()
+                        .any(|branch| branch == &target.branch)
+                {
+                    examination
+                        .approval_boundaries
+                        .push(format!("protected_branch:{}", target.branch));
+                }
+            }
+            examination.approval_boundaries.sort();
+            examination.approval_boundaries.dedup();
+        }
         let (workspace_git_preflight, default_repository_root, repository_preflight_blocker) =
             if envelope
                 .requested_capabilities
@@ -841,6 +1010,18 @@ impl TaskExecutor for AgentTaskExecutor {
         if let Some(preflight) = workspace_git_preflight {
             context.emit_event(TaskSessionEventKind::Runtime, preflight)?;
         }
+        if let Some(record) = deployment_target_preflight.record.as_ref() {
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "deployment_target_preflight",
+                    "schema_version": 1,
+                    "status": record.status,
+                    "resolution": record,
+                    "guidance": deployment_target_preflight.blocker,
+                }),
+            )?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
@@ -904,6 +1085,20 @@ impl TaskExecutor for AgentTaskExecutor {
                 "mcp_connection_ids".to_string(),
             ],
         })?;
+        if let Some(blocker) = deployment_target_preflight.blocker.as_ref() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Deployment target preflight blocked execution. {blocker}"
+            )));
+        }
         if let Some(blocker) = repository_preflight_blocker {
             let runtime_preparation_duration = runtime_preparation.finish();
             emit_execution_trace_stage(
@@ -944,10 +1139,27 @@ impl TaskExecutor for AgentTaskExecutor {
         )?;
         if let Some(authority) = task_tool_authority.as_mut() {
             authority.default_repository_root = default_repository_root;
+            authority.bound_branch = deployment_target_preflight
+                .target
+                .as_ref()
+                .map(|target| target.branch.clone());
         }
         resolved.config.task_tool_authority = task_tool_authority;
+        let expected_ocp_command = crate::infrastructure::ocp::ocp_worker_command().ok();
         for server in &mut resolved.config.mcp_servers {
             server.name = format!("spacesly-{}", server.secret_id);
+            if expected_ocp_command.as_ref() == Some(&server.command) {
+                if let Some(target) = deployment_target_preflight.target.as_ref() {
+                    server.environment.insert(
+                        crate::infrastructure::ocp::ENV_DEFAULT_NAMESPACE.to_string(),
+                        target.namespace.clone(),
+                    );
+                    server.environment.insert(
+                        crate::infrastructure::ocp::TASK_BOUND_NAMESPACE_ENV.to_string(),
+                        target.namespace.clone(),
+                    );
+                }
+            }
             server.proxy_authority = Some(context.external_authority(
                 &server.secret_id,
                 &server.command,
@@ -3473,6 +3685,22 @@ mod tests {
         }
     }
 
+    fn deployment_target_fact(
+        label: &str,
+        target: &str,
+        branch: &str,
+        namespace: &str,
+    ) -> DeploymentTargetRuleFact {
+        DeploymentTargetRuleFact {
+            label: label.to_string(),
+            target: target.to_string(),
+            branch: branch.to_string(),
+            namespace: namespace.to_string(),
+            source: "global.agent_rules".to_string(),
+            source_line: 10,
+        }
+    }
+
     fn initialize_repository(path: &Path) {
         std::fs::create_dir_all(path).expect("repository directory");
         let status = std::process::Command::new(
@@ -3589,6 +3817,69 @@ mod tests {
             .blocker
             .as_deref()
             .is_some_and(|reason| reason.contains("conflicts")));
+    }
+
+    #[test]
+    fn deployment_target_preflight_resolves_exact_label_with_provenance() {
+        let facts = RuleFactsRecord {
+            deployment_targets: vec![deployment_target_fact(
+                "NQLA_PRESTAGE",
+                "prerelease",
+                "prerelease",
+                "qcash-prerelease",
+            )],
+            ..Default::default()
+        };
+        let preflight = resolve_deployment_target_preflight(
+            &json!({ "ticket": { "labels": ["nqla_prestage"] } }),
+            &facts,
+        );
+
+        assert!(preflight.blocker.is_none());
+        let target = preflight.target.expect("target resolved");
+        assert_eq!(target.branch, "prerelease");
+        assert_eq!(target.namespace, "qcash-prerelease");
+        let record = preflight.record.expect("resolution retained");
+        assert_eq!(record.status, "resolved");
+        assert_eq!(record.source_line, 10);
+    }
+
+    #[test]
+    fn deployment_target_preflight_blocks_conflicting_labels() {
+        let facts = RuleFactsRecord {
+            deployment_targets: vec![
+                deployment_target_fact("NQLA_PRESTAGE", "prerelease", "prerelease", "pre"),
+                deployment_target_fact("NQLA_DEV", "dev", "dev", "development"),
+            ],
+            ..Default::default()
+        };
+        let preflight = resolve_deployment_target_preflight(
+            &json!({ "ticket": { "labels": ["NQLA_PRESTAGE", "NQLA_DEV"] } }),
+            &facts,
+        );
+
+        assert!(preflight.target.is_none());
+        assert_eq!(
+            preflight.record.expect("ambiguity retained").status,
+            "ambiguous"
+        );
+        assert!(preflight.blocker.is_some());
+
+        let invalid_facts = RuleFactsRecord {
+            deployment_targets: vec![deployment_target_fact(
+                "NQLA_BAD",
+                "bad",
+                "--delete",
+                "../production",
+            )],
+            ..Default::default()
+        };
+        let invalid = resolve_deployment_target_preflight(
+            &json!({ "ticket": { "labels": ["NQLA_BAD"] } }),
+            &invalid_facts,
+        );
+        assert_eq!(invalid.record.expect("invalid retained").status, "invalid");
+        assert!(invalid.target.is_none());
     }
 
     fn test_governance(task_session_id: u64) -> GovernanceResolutionRecord {

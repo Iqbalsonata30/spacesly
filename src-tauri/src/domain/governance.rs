@@ -104,6 +104,10 @@ pub struct DeploymentTargetRuleFact {
     pub target: String,
     pub branch: String,
     pub namespace: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_line: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -414,6 +418,8 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
                     target: cells[1].to_string(),
                     branch: cells[2].to_string(),
                     namespace: cells[3].to_string(),
+                    source: "global.agent_rules".to_string(),
+                    source_line: (line_index + 1) as u32,
                 });
             }
         }
@@ -1056,6 +1062,8 @@ mod tests {
         assert!(facts.protected_branches[0].approval_required);
         assert_eq!(facts.deployment_targets[0].label, "NQLA_DEV");
         assert_eq!(facts.deployment_targets[0].target, "dev");
+        assert_eq!(facts.deployment_targets[0].source, "global.agent_rules");
+        assert!(facts.deployment_targets[0].source_line > 0);
         assert_eq!(facts.deployment_targets[1].label, "NQLA_PRESTAGE");
         assert!(facts.warnings.is_empty());
     }

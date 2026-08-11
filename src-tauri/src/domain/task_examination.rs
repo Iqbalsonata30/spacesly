@@ -95,6 +95,20 @@ pub struct RepositoryResolutionRecord {
     pub reason: String,
 }
 
+/// Exact deployment environment selected from a user-defined Rules table.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeploymentTargetResolutionRecord {
+    pub schema_version: u32,
+    pub status: String,
+    pub matched_label: Option<String>,
+    pub target: Option<String>,
+    pub branch: Option<String>,
+    pub namespace: Option<String>,
+    pub source: String,
+    pub source_line: u32,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -112,6 +126,8 @@ pub struct TaskExaminationRecord {
     pub semantic_planner: Option<SemanticPlannerEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_resolution: Option<RepositoryResolutionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_target_resolution: Option<DeploymentTargetResolutionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -151,6 +167,7 @@ impl TaskExaminationRecord {
             self.connector_capabilities.len(),
             self.capability_mappings.len(),
             usize::from(self.repository_resolution.is_some()),
+            usize::from(self.deployment_target_resolution.is_some()),
             self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
@@ -240,6 +257,41 @@ impl TaskExaminationRecord {
             })
         {
             return Err("Task Examination repository resolution is invalid.".to_string());
+        }
+        if self
+            .deployment_target_resolution
+            .as_ref()
+            .is_some_and(|resolution| {
+                resolution.schema_version != 1
+                    || !matches!(
+                        resolution.status.as_str(),
+                        "resolved" | "ambiguous" | "invalid"
+                    )
+                    || resolution.source.trim().is_empty()
+                    || resolution.source.len() > 128
+                    || resolution.reason.trim().is_empty()
+                    || resolution.reason.len() > 512
+                    || [
+                        resolution.matched_label.as_ref(),
+                        resolution.target.as_ref(),
+                        resolution.branch.as_ref(),
+                        resolution.namespace.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| {
+                        value.trim().is_empty()
+                            || value.len() > 253
+                            || value.chars().any(char::is_control)
+                    })
+                    || (resolution.status == "resolved"
+                        && (resolution.matched_label.is_none()
+                            || resolution.target.is_none()
+                            || resolution.branch.is_none()
+                            || resolution.namespace.is_none()))
+            })
+        {
+            return Err("Task Examination deployment target resolution is invalid.".to_string());
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -508,6 +560,7 @@ pub fn examine_task(
         capability_mappings,
         semantic_planner,
         repository_resolution: None,
+        deployment_target_resolution: None,
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,
