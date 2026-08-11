@@ -31,6 +31,20 @@ pub fn run_task_tools_from_env() -> Result<(), String> {
     if root != authority.workspace_root || !root.is_dir() {
         return Err("Task tool workspace root changed or is not a directory.".to_string());
     }
+    if let Some(default_repository_root) = authority.default_repository_root.as_ref() {
+        let canonical = default_repository_root
+            .canonicalize()
+            .map_err(|error| format!("Failed to resolve default Git repository: {error}"))?;
+        if canonical != *default_repository_root
+            || !canonical.starts_with(&root)
+            || repository_root_at(&canonical)?.as_deref() != Some(canonical.as_path())
+        {
+            return Err(
+                "Default Git repository is not an exact repository root inside the assigned workspace."
+                    .to_string(),
+            );
+        }
+    }
     let workspace_roots = WorkspaceRoot::home()?;
     workspace_roots.set_path(&authority.workspace_id, root)?;
 
@@ -146,7 +160,7 @@ fn tool_definitions(authority: &TaskToolAuthority) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "operation": { "type": "string", "enum": ["info", "status", "stage_file", "stage_all", "unstage_file", "unstage_all", "checkout", "pull", "commit", "push", "merge", "rebase"] },
-                    "workdir": { "type": "string", "description": "Repository directory inside the assigned workspace. Required when the workspace root is not itself a Git repository." },
+                    "workdir": { "type": "string", "description": "Repository directory inside the assigned workspace. Omit it when Task Examination resolved an authoritative default repository." },
                     "path": { "type": "string" },
                     "branch": { "type": "string" },
                     "message": { "type": "string" }
@@ -264,10 +278,24 @@ fn call_git(
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Value, String> {
     let workspace = authority.workspace_id.clone();
-    let workdir = resolve_workdir(
-        &authority.workspace_root,
-        arguments.get("workdir").and_then(Value::as_str),
-    )?;
+    let requested_workdir = arguments.get("workdir").and_then(Value::as_str);
+    let workdir = match (
+        requested_workdir,
+        authority.default_repository_root.as_ref(),
+    ) {
+        (None, Some(default)) => default.clone(),
+        (Some(requested), Some(default)) => {
+            let resolved = resolve_workdir(&authority.workspace_root, Some(requested))?;
+            if &resolved != default {
+                return Err(
+                    "Git workdir conflicts with the repository resolved by Task Examination."
+                        .to_string(),
+                );
+            }
+            resolved
+        }
+        (requested, None) => resolve_workdir(&authority.workspace_root, requested)?,
+    };
     let repo_root = repository_root_at(&workdir)?.ok_or_else(|| {
         "Git workdir is not inside a repository. Provide a repository directory within the assigned workspace using 'workdir'.".to_string()
     })?;
@@ -632,7 +660,7 @@ mod tests {
             .claim_next(owner, 1, Duration::from_secs(30), 1)
             .expect("claim succeeds")
             .expect("assignment");
-        let authority = store
+        let mut authority = store
             .task_tool_authority(
                 assignment.fence,
                 "workspace-test",
@@ -678,6 +706,35 @@ mod tests {
         )
         .expect_err("workspace root itself is not a repository");
         assert!(missing_workdir.contains("Provide a repository directory"));
+
+        authority.default_repository_root =
+            Some(repository.canonicalize().expect("default repository root"));
+        let default_response = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": { "operation": "info" }
+                }
+            }),
+        )
+        .expect("resolved default repository inspected");
+        assert_eq!(default_response["is_git_repo"], true);
+        assert_eq!(default_response["repo_root"], response["repo_root"]);
+
+        let conflicting = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "git",
+                    "arguments": { "operation": "info", "workdir": "." }
+                }
+            }),
+        )
+        .expect_err("resolved repository cannot be overridden");
+        assert!(conflicting.contains("conflicts with the repository resolved"));
     }
 
     #[test]
@@ -692,6 +749,7 @@ mod tests {
             fencing_token: 1,
             workspace_id: "workspace".to_string(),
             workspace_root: PathBuf::from("/workspace"),
+            default_repository_root: None,
             capabilities: vec!["workspace_read".to_string()],
         };
         let names = tool_definitions(&authority)

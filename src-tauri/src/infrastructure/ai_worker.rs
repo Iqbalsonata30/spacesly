@@ -3828,6 +3828,7 @@ mod tests {
             fencing_token: 4,
             workspace_id: "workspace-personal".to_string(),
             workspace_root: PathBuf::from("/tmp"),
+            default_repository_root: None,
             capabilities: vec!["workspace_read".to_string(), "shell".to_string()],
         });
 

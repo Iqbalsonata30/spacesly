@@ -173,6 +173,8 @@ pub struct TaskToolAuthority {
     pub fencing_token: u64,
     pub workspace_id: String,
     pub workspace_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_repository_root: Option<PathBuf>,
     pub capabilities: Vec<String>,
 }
 
@@ -855,6 +857,7 @@ impl SchedulerStore {
             fencing_token: fence.fencing_token,
             workspace_id: workspace_id.to_string(),
             workspace_root,
+            default_repository_root: None,
             capabilities,
         })
     }

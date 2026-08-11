@@ -80,6 +80,21 @@ pub struct SemanticPlannerEvidence {
     pub objective_count: usize,
 }
 
+/// Deterministic, secret-free repository scope selected before worker execution.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryResolutionRecord {
+    pub schema_version: u32,
+    pub status: String,
+    pub repository_id: Option<String>,
+    pub remote_url: Option<String>,
+    pub local_path: Option<String>,
+    pub backend_path: Option<String>,
+    pub frontend_path: Option<String>,
+    pub source: String,
+    pub source_line: u32,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -95,6 +110,8 @@ pub struct TaskExaminationRecord {
     pub capability_mappings: Vec<ConnectorCapabilityMapping>,
     #[serde(default)]
     pub semantic_planner: Option<SemanticPlannerEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_resolution: Option<RepositoryResolutionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -133,6 +150,7 @@ impl TaskExaminationRecord {
             self.capability_catalog.len(),
             self.connector_capabilities.len(),
             self.capability_mappings.len(),
+            usize::from(self.repository_resolution.is_some()),
             self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
@@ -181,6 +199,47 @@ impl TaskExaminationRecord {
                 || planner.objective_count > 8
         }) {
             return Err("Task Examination semantic planner evidence is invalid.".to_string());
+        }
+        if self
+            .repository_resolution
+            .as_ref()
+            .is_some_and(|resolution| {
+                resolution.schema_version != 1
+                    || !matches!(
+                        resolution.status.as_str(),
+                        "resolved"
+                            | "ambiguous"
+                            | "conflict"
+                            | "missing_checkout"
+                            | "invalid_checkout"
+                            | "outside_workspace"
+                    )
+                    || resolution.repository_id.as_ref().is_some_and(|value| {
+                        value.trim().is_empty()
+                            || value.len() > 253
+                            || value.chars().any(char::is_control)
+                    })
+                    || resolution.remote_url.as_ref().is_some_and(|value| {
+                        value.trim().is_empty()
+                            || value.len() > 2_000
+                            || value.chars().any(char::is_control)
+                    })
+                    || resolution.source.trim().is_empty()
+                    || resolution.source.len() > 128
+                    || resolution.reason.trim().is_empty()
+                    || resolution.reason.len() > 512
+                    || resolution
+                        .local_path
+                        .as_ref()
+                        .is_some_and(|path| path.is_empty() || path.len() > 4_096)
+                    || resolution
+                        .backend_path
+                        .iter()
+                        .chain(resolution.frontend_path.iter())
+                        .any(|path| path.is_empty() || path.len() > 1_024)
+            })
+        {
+            return Err("Task Examination repository resolution is invalid.".to_string());
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -448,6 +507,7 @@ pub fn examine_task(
         connector_capabilities: connector_capabilities.to_vec(),
         capability_mappings,
         semantic_planner,
+        repository_resolution: None,
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,

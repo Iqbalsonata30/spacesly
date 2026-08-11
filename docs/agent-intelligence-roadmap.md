@@ -252,9 +252,22 @@ Exit criteria:
 
 ### Phase 10 — Structured Rule Compiler and Preflight Resolver
 
-Status: planned.
+Status: in progress.
 
 Expand rule compilation into repository mappings, environment tables, branch protections, approval boundaries, required verification, and connector configuration checks. Resolve repository and environment scope before starting the worker.
+
+Implemented repository-resolution increment:
+
+- Repository facts use the versioned v2 compiler and retain their Rules source plus line provenance while v1 retained facts remain readable.
+- Git tasks select a unique repository from the immutable execution contract and compiled Rules before the worker starts.
+- When Rules omit a local checkout, bounded contained discovery can resolve a unique Git repository whose directory matches the Bitbucket repository ID.
+- The resolved exact repository root and Helm backend/frontend subpaths are persisted in Task Examination and installed as the assignment-local Git tool default.
+- Missing, ambiguous, conflicting, non-repository, and workspace-escaping checkout selections block before model execution with corrective guidance.
+
+Current limitations:
+
+- Deployment environment tables are compiled but are not yet resolved against task labels into authoritative branch/namespace defaults.
+- Connector configuration preflight and independently enforceable verification requirements remain planned.
 
 Benefits:
 

@@ -9,7 +9,33 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 ## Current Position
 
 - Completed through Phase 9: resource-level idempotency foundation.
-- Phase 10, structured rule compilation and preflight resolution, is the next roadmap milestone.
+- Phase 10 is in progress with authoritative Helm repository resolution and Git-tool defaults.
+
+## Phase 10 In Progress
+
+Implemented repository-resolution increment:
+
+- Rule facts schema/compiler v2 records repository source and line provenance; retained v1 facts remain valid.
+- Repository selection combines the immutable execution contract with compiled repository Rules.
+- A declared checkout is canonicalized and must be an exact Git root contained by the trusted workspace.
+- When no checkout is declared, discovery is bounded to four directory levels and 4,096 directories, does not follow symlinks, and accepts only a unique repository directory matching the compiled repository ID.
+- The secret-free resolution record includes repository identity, sanitized remote URL, canonical local path, Helm backend/frontend paths, provenance, status, and reason.
+- The assignment-local Git authority receives the resolved repository as its default; an explicit Git `workdir` must resolve to that same root and cannot redirect the task to another contained repository.
+- Ambiguous repository Rules or checkout matches, conflicting contract/Rules paths, missing/non-Git paths, and workspace escapes block before OpenCode starts.
+
+Regression evidence:
+
+- Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
+- Focused Git default-workdir test: passed.
+- Focused Rules v2 compilation/provenance and v1 compatibility tests: 2 passed.
+- Full Rust suite: 429 passed, 3 ignored, 0 failed.
+
+Remaining Phase 10 scope:
+
+1. Resolve compiled deployment targets into authoritative environment, branch, and namespace selections.
+2. Preflight connector base URLs and required connector configuration with secret-free diagnostics.
+3. Compile required verification policies and their provenance.
+4. Detect cross-rule contradictions beyond repository path selection.
 
 ## Phase 9 Completed
 
@@ -114,7 +140,7 @@ Regression evidence recorded so far:
 ## Known Gaps
 
 1. Replay fencing remains exact tool name plus argument digest except for state-reconciling Deployment scale/restart operations.
-2. Rules can identify a local repository, but repository selection is not yet compiled into an authoritative task-tool default.
+2. Deployment target Rules are compiled, but environment/branch/namespace selection is not yet authoritative at preflight.
 3. Some connector configuration errors are discovered only when the connector is called.
 4. Objective evidence is structurally required, but not every connector has an independent state verifier.
 5. Dynamic tasks lack a release-grade evaluation corpus and safety scorecard.

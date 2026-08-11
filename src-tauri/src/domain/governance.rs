@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
-pub const RULE_FACTS_SCHEMA_VERSION: u32 = 1;
-pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v1";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 2;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
+const LEGACY_RULE_FACTS_SCHEMA_VERSION: u32 = 1;
+const LEGACY_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v1";
 const MAX_SELECTED_SKILLS: usize = 16;
 const MAX_SELECTED_SKILL_BYTES: usize = 32 * 1024;
 
@@ -83,6 +85,10 @@ pub struct RepositoryRuleFact {
     pub local_path: Option<String>,
     pub backend_path: Option<String>,
     pub frontend_path: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_line: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,9 +153,12 @@ impl GovernanceResolutionRecord {
             // Schema 0 is the serde default for retained v1 governance snapshots created before
             // Rule facts existed. They remain valid and immutable; new resolutions always emit v1.
             if self.rules.facts.schema_version != 0 {
-                if self.rules.facts.schema_version != RULE_FACTS_SCHEMA_VERSION
-                    || self.rules.facts.compiler_version != RULE_FACTS_COMPILER_VERSION
-                    || self.rules.facts.source_digest != self.rules.final_digest
+                let supported_compiler = (self.rules.facts.schema_version
+                    == RULE_FACTS_SCHEMA_VERSION
+                    && self.rules.facts.compiler_version == RULE_FACTS_COMPILER_VERSION)
+                    || (self.rules.facts.schema_version == LEGACY_RULE_FACTS_SCHEMA_VERSION
+                        && self.rules.facts.compiler_version == LEGACY_RULE_FACTS_COMPILER_VERSION);
+                if !supported_compiler || self.rules.facts.source_digest != self.rules.final_digest
                 {
                     return Err("Governance Rule facts are stale or unsupported.".to_string());
                 }
@@ -346,14 +355,18 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     let mut protected_branches = Vec::new();
     let mut deployment_targets = Vec::new();
 
-    for line in snapshot.lines() {
+    for (line_index, line) in snapshot.lines().enumerate() {
         for matched in url_pattern.find_iter(line) {
             let url = matched
                 .as_str()
                 .trim_end_matches(|character: char| matches!(character, '.' | ',' | ')' | ']'))
                 .to_string();
-            if url.contains("/repos/") && !remote_urls.contains(&url) {
-                remote_urls.push(url);
+            if url.contains("/repos/")
+                && !remote_urls
+                    .iter()
+                    .any(|(candidate, _): &(String, u32)| candidate == &url)
+            {
+                remote_urls.push((url, (line_index + 1) as u32));
             }
         }
         if local_path.is_none() {
@@ -412,7 +425,7 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
 
     let repositories = remote_urls
         .into_iter()
-        .map(|remote_url| RepositoryRuleFact {
+        .map(|(remote_url, source_line)| RepositoryRuleFact {
             id: remote_url
                 .split("/repos/")
                 .nth(1)
@@ -423,6 +436,8 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
             local_path: local_path.clone(),
             backend_path: backend_path.clone(),
             frontend_path: frontend_path.clone(),
+            source: "global.agent_rules".to_string(),
+            source_line,
         })
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
@@ -1032,6 +1047,8 @@ mod tests {
             facts.repositories[0].frontend_path.as_deref(),
             Some("frontend")
         );
+        assert_eq!(facts.repositories[0].source, "global.agent_rules");
+        assert_eq!(facts.repositories[0].source_line, 4);
         assert_eq!(
             facts.protected_branches[0].branches,
             vec!["cloud", "drc", "eks-green", "master"]
@@ -1078,6 +1095,17 @@ mod tests {
         resolution
             .validate_for(5)
             .expect("pre-facts retained governance remains compatible");
+    }
+
+    #[test]
+    fn retained_v1_rule_facts_remain_valid_after_v2_compiler_upgrade() {
+        let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
+            .expect("governance resolves");
+        resolution.rules.facts.schema_version = LEGACY_RULE_FACTS_SCHEMA_VERSION;
+        resolution.rules.facts.compiler_version = LEGACY_RULE_FACTS_COMPILER_VERSION.to_string();
+        resolution
+            .validate_for(5)
+            .expect("retained v1 rule facts remain compatible");
     }
 
     #[test]

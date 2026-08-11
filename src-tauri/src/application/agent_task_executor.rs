@@ -2,8 +2,8 @@ use super::execution_engine::{
     TaskEventReporter, TaskExecutionContext, TaskExecutionError, TaskExecutor,
 };
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
-use crate::domain::governance::GovernanceResolutionRecord;
-use crate::domain::task_examination::examine_task;
+use crate::domain::governance::{GovernanceResolutionRecord, RepositoryRuleFact, RuleFactsRecord};
+use crate::domain::task_examination::{examine_task, RepositoryResolutionRecord};
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
     RuntimeRecoveryContext,
@@ -18,13 +18,290 @@ use crate::infrastructure::ai_worker::{
     AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
 };
 use crate::infrastructure::git::repository_root_at;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 const MAX_AUTOMATIC_RUNTIME_RETRIES: u8 = 1;
+const MAX_REPOSITORY_DISCOVERY_DEPTH: usize = 4;
+const MAX_REPOSITORY_DISCOVERY_DIRECTORIES: usize = 4_096;
+
+struct RepositoryPreflight {
+    record: Option<RepositoryResolutionRecord>,
+    repository_root: Option<PathBuf>,
+    blocker: Option<String>,
+}
+
+fn resolve_repository_preflight(
+    contract: &Value,
+    rule_facts: &RuleFactsRecord,
+    workspace_root: &Path,
+) -> RepositoryPreflight {
+    if rule_facts.repositories.is_empty() {
+        return RepositoryPreflight {
+            record: None,
+            repository_root: None,
+            blocker: None,
+        };
+    }
+    let contract_text = serde_json::to_string(contract)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let matching = rule_facts
+        .repositories
+        .iter()
+        .filter(|repository| {
+            contract_text.contains(&repository.id.to_ascii_lowercase())
+                || contract_text.contains(&repository.remote_url.to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
+    let selected = if matching.len() == 1 {
+        Some(matching[0])
+    } else if matching.is_empty() && rule_facts.repositories.len() == 1 {
+        rule_facts.repositories.first()
+    } else {
+        None
+    };
+    let Some(repository) = selected else {
+        let reason = if matching.len() > 1 {
+            "The task matches multiple repository Rules; declare one repository root in the execution contract."
+        } else {
+            "Multiple repository Rules are available, but the task does not identify which repository to use."
+        };
+        return repository_preflight_failure("ambiguous", None, reason);
+    };
+    let contract_path = contract
+        .pointer("/repository/root_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(contract_path), Some(rule_path)) =
+        (contract_path, repository.local_path.as_deref())
+    {
+        let contract_candidate = absolute_repository_candidate(workspace_root, contract_path);
+        let rule_candidate = absolute_repository_candidate(workspace_root, rule_path);
+        let resolved_contract = contract_candidate
+            .canonicalize()
+            .unwrap_or(contract_candidate);
+        let resolved_rule = rule_candidate.canonicalize().unwrap_or(rule_candidate);
+        if resolved_contract != resolved_rule {
+            return repository_preflight_failure(
+                "conflict",
+                Some(repository),
+                "The execution contract repository root conflicts with the authoritative Rules checkout path.",
+            );
+        }
+    }
+    let candidate = contract_path
+        .or(repository.local_path.as_deref())
+        .map(|path| absolute_repository_candidate(workspace_root, path));
+    let candidate = match candidate {
+        Some(candidate) => candidate,
+        None => match discover_named_repositories(workspace_root, &repository.id) {
+            Ok((matches, false)) if matches.len() == 1 => matches[0].clone(),
+            Ok((matches, _)) if matches.len() > 1 => {
+                return repository_preflight_failure(
+                    "ambiguous",
+                    Some(repository),
+                    "More than one contained Git checkout matches the repository Rule; declare its exact local checkout path.",
+                );
+            }
+            Ok((_, true)) => {
+                return repository_preflight_failure(
+                    "missing_checkout",
+                    Some(repository),
+                    "Bounded repository discovery was exhausted; declare the exact local checkout path in Rules.",
+                );
+            }
+            Ok(_) => {
+                return repository_preflight_failure(
+                    "missing_checkout",
+                    Some(repository),
+                    "The repository Rule has no local checkout path and no matching contained Git checkout was discovered. Add `Local checkout: /absolute/path` to Rules.",
+                );
+            }
+            Err(error) => {
+                return repository_preflight_failure(
+                    "invalid_checkout",
+                    Some(repository),
+                    &format!("Repository discovery failed: {error}"),
+                );
+            }
+        },
+    };
+    let canonical_workspace = match workspace_root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return repository_preflight_failure(
+                "invalid_checkout",
+                Some(repository),
+                "The trusted workspace root does not exist or cannot be resolved.",
+            );
+        }
+    };
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return repository_preflight_failure(
+                "missing_checkout",
+                Some(repository),
+                "The configured repository checkout does not exist or cannot be resolved.",
+            );
+        }
+    };
+    if !canonical.starts_with(&canonical_workspace) {
+        return repository_preflight_failure(
+            "outside_workspace",
+            Some(repository),
+            "The configured repository checkout escapes the trusted workspace root.",
+        );
+    }
+    match repository_root_at(&canonical) {
+        Ok(Some(root)) if root == canonical => {}
+        Ok(Some(_)) => {
+            return repository_preflight_failure(
+                "invalid_checkout",
+                Some(repository),
+                "The configured checkout path is inside a repository but is not its root.",
+            );
+        }
+        Ok(None) => {
+            return repository_preflight_failure(
+                "invalid_checkout",
+                Some(repository),
+                "The configured checkout path is not a Git repository root.",
+            );
+        }
+        Err(error) => {
+            return repository_preflight_failure(
+                "invalid_checkout",
+                Some(repository),
+                &format!("Git could not validate the configured checkout: {error}"),
+            );
+        }
+    }
+    RepositoryPreflight {
+        record: Some(repository_resolution_record(
+            "resolved",
+            Some(repository),
+            Some(&canonical),
+            "A unique contained Git checkout was resolved from the immutable contract and Rules.",
+        )),
+        repository_root: Some(canonical),
+        blocker: None,
+    }
+}
+
+fn repository_preflight_failure(
+    status: &str,
+    repository: Option<&RepositoryRuleFact>,
+    reason: &str,
+) -> RepositoryPreflight {
+    RepositoryPreflight {
+        record: Some(repository_resolution_record(
+            status, repository, None, reason,
+        )),
+        repository_root: None,
+        blocker: Some(reason.to_string()),
+    }
+}
+
+fn repository_resolution_record(
+    status: &str,
+    repository: Option<&RepositoryRuleFact>,
+    local_path: Option<&Path>,
+    reason: &str,
+) -> RepositoryResolutionRecord {
+    RepositoryResolutionRecord {
+        schema_version: 1,
+        status: status.to_string(),
+        repository_id: repository.map(|value| value.id.clone()),
+        remote_url: repository.map(|value| sanitize_repository_url(&value.remote_url)),
+        local_path: local_path.map(|path| path.to_string_lossy().to_string()),
+        backend_path: repository.and_then(|value| value.backend_path.clone()),
+        frontend_path: repository.and_then(|value| value.frontend_path.clone()),
+        source: repository
+            .map(|value| value.source.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "global.agent_rules".to_string()),
+        source_line: repository.map(|value| value.source_line).unwrap_or(0),
+        reason: reason.to_string(),
+    }
+}
+
+fn sanitize_repository_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "invalid-repository-url".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn absolute_repository_candidate(workspace_root: &Path, value: &str) -> PathBuf {
+    let candidate = PathBuf::from(value);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        workspace_root.join(candidate)
+    }
+}
+
+fn discover_named_repositories(
+    workspace_root: &Path,
+    repository_id: &str,
+) -> Result<(Vec<PathBuf>, bool), String> {
+    let mut pending = vec![(workspace_root.to_path_buf(), 0usize)];
+    let mut matches = Vec::new();
+    let mut inspected = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        inspected = inspected.saturating_add(1);
+        if inspected > MAX_REPOSITORY_DISCOVERY_DIRECTORIES {
+            return Ok((matches, true));
+        }
+        if directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(repository_id))
+            && repository_root_at(&directory)?.as_deref() == Some(directory.as_path())
+        {
+            matches.push(directory);
+            continue;
+        }
+        if depth >= MAX_REPOSITORY_DISCOVERY_DEPTH {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if depth == 0 => {
+                return Err(format!("Could not read '{}': {error}", directory.display()));
+            }
+            Err(_) => continue,
+        };
+        let mut children = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                (file_type.is_dir()
+                    && !file_type.is_symlink()
+                    && !matches!(name, ".git" | "node_modules" | "target" | ".cache"))
+                .then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        children.sort();
+        pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
+    }
+    matches.sort();
+    matches.dedup();
+    Ok((matches, false))
+}
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeAttemptObservation {
@@ -453,14 +730,42 @@ impl TaskExecutor for AgentTaskExecutor {
             ));
         }
         examination.objective_checkpoints = objective_checkpoints;
-        let workspace_git_preflight = if envelope
-            .requested_capabilities
-            .iter()
-            .any(|capability| capability == "git")
-        {
-            resolved.config.opencode_workdir.as_deref().map(|workdir| {
+        let (workspace_git_preflight, default_repository_root, repository_preflight_blocker) =
+            if envelope
+                .requested_capabilities
+                .iter()
+                .any(|capability| capability == "git")
+            {
+                resolved.config.opencode_workdir.as_deref().map_or(
+                (None, None, None),
+                |workdir| {
                 let configured = std::path::PathBuf::from(workdir);
                 let canonical = configured.canonicalize().ok();
+                let repository_preflight = resolve_repository_preflight(
+                    resolved
+                        .task
+                        .execution_contract
+                        .as_ref()
+                        .expect("validated execution contract"),
+                    &resolved.governance.rules.facts,
+                    &configured,
+                );
+                examination.repository_resolution = repository_preflight.record.clone();
+                if let Some(record) = repository_preflight.record.as_ref() {
+                    return (
+                        Some(json!({
+                            "type": "workspace_git_preflight",
+                            "schema_version": 2,
+                            "status": record.status,
+                            "workspace_root": canonical,
+                            "repository_root": repository_preflight.repository_root,
+                            "repository_resolution": record,
+                            "guidance": repository_preflight.blocker,
+                        })),
+                        repository_preflight.repository_root,
+                        repository_preflight.blocker,
+                    );
+                }
                 let (status, repository_root, guidance) = match canonical.as_deref() {
                     None => (
                         "invalid_workspace",
@@ -494,18 +799,22 @@ impl TaskExecutor for AgentTaskExecutor {
                 {
                     examination.warnings.push(guidance.to_string());
                 }
-                json!({
-                    "type": "workspace_git_preflight",
-                    "schema_version": 1,
-                    "status": status,
-                    "workspace_root": canonical,
-                    "repository_root": repository_root,
-                    "guidance": guidance,
-                })
+                (
+                    Some(json!({
+                        "type": "workspace_git_preflight",
+                        "schema_version": 1,
+                        "status": status,
+                        "workspace_root": canonical,
+                        "repository_root": repository_root,
+                        "guidance": guidance,
+                    })),
+                    None,
+                    None,
+                )
             })
-        } else {
-            None
-        };
+            } else {
+                (None, None, None)
+            };
         let semantic_objective_mutations = Arc::new(semantic_objective_mutations);
         examination
             .validate(&envelope.context_digest)
@@ -595,6 +904,20 @@ impl TaskExecutor for AgentTaskExecutor {
                 "mcp_connection_ids".to_string(),
             ],
         })?;
+        if let Some(blocker) = repository_preflight_blocker {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Repository preflight blocked execution. {blocker}"
+            )));
+        }
         if !connector_preflight_blockers.is_empty() {
             let runtime_preparation_duration = runtime_preparation.finish();
             emit_execution_trace_stage(
@@ -614,11 +937,15 @@ impl TaskExecutor for AgentTaskExecutor {
             resolved.config.opencode_workdir.as_deref().ok_or_else(|| {
                 TaskExecutionError::new("Trusted Agent workspace root is required.")
             })?;
-        resolved.config.task_tool_authority = context.task_tool_authority(
+        let mut task_tool_authority = context.task_tool_authority(
             &envelope.workspace_id,
             std::path::PathBuf::from(workspace_root),
             &envelope.requested_capabilities,
         )?;
+        if let Some(authority) = task_tool_authority.as_mut() {
+            authority.default_repository_root = default_repository_root;
+        }
+        resolved.config.task_tool_authority = task_tool_authority;
         for server in &mut resolved.config.mcp_servers {
             server.name = format!("spacesly-{}", server.secret_id);
             server.proxy_authority = Some(context.external_authority(
@@ -3132,6 +3459,136 @@ mod tests {
                 proxy_authority: None,
             }],
         }
+    }
+
+    fn repository_fact(local_path: Option<String>) -> RepositoryRuleFact {
+        RepositoryRuleFact {
+            id: "qcash-deployment".to_string(),
+            remote_url: "https://bitbucket.example/projects/OPS/repos/qcash-deployment".to_string(),
+            local_path,
+            backend_path: Some("service".to_string()),
+            frontend_path: Some("frontend".to_string()),
+            source: "global.agent_rules".to_string(),
+            source_line: 2,
+        }
+    }
+
+    fn initialize_repository(path: &Path) {
+        std::fs::create_dir_all(path).expect("repository directory");
+        let status = std::process::Command::new(
+            crate::infrastructure::git::git_executable().expect("git executable"),
+        )
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .status()
+        .expect("git init runs");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn repository_preflight_discovers_unique_named_checkout_and_records_provenance() {
+        let directory = tempdir().expect("workspace");
+        let repository = directory.path().join("BRI").join("qcash-deployment");
+        initialize_repository(&repository);
+        let mut fact = repository_fact(None);
+        let secret = "repository-secret";
+        fact.remote_url = format!(
+            "https://user:{secret}@bitbucket.example/projects/OPS/repos/qcash-deployment?token={secret}"
+        );
+        let facts = RuleFactsRecord {
+            repositories: vec![fact],
+            ..Default::default()
+        };
+
+        let preflight = resolve_repository_preflight(
+            &json!({ "objective": { "summary": "Create qcash-deployment Helm template" } }),
+            &facts,
+            directory.path(),
+        );
+
+        assert!(preflight.blocker.is_none());
+        assert_eq!(
+            preflight.repository_root.as_deref(),
+            Some(
+                repository
+                    .canonicalize()
+                    .expect("repository root")
+                    .as_path()
+            )
+        );
+        let record = preflight.record.expect("resolution record");
+        assert_eq!(record.status, "resolved");
+        assert_eq!(record.repository_id.as_deref(), Some("qcash-deployment"));
+        assert_eq!(record.source_line, 2);
+        assert_eq!(record.backend_path.as_deref(), Some("service"));
+        assert!(!serde_json::to_string(&record)
+            .expect("resolution serializes")
+            .contains(secret));
+    }
+
+    #[test]
+    fn repository_preflight_blocks_ambiguous_and_escaping_checkouts() {
+        let directory = tempdir().expect("workspace");
+        for parent in ["one", "two"] {
+            initialize_repository(&directory.path().join(parent).join("qcash-deployment"));
+        }
+        let facts = RuleFactsRecord {
+            repositories: vec![repository_fact(None)],
+            ..Default::default()
+        };
+        let ambiguous = resolve_repository_preflight(&json!({}), &facts, directory.path());
+        assert_eq!(
+            ambiguous.record.expect("ambiguous record").status,
+            "ambiguous"
+        );
+        assert!(ambiguous.blocker.is_some());
+
+        let outside = tempdir().expect("outside");
+        initialize_repository(outside.path());
+        let escaping_facts = RuleFactsRecord {
+            repositories: vec![repository_fact(Some(
+                outside.path().to_string_lossy().to_string(),
+            ))],
+            ..Default::default()
+        };
+        let escaping = resolve_repository_preflight(&json!({}), &escaping_facts, directory.path());
+        assert_eq!(
+            escaping.record.expect("escape record").status,
+            "outside_workspace"
+        );
+        assert!(escaping.blocker.is_some());
+    }
+
+    #[test]
+    fn repository_preflight_blocks_conflicting_contract_and_rule_paths() {
+        let directory = tempdir().expect("workspace");
+        let ruled = directory.path().join("ruled").join("qcash-deployment");
+        let contracted = directory.path().join("contracted").join("qcash-deployment");
+        initialize_repository(&ruled);
+        initialize_repository(&contracted);
+        let facts = RuleFactsRecord {
+            repositories: vec![repository_fact(Some(ruled.to_string_lossy().to_string()))],
+            ..Default::default()
+        };
+
+        let preflight = resolve_repository_preflight(
+            &json!({
+                "repository": {
+                    "root_path": contracted.to_string_lossy(),
+                }
+            }),
+            &facts,
+            directory.path(),
+        );
+
+        assert_eq!(
+            preflight.record.expect("conflict record").status,
+            "conflict"
+        );
+        assert!(preflight
+            .blocker
+            .as_deref()
+            .is_some_and(|reason| reason.contains("conflicts")));
     }
 
     fn test_governance(task_session_id: u64) -> GovernanceResolutionRecord {
