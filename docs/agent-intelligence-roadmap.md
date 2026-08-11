@@ -269,10 +269,13 @@ Implemented repository-resolution increment:
 - User-defined Connector blocks bind a configured connector ID and type to a sanitized base URL plus required operations. Once Connector Rules are present, every requested connector must have a matching block.
 - Preflight compares the authoritative base URL with secret-backed connector configuration and verifies required operations against the live MCP inventory using exact, type-qualified, ID-qualified, then unique-suffix matching.
 - Missing/duplicate Rules, malformed or mismatched URLs, unavailable connectors, missing operations, and ambiguous tool matches block before model execution with secret-free diagnostics.
+- User-defined `Verification` blocks bind required successful connector operations globally or to exact ticket labels. The bound operation names are resolved against the live inventory and retained with Rules provenance.
+- A runtime `completed` claim is accepted only when every bound operation has a successful tool receipt from the current attempt, an automatic retry, or a durable objective checkpoint from an earlier assignment.
+- Missing evidence fails closed as an explicit blocked result; the worker summary cannot override the receipt check.
 
 Current limitations:
 
-- Independently enforceable verification requirements remain planned.
+- This increment verifies successful operation execution, not yet the semantic resource identity or returned external state; those connector-aware checks remain Phase 11 scope.
 - Tasks without an exact deployment label do not receive an environment binding; broader explicit task-to-environment selectors remain planned.
 
 Benefits:

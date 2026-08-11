@@ -124,6 +124,21 @@ pub struct ConnectorConfigurationPreflightRecord {
     pub reason: String,
 }
 
+/// Task-bound, secret-free proof requirements compiled from user Rules.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationPolicyBindingRecord {
+    pub schema_version: u32,
+    pub policy_id: String,
+    pub connector_id: String,
+    pub status: String,
+    pub matched_labels: Vec<String>,
+    pub required_operations: Vec<String>,
+    pub verified_tools: Vec<String>,
+    pub source: String,
+    pub source_line: u32,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -145,6 +160,8 @@ pub struct TaskExaminationRecord {
     pub deployment_target_resolution: Option<DeploymentTargetResolutionRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connector_configuration_preflights: Vec<ConnectorConfigurationPreflightRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_policy_bindings: Vec<VerificationPolicyBindingRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -353,6 +370,36 @@ impl TaskExaminationRecord {
             return Err(
                 "Task Examination connector configuration preflight is invalid.".to_string(),
             );
+        }
+        if self.verification_policy_bindings.iter().any(|record| {
+            record.schema_version != 1
+                || !canonical_inventory_name(&record.policy_id, false)
+                || !canonical_inventory_name(&record.connector_id, false)
+                || !matches!(
+                    record.status.as_str(),
+                    "ready" | "invalid_rule" | "missing_operations"
+                )
+                || record.matched_labels.len() > MAX_EXAMINATION_ITEMS
+                || (record.status == "ready" && record.required_operations.is_empty())
+                || record.required_operations.len() > MAX_EXAMINATION_ITEMS
+                || (record.status == "ready"
+                    && record.verified_tools.len() != record.required_operations.len())
+                || record
+                    .required_operations
+                    .iter()
+                    .chain(record.verified_tools.iter())
+                    .any(|value| !canonical_inventory_name(value, true))
+                || record.matched_labels.iter().any(|label| {
+                    label.trim().is_empty()
+                        || label.len() > 128
+                        || label.chars().any(char::is_control)
+                })
+                || record.source.trim().is_empty()
+                || record.source.len() > 128
+                || record.reason.trim().is_empty()
+                || record.reason.len() > 512
+        }) {
+            return Err("Task Examination verification policy binding is invalid.".to_string());
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -623,6 +670,7 @@ pub fn examine_task(
         repository_resolution: None,
         deployment_target_resolution: None,
         connector_configuration_preflights: Vec::new(),
+        verification_policy_bindings: Vec::new(),
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,

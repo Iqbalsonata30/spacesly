@@ -122,6 +122,20 @@ pub struct ConnectorRuleFact {
     pub source_line: u32,
 }
 
+/// User-authored evidence requirements for accepting a connector-backed task as complete.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationRuleFact {
+    pub id: String,
+    pub connector_id: String,
+    #[serde(default)]
+    pub applies_to_labels: Vec<String>,
+    pub required_operations: Vec<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_line: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuleFactsRecord {
     pub schema_version: u32,
@@ -132,6 +146,8 @@ pub struct RuleFactsRecord {
     pub deployment_targets: Vec<DeploymentTargetRuleFact>,
     #[serde(default)]
     pub connectors: Vec<ConnectorRuleFact>,
+    #[serde(default)]
+    pub verification_policies: Vec<VerificationRuleFact>,
     pub warnings: Vec<String>,
 }
 
@@ -185,6 +201,7 @@ impl GovernanceResolutionRecord {
                 || self.rules.facts.protected_branches.len() > 32
                 || self.rules.facts.deployment_targets.len() > 64
                 || self.rules.facts.connectors.len() > 32
+                || self.rules.facts.verification_policies.len() > 64
                 || self.rules.facts.warnings.len() > 32
             {
                 return Err("Governance Rule facts exceed bounded limits.".to_string());
@@ -374,6 +391,7 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     let mut protected_branches = Vec::new();
     let mut deployment_targets = Vec::new();
     let connectors = compile_connector_rule_facts(snapshot);
+    let verification_policies = compile_verification_rule_facts(snapshot);
 
     for (line_index, line) in snapshot.lines().enumerate() {
         for matched in url_pattern.find_iter(line) {
@@ -490,8 +508,93 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
         },
         deployment_targets,
         connectors,
+        verification_policies,
         warnings,
     }
+}
+
+fn compile_verification_rule_facts(snapshot: &str) -> Vec<VerificationRuleFact> {
+    let heading = Regex::new(r"(?i)^#{1,6}\s+verification\s*:\s*([a-z0-9_.-]+)\s*$")
+        .expect("valid verification heading regex");
+    let field = Regex::new(
+        r"(?i)^(?:[-*]|\d+[.)])?\s*(connector|applies to labels|required successful operations)\s*:\s*(.*)$",
+    )
+    .expect("valid verification field regex");
+    let mut policies = Vec::new();
+    let mut current: Option<VerificationRuleFact> = None;
+    let mut collecting = None::<String>;
+    for (line_index, line) in snapshot.lines().enumerate() {
+        if let Some(id) = heading.captures(line).and_then(|captures| captures.get(1)) {
+            if let Some(policy) = current.take() {
+                policies.push(policy);
+            }
+            current = Some(VerificationRuleFact {
+                id: id.as_str().to_ascii_lowercase(),
+                source: "global.agent_rules".to_string(),
+                source_line: (line_index + 1) as u32,
+                ..Default::default()
+            });
+            collecting = None;
+            continue;
+        }
+        let Some(policy) = current.as_mut() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            policies.push(current.take().expect("verification policy exists"));
+            collecting = None;
+            continue;
+        }
+        if let Some(captures) = field.captures(line) {
+            let name = captures[1].to_ascii_lowercase();
+            let value = clean_rule_scalar(&captures[2]);
+            collecting = matches!(
+                name.as_str(),
+                "applies to labels" | "required successful operations"
+            )
+            .then_some(name.clone());
+            match name.as_str() {
+                "connector" => policy.connector_id = value.to_ascii_lowercase(),
+                "applies to labels" => policy
+                    .applies_to_labels
+                    .extend(split_rule_operations(&value)),
+                "required successful operations" => policy
+                    .required_operations
+                    .extend(split_rule_operations(&value)),
+                _ => unreachable!(),
+            }
+            continue;
+        }
+        if let Some(field) = collecting.as_deref() {
+            let value = line
+                .trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .trim_matches('`');
+            if !value.is_empty() && !value.contains(':') {
+                match field {
+                    "applies to labels" => policy
+                        .applies_to_labels
+                        .extend(split_rule_operations(value)),
+                    "required successful operations" => policy
+                        .required_operations
+                        .extend(split_rule_operations(value)),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    if let Some(policy) = current {
+        policies.push(policy);
+    }
+    for policy in &mut policies {
+        policy.applies_to_labels.sort();
+        policy.applies_to_labels.dedup();
+        policy.required_operations.sort();
+        policy.required_operations.dedup();
+    }
+    policies.sort_by(|left, right| left.id.cmp(&right.id));
+    policies
 }
 
 fn compile_connector_rule_facts(snapshot: &str) -> Vec<ConnectorRuleFact> {
@@ -1205,6 +1308,29 @@ mod tests {
         assert_eq!(connector.required_operations, vec!["get_page", "search"]);
         assert_eq!(connector.source, "global.agent_rules");
         assert_eq!(connector.source_line, 2);
+    }
+
+    #[test]
+    fn rule_compiler_extracts_label_scoped_verification_policy() {
+        let facts = compile_rule_facts(
+            r#"
+## Verification: confluence-source-read
+- Connector: corporate-confluence
+- Applies to labels:
+  - NQLA_PRESTAGE
+- Required successful operations:
+  - search
+  - get_page
+"#,
+        );
+        assert_eq!(facts.verification_policies.len(), 1);
+        let policy = &facts.verification_policies[0];
+        assert_eq!(policy.id, "confluence-source-read");
+        assert_eq!(policy.connector_id, "corporate-confluence");
+        assert_eq!(policy.applies_to_labels, vec!["nqla_prestage"]);
+        assert_eq!(policy.required_operations, vec!["get_page", "search"]);
+        assert_eq!(policy.source, "global.agent_rules");
+        assert_eq!(policy.source_line, 2);
     }
 
     #[test]

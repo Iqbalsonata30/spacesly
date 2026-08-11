@@ -8,7 +8,7 @@ use crate::domain::governance::{
 };
 use crate::domain::task_examination::{
     examine_task, ConnectorConfigurationPreflightRecord, ConnectorDiscoveryStatus,
-    DeploymentTargetResolutionRecord, RepositoryResolutionRecord,
+    DeploymentTargetResolutionRecord, RepositoryResolutionRecord, VerificationPolicyBindingRecord,
 };
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
@@ -45,6 +45,146 @@ struct DeploymentTargetPreflight {
     record: Option<DeploymentTargetResolutionRecord>,
     target: Option<DeploymentTargetRuleFact>,
     blocker: Option<String>,
+}
+
+fn matching_connector_tool(
+    operation: &str,
+    connector_id: &str,
+    connector_type: &str,
+    tools: &[crate::domain::task_examination::DiscoveredToolCapability],
+) -> Result<String, &'static str> {
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let exact = names
+        .iter()
+        .copied()
+        .filter(|name| *name == operation)
+        .collect::<Vec<_>>();
+    let typed_name = format!("{connector_type}_{operation}");
+    let typed = names
+        .iter()
+        .copied()
+        .filter(|name| *name == typed_name)
+        .collect::<Vec<_>>();
+    let connector_name = format!("{connector_id}_{operation}");
+    let connector_scoped = names
+        .iter()
+        .copied()
+        .filter(|name| *name == connector_name)
+        .collect::<Vec<_>>();
+    let suffix = format!("_{operation}");
+    let fallback = names
+        .iter()
+        .copied()
+        .filter(|name| name.ends_with(&suffix))
+        .collect::<Vec<_>>();
+    let candidates = [exact, typed, connector_scoped, fallback]
+        .into_iter()
+        .find(|candidates| !candidates.is_empty())
+        .unwrap_or_default();
+    match candidates.as_slice() {
+        [tool] => Ok((*tool).to_string()),
+        [] => Err("missing_operations"),
+        _ => Err("ambiguous_operation"),
+    }
+}
+
+fn resolve_verification_policy_bindings(
+    contract: &Value,
+    connector_ids: &[String],
+    rule_facts: &RuleFactsRecord,
+    capabilities: &[crate::domain::task_examination::ConnectorCapabilitySnapshot],
+) -> (Vec<VerificationPolicyBindingRecord>, Vec<String>) {
+    let labels = contract
+        .pointer("/ticket/labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut blockers = Vec::new();
+    for policy in &rule_facts.verification_policies {
+        if !connector_ids.iter().any(|id| id == &policy.connector_id) {
+            continue;
+        }
+        let matched_labels = labels
+            .iter()
+            .filter(|label| {
+                policy
+                    .applies_to_labels
+                    .iter()
+                    .any(|required| label.eq_ignore_ascii_case(required))
+            })
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>();
+        if !policy.applies_to_labels.is_empty() && matched_labels.is_empty() {
+            continue;
+        }
+        let connector_rule = rule_facts
+            .connectors
+            .iter()
+            .find(|rule| rule.id == policy.connector_id);
+        let capability = capabilities.iter().find(|capability| {
+            capability.connector_id == policy.connector_id
+                && capability.status == ConnectorDiscoveryStatus::Available
+        });
+        let invalid = !canonical_connector_token(&policy.id)
+            || !canonical_connector_token(&policy.connector_id)
+            || policy.required_operations.is_empty()
+            || policy
+                .required_operations
+                .iter()
+                .any(|operation| !canonical_connector_operation(operation));
+        let (status, verified_tools, reason) = if invalid || connector_rule.is_none() {
+            ("invalid_rule", Vec::new(), "Verification policy must reference one valid Connector Rule and declare canonical required operations.")
+        } else if let (Some(rule), Some(capability)) = (connector_rule, capability) {
+            let resolved = policy
+                .required_operations
+                .iter()
+                .map(|operation| {
+                    matching_connector_tool(
+                        operation,
+                        &policy.connector_id,
+                        &rule.connector_type,
+                        &capability.tools,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match resolved {
+                Ok(tools) => ("ready", tools, "Required successful connector operations were bound to the live tool inventory."),
+                Err(_) => ("missing_operations", Vec::new(), "One or more verification operations are absent or ambiguous in the live tool inventory."),
+            }
+        } else {
+            (
+                "missing_operations",
+                Vec::new(),
+                "Verification policy connector has no usable live tool inventory.",
+            )
+        };
+        if status != "ready" {
+            blockers.push(format!("{}: {reason}", policy.id));
+        }
+        records.push(VerificationPolicyBindingRecord {
+            schema_version: 1,
+            policy_id: policy.id.clone(),
+            connector_id: policy.connector_id.clone(),
+            status: status.to_string(),
+            matched_labels,
+            required_operations: policy.required_operations.clone(),
+            verified_tools,
+            source: policy.source.clone(),
+            source_line: policy.source_line,
+            reason: reason.to_string(),
+        });
+    }
+    records.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
+    blockers.sort();
+    (records, blockers)
 }
 
 fn resolve_connector_configuration_preflights(
@@ -172,44 +312,10 @@ fn resolve_connector_rule(
     }
     let mut verified_tools = Vec::new();
     for operation in &rule.required_operations {
-        let names = capability
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>();
-        let exact = names
-            .iter()
-            .copied()
-            .filter(|name| *name == operation)
-            .collect::<Vec<_>>();
-        let typed_name = format!("{}_{}", rule.connector_type, operation);
-        let typed = names
-            .iter()
-            .copied()
-            .filter(|name| *name == typed_name)
-            .collect::<Vec<_>>();
-        let connector_name = format!("{}_{}", rule.id, operation);
-        let connector_scoped = names
-            .iter()
-            .copied()
-            .filter(|name| *name == connector_name)
-            .collect::<Vec<_>>();
-        let suffix = format!("_{operation}");
-        let fallback = names
-            .iter()
-            .copied()
-            .filter(|name| name.ends_with(&suffix))
-            .collect::<Vec<_>>();
-        let candidates = [exact, typed, connector_scoped, fallback]
-            .into_iter()
-            .find(|candidates| !candidates.is_empty())
-            .unwrap_or_default()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        match candidates.as_slice() {
-            [tool] => verified_tools.push(tool.clone()),
-            [] => {
+        match matching_connector_tool(operation, &rule.id, &rule.connector_type, &capability.tools)
+        {
+            Ok(tool) => verified_tools.push(tool),
+            Err("missing_operations") => {
                 return connector_preflight_failure(
                     &rule.id,
                     Some(rule),
@@ -217,7 +323,7 @@ fn resolve_connector_rule(
                     "Connector live inventory is missing one or more required operations.",
                 );
             }
-            _ => {
+            Err(_) => {
                 return connector_preflight_failure(
                     &rule.id,
                     Some(rule),
@@ -749,6 +855,7 @@ fn runtime_callback(
     observation: Arc<Mutex<RuntimeAttemptObservation>>,
     objective_mutations: Arc<HashMap<String, bool>>,
     protected_mutations: Arc<Mutex<HashMap<(String, String), String>>>,
+    successful_receipts: Arc<Mutex<Vec<AgentTaskObjectiveToolReceipt>>>,
 ) -> AiWorkerEventCallback {
     Box::new(move |event| {
         let open = callback_gate.lock().map_err(|error| error.to_string())?;
@@ -885,6 +992,10 @@ fn runtime_callback(
                 if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
                     observation.successful_mutation_observed = true;
                 }
+                successful_receipts
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .push(receipt.clone());
                 observation.uncheckpointed_tool_receipts.push(receipt);
             } else {
                 let mut attempt = observation.lock().map_err(|error| error.to_string())?;
@@ -911,6 +1022,34 @@ fn runtime_callback(
         }
         emit_runtime_event(&reporter, event)
     })
+}
+
+fn missing_verification_tools(
+    policies: &[VerificationPolicyBindingRecord],
+    checkpoints: &[crate::domain::task_session::AgentTaskObjectiveCheckpoint],
+    current_receipts: &[AgentTaskObjectiveToolReceipt],
+) -> Vec<String> {
+    let observed = checkpoints
+        .iter()
+        .flat_map(|checkpoint| checkpoint.tool_receipts.iter())
+        .chain(current_receipts.iter())
+        .map(|receipt| receipt.tool_name.trim().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut missing = policies
+        .iter()
+        .filter(|policy| policy.status == "ready")
+        .flat_map(|policy| {
+            let observed = &observed;
+            policy
+                .verified_tools
+                .iter()
+                .filter(move |tool| !observed.contains(&tool.trim().to_ascii_lowercase()))
+                .map(|tool| format!("{}:{tool}", policy.policy_id))
+        })
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 /// Trusted configuration and contract reconstructed from one durable Task Session envelope.
@@ -1109,6 +1248,19 @@ impl TaskExecutor for AgentTaskExecutor {
                 &resolved.connector_capabilities,
             );
         examination.connector_configuration_preflights = connector_configuration_preflights;
+        let (verification_policy_bindings, verification_policy_blockers) =
+            resolve_verification_policy_bindings(
+                resolved
+                    .task
+                    .execution_contract
+                    .as_ref()
+                    .expect("validated execution contract"),
+                &envelope.connector_ids,
+                &resolved.governance.rules.facts,
+                &resolved.connector_capabilities,
+            );
+        examination.verification_policy_bindings = verification_policy_bindings;
+        let bound_verification_policies = examination.verification_policy_bindings.clone();
         let objective_checkpoints = context.objective_checkpoints()?;
         let protected_mutations = Arc::new(Mutex::new(
             objective_checkpoints
@@ -1154,7 +1306,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 "Retained objective checkpoint does not belong to the immutable semantic plan.",
             ));
         }
-        examination.objective_checkpoints = objective_checkpoints;
+        examination.objective_checkpoints = objective_checkpoints.clone();
         let deployment_target_preflight = resolve_deployment_target_preflight(
             resolved
                 .task
@@ -1321,6 +1473,24 @@ impl TaskExecutor for AgentTaskExecutor {
                 }),
             )?;
         }
+        for record in &examination.verification_policy_bindings {
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "verification_policy_preflight",
+                    "schema_version": 1,
+                    "policy_id": record.policy_id,
+                    "connector_id": record.connector_id,
+                    "status": record.status,
+                    "matched_labels": record.matched_labels,
+                    "required_operations": record.required_operations,
+                    "verified_tools": record.verified_tools,
+                    "source": record.source,
+                    "source_line": record.source_line,
+                    "reason": record.reason,
+                }),
+            )?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
@@ -1411,6 +1581,21 @@ impl TaskExecutor for AgentTaskExecutor {
             return Err(TaskExecutionError::blocked(format!(
                 "Connector configuration preflight blocked execution. {}",
                 connector_configuration_blockers.join(" ")
+            )));
+        }
+        if !verification_policy_blockers.is_empty() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Verification policy preflight blocked execution. {}",
+                verification_policy_blockers.join(" ")
             )));
         }
         if let Some(blocker) = repository_preflight_blocker {
@@ -1508,6 +1693,7 @@ impl TaskExecutor for AgentTaskExecutor {
         let mut retry_task = resolved.task;
         let mut retry_config = resolved.config;
         let mut terminal_recovery_action = None;
+        let successful_receipts = Arc::new(Mutex::new(Vec::new()));
         let result = loop {
             context.ensure_current()?;
             let observation = Arc::new(Mutex::new(RuntimeAttemptObservation::default()));
@@ -1521,6 +1707,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 observation.clone(),
                 semantic_objective_mutations.clone(),
                 protected_mutations.clone(),
+                successful_receipts.clone(),
             );
             let attempt_result = self.runner.execute(
                 retry_config.clone(),
@@ -1695,6 +1882,42 @@ impl TaskExecutor for AgentTaskExecutor {
                 "result": result,
             }),
         )?;
+        if result.completion_status == AiWorkerCompletionStatus::Completed {
+            let current_receipts = successful_receipts
+                .lock()
+                .map_err(|error| TaskExecutionError::new(error.to_string()))?;
+            let missing = missing_verification_tools(
+                &bound_verification_policies,
+                &objective_checkpoints,
+                &current_receipts,
+            );
+            if !missing.is_empty() {
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "verification_policy_result",
+                        "schema_version": 1,
+                        "status": "blocked",
+                        "missing_successful_tools": missing,
+                    }),
+                )?;
+                return Err(TaskExecutionError::blocked(format!(
+                    "Verification policy blocked completion because successful tool receipts are missing: {}.",
+                    missing.join(", ")
+                )));
+            }
+            if !bound_verification_policies.is_empty() {
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "verification_policy_result",
+                        "schema_version": 1,
+                        "status": "satisfied",
+                        "policy_count": bound_verification_policies.len(),
+                    }),
+                )?;
+            }
+        }
         let completion_status = match result.completion_status {
             AiWorkerCompletionStatus::Completed => AgentTaskCompletionStatus::Completed,
             AiWorkerCompletionStatus::Blocked => AgentTaskCompletionStatus::Blocked,
@@ -4058,6 +4281,95 @@ mod tests {
             error: None,
             warnings: Vec::new(),
         }
+    }
+
+    fn verification_binding(tools: &[&str]) -> VerificationPolicyBindingRecord {
+        VerificationPolicyBindingRecord {
+            schema_version: 1,
+            policy_id: "confluence-source-read".to_string(),
+            connector_id: "corporate-confluence".to_string(),
+            status: "ready".to_string(),
+            matched_labels: vec!["NQLA_PRESTAGE".to_string()],
+            required_operations: tools.iter().map(|tool| tool.to_string()).collect(),
+            verified_tools: tools
+                .iter()
+                .map(|tool| format!("confluence_{tool}"))
+                .collect(),
+            source: "global.agent_rules".to_string(),
+            source_line: 30,
+            reason: "bound".to_string(),
+        }
+    }
+
+    fn read_receipt(tool_name: &str) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.to_string(),
+            risk: "read".to_string(),
+            arguments_digest: "digest".to_string(),
+            resource_operation_key: None,
+        }
+    }
+
+    #[test]
+    fn verification_policy_binds_only_for_matching_task_label() {
+        let facts = RuleFactsRecord {
+            connectors: vec![connector_rule("https://confluence.example", &["get_page"])],
+            verification_policies: vec![crate::domain::governance::VerificationRuleFact {
+                id: "confluence-source-read".to_string(),
+                connector_id: "corporate-confluence".to_string(),
+                applies_to_labels: vec!["NQLA_PRESTAGE".to_string()],
+                required_operations: vec!["get_page".to_string()],
+                source: "global.agent_rules".to_string(),
+                source_line: 30,
+            }],
+            ..Default::default()
+        };
+        let capabilities = vec![confluence_capabilities(&["confluence_get_page"])];
+        let (matched, blockers) = resolve_verification_policy_bindings(
+            &json!({"ticket": {"labels": ["nqla_prestage"]}}),
+            &["corporate-confluence".to_string()],
+            &facts,
+            &capabilities,
+        );
+        assert!(blockers.is_empty());
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].verified_tools, vec!["confluence_get_page"]);
+
+        let (unmatched, blockers) = resolve_verification_policy_bindings(
+            &json!({"ticket": {"labels": ["NQLA_DEV"]}}),
+            &["corporate-confluence".to_string()],
+            &facts,
+            &capabilities,
+        );
+        assert!(blockers.is_empty());
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn completion_verification_requires_every_bound_successful_tool() {
+        let policies = vec![verification_binding(&["search", "get_page"])];
+        let missing =
+            missing_verification_tools(&policies, &[], &[read_receipt("confluence_search")]);
+        assert_eq!(missing, vec!["confluence-source-read:confluence_get_page"]);
+    }
+
+    #[test]
+    fn completion_verification_accepts_checkpoint_and_current_attempt_receipts() {
+        let policies = vec![verification_binding(&["search", "get_page"])];
+        let checkpoints = vec![crate::domain::task_session::AgentTaskObjectiveCheckpoint {
+            objective_id: "read-source".to_string(),
+            evidence: vec!["search completed".to_string()],
+            tool_receipts: vec![read_receipt("confluence_search")],
+            source_attempt_id: 1,
+            recorded_at: 1,
+        }];
+        assert!(missing_verification_tools(
+            &policies,
+            &checkpoints,
+            &[read_receipt("confluence_get_page")],
+        )
+        .is_empty());
     }
 
     fn initialize_repository(path: &Path) {

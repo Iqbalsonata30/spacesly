@@ -52,6 +52,26 @@ Implemented connector-configuration increment:
 - Missing or duplicate Rules, malformed/quoted/mismatched configuration URLs, unavailable inventories, absent operations, and ambiguous fallback matches block before OpenCode starts.
 - Task Examination and runtime events retain only the sanitized authoritative URL, required operation names, verified tool names, provenance, status, and reason—never environment values or credentials.
 
+Implemented structured verification-policy increment:
+
+```markdown
+## Verification: confluence-source-read
+
+- Connector: corporate-confluence
+- Applies to labels:
+  - NQLA_PRESTAGE
+- Required successful operations:
+  - search
+  - get_page
+```
+
+- Verification Rules are provider-neutral across MCP connectors and may apply to every task using a connector or only tasks carrying an exact ticket label.
+- Preflight requires a valid referenced Connector Rule and resolves each required operation against the connector's live tool inventory using the same deterministic matching precedence as connector configuration.
+- The immutable Task Examination records the applicable policy, matched labels, required operation names, verified live tools, source provenance, status, and reason without connector arguments, responses, or secrets.
+- Successful receipts are retained across checkpoints and automatic retries. Durable objective-checkpoint receipts also satisfy resumed executions.
+- A worker `completed` result is changed to an explicit blocked outcome when any bound successful-operation receipt is absent; model-authored summaries are not accepted as proof.
+- Current limitation: a receipt proves that the bound tool succeeded, but does not yet prove it read the intended resource or that returned external state satisfies a semantic predicate. Phase 11 adds connector-aware state verifiers.
+
 Regression evidence:
 
 - Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
@@ -61,13 +81,14 @@ Regression evidence:
 - Focused Git branch and OCP namespace enforcement tests: 2 passed.
 - Focused connector Rule compilation/provenance test: passed.
 - Focused connector URL, live-operation, missing, mismatch, and ambiguity tests: 2 passed.
-- Full Rust suite: 435 passed, 3 ignored, 0 failed.
+- Focused verification Rule parsing, label binding, missing-receipt, and checkpoint/resume receipt tests: 4 passed.
+- Full Rust suite: 439 passed, 3 ignored, 0 failed.
 
 Remaining Phase 10 scope:
 
-1. Compile required verification policies and their provenance.
-2. Detect cross-rule contradictions beyond repository path, deployment-label, and connector selection.
-3. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
+1. Detect cross-rule contradictions beyond repository path, deployment-label, connector selection, and verification references.
+2. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
+3. Add connector-aware semantic state verification beyond successful-operation receipts.
 
 ## Phase 9 Completed
 
