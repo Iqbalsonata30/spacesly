@@ -3,8 +3,8 @@ use super::execution_engine::{
 };
 use crate::domain::execution_manifest::{ExecutionManifestDraft, ExecutionModelConfiguration};
 use crate::domain::governance::{
-    ConnectorRuleFact, DeploymentTargetRuleFact, GovernanceResolutionRecord, RepositoryRuleFact,
-    RuleFactsRecord,
+    compile_rule_facts, ConnectorRuleFact, DeploymentTargetRuleFact, GovernanceResolutionRecord,
+    RepositoryRuleFact, RuleFactsRecord,
 };
 use crate::domain::task_examination::{
     examine_task, ConnectorConfigurationPreflightRecord, ConnectorDiscoveryStatus,
@@ -1645,6 +1645,34 @@ fn resolve_deployment_target_preflight(
         )),
         target: Some(target.clone()),
         blocker: None,
+    }
+}
+
+pub(crate) fn evaluate_deployment_target_preflight_fixture(
+    rules: &str,
+    labels: &[String],
+    explicit_target: Option<&str>,
+) -> crate::domain::agent_evaluation::DeploymentTargetPreflightObservation {
+    let mut contract = json!({ "ticket": { "labels": labels } });
+    if let Some(explicit_target) = explicit_target {
+        contract["deployment"] = json!({ "target": explicit_target });
+    }
+    let facts = compile_rule_facts(rules);
+    let preflight = resolve_deployment_target_preflight(&contract, &facts);
+    let record = preflight.record.as_ref();
+    crate::domain::agent_evaluation::DeploymentTargetPreflightObservation {
+        status: record.map(|record| record.status.clone()),
+        selector_kind: record.and_then(|record| record.selector_kind.clone()),
+        selector_value: record.and_then(|record| record.selector_value.clone()),
+        target: preflight.target.map(|target| {
+            crate::domain::agent_evaluation::RulesDeploymentTargetExpectation {
+                label: target.label,
+                target: target.target,
+                branch: target.branch,
+                namespace: target.namespace,
+            }
+        }),
+        blocked: preflight.blocker.is_some(),
     }
 }
 

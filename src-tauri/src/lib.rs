@@ -24,6 +24,7 @@ pub fn run_agent_evaluation() -> Result<(), String> {
         &corpus,
         infrastructure::ai_worker::evaluate_model_result_fixture,
         infrastructure::ai_worker::evaluate_planning_proposal_fixture,
+        application::agent_task_executor::evaluate_deployment_target_preflight_fixture,
     )?;
     println!(
         "{}",

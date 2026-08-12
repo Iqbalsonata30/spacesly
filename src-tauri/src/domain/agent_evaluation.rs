@@ -76,6 +76,12 @@ pub enum AgentEvaluationScenario {
         rules: String,
         expected: RulesCompilationExpectation,
     },
+    DeploymentTargetPreflight {
+        rules: String,
+        labels: Vec<String>,
+        explicit_target: Option<String>,
+        expected: DeploymentTargetPreflightExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -141,6 +147,17 @@ pub struct RulesDeploymentTargetExpectation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeploymentTargetPreflightExpectation {
+    pub status: Option<String>,
+    pub selector_kind: Option<String>,
+    pub selector_value: Option<String>,
+    pub target: Option<RulesDeploymentTargetExpectation>,
+    pub blocked: bool,
+}
+
+pub type DeploymentTargetPreflightObservation = DeploymentTargetPreflightExpectation;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentEvaluationReport {
     pub schema_version: u32,
     pub corpus_id: String,
@@ -183,6 +200,11 @@ pub fn evaluate_agent_corpus(
     corpus: &AgentEvaluationCorpus,
     model_result_validator: impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
     planning_proposal_validator: impl Fn(&str) -> PlanningProposalObservation,
+    deployment_target_validator: impl Fn(
+        &str,
+        &[String],
+        Option<&str>,
+    ) -> DeploymentTargetPreflightObservation,
 ) -> Result<AgentEvaluationReport, String> {
     validate_corpus(corpus)?;
     let mut failures = Vec::new();
@@ -192,6 +214,7 @@ pub fn evaluate_agent_corpus(
             fixture,
             &model_result_validator,
             &planning_proposal_validator,
+            &deployment_target_validator,
         );
         let counts = category_counts.entry(fixture.category).or_default();
         counts.0 += 1;
@@ -241,6 +264,11 @@ fn evaluate_fixture(
     fixture: &AgentEvaluationFixture,
     model_result_validator: &impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
     planning_proposal_validator: &impl Fn(&str) -> PlanningProposalObservation,
+    deployment_target_validator: &impl Fn(
+        &str,
+        &[String],
+        Option<&str>,
+    ) -> DeploymentTargetPreflightObservation,
 ) -> Vec<String> {
     match &fixture.scenario {
         AgentEvaluationScenario::RuntimeRecovery {
@@ -385,6 +413,15 @@ fn evaluate_fixture(
             };
             rules_compilation_mismatches(&observed, expected)
         }
+        AgentEvaluationScenario::DeploymentTargetPreflight {
+            rules,
+            labels,
+            explicit_target,
+            expected,
+        } => {
+            let observed = deployment_target_validator(rules, labels, explicit_target.as_deref());
+            deployment_target_preflight_mismatches(&observed, expected)
+        }
     }
 }
 
@@ -508,6 +545,45 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent Rules-compilation fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::DeploymentTargetPreflight {
+                rules,
+                labels,
+                explicit_target,
+                expected,
+            } => {
+                let valid_status = expected.status.as_deref().is_none_or(|status| {
+                    matches!(
+                        status,
+                        "resolved" | "ambiguous" | "unresolved" | "conflict" | "invalid"
+                    )
+                });
+                let valid_selector = expected.selector_kind.as_deref().is_none_or(|selector| {
+                    matches!(selector, "ticket_label" | "explicit_target" | "combined")
+                });
+                let valid_target = expected.target.as_ref().is_none_or(valid_deployment_target);
+                let resolved = expected.status.as_deref() == Some("resolved");
+                if rules.trim().is_empty()
+                    || rules.len() > 32 * 1024
+                    || rules.contains('\0')
+                    || labels.len() > 64
+                    || labels.iter().any(|label| !valid_identifier(label))
+                    || explicit_target
+                        .as_deref()
+                        .is_some_and(|target| !valid_identifier(target))
+                    || !valid_status
+                    || !valid_selector
+                    || !valid_target
+                    || resolved != expected.target.is_some()
+                    || expected.blocked == resolved
+                    || expected.status.is_none()
+                    || expected.selector_kind.is_none()
+                    || expected.selector_value.as_deref().is_some_and(|value| {
+                        value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+                    })
+                {
+                    return Err("Agent deployment-target preflight fixture is invalid.".to_string());
+                }
+            }
         }
     }
     Ok(())
@@ -546,6 +622,42 @@ fn rules_compilation_mismatches(
         mismatches.push("warning_count".to_string());
     }
     mismatches
+}
+
+fn deployment_target_preflight_mismatches(
+    observed: &DeploymentTargetPreflightObservation,
+    expected: &DeploymentTargetPreflightExpectation,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if observed.status != expected.status {
+        mismatches.push("status".to_string());
+    }
+    if observed.selector_kind != expected.selector_kind {
+        mismatches.push("selector_kind".to_string());
+    }
+    if observed.selector_value != expected.selector_value {
+        mismatches.push("selector_value".to_string());
+    }
+    if observed.target != expected.target {
+        mismatches.push("target".to_string());
+    }
+    if observed.blocked != expected.blocked {
+        mismatches.push("blocked".to_string());
+    }
+    mismatches
+}
+
+fn valid_deployment_target(target: &RulesDeploymentTargetExpectation) -> bool {
+    [
+        &target.label,
+        &target.target,
+        &target.branch,
+        &target.namespace,
+    ]
+    .into_iter()
+    .all(|value| {
+        !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+    })
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -688,21 +800,37 @@ mod tests {
             .collect()
     }
 
+    fn fixture_deployment_target_validator(
+        rules: &str,
+        labels: &[String],
+        explicit_target: Option<&str>,
+    ) -> DeploymentTargetPreflightObservation {
+        crate::application::agent_task_executor::evaluate_deployment_target_preflight_fixture(
+            rules,
+            labels,
+            explicit_target,
+        )
+    }
+
     #[test]
     fn embedded_corpus_passes_and_never_invents_uncovered_scores() {
         let corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
-        let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
-                .expect("corpus evaluates");
-        assert_eq!(report.total, 21);
-        assert_eq!(report.passed, 21);
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+        )
+        .expect("corpus evaluates");
+        assert_eq!(report.total, 28);
+        assert_eq!(report.passed, 28);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::SafeExecution].passed,
-            9
+            16
         );
         assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
@@ -719,6 +847,7 @@ mod tests {
             &without_planning,
             fixture_model_validator,
             fixture_planning_validator,
+            fixture_deployment_target_validator,
         )
         .expect("partial corpus evaluates");
         assert!(!uncovered_report.categories[&AgentEvaluationCategory::Planning].evaluated);
@@ -739,9 +868,13 @@ mod tests {
         };
         *error = "timeout token=private-value".to_string();
         expected.action = RuntimeRecoveryAction::StopFailed;
-        let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
-                .expect("corpus evaluates");
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+        )
+        .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].mismatches, ["action"]);
         let encoded = serde_json::to_string(&report).expect("report serializes");
@@ -774,9 +907,13 @@ mod tests {
         expected.operation_hints.clear();
         expected.resource_hints.clear();
 
-        let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
-                .expect("corpus evaluates");
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+        )
+        .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].mismatches, ["mutation_objective_count"]);
         let encoded = serde_json::to_string(&report).expect("report serializes");
@@ -804,13 +941,54 @@ mod tests {
         rules.push_str("\nOperator token=rules-private-value");
         expected.warning_count = 1;
 
-        let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
-                .expect("corpus evaluates");
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+        )
+        .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].mismatches, ["warning_count"]);
         let encoded = serde_json::to_string(&report).expect("report serializes");
         assert!(!encoded.contains("rules-private-value"));
+        assert!(!encoded.contains("token="));
+    }
+
+    #[test]
+    fn preflight_failure_report_never_echoes_rules_or_selectors() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::DeploymentTargetPreflight { .. }
+                )
+            })
+            .expect("deployment preflight fixture exists");
+        let AgentEvaluationScenario::DeploymentTargetPreflight {
+            rules, expected, ..
+        } = &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is a deployment preflight");
+        };
+        rules.push_str("\nOperator token=preflight-private-value");
+        expected.selector_value = Some("unexpected-selector".to_string());
+
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+        )
+        .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].mismatches, ["selector_value"]);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("preflight-private-value"));
+        assert!(!encoded.contains("unexpected-selector"));
         assert!(!encoded.contains("token="));
     }
 
@@ -822,6 +1000,7 @@ mod tests {
             &corpus,
             fixture_model_validator,
             fixture_planning_validator,
+            fixture_deployment_target_validator,
         )
         .expect_err("duplicate fixture rejected")
         .contains("unique"));
@@ -841,6 +1020,7 @@ mod tests {
             &corpus,
             fixture_model_validator,
             fixture_planning_validator,
+            fixture_deployment_target_validator,
         )
         .expect_err("NUL in Rules fixture rejected")
         .contains("Rules-compilation"));

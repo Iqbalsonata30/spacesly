@@ -318,6 +318,111 @@
         "evidence_verifier_ids": [],
         "warning_count": 0
       }
+    },
+    {
+      "fixture_id": "preflight-resolves-ticket-label",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": ["payment_prestage"],
+      "explicit_target": null,
+      "expected": {
+        "status": "resolved",
+        "selector_kind": "ticket_label",
+        "selector_value": "PAYMENT_PRESTAGE",
+        "target": {"label":"PAYMENT_PRESTAGE","target":"prerelease","branch":"release","namespace":"payment-prerelease"},
+        "blocked": false
+      }
+    },
+    {
+      "fixture_id": "preflight-resolves-explicit-target",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": [],
+      "explicit_target": "prerelease",
+      "expected": {
+        "status": "resolved",
+        "selector_kind": "explicit_target",
+        "selector_value": "prerelease",
+        "target": {"label":"PAYMENT_PRESTAGE","target":"prerelease","branch":"release","namespace":"payment-prerelease"},
+        "blocked": false
+      }
+    },
+    {
+      "fixture_id": "preflight-combines-agreeing-selectors",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": ["PAYMENT_PRESTAGE"],
+      "explicit_target": "prerelease",
+      "expected": {
+        "status": "resolved",
+        "selector_kind": "combined",
+        "selector_value": "prerelease",
+        "target": {"label":"PAYMENT_PRESTAGE","target":"prerelease","branch":"release","namespace":"payment-prerelease"},
+        "blocked": false
+      }
+    },
+    {
+      "fixture_id": "preflight-blocks-conflicting-selectors",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": ["PAYMENT_DEV"],
+      "explicit_target": "prerelease",
+      "expected": {
+        "status": "conflict",
+        "selector_kind": "combined",
+        "selector_value": "prerelease",
+        "target": null,
+        "blocked": true
+      }
+    },
+    {
+      "fixture_id": "preflight-blocks-unknown-explicit-target",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": [],
+      "explicit_target": "production",
+      "expected": {
+        "status": "unresolved",
+        "selector_kind": "explicit_target",
+        "selector_value": "production",
+        "target": null,
+        "blocked": true
+      }
+    },
+    {
+      "fixture_id": "preflight-blocks-ambiguous-labels",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_DEV | development | develop | payment-dev |\n| PAYMENT_PRESTAGE | prerelease | release | payment-prerelease |",
+      "labels": ["PAYMENT_DEV", "PAYMENT_PRESTAGE"],
+      "explicit_target": null,
+      "expected": {
+        "status": "ambiguous",
+        "selector_kind": "ticket_label",
+        "selector_value": null,
+        "target": null,
+        "blocked": true
+      }
+    },
+    {
+      "fixture_id": "preflight-blocks-invalid-rule-target",
+      "category": "safe_execution",
+      "scenario": "deployment_target_preflight",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENT_BROKEN | broken | --delete | ../production |",
+      "labels": ["PAYMENT_BROKEN"],
+      "explicit_target": null,
+      "expected": {
+        "status": "invalid",
+        "selector_kind": "ticket_label",
+        "selector_value": "PAYMENT_BROKEN",
+        "target": null,
+        "blocked": true
+      }
     }
   ]
 }
