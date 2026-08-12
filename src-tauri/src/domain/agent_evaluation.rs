@@ -67,6 +67,10 @@ pub enum AgentEvaluationScenario {
         approval_granted: bool,
         expected: ModelResultExpectation,
     },
+    PlanningProposal {
+        response: String,
+        expected: PlanningProposalExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -88,6 +92,26 @@ pub struct ModelResultObservation {
     pub completion_status: String,
     pub objective_result_count: usize,
     pub blocked_reason_present: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanningProposalExpectation {
+    pub accepted: bool,
+    pub objective_count: usize,
+    pub mutation_objective_count: usize,
+    pub objective_ids: Vec<String>,
+    pub operation_hints: Vec<String>,
+    pub resource_hints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanningProposalObservation {
+    pub accepted: bool,
+    pub objective_count: usize,
+    pub mutation_objective_count: usize,
+    pub objective_ids: Vec<String>,
+    pub operation_hints: Vec<String>,
+    pub resource_hints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -132,12 +156,17 @@ pub fn parse_agent_evaluation_corpus(value: &str) -> Result<AgentEvaluationCorpu
 pub fn evaluate_agent_corpus(
     corpus: &AgentEvaluationCorpus,
     model_result_validator: impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
+    planning_proposal_validator: impl Fn(&str) -> PlanningProposalObservation,
 ) -> Result<AgentEvaluationReport, String> {
     validate_corpus(corpus)?;
     let mut failures = Vec::new();
     let mut category_counts = BTreeMap::<AgentEvaluationCategory, (usize, usize)>::new();
     for fixture in &corpus.fixtures {
-        let mismatches = evaluate_fixture(fixture, &model_result_validator);
+        let mismatches = evaluate_fixture(
+            fixture,
+            &model_result_validator,
+            &planning_proposal_validator,
+        );
         let counts = category_counts.entry(fixture.category).or_default();
         counts.0 += 1;
         if mismatches.is_empty() {
@@ -185,6 +214,7 @@ pub fn evaluate_agent_corpus(
 fn evaluate_fixture(
     fixture: &AgentEvaluationFixture,
     model_result_validator: &impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
+    planning_proposal_validator: &impl Fn(&str) -> PlanningProposalObservation,
 ) -> Vec<String> {
     match &fixture.scenario {
         AgentEvaluationScenario::RuntimeRecovery {
@@ -241,6 +271,29 @@ fn evaluate_fixture(
             }
             mismatches
         }
+        AgentEvaluationScenario::PlanningProposal { response, expected } => {
+            let observed = planning_proposal_validator(response);
+            let mut mismatches = Vec::new();
+            if observed.accepted != expected.accepted {
+                mismatches.push("accepted".to_string());
+            }
+            if observed.objective_count != expected.objective_count {
+                mismatches.push("objective_count".to_string());
+            }
+            if observed.mutation_objective_count != expected.mutation_objective_count {
+                mismatches.push("mutation_objective_count".to_string());
+            }
+            if observed.objective_ids != expected.objective_ids {
+                mismatches.push("objective_ids".to_string());
+            }
+            if observed.operation_hints != expected.operation_hints {
+                mismatches.push("operation_hints".to_string());
+            }
+            if observed.resource_hints != expected.resource_hints {
+                mismatches.push("resource_hints".to_string());
+            }
+            mismatches
+        }
     }
 }
 
@@ -289,6 +342,38 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     || expected.objective_result_count > 8
                 {
                     return Err("Agent model-result fixture is invalid.".to_string());
+                }
+            }
+            AgentEvaluationScenario::PlanningProposal { response, expected } => {
+                let mut expected_values = expected
+                    .operation_hints
+                    .iter()
+                    .chain(expected.resource_hints.iter());
+                if response.trim().is_empty()
+                    || response.len() > 64 * 1024
+                    || expected.objective_count > 8
+                    || (expected.accepted && expected.objective_count == 0)
+                    || expected.mutation_objective_count > expected.objective_count
+                    || expected.objective_ids.len() != expected.objective_count
+                    || expected
+                        .objective_ids
+                        .iter()
+                        .any(|id| !valid_identifier(id))
+                    || expected.operation_hints.len() > 128
+                    || expected.resource_hints.len() > 128
+                    || expected_values.any(|value| {
+                        value.trim().is_empty()
+                            || value.len() > 120
+                            || value.chars().any(char::is_control)
+                    })
+                    || (!expected.accepted
+                        && (expected.objective_count != 0
+                            || expected.mutation_objective_count != 0
+                            || !expected.objective_ids.is_empty()
+                            || !expected.operation_hints.is_empty()
+                            || !expected.resource_hints.is_empty()))
+                {
+                    return Err("Agent planning-proposal fixture is invalid.".to_string());
                 }
             }
         }
@@ -367,23 +452,109 @@ mod tests {
         }
     }
 
+    fn fixture_planning_validator(response: &str) -> PlanningProposalObservation {
+        let parsed = serde_json::from_str::<serde_json::Value>(response).ok();
+        let objectives = parsed
+            .as_ref()
+            .and_then(|value| value.get("objectives"))
+            .and_then(serde_json::Value::as_array);
+        let accepted = objectives.is_some_and(|objectives| {
+            !objectives.is_empty()
+                && objectives.len() <= 8
+                && objectives.iter().all(|objective| {
+                    objective
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                        && objective
+                            .get("success_evidence")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                })
+        });
+        if !accepted {
+            return PlanningProposalObservation {
+                accepted: false,
+                objective_count: 0,
+                mutation_objective_count: 0,
+                objective_ids: Vec::new(),
+                operation_hints: Vec::new(),
+                resource_hints: Vec::new(),
+            };
+        }
+        let objectives = objectives.expect("accepted proposal has objectives");
+        let mut operation_hints = fixture_planning_hints(objectives, "operation_hints");
+        let mut resource_hints = fixture_planning_hints(objectives, "resource_hints");
+        operation_hints.sort();
+        operation_hints.dedup();
+        resource_hints.sort();
+        resource_hints.dedup();
+        PlanningProposalObservation {
+            accepted: true,
+            objective_count: objectives.len(),
+            mutation_objective_count: objectives
+                .iter()
+                .filter(|objective| {
+                    objective
+                        .get("mutation_expected")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or_default()
+                })
+                .count(),
+            objective_ids: (1..=objectives.len())
+                .map(|index| format!("objective-{index}"))
+                .collect(),
+            operation_hints,
+            resource_hints,
+        }
+    }
+
+    fn fixture_planning_hints(objectives: &[serde_json::Value], field: &str) -> Vec<String> {
+        objectives
+            .iter()
+            .filter_map(|objective| objective.get(field))
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty() && value.len() <= 120)
+            .collect()
+    }
+
     #[test]
-    fn embedded_recovery_corpus_passes_and_never_invents_uncovered_scores() {
+    fn embedded_corpus_passes_and_never_invents_uncovered_scores() {
         let corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator).expect("corpus evaluates");
-        assert_eq!(report.total, 14);
-        assert_eq!(report.passed, 14);
+            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
+                .expect("corpus evaluates");
+        assert_eq!(report.total, 18);
+        assert_eq!(report.passed, 18);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
-        assert!(!report.categories[&AgentEvaluationCategory::Planning].evaluated);
+        assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::Planning].pass_rate_basis_points,
-            None
+            Some(10_000)
         );
         assert!(report.categories[&AgentEvaluationCategory::EvidenceQuality].evaluated);
+
+        let mut without_planning = corpus;
+        without_planning
+            .fixtures
+            .retain(|fixture| fixture.category != AgentEvaluationCategory::Planning);
+        let uncovered_report = evaluate_agent_corpus(
+            &without_planning,
+            fixture_model_validator,
+            fixture_planning_validator,
+        )
+        .expect("partial corpus evaluates");
+        assert!(!uncovered_report.categories[&AgentEvaluationCategory::Planning].evaluated);
+        assert_eq!(
+            uncovered_report.categories[&AgentEvaluationCategory::Planning].pass_rate_basis_points,
+            None
+        );
     }
 
     #[test]
@@ -398,7 +569,8 @@ mod tests {
         *error = "timeout token=private-value".to_string();
         expected.action = RuntimeRecoveryAction::StopFailed;
         let report =
-            evaluate_agent_corpus(&corpus, fixture_model_validator).expect("corpus evaluates");
+            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
+                .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].mismatches, ["action"]);
         let encoded = serde_json::to_string(&report).expect("report serializes");
@@ -407,12 +579,51 @@ mod tests {
     }
 
     #[test]
+    fn planning_failure_report_never_echoes_the_model_response() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::PlanningProposal { .. }
+                )
+            })
+            .expect("planning fixture exists");
+        let AgentEvaluationScenario::PlanningProposal { response, expected } =
+            &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is a planning proposal");
+        };
+        *response = r#"{"objectives":[{"summary":"token=planning-private-value","success_evidence":"verified","mutation_expected":true}]}"#.to_string();
+        expected.objective_count = 1;
+        expected.mutation_objective_count = 0;
+        expected.objective_ids = vec!["objective-1".to_string()];
+        expected.operation_hints.clear();
+        expected.resource_hints.clear();
+
+        let report =
+            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
+                .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].mismatches, ["mutation_objective_count"]);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("planning-private-value"));
+        assert!(!encoded.contains("token="));
+    }
+
+    #[test]
     fn malformed_or_duplicate_fixtures_fail_closed() {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         corpus.fixtures[1].fixture_id = corpus.fixtures[0].fixture_id.clone();
-        assert!(evaluate_agent_corpus(&corpus, fixture_model_validator)
-            .expect_err("duplicate fixture rejected")
-            .contains("unique"));
+        assert!(evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+        )
+        .expect_err("duplicate fixture rejected")
+        .contains("unique"));
         assert!(parse_agent_evaluation_corpus(r#"{"schema_version":2}"#).is_err());
     }
 }

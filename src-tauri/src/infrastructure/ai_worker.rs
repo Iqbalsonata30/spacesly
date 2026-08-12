@@ -1852,6 +1852,52 @@ pub(crate) fn evaluate_model_result_fixture(
     }
 }
 
+pub(crate) fn evaluate_planning_proposal_fixture(
+    response: &str,
+) -> crate::domain::agent_evaluation::PlanningProposalObservation {
+    let Ok(proposal) = parse_task_planning_proposal(response, "evaluation-model".to_string())
+    else {
+        return crate::domain::agent_evaluation::PlanningProposalObservation {
+            accepted: false,
+            objective_count: 0,
+            mutation_objective_count: 0,
+            objective_ids: Vec::new(),
+            operation_hints: Vec::new(),
+            resource_hints: Vec::new(),
+        };
+    };
+    let mut operation_hints = proposal
+        .objectives
+        .iter()
+        .flat_map(|objective| objective.operation_hints.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut resource_hints = proposal
+        .objectives
+        .iter()
+        .flat_map(|objective| objective.resource_hints.iter().cloned())
+        .collect::<Vec<_>>();
+    operation_hints.sort();
+    operation_hints.dedup();
+    resource_hints.sort();
+    resource_hints.dedup();
+    crate::domain::agent_evaluation::PlanningProposalObservation {
+        accepted: true,
+        objective_count: proposal.objectives.len(),
+        mutation_objective_count: proposal
+            .objectives
+            .iter()
+            .filter(|objective| objective.mutation_expected)
+            .count(),
+        objective_ids: proposal
+            .objectives
+            .iter()
+            .map(|objective| objective.id.clone())
+            .collect(),
+        operation_hints,
+        resource_hints,
+    }
+}
+
 fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String> {
     let raw = extract_json_object(response)
         .ok_or_else(|| "response did not contain a JSON object".to_string())?;
@@ -4448,22 +4494,28 @@ mod tests {
     }
 
     #[test]
-    fn embedded_agent_evaluation_uses_production_model_result_validation() {
+    fn embedded_agent_evaluation_uses_production_model_validators() {
         let corpus = crate::domain::agent_evaluation::embedded_agent_evaluation_corpus()
             .expect("embedded evaluation corpus");
         let report = crate::domain::agent_evaluation::evaluate_agent_corpus(
             &corpus,
             evaluate_model_result_fixture,
+            evaluate_planning_proposal_fixture,
         )
         .expect("production evaluation completes");
-        assert_eq!(report.total, 14);
-        assert_eq!(report.passed, 14);
+        assert_eq!(report.total, 18);
+        assert_eq!(report.passed, 18);
         assert_eq!(report.failed, 0);
         assert_eq!(
             report.categories
                 [&crate::domain::agent_evaluation::AgentEvaluationCategory::EvidenceQuality]
                 .passed,
             5
+        );
+        assert_eq!(
+            report.categories[&crate::domain::agent_evaluation::AgentEvaluationCategory::Planning]
+                .passed,
+            4
         );
     }
 

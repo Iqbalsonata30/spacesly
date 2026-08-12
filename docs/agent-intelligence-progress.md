@@ -12,31 +12,33 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
 - Phase 11 now also includes Rules-bound exact Jira issue-status and dynamic Jira comment-state verifiers.
-- Phase 12 is in progress with a replayable, headless recovery-policy corpus and deterministic safety scorecard.
+- Phase 12 is in progress with a replayable, headless production-policy corpus and deterministic scorecard across all four initial categories.
 
 ## Phase 12 In Progress
 
-Implemented recovery-policy corpus vertical slice:
+Implemented recovery, result-evidence, and planning-proposal corpus slices:
 
-- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its fourteen cases cover bounded recovery policy plus production model-result evidence enforcement.
+- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its eighteen cases cover bounded recovery policy, production model-result evidence enforcement, and semantic-planning proposal validation.
 - The evaluator invokes the production recovery decision function directly and compares its failure class, recovery action, and retryability with each fixture's expected terminal policy.
 - Reports contain stable corpus/fixture identities, mismatch field names, exact totals, and basis-point pass rates. They never reproduce fixture errors, task text, diagnostics, or secrets.
 - Model-result fixtures invoke the production structured-response and objective-coverage validator. Valid complete evidence succeeds, while malformed JSON, omitted objectives, duplicate objectives, evidence-free objectives, and sensitive completion without approval block.
-- All roadmap score categories are emitted. The current run reports safe execution 6/6, recovery 3/3, and evidence quality 5/5; planning is explicitly unevaluated rather than receiving a misleading score.
+- Planning fixtures invoke the production semantic-planning proposal parser. They verify bounded objective decomposition, stable objective IDs, normalized non-authoritative hints, mutation classification, and fail-closed handling of malformed, empty, or evidence-free proposals.
+- All roadmap score categories are now represented. The current run reports planning 4/4, safe execution 6/6, recovery 3/3, and evidence quality 5/5.
 - Run the release-safe headless command with `spacesly --spacesly-evaluate-agent`; it prints JSON and returns a non-zero exit code if parsing, validation, or any fixture fails.
 - Duplicate or malformed fixture IDs, unsupported schema versions, empty/oversized errors, excessive retry policy, and empty/oversized corpora fail closed.
 
 Phase 12 regression evidence:
 
-- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, and report-redaction tests: 4 passed.
-- Headless embedded corpus: 14 passed, 0 failed; safe execution, recovery, and evidence quality 100%; planning unevaluated.
-- Full Rust suite: 496 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, and report-redaction tests: 5 passed.
+- Headless embedded corpus: 18 passed, 0 failed; planning, safe execution, recovery, and evidence quality 100%.
+- Full Rust suite: 497 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
 Remaining Phase 12 scope:
 
-- Add real production-path fixtures for planning, Rules/preflight, workspace containment, approval continuation, mutation-ledger recovery, and provider evidence adapters.
+- Planning coverage currently measures deterministic proposal-schema enforcement, not whether a live model semantically decomposes an arbitrary task correctly; curated task-to-plan model fixtures remain future work.
+- Add real production-path fixtures for Rules/preflight, workspace containment, approval continuation, mutation-ledger recovery, and provider evidence adapters.
 - Add connector simulators and a CI release gate only after each score category has representative coverage.
 
 ## Phase 11 In Progress

@@ -23,6 +23,7 @@ pub fn run_agent_evaluation() -> Result<(), String> {
     let report = domain::agent_evaluation::evaluate_agent_corpus(
         &corpus,
         infrastructure::ai_worker::evaluate_model_result_fixture,
+        infrastructure::ai_worker::evaluate_planning_proposal_fixture,
     )?;
     println!(
         "{}",
