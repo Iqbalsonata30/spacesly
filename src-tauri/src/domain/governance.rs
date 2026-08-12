@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
-pub const RULE_FACTS_SCHEMA_VERSION: u32 = 3;
-pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 4;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v4";
+const PRIOR_RULE_FACTS_SCHEMA_VERSION: u32 = 3;
+const PRIOR_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
 const PREVIOUS_RULE_FACTS_SCHEMA_VERSION: u32 = 2;
 const PREVIOUS_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
 const LEGACY_RULE_FACTS_SCHEMA_VERSION: u32 = 1;
@@ -144,6 +146,10 @@ pub struct EvidenceVerifierRuleFact {
     pub id: String,
     pub provider: String,
     #[serde(default)]
+    pub connector_id: Option<String>,
+    #[serde(default)]
+    pub read_operation: Option<String>,
+    #[serde(default)]
     pub applies_to_labels: Vec<String>,
     pub required_states: Vec<String>,
     #[serde(default)]
@@ -214,6 +220,8 @@ impl GovernanceResolutionRecord {
                 let supported_compiler = (self.rules.facts.schema_version
                     == RULE_FACTS_SCHEMA_VERSION
                     && self.rules.facts.compiler_version == RULE_FACTS_COMPILER_VERSION)
+                    || (self.rules.facts.schema_version == PRIOR_RULE_FACTS_SCHEMA_VERSION
+                        && self.rules.facts.compiler_version == PRIOR_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == PREVIOUS_RULE_FACTS_SCHEMA_VERSION
                         && self.rules.facts.compiler_version
                             == PREVIOUS_RULE_FACTS_COMPILER_VERSION)
@@ -575,7 +583,7 @@ fn compile_evidence_verifier_rule_facts(snapshot: &str) -> Vec<EvidenceVerifierR
     let heading = Regex::new(r"(?i)^#{1,6}\s+evidence verifier\s*:\s*([a-z0-9_.-]+)\s*$")
         .expect("valid evidence verifier heading regex");
     let field = Regex::new(
-        r"(?i)^(?:[-*]|\d+[.)])?\s*(provider|applies to labels|required states|poll interval seconds|timeout seconds)\s*:\s*(.*)$",
+        r"(?i)^(?:[-*]|\d+[.)])?\s*(provider|connector|read operation|applies to labels|required states|poll interval seconds|timeout seconds)\s*:\s*(.*)$",
     )
     .expect("valid evidence verifier field regex");
     let mut verifiers = Vec::new();
@@ -610,6 +618,8 @@ fn compile_evidence_verifier_rule_facts(snapshot: &str) -> Vec<EvidenceVerifierR
                 .then_some(name.clone());
             match name.as_str() {
                 "provider" => verifier.provider = value.to_ascii_lowercase(),
+                "connector" => verifier.connector_id = Some(value.to_ascii_lowercase()),
+                "read operation" => verifier.read_operation = Some(value.to_ascii_lowercase()),
                 "applies to labels" => verifier
                     .applies_to_labels
                     .extend(split_rule_operations(&value)),
@@ -1096,6 +1106,8 @@ fn normalized_contract_text(contract: &Value) -> String {
     collect_array(contract.pointer("/ticket/labels"), &mut values);
     collect_string(contract.pointer("/deployment/target"), &mut values);
     collect_string(contract.pointer("/deployment/workload"), &mut values);
+    collect_string(contract.pointer("/build/result_key"), &mut values);
+    collect_string(contract.pointer("/build/provider"), &mut values);
     if let Some(workflow) = contract.get("workflow").and_then(Value::as_array) {
         for step in workflow {
             collect_string(step.get("title"), &mut values);
@@ -1577,6 +1589,24 @@ mod tests {
     }
 
     #[test]
+    fn rule_compiler_extracts_bamboo_connector_and_read_operation() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: bamboo-build-state
+- Provider: bamboo
+- Connector: corporate-bamboo
+- Read operation: get_build
+- Required states: successful_build
+"#,
+        );
+        let verifier = &facts.evidence_verifiers[0];
+        assert_eq!(verifier.provider, "bamboo");
+        assert_eq!(verifier.connector_id.as_deref(), Some("corporate-bamboo"));
+        assert_eq!(verifier.read_operation.as_deref(), Some("get_build"));
+        assert_eq!(verifier.required_states, vec!["successful_build"]);
+    }
+
+    #[test]
     fn retained_resolution_is_self_consistent_and_catalog_independent() {
         let initial = profile(vec![skill("kubernetes", "infrastructure", "automatic", 90)]);
         let resolution = resolve_governance(5, &initial, &contract("Run diagnostics"))
@@ -1605,9 +1635,15 @@ mod tests {
     }
 
     #[test]
-    fn retained_prior_rule_facts_remain_valid_after_v3_compiler_upgrade() {
+    fn retained_prior_rule_facts_remain_valid_after_v4_compiler_upgrade() {
         let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
             .expect("governance resolves");
+        resolution.rules.facts.schema_version = PRIOR_RULE_FACTS_SCHEMA_VERSION;
+        resolution.rules.facts.compiler_version = PRIOR_RULE_FACTS_COMPILER_VERSION.to_string();
+        resolution
+            .validate_for(5)
+            .expect("retained v3 rule facts remain compatible");
+
         resolution.rules.facts.schema_version = PREVIOUS_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = PREVIOUS_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution

@@ -285,15 +285,29 @@ fn resolve_rule_contradictions(
     contradictions
 }
 
+struct EvidenceVerifierResolutionContext<'a> {
+    requested_capabilities: &'a [String],
+    connector_ids: &'a [String],
+    rule_facts: &'a RuleFactsRecord,
+    repository_root: Option<&'a Path>,
+    deployment_target: Option<&'a DeploymentTargetRuleFact>,
+    trusted_kubernetes_connector: bool,
+    capabilities: &'a [crate::domain::task_examination::ConnectorCapabilitySnapshot],
+}
+
 fn resolve_evidence_verifier_bindings(
     contract: &Value,
-    requested_capabilities: &[String],
-    connector_ids: &[String],
-    rule_facts: &RuleFactsRecord,
-    repository_root: Option<&Path>,
-    deployment_target: Option<&DeploymentTargetRuleFact>,
-    trusted_kubernetes_connector: bool,
+    context: EvidenceVerifierResolutionContext<'_>,
 ) -> (Vec<EvidenceVerifierBindingRecord>, Vec<String>) {
+    let EvidenceVerifierResolutionContext {
+        requested_capabilities,
+        connector_ids,
+        rule_facts,
+        repository_root,
+        deployment_target,
+        trusted_kubernetes_connector,
+        capabilities,
+    } = context;
     let labels = contract
         .pointer("/ticket/labels")
         .and_then(Value::as_array)
@@ -308,6 +322,11 @@ fn resolve_evidence_verifier_bindings(
             requested_capabilities
                 .iter()
                 .any(|capability| capability == "git")
+        } else if verifier.provider == "bamboo" && verifier.connector_id.is_some() {
+            verifier
+                .connector_id
+                .as_ref()
+                .is_some_and(|id| connector_ids.contains(id))
         } else {
             connector_ids.iter().any(|connector_id| {
                 rule_facts.connectors.iter().any(|connector| {
@@ -345,6 +364,7 @@ fn resolve_evidence_verifier_bindings(
                 )
             }),
             "kubernetes" => verifier.required_states == ["deployment_available"],
+            "bamboo" => verifier.required_states == ["successful_build"],
             _ => false,
         };
         let workload = contract
@@ -352,6 +372,72 @@ fn resolve_evidence_verifier_bindings(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| canonical_connector_token(value));
+        let build_result_key = contract
+            .pointer("/build/result_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| canonical_bamboo_result_key(value));
+        let bamboo_build_provider = contract
+            .pointer("/build/provider")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("bamboo"));
+        let bamboo_connector_rule = verifier.connector_id.as_ref().and_then(|connector_id| {
+            rule_facts.connectors.iter().find(|rule| {
+                rule.id == *connector_id && rule.connector_type.eq_ignore_ascii_case("bamboo")
+            })
+        });
+        let bamboo_capability = verifier.connector_id.as_ref().and_then(|connector_id| {
+            capabilities.iter().find(|capability| {
+                capability.connector_id == *connector_id
+                    && capability.status == ConnectorDiscoveryStatus::Available
+            })
+        });
+        let bamboo_read_tool = match (
+            verifier.read_operation.as_deref(),
+            verifier.connector_id.as_deref(),
+            bamboo_connector_rule,
+            bamboo_capability,
+        ) {
+            (Some(operation), Some(connector_id), Some(rule), Some(capability)) => {
+                matching_connector_tool(
+                    operation,
+                    connector_id,
+                    &rule.connector_type,
+                    &capability.tools,
+                )
+                .ok()
+                .filter(|tool| {
+                    capability
+                        .tools
+                        .iter()
+                        .any(|candidate| candidate.name == *tool && candidate.risk == "read")
+                })
+            }
+            _ => None,
+        };
+        let bamboo_read_argument = bamboo_read_tool.as_ref().and_then(|tool| {
+            let capability = bamboo_capability?;
+            let tool = capability
+                .tools
+                .iter()
+                .find(|candidate| candidate.name == *tool)?;
+            let candidates = tool
+                .argument_names
+                .iter()
+                .filter(|argument| {
+                    matches!(
+                        argument.as_str(),
+                        "result_key"
+                            | "build_result_key"
+                            | "buildResultKey"
+                            | "build_key"
+                            | "buildKey"
+                    )
+                })
+                .collect::<Vec<_>>();
+            (candidates.len() == 1).then(|| candidates[0].clone())
+        });
         let polling_configured =
             verifier.poll_interval_seconds.is_some() || verifier.timeout_seconds.is_some();
         let valid_polling = verifier.polling_configuration_error.is_none()
@@ -380,7 +466,14 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Evidence polling requires Kubernetes plus both bounded interval and timeout seconds.",
             )
-        } else if !matches!(verifier.provider.as_str(), "git" | "kubernetes") {
+        } else if verifier.provider != "bamboo"
+            && (verifier.connector_id.is_some() || verifier.read_operation.is_some())
+        {
+            (
+                "invalid_rule",
+                "Connector and Read operation fields are supported only by the Bamboo evidence adapter.",
+            )
+        } else if !matches!(verifier.provider.as_str(), "git" | "kubernetes" | "bamboo") {
             (
                 "unsupported_provider",
                 "This evidence verifier provider has no deterministic adapter yet.",
@@ -389,6 +482,34 @@ fn resolve_evidence_verifier_bindings(
             (
                 "invalid_rule",
                 "Evidence Verifier required states are not supported by this provider adapter.",
+            )
+        } else if verifier.provider == "bamboo"
+            && (verifier
+                .connector_id
+                .as_deref()
+                .is_none_or(|value| !canonical_connector_token(value))
+                || verifier
+                    .read_operation
+                    .as_deref()
+                    .is_none_or(|value| !canonical_connector_operation(value)))
+        {
+            (
+                "invalid_rule",
+                "Bamboo evidence verification requires canonical Connector and Read operation fields.",
+            )
+        } else if verifier.provider == "bamboo"
+            && (bamboo_connector_rule.is_none() || bamboo_capability.is_none())
+        {
+            (
+                "missing_connector",
+                "Bamboo evidence verification requires one selected, available Bamboo Connector Rule.",
+            )
+        } else if verifier.provider == "bamboo"
+            && (bamboo_read_tool.is_none() || bamboo_read_argument.is_none())
+        {
+            (
+                "missing_operation",
+                "The Bamboo read operation is absent, ambiguous, or not classified read-only.",
             )
         } else if verifier.provider == "kubernetes" && !trusted_kubernetes_connector {
             (
@@ -416,9 +537,18 @@ fn resolve_evidence_verifier_bindings(
             && (deployment_target.is_none() || workload.is_none())
         {
             ("missing_resource", "Kubernetes deployment availability requires a resolved deployment target and canonical deployment.workload.")
+        } else if verifier.provider == "bamboo"
+            && (!bamboo_build_provider || build_result_key.is_none())
+        {
+            (
+                "missing_resource",
+                "Bamboo successful-build verification requires canonical build.result_key authority.",
+            )
         } else {
             let reason = if verifier.provider == "kubernetes" {
                 "The Deployment verifier is bound to the trusted connector and resolved resource identity."
+            } else if verifier.provider == "bamboo" {
+                "The Bamboo verifier is bound to one live read tool and exact immutable build identity."
             } else {
                 "The Git terminal-state verifier is bound to the resolved trusted repository."
             };
@@ -434,10 +564,25 @@ fn resolve_evidence_verifier_bindings(
             status: status.to_string(),
             matched_labels,
             required_states: verifier.required_states.clone(),
-            resource_kind: (verifier.provider == "kubernetes").then(|| "deployment".to_string()),
-            resource_name: (verifier.provider == "kubernetes")
-                .then(|| workload.map(str::to_string))
+            connector_id: (verifier.provider == "bamboo")
+                .then(|| verifier.connector_id.clone())
                 .flatten(),
+            read_tool: (verifier.provider == "bamboo")
+                .then(|| bamboo_read_tool.clone())
+                .flatten(),
+            read_argument: (verifier.provider == "bamboo")
+                .then(|| bamboo_read_argument.clone())
+                .flatten(),
+            resource_kind: match verifier.provider.as_str() {
+                "kubernetes" => Some("deployment".to_string()),
+                "bamboo" => Some("build".to_string()),
+                _ => None,
+            },
+            resource_name: match verifier.provider.as_str() {
+                "kubernetes" => workload.map(str::to_string),
+                "bamboo" => build_result_key.map(|value| value.to_ascii_uppercase()),
+                _ => None,
+            },
             namespace: (verifier.provider == "kubernetes")
                 .then(|| deployment_target.map(|target| target.namespace.clone()))
                 .flatten(),
@@ -632,6 +777,108 @@ fn deployment_availability_evidence_json(result: &DeploymentAvailabilityPollResu
         value["generation_observed"] = json!(evidence.generation_observed);
     }
     value
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BambooBuildStatus {
+    Successful,
+    Failed,
+    InProgress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BambooBuildEvidence {
+    result_key: String,
+    status: BambooBuildStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BambooEvidenceError {
+    Conflict,
+    Unavailable,
+}
+
+fn parse_bamboo_build_evidence(
+    response: &Value,
+    expected_result_key: &str,
+) -> Result<BambooBuildEvidence, BambooEvidenceError> {
+    let expected = expected_result_key.to_ascii_uppercase();
+    let mut roots = vec![response.clone()];
+    if let Some(structured) = response.get("structuredContent") {
+        roots.push(structured.clone());
+    }
+    if let Some(content) = response.get("content").and_then(Value::as_array) {
+        roots.extend(content.iter().filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        }));
+    }
+
+    let mut conflicting_identity = false;
+    let mut visited = 0_usize;
+    for root in &roots {
+        let mut stack = vec![(root, 0_usize)];
+        while let Some((value, depth)) = stack.pop() {
+            visited = visited.saturating_add(1);
+            if visited > 128 || depth > 6 {
+                continue;
+            }
+            if let Some(object) = value.as_object() {
+                let identity = [
+                    "buildResultKey",
+                    "build_result_key",
+                    "resultKey",
+                    "result_key",
+                    "buildKey",
+                    "build_key",
+                    "key",
+                ]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| canonical_bamboo_result_key(value));
+                let state = ["buildState", "build_state", "state", "status"]
+                    .iter()
+                    .find_map(|key| object.get(*key).and_then(Value::as_str))
+                    .and_then(normalize_bamboo_build_status);
+                if let Some(identity) = identity {
+                    if identity.to_ascii_uppercase() == expected {
+                        return state
+                            .map(|status| BambooBuildEvidence {
+                                result_key: expected,
+                                status,
+                            })
+                            .ok_or(BambooEvidenceError::Unavailable);
+                    }
+                    conflicting_identity = true;
+                }
+                stack.extend(object.values().map(|value| (value, depth + 1)));
+            } else if let Some(values) = value.as_array() {
+                stack.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+        }
+    }
+    Err(if conflicting_identity {
+        BambooEvidenceError::Conflict
+    } else {
+        BambooEvidenceError::Unavailable
+    })
+}
+
+fn normalize_bamboo_build_status(value: &str) -> Option<BambooBuildStatus> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "");
+    match normalized.as_str() {
+        "successful" | "success" | "passed" => Some(BambooBuildStatus::Successful),
+        "failed" | "failure" | "error" | "cancelled" | "canceled" => {
+            Some(BambooBuildStatus::Failed)
+        }
+        "inprogress" | "building" | "queued" | "pending" => Some(BambooBuildStatus::InProgress),
+        _ => None,
+    }
 }
 
 fn matching_connector_tool(
@@ -986,6 +1233,23 @@ fn canonical_connector_operation(value: &str) -> bool {
             && value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
             }))
+}
+
+fn canonical_bamboo_result_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.contains('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 fn normalized_connector_base_url(value: &str) -> Option<String> {
@@ -2178,12 +2442,15 @@ impl TaskExecutor for AgentTaskExecutor {
         let (evidence_verifier_bindings, evidence_verifier_blockers) =
             resolve_evidence_verifier_bindings(
                 &evidence_contract,
-                &envelope.requested_capabilities,
-                &envelope.connector_ids,
-                &resolved.governance.rules.facts,
-                default_repository_root.as_deref(),
-                deployment_target_preflight.target.as_ref(),
-                trusted_kubernetes_connector,
+                EvidenceVerifierResolutionContext {
+                    requested_capabilities: &envelope.requested_capabilities,
+                    connector_ids: &envelope.connector_ids,
+                    rule_facts: &resolved.governance.rules.facts,
+                    repository_root: default_repository_root.as_deref(),
+                    deployment_target: deployment_target_preflight.target.as_ref(),
+                    trusted_kubernetes_connector,
+                    capabilities: &resolved.connector_capabilities,
+                },
             );
         examination.evidence_verifier_bindings = evidence_verifier_bindings;
         let bound_evidence_verifiers = examination.evidence_verifier_bindings.clone();
@@ -2286,6 +2553,9 @@ impl TaskExecutor for AgentTaskExecutor {
                     "status": record.status,
                     "matched_labels": record.matched_labels,
                     "required_states": record.required_states,
+                    "connector_id": record.connector_id,
+                    "read_tool": record.read_tool,
+                    "read_argument": record.read_argument,
                     "resource_kind": record.resource_kind,
                     "resource_name": record.resource_name,
                     "namespace": record.namespace,
@@ -2481,6 +2751,12 @@ impl TaskExecutor for AgentTaskExecutor {
         }
         resolved.config.task_tool_authority = task_tool_authority;
         let mut evidence_ocp_environment = None;
+        let bamboo_evidence_connector_ids = bound_evidence_verifiers
+            .iter()
+            .filter(|binding| binding.provider == "bamboo" && binding.status == "ready")
+            .filter_map(|binding| binding.connector_id.clone())
+            .collect::<HashSet<_>>();
+        let mut evidence_mcp_connectors = HashMap::new();
         for server in &mut resolved.config.mcp_servers {
             server.name = format!("spacesly-{}", server.secret_id);
             if expected_ocp_command.as_ref() == Some(&server.command)
@@ -2497,6 +2773,12 @@ impl TaskExecutor for AgentTaskExecutor {
                     );
                 }
                 evidence_ocp_environment = Some(server.environment.clone());
+            }
+            if bamboo_evidence_connector_ids.contains(&server.secret_id) {
+                evidence_mcp_connectors.insert(
+                    server.secret_id.clone(),
+                    (server.command.clone(), server.environment.clone()),
+                );
             }
             server.proxy_authority = Some(context.external_authority(
                 &server.secret_id,
@@ -2846,6 +3128,84 @@ impl TaskExecutor for AgentTaskExecutor {
                 if !satisfied {
                     return Err(TaskExecutionError::blocked(
                         "Kubernetes Deployment availability verification blocked completion.",
+                    ));
+                }
+            }
+            for binding in bound_evidence_verifiers
+                .iter()
+                .filter(|binding| binding.provider == "bamboo")
+            {
+                let connector_id = binding.connector_id.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Bamboo evidence connector is missing.")
+                })?;
+                let tool = binding.read_tool.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Bamboo evidence read tool is missing.")
+                })?;
+                let argument = binding.read_argument.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Bamboo evidence read argument is missing.")
+                })?;
+                let result_key = binding.resource_name.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Bamboo evidence build identity is missing.")
+                })?;
+                context.authorize_capability(&format!("external_tools:{connector_id}"))?;
+                let (command, environment) =
+                    evidence_mcp_connectors.get(connector_id).ok_or_else(|| {
+                        TaskExecutionError::blocked(
+                            "Bamboo evidence verifier lost its trusted connector configuration.",
+                        )
+                    })?;
+                context.ensure_current()?;
+                let arguments = Value::Object(serde_json::Map::from_iter([(
+                    argument.to_string(),
+                    json!(result_key),
+                )]));
+                let response = crate::infrastructure::mcp::call_mcp_read_tool(
+                    connector_id,
+                    command,
+                    environment,
+                    tool,
+                    arguments,
+                );
+                context.ensure_current()?;
+                let (state, satisfied) = match response
+                    .as_ref()
+                    .map_err(|_| BambooEvidenceError::Unavailable)
+                    .and_then(|response| parse_bamboo_build_evidence(response, result_key))
+                {
+                    Ok(BambooBuildEvidence {
+                        status: BambooBuildStatus::Successful,
+                        ..
+                    }) => ("successful", true),
+                    Ok(BambooBuildEvidence {
+                        status: BambooBuildStatus::Failed,
+                        ..
+                    }) => ("failed", false),
+                    Ok(BambooBuildEvidence {
+                        status: BambooBuildStatus::InProgress,
+                        ..
+                    }) => ("in_progress", false),
+                    Err(BambooEvidenceError::Conflict) => ("conflict", false),
+                    Err(BambooEvidenceError::Unavailable) => ("unavailable", false),
+                };
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "evidence_verifier_result",
+                        "schema_version": 1,
+                        "provider": "bamboo",
+                        "status": if satisfied { "satisfied" } else { "blocked" },
+                        "connector_id": connector_id,
+                        "resource_kind": "build",
+                        "resource_name": result_key,
+                        "evidence": [{
+                            "state": "successful_build",
+                            "status": state,
+                        }],
+                    }),
+                )?;
+                if !satisfied {
+                    return Err(TaskExecutionError::blocked(
+                        "Bamboo successful-build verification blocked completion.",
                     ));
                 }
             }
@@ -5251,6 +5611,9 @@ mod tests {
             status: "ready".to_string(),
             matched_labels: Vec::new(),
             required_states: states.iter().map(|state| state.to_string()).collect(),
+            connector_id: None,
+            read_tool: None,
+            read_argument: None,
             resource_kind: None,
             resource_name: None,
             namespace: None,
@@ -5400,6 +5763,64 @@ mod tests {
     }
 
     #[test]
+    fn bamboo_build_evidence_accepts_only_exact_successful_result() {
+        let response = json!({
+            "content": [{
+                "type": "text",
+                "text": r#"{"buildResultKey":"PAYROLL-DEPLOY-42","buildState":"Successful","diagnostic_detail":"discard-me"}"#
+            }]
+        });
+        let evidence = parse_bamboo_build_evidence(&response, "PAYROLL-DEPLOY-42")
+            .expect("exact successful result parses");
+        assert_eq!(evidence.status, BambooBuildStatus::Successful);
+        assert_eq!(evidence.result_key, "PAYROLL-DEPLOY-42");
+        assert!(!format!("{evidence:?}").contains("discard-me"));
+    }
+
+    #[test]
+    fn bamboo_build_evidence_distinguishes_failure_progress_and_identity_conflict() {
+        let failed = parse_bamboo_build_evidence(
+            &json!({"result": {"build_key": "PAYROLL-DEPLOY-42", "state": "FAILED"}}),
+            "PAYROLL-DEPLOY-42",
+        )
+        .expect("failure is a valid terminal observation");
+        assert_eq!(failed.status, BambooBuildStatus::Failed);
+
+        let progressing = parse_bamboo_build_evidence(
+            &json!({"build": {"result_key": "PAYROLL-DEPLOY-42", "status": "in-progress"}}),
+            "PAYROLL-DEPLOY-42",
+        )
+        .expect("progress is a valid observation");
+        assert_eq!(progressing.status, BambooBuildStatus::InProgress);
+
+        assert_eq!(
+            parse_bamboo_build_evidence(
+                &json!({"buildResultKey": "PAYROLL-DEPLOY-43", "buildState": "Successful"}),
+                "PAYROLL-DEPLOY-42",
+            ),
+            Err(BambooEvidenceError::Conflict)
+        );
+    }
+
+    #[test]
+    fn bamboo_build_evidence_rejects_prose_and_unknown_status() {
+        assert_eq!(
+            parse_bamboo_build_evidence(
+                &json!({"content": [{"type": "text", "text": "PAYROLL-DEPLOY-42 succeeded"}]}),
+                "PAYROLL-DEPLOY-42",
+            ),
+            Err(BambooEvidenceError::Unavailable)
+        );
+        assert_eq!(
+            parse_bamboo_build_evidence(
+                &json!({"result_key": "PAYROLL-DEPLOY-42", "status": "maybe"}),
+                "PAYROLL-DEPLOY-42",
+            ),
+            Err(BambooEvidenceError::Unavailable)
+        );
+    }
+
+    #[test]
     fn git_evidence_verifier_observes_clean_new_commit_and_upstream_state() {
         let directory = tempdir().expect("workspace");
         let repository = directory.path().join("repository");
@@ -5466,7 +5887,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_verifier_binding_is_label_scoped_and_fails_closed_for_unsupported_provider() {
+    fn evidence_verifier_binding_is_label_scoped_and_binds_bamboo_read_tool() {
         let git_rule = crate::domain::governance::EvidenceVerifierRuleFact {
             id: "git-release-state".to_string(),
             provider: "git".to_string(),
@@ -5479,6 +5900,8 @@ mod tests {
         let bamboo_rule = crate::domain::governance::EvidenceVerifierRuleFact {
             id: "bamboo-build-state".to_string(),
             provider: "bamboo".to_string(),
+            connector_id: Some("corporate-bamboo".to_string()),
+            read_operation: Some("get_build".to_string()),
             applies_to_labels: Vec::new(),
             required_states: vec!["successful_build".to_string()],
             source: "global.agent_rules".to_string(),
@@ -5500,12 +5923,15 @@ mod tests {
                 "ticket": {"labels": ["RELEASE"]},
                 "repository": {"head_commit": "abc"}
             }),
-            &["git".to_string()],
-            &[],
-            &facts,
-            Some(directory.path()),
-            None,
-            false,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["git".to_string()],
+                connector_ids: &[],
+                rule_facts: &facts,
+                repository_root: Some(directory.path()),
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
         );
         assert!(blockers.is_empty());
         assert_eq!(records.len(), 1);
@@ -5513,26 +5939,66 @@ mod tests {
 
         let (records, blockers) = resolve_evidence_verifier_bindings(
             &json!({"ticket": {"labels": ["RELEASE"]}, "repository": {}}),
-            &["git".to_string()],
-            &[],
-            &facts,
-            Some(directory.path()),
-            None,
-            false,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["git".to_string()],
+                connector_ids: &[],
+                rule_facts: &facts,
+                repository_root: Some(directory.path()),
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
         );
         assert_eq!(records[0].status, "missing_repository");
         assert_eq!(blockers.len(), 1);
 
         let (records, blockers) = resolve_evidence_verifier_bindings(
-            &json!({}),
-            &["external_tools:corporate-bamboo".to_string()],
-            &["corporate-bamboo".to_string()],
-            &facts,
-            None,
-            None,
-            false,
+            &json!({"build": {"provider": "bamboo", "result_key": "PAYROLL-DEPLOY-42"}}),
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-bamboo".to_string()],
+                connector_ids: &["corporate-bamboo".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[
+                    crate::domain::task_examination::ConnectorCapabilitySnapshot {
+                        connector_id: "corporate-bamboo".to_string(),
+                        status: ConnectorDiscoveryStatus::Available,
+                        tools: vec![crate::domain::task_examination::DiscoveredToolCapability {
+                            name: "bamboo_get_build".to_string(),
+                            risk: "read".to_string(),
+                            argument_names: vec!["result_key".to_string()],
+                        }],
+                        error: None,
+                        warnings: Vec::new(),
+                    },
+                ],
+            },
         );
-        assert_eq!(records[0].status, "unsupported_provider");
+        assert!(blockers.is_empty());
+        assert_eq!(records[0].status, "ready");
+        assert_eq!(records[0].connector_id.as_deref(), Some("corporate-bamboo"));
+        assert_eq!(records[0].read_tool.as_deref(), Some("bamboo_get_build"));
+        assert_eq!(records[0].read_argument.as_deref(), Some("result_key"));
+        assert_eq!(
+            records[0].resource_name.as_deref(),
+            Some("PAYROLL-DEPLOY-42")
+        );
+
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"build": {"provider": "bamboo", "result_key": "PAYROLL-DEPLOY-42"}}),
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-bamboo".to_string()],
+                connector_ids: &["corporate-bamboo".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
+        );
+        assert_eq!(records[0].status, "missing_connector");
         assert_eq!(blockers.len(), 1);
 
         let mut invalid_git_polling = facts.clone();
@@ -5543,12 +6009,15 @@ mod tests {
                 "ticket": {"labels": ["RELEASE"]},
                 "repository": {"head_commit": "abc"}
             }),
-            &["git".to_string()],
-            &[],
-            &invalid_git_polling,
-            Some(directory.path()),
-            None,
-            false,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["git".to_string()],
+                connector_ids: &[],
+                rule_facts: &invalid_git_polling,
+                repository_root: Some(directory.path()),
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
         );
         assert_eq!(records[0].status, "invalid_rule");
         assert_eq!(records[0].poll_interval_seconds, None);
@@ -5581,12 +6050,15 @@ mod tests {
             deployment_target_fact("PRESTAGE", "prerelease", "prerelease", "qcash-prerelease");
         let (records, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {"workload": "payroll-api"}}),
-            &["external_tools:ocp-dev".to_string()],
-            &["ocp-dev".to_string()],
-            &facts,
-            None,
-            Some(&target),
-            true,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:ocp-dev".to_string()],
+                connector_ids: &["ocp-dev".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: Some(&target),
+                trusted_kubernetes_connector: true,
+                capabilities: &[],
+            },
         );
         assert!(blockers.is_empty());
         assert_eq!(records[0].status, "ready");
@@ -5598,24 +6070,30 @@ mod tests {
 
         let (missing, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {}}),
-            &["external_tools:ocp-dev".to_string()],
-            &["ocp-dev".to_string()],
-            &facts,
-            None,
-            Some(&target),
-            true,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:ocp-dev".to_string()],
+                connector_ids: &["ocp-dev".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: Some(&target),
+                trusted_kubernetes_connector: true,
+                capabilities: &[],
+            },
         );
         assert_eq!(missing[0].status, "missing_resource");
         assert_eq!(blockers.len(), 1);
 
         let (unsupported, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {"workload": "payroll-api"}}),
-            &["external_tools:ocp-dev".to_string()],
-            &["ocp-dev".to_string()],
-            &facts,
-            None,
-            Some(&target),
-            false,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:ocp-dev".to_string()],
+                connector_ids: &["ocp-dev".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: Some(&target),
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
         );
         assert_eq!(unsupported[0].status, "unsupported_provider");
         assert_eq!(blockers.len(), 1);
@@ -5624,12 +6102,15 @@ mod tests {
         invalid_polling.evidence_verifiers[0].timeout_seconds = None;
         let (invalid, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {"workload": "payroll-api"}}),
-            &["external_tools:ocp-dev".to_string()],
-            &["ocp-dev".to_string()],
-            &invalid_polling,
-            None,
-            Some(&target),
-            true,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:ocp-dev".to_string()],
+                connector_ids: &["ocp-dev".to_string()],
+                rule_facts: &invalid_polling,
+                repository_root: None,
+                deployment_target: Some(&target),
+                trusted_kubernetes_connector: true,
+                capabilities: &[],
+            },
         );
         assert_eq!(invalid[0].status, "invalid_rule");
         assert_eq!(blockers.len(), 1);

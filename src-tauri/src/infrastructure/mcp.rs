@@ -1065,6 +1065,41 @@ pub fn discover_mcp_capability_snapshot(
     }
 }
 
+/// Calls one exact read-only tool on a task-selected MCP connector.
+///
+/// The caller remains responsible for task authority and semantic response validation. This
+/// boundary rejects mutation-classified tools and redacts connector environment values from
+/// transport diagnostics before returning them.
+pub fn call_mcp_read_tool(
+    connector_id: &str,
+    command: &[String],
+    environment: &HashMap<String, String>,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    if !canonical_capability_name(connector_id)
+        || !canonical_capability_name(tool_name)
+        || ToolBroker::risk_for_tool(tool_name)
+            != crate::infrastructure::tool_broker::ToolRisk::Read
+        || !arguments.is_object()
+    {
+        return Err("MCP evidence read request is invalid or not read-only.".to_string());
+    }
+    let Some((executable, args)) = command.split_first() else {
+        return Err("MCP evidence connector command is empty.".to_string());
+    };
+    let server = McpServerConfig {
+        command: executable.clone(),
+        args: args.to_vec(),
+        env: environment.clone(),
+        scope_id: Some(format!("agent-evidence:{connector_id}")),
+        secret_id: Some(connector_id.to_string()),
+    };
+    let result = with_mcp_client(&server, |client| client.call_tool(tool_name, arguments));
+    let _ = close_mcp_session(server);
+    result
+}
+
 fn unavailable_capability_snapshot(
     connector_id: &str,
     error: impl Into<String>,
@@ -2627,6 +2662,54 @@ done
             secret_id: Some(connector_id),
         })
         .expect("capability session closes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn calls_one_exact_read_only_mcp_evidence_tool() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"bamboo_get_build","inputSchema":{"type":"object","properties":{"result_key":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"{\"buildResultKey\":\"PAYROLL-DEPLOY-42\",\"buildState\":\"Successful\"}"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let connector_id = format!("bamboo-evidence-{}", request_seed());
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let result = call_mcp_read_tool(
+            &connector_id,
+            &command,
+            &HashMap::new(),
+            "bamboo_get_build",
+            json!({"result_key": "PAYROLL-DEPLOY-42"}),
+        )
+        .expect("read-only evidence call succeeds");
+        assert_eq!(
+            result.pointer("/content/0/type").and_then(Value::as_str),
+            Some("text")
+        );
+    }
+
+    #[test]
+    fn mcp_evidence_boundary_rejects_mutation_tools_before_spawn() {
+        let error = call_mcp_read_tool(
+            "bamboo",
+            &["/does/not/exist".to_string()],
+            &HashMap::new(),
+            "bamboo_trigger_build",
+            json!({"plan_key": "PAYROLL-DEPLOY"}),
+        )
+        .expect_err("mutation tool must be rejected before connector spawn");
+        assert!(error.contains("not read-only"));
     }
 
     #[cfg(unix)]

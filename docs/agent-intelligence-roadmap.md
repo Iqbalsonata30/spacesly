@@ -309,7 +309,7 @@ Implemented Git evidence-verifier increment:
 - Spacesly evaluates those states directly in the resolved trusted repository after the worker returns but before accepting completion.
 - `new_commit` compares current `HEAD` with the immutable contract `repository.head_commit`; `pushed_upstream` requires an upstream and proves that upstream contains `HEAD`.
 - Results persist as secret-free state/status evidence. Unsatisfied or unavailable required states block completion independently of the model summary.
-- Unsupported providers fail closed when an applicable rule is requested; Bamboo and Jira semantic adapters remain planned.
+- Unsupported providers fail closed when an applicable rule is requested; Jira semantic adapters remain planned.
 
 Implemented Kubernetes Deployment availability increment:
 
@@ -318,6 +318,14 @@ Implemented Kubernetes Deployment availability increment:
 - Availability requires the controller to have observed the current generation and updated, ready, and available replicas all to equal desired replicas.
 - Namespace mismatch and unsafe resource identities fail before credentials are loaded or cluster I/O begins.
 - Optional Rules-controlled polling uses bounded interval/timeout values, rechecks task authority between reads, caps each request by the remaining deadline, and retries progressing state without retrying unavailable connector reads.
+
+Implemented Bamboo exact build-result increment:
+
+- User Rules select the Bamboo connector and semantic read operation; live MCP discovery must resolve it to exactly one read-only tool with one supported result-key argument.
+- The immutable contract supplies `build.provider=bamboo` and the exact `build.result_key`.
+- Spacesly independently calls the connector after execution and strictly normalizes structured build identity/state without retaining raw output or connector errors.
+- Successful state for a different build, prose-only claims, failed/progressing states, and unknown response shapes block completion.
+- Newly triggered builds still require a trusted mutation-result identity capture before this verifier can follow their dynamic result key.
 
 Benefits:
 

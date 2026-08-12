@@ -92,6 +92,11 @@ export interface ExecutionContract {
     /** Kubernetes Deployment name used by deterministic rollout-health evidence policies. */
     workload?: string;
   };
+  /** Optional exact external build identity used by deterministic build evidence policies. */
+  build?: {
+    provider: "bamboo";
+    result_key: string;
+  };
   capability_plan: {
     schema_version: 1;
     planner_version: "agent-capability-plan-v1";

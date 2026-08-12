@@ -10,7 +10,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
-- Phase 11 is in progress with independent Git terminal-state and Kubernetes Deployment-availability verifiers.
+- Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
 
 ## Phase 11 In Progress
 
@@ -38,7 +38,7 @@ Implemented Git evidence-verifier vertical slice:
 Known limitation of this slice:
 
 - `new_commit` proves that repository `HEAD` changed from the immutable task baseline, but does not yet attribute the commit contents to a specific semantic objective.
-- Bamboo build status and exact Jira issue/comment state still require provider-specific response adapters.
+- Exact Jira issue/comment state still requires a provider-specific response adapter.
 
 Implemented Kubernetes Deployment availability vertical slice:
 
@@ -68,9 +68,36 @@ Implemented Kubernetes Deployment availability vertical slice:
 - Durable evidence contains only resource kind, replica counters, generation-observed status, and satisfied/unsatisfied/unavailable state.
 - Missing target/workload authority, unavailable reads, stale generations, and incomplete replicas fail closed.
 - Rules may optionally provide both a poll interval and rollout timeout. Values are bounded to 1–30 seconds and 1–600 seconds respectively, with the interval no greater than the timeout; invalid or partial policies block during preflight.
-- Rule facts compiler v3 persists the typed polling policy; retained v1/v2 task snapshots remain valid under their original immutable semantics.
+- Rule facts compiler v4 persists typed polling plus Bamboo connector/read-operation bindings; retained v1–v3 task snapshots remain valid under their original immutable semantics.
 - A progressing Deployment is reread until it becomes available or reaches the deadline. Connector/RBAC failures are not blindly retried, every wait rechecks assignment authority, and each API request is capped by the remaining deadline.
 - Omitting both polling fields preserves the one-snapshot verifier behavior.
+
+Implemented Bamboo exact build-result vertical slice:
+
+```markdown
+## Evidence Verifier: bamboo-build-state
+
+- Provider: bamboo
+- Connector: corporate-bamboo
+- Read operation: get_build
+- Required states:
+  - successful_build
+```
+
+```json
+{
+  "build": {
+    "provider": "bamboo",
+    "result_key": "PAYROLL-DEPLOY-42"
+  }
+}
+```
+
+- The verifier binds one exact user-defined Bamboo connector, one live-discovered read-only MCP tool, and one supported result-key argument before execution.
+- After the worker returns, Spacesly performs a separate MCP read and accepts success only when structured JSON contains the exact immutable result key and a normalized successful terminal state.
+- Failed and progressing builds, mismatched identities, unknown/prose responses, mutation-classified tools, missing connector capability, and transport errors block completion.
+- Durable evidence contains only connector ID, exact build result key, and normalized state. Raw MCP output, connector diagnostics, credentials, and unrelated response fields are not retained.
+- This slice verifies builds whose exact result key is already present in the immutable contract. Trusted capture of a result key returned by a newly triggered build and Bamboo polling remain follow-up work.
 
 Phase 11 regression evidence:
 
@@ -78,7 +105,8 @@ Phase 11 regression evidence:
 - Focused clean-worktree/new-commit state-transition and local-upstream containment tests: 2 passed.
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
-- Full Rust suite: 459 passed, 3 ignored, 0 failed in serial mode.
+- Focused Bamboo Rules/binding, strict response parsing, MCP read-only boundary, and redaction tests: 7 passed.
+- Full Rust suite: 465 passed, 3 ignored, 0 failed in serial mode.
 - `cargo check` and formatting: passed.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 
