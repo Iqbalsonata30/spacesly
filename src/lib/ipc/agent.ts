@@ -86,6 +86,10 @@ export interface ExecutionContract {
     branch: string | null;
     head_commit: string | null;
   };
+  /** Optional deterministic selector resolved only through the user's deployment Rules table. */
+  deployment?: {
+    target: string;
+  };
   capability_plan: {
     schema_version: 1;
     planner_version: "agent-capability-plan-v1";

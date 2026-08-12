@@ -390,6 +390,7 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     let mut frontend_path = None;
     let mut protected_branches = Vec::new();
     let mut deployment_targets = Vec::new();
+    let mut in_deployment_table = false;
     let connectors = compile_connector_rule_facts(snapshot);
     let verification_policies = compile_verification_rule_facts(snapshot);
 
@@ -444,8 +445,21 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
                 .filter(|cell| !cell.is_empty())
                 .collect::<Vec<_>>();
             if cells.len() >= 4
-                && cells[0].starts_with("NQLA_")
-                && !cells.iter().any(|cell| cell.chars().all(|c| c == '-'))
+                && cells[0].to_ascii_lowercase().contains("label")
+                && cells[1].to_ascii_lowercase().contains("environment")
+                && cells[2].to_ascii_lowercase().contains("branch")
+                && cells[3].to_ascii_lowercase().contains("namespace")
+            {
+                in_deployment_table = true;
+                continue;
+            }
+            let separator = cells
+                .iter()
+                .all(|cell| cell.chars().all(|character| matches!(character, '-' | ':')));
+            if in_deployment_table
+                && cells.len() >= 4
+                && !separator
+                && cells[..4].iter().all(|cell| !cell.trim().is_empty())
             {
                 deployment_targets.push(DeploymentTargetRuleFact {
                     label: cells[0].to_string(),
@@ -456,6 +470,8 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
                     source_line: (line_index + 1) as u32,
                 });
             }
+        } else {
+            in_deployment_table = false;
         }
     }
     protected_branches.sort();
@@ -953,6 +969,7 @@ fn normalized_contract_text(contract: &Value) -> String {
     );
     collect_string(contract.pointer("/ticket/title"), &mut values);
     collect_array(contract.pointer("/ticket/labels"), &mut values);
+    collect_string(contract.pointer("/deployment/target"), &mut values);
     if let Some(workflow) = contract.get("workflow").and_then(Value::as_array) {
         for step in workflow {
             collect_string(step.get("title"), &mut values);
@@ -1294,12 +1311,13 @@ mod tests {
             r#"
 | Jira Label | Environment | Git Branch | OpenShift Namespace |
 |------------|-------------|------------|---------------------|
-| NQLA_PRESTAGE | prerelease | prerelease | qcash-prerelease |
-| NQLA_PRESTAGE | drc | drc | qcash-drc |
-| NQLA_PRESTAGE | drc | drc | qcash-drc |
+| PRESTAGE_LOCAL | prerelease | prerelease | qcash-prerelease |
+| PRESTAGE_LOCAL | drc | drc | qcash-drc |
+| PRESTAGE_LOCAL | drc | drc | qcash-drc |
 "#,
         );
         assert_eq!(facts.deployment_targets.len(), 2);
+        assert_eq!(facts.deployment_targets[0].label, "PRESTAGE_LOCAL");
         assert_eq!(facts.deployment_targets[0].target, "drc");
         assert_eq!(facts.deployment_targets[1].target, "prerelease");
     }

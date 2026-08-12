@@ -9,9 +9,10 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 ## Current Position
 
 - Completed through Phase 9: resource-level idempotency foundation.
-- Phase 10 is in progress with authoritative scope resolution, connector preflight, verification receipts, and contradiction detection.
+- Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
+- Phase 11 evidence verifiers are next.
 
-## Phase 10 In Progress
+## Phase 10 Completed
 
 Implemented repository-resolution increment:
 
@@ -80,6 +81,24 @@ Implemented cross-rule contradiction increment:
 - Contradictions are retained in Task Examination, emitted as structured runtime events, and block before OpenCode can choose between competing facts.
 - Unrelated connector, environment, verification, and repository definitions do not block a task that does not select them.
 
+Implemented explicit deployment-selector increment:
+
+```json
+{
+  "deployment": {
+    "target": "prerelease"
+  }
+}
+```
+
+- The immutable Execution Contract accepts optional `deployment.target` for local or externally-created tasks without a mapped Jira label.
+- Deployment tables are recognized by their structured headers rather than a hard-coded Jira-label prefix, so user-defined label schemes remain valid.
+- The selector uses exact case-insensitive target-name matching against the user-defined deployment Rules table; task prose is never interpreted as environment authority.
+- Label-only, explicit-only, and agreeing combined selectors resolve to one Rules row with selector provenance retained in Task Examination.
+- The resolved row enters the existing authority path, binding the Git branch and trusted OCP namespace exactly as a Jira-label selection does.
+- Malformed, unknown, ambiguous, and label-conflicting selectors block before OpenCode. Duplicate explicit target names are also surfaced by task-scoped contradiction diagnostics.
+- The structured target is included in task resource examination and governance matching context.
+
 Regression evidence:
 
 - Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
@@ -91,12 +110,14 @@ Regression evidence:
 - Focused connector URL, live-operation, missing, mismatch, and ambiguity tests: 2 passed.
 - Focused verification Rule parsing, label binding, missing-receipt, and checkpoint/resume receipt tests: 4 passed.
 - Focused conflicting-row preservation and task-scoped contradiction tests: 2 passed.
-- Full Rust suite: 441 passed, 3 ignored, 0 failed.
+- Focused explicit target, combined-selector, conflict, invalid, unresolved, ambiguity, and authority-binding tests: 5 passed.
+- Full Rust suite: 445 passed, 3 ignored, 0 failed in the final serial run. An earlier loaded run produced unrelated scheduler/chat timeouts and one later parallel process abort; every named timeout passed individually and the serial suite completed cleanly.
+- Frontend unit tests: 7 passed, 0 failed.
+- `svelte-check`: 0 errors and 0 warnings.
 
-Remaining Phase 10 scope:
+Next roadmap scope:
 
-1. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
-2. Add connector-aware semantic state verification beyond successful-operation receipts.
+1. Phase 11 connector-aware semantic state verification beyond successful-operation receipts.
 
 ## Phase 9 Completed
 

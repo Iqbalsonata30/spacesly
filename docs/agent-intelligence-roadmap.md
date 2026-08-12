@@ -252,7 +252,7 @@ Exit criteria:
 
 ### Phase 10 — Structured Rule Compiler and Preflight Resolver
 
-Status: in progress.
+Status: completed.
 
 Expand rule compilation into repository mappings, environment tables, branch protections, approval boundaries, required verification, and connector configuration checks. Resolve repository and environment scope before starting the worker.
 
@@ -273,11 +273,14 @@ Implemented repository-resolution increment:
 - A runtime `completed` claim is accepted only when every bound operation has a successful tool receipt from the current attempt, an automatic retry, or a durable objective checkpoint from an earlier assignment.
 - Missing evidence fails closed as an explicit blocked result; the worker summary cannot override the receipt check.
 - Task-scoped contradiction analysis preserves conflicting deployment rows and detects duplicate authoritative repository IDs, deployment labels, connector IDs, and applicable verification-policy IDs. It persists secret-free source references and blocks before worker execution.
+- Tasks without a mapped ticket label may declare the immutable structured selector `deployment.target`. Spacesly resolves it only by exact target-name matching against the user Rules table, then applies the same Git branch and OCP namespace bindings as a label-derived target.
+- Deployment table recognition is header-driven and does not require an organization-specific Jira-label prefix.
+- When both a ticket label and `deployment.target` are present, both must resolve to the same branch and namespace. Unknown, malformed, ambiguous, or conflicting selectors block before model execution.
 
 Current limitations:
 
 - This increment verifies successful operation execution, not yet the semantic resource identity or returned external state; those connector-aware checks remain Phase 11 scope.
-- Tasks without an exact deployment label do not receive an environment binding; broader explicit task-to-environment selectors remain planned.
+- Environment selection is intentionally limited to exact ticket labels or the structured `deployment.target`; environment names inferred from free-form task prose remain unsupported.
 
 Benefits:
 

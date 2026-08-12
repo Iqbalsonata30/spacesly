@@ -100,6 +100,10 @@ pub struct RepositoryResolutionRecord {
 pub struct DeploymentTargetResolutionRecord {
     pub schema_version: u32,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_value: Option<String>,
     pub matched_label: Option<String>,
     pub target: Option<String>,
     pub branch: Option<String>,
@@ -215,6 +219,8 @@ impl TaskExaminationRecord {
             usize::from(self.repository_resolution.is_some()),
             usize::from(self.deployment_target_resolution.is_some()),
             self.connector_configuration_preflights.len(),
+            self.verification_policy_bindings.len(),
+            self.rule_contradictions.len(),
             self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
@@ -309,17 +315,24 @@ impl TaskExaminationRecord {
             .deployment_target_resolution
             .as_ref()
             .is_some_and(|resolution| {
-                resolution.schema_version != 1
+                !matches!(resolution.schema_version, 1 | 2)
                     || !matches!(
                         resolution.status.as_str(),
-                        "resolved" | "ambiguous" | "invalid"
+                        "resolved" | "ambiguous" | "invalid" | "conflict" | "unresolved"
                     )
+                    || resolution.selector_kind.as_ref().is_some_and(|kind| {
+                        !matches!(
+                            kind.as_str(),
+                            "ticket_label" | "explicit_target" | "combined"
+                        )
+                    })
                     || resolution.source.trim().is_empty()
                     || resolution.source.len() > 128
                     || resolution.reason.trim().is_empty()
                     || resolution.reason.len() > 512
                     || [
                         resolution.matched_label.as_ref(),
+                        resolution.selector_value.as_ref(),
                         resolution.target.as_ref(),
                         resolution.branch.as_ref(),
                         resolution.namespace.as_ref(),
@@ -331,8 +344,11 @@ impl TaskExaminationRecord {
                             || value.len() > 253
                             || value.chars().any(char::is_control)
                     })
-                    || (resolution.status == "resolved"
-                        && (resolution.matched_label.is_none()
+                    || (resolution.schema_version == 2
+                        && resolution.status == "resolved"
+                        && (resolution.selector_kind.is_none()
+                            || resolution.selector_value.is_none()
+                            || resolution.matched_label.is_none()
                             || resolution.target.is_none()
                             || resolution.branch.is_none()
                             || resolution.namespace.is_none()))
@@ -890,6 +906,11 @@ fn resource_references(contract: &Value) -> Vec<TaskResourceReference> {
             "repository.branch",
             &["repository", "branch"][..],
         ),
+        (
+            "deployment_target",
+            "deployment.target",
+            &["deployment", "target"][..],
+        ),
     ] {
         if let Some(value) = contract_path(contract, path)
             .and_then(Value::as_str)
@@ -994,6 +1015,34 @@ mod tests {
             rules_revision: Some("rules".to_string()),
             skills_revision: Some("skills".to_string()),
         }
+    }
+
+    #[test]
+    fn retained_v1_deployment_resolution_remains_valid_without_selector_provenance() {
+        let mut examined = examine_task(
+            &serde_json::json!({}),
+            "sha256:contract",
+            &envelope(),
+            &HashSet::new(),
+            &RuleFactsRecord::default(),
+            &[],
+        );
+        examined.deployment_target_resolution = Some(DeploymentTargetResolutionRecord {
+            schema_version: 1,
+            status: "resolved".to_string(),
+            selector_kind: None,
+            selector_value: None,
+            matched_label: Some("NQLA_PRESTAGE".to_string()),
+            target: Some("prerelease".to_string()),
+            branch: Some("prerelease".to_string()),
+            namespace: Some("qcash-prerelease".to_string()),
+            source: "global.agent_rules".to_string(),
+            source_line: 10,
+            reason: "retained".to_string(),
+        });
+        examined
+            .validate("sha256:contract")
+            .expect("retained v1 deployment resolution remains readable");
     }
 
     #[test]

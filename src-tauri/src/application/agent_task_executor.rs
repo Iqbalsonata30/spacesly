@@ -144,6 +144,31 @@ fn resolve_rule_contradictions(
             });
         }
     }
+    if let Some(selector) = contract
+        .pointer("/deployment/target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let definitions = rule_facts
+            .deployment_targets
+            .iter()
+            .filter(|target| target.target.eq_ignore_ascii_case(selector))
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "deployment_target".to_string(),
+                key: format!("target:{selector}"),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason: "One explicit target name maps to multiple deployment Rules rows."
+                    .to_string(),
+            });
+        }
+    }
 
     for connector_id in connector_ids {
         let definitions = rule_facts
@@ -599,7 +624,7 @@ fn resolve_deployment_target_preflight(
         .map(str::trim)
         .filter(|label| !label.is_empty())
         .collect::<Vec<_>>();
-    let mut matching = rule_facts
+    let mut label_matches = rule_facts
         .deployment_targets
         .iter()
         .filter(|target| {
@@ -609,7 +634,165 @@ fn resolve_deployment_target_preflight(
         })
         .cloned()
         .collect::<Vec<_>>();
-    matching.sort_by(|left, right| {
+    sort_and_dedup_deployment_targets(&mut label_matches);
+    let explicit_selector = match contract.pointer("/deployment/target") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if canonical_connector_token(value.trim()) && value == value.trim() =>
+        {
+            Some(value.as_str())
+        }
+        Some(_) => {
+            let reason =
+                "Execution Contract deployment.target must be a non-empty canonical identifier.";
+            return DeploymentTargetPreflight {
+                record: Some(deployment_target_resolution_record(
+                    "invalid",
+                    "explicit_target",
+                    None,
+                    None,
+                    reason,
+                )),
+                target: None,
+                blocker: Some(reason.to_string()),
+            };
+        }
+    };
+    let mut explicit_matches = explicit_selector
+        .map(|selector| {
+            rule_facts
+                .deployment_targets
+                .iter()
+                .filter(|target| target.target.eq_ignore_ascii_case(selector))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    sort_and_dedup_deployment_targets(&mut explicit_matches);
+
+    if label_matches.len() > 1 {
+        let reason = "Ticket labels select multiple conflicting deployment targets; keep exactly one environment label or correct the Rules table.";
+        return DeploymentTargetPreflight {
+            record: Some(deployment_target_resolution_record(
+                "ambiguous",
+                "ticket_label",
+                None,
+                None,
+                reason,
+            )),
+            target: None,
+            blocker: Some(reason.to_string()),
+        };
+    }
+    if explicit_matches.len() > 1 {
+        let reason =
+            "The explicit deployment target matches multiple Rules rows; make target names unique.";
+        return DeploymentTargetPreflight {
+            record: Some(deployment_target_resolution_record(
+                "ambiguous",
+                "explicit_target",
+                explicit_selector,
+                None,
+                reason,
+            )),
+            target: None,
+            blocker: Some(reason.to_string()),
+        };
+    }
+    if explicit_selector.is_some() && explicit_matches.is_empty() {
+        let reason =
+            "The explicit deployment target has no exact match in the authoritative Rules table.";
+        return DeploymentTargetPreflight {
+            record: Some(deployment_target_resolution_record(
+                "unresolved",
+                "explicit_target",
+                explicit_selector,
+                None,
+                reason,
+            )),
+            target: None,
+            blocker: Some(reason.to_string()),
+        };
+    }
+    let label_target = label_matches.first();
+    let explicit_target = explicit_matches.first();
+    if let (Some(label_target), Some(explicit_target)) = (label_target, explicit_target) {
+        if label_target.target != explicit_target.target
+            || label_target.branch != explicit_target.branch
+            || label_target.namespace != explicit_target.namespace
+        {
+            let reason =
+                "The ticket label and explicit deployment target select different Rules rows.";
+            return DeploymentTargetPreflight {
+                record: Some(deployment_target_resolution_record(
+                    "conflict",
+                    "combined",
+                    explicit_selector,
+                    None,
+                    reason,
+                )),
+                target: None,
+                blocker: Some(reason.to_string()),
+            };
+        }
+    }
+    let (target, selector_kind, selector_value, reason) = match (label_target, explicit_target) {
+        (Some(target), Some(_)) => (
+            Some(target),
+            "combined",
+            explicit_selector,
+            "The ticket label and explicit target selected the same user-defined deployment target.",
+        ),
+        (Some(target), None) => (
+            Some(target),
+            "ticket_label",
+            Some(target.label.as_str()),
+            "An exact ticket label selected one user-defined deployment target.",
+        ),
+        (None, Some(target)) => (
+            Some(target),
+            "explicit_target",
+            explicit_selector,
+            "The explicit Execution Contract target selected one user-defined deployment target.",
+        ),
+        (None, None) => (None, "", None, ""),
+    };
+    let Some(target) = target else {
+        return DeploymentTargetPreflight {
+            record: None,
+            target: None,
+            blocker: None,
+        };
+    };
+    if !valid_rule_branch(&target.branch) || !valid_kubernetes_namespace(&target.namespace) {
+        let reason = "The matched deployment target contains an invalid Git branch or Kubernetes namespace; correct the Rules table.";
+        return DeploymentTargetPreflight {
+            record: Some(deployment_target_resolution_record(
+                "invalid",
+                selector_kind,
+                selector_value,
+                Some(target),
+                reason,
+            )),
+            target: None,
+            blocker: Some(reason.to_string()),
+        };
+    }
+    DeploymentTargetPreflight {
+        record: Some(deployment_target_resolution_record(
+            "resolved",
+            selector_kind,
+            selector_value,
+            Some(target),
+            reason,
+        )),
+        target: Some(target.clone()),
+        blocker: None,
+    }
+}
+
+fn sort_and_dedup_deployment_targets(targets: &mut Vec<DeploymentTargetRuleFact>) {
+    targets.sort_by(|left, right| {
         (&left.label, &left.target, &left.branch, &left.namespace).cmp(&(
             &right.label,
             &right.target,
@@ -617,56 +800,12 @@ fn resolve_deployment_target_preflight(
             &right.namespace,
         ))
     });
-    matching.dedup_by(|left, right| {
+    targets.dedup_by(|left, right| {
         left.label.eq_ignore_ascii_case(&right.label)
             && left.target == right.target
             && left.branch == right.branch
             && left.namespace == right.namespace
     });
-    match matching.as_slice() {
-        [] => DeploymentTargetPreflight {
-            record: None,
-            target: None,
-            blocker: None,
-        },
-        [target] => {
-            if !valid_rule_branch(&target.branch) || !valid_kubernetes_namespace(&target.namespace)
-            {
-                let reason = "The matched deployment target contains an invalid Git branch or Kubernetes namespace; correct the Rules table.";
-                return DeploymentTargetPreflight {
-                    record: Some(deployment_target_resolution_record(
-                        "invalid",
-                        Some(target),
-                        reason,
-                    )),
-                    target: None,
-                    blocker: Some(reason.to_string()),
-                };
-            }
-            DeploymentTargetPreflight {
-                record: Some(deployment_target_resolution_record(
-                    "resolved",
-                    Some(target),
-                    "An exact ticket label selected one user-defined deployment target.",
-                )),
-                target: Some(target.clone()),
-                blocker: None,
-            }
-        }
-        _ => {
-            let reason =
-                "Ticket labels select multiple conflicting deployment targets; keep exactly one environment label or correct the Rules table.";
-            DeploymentTargetPreflight {
-                record: Some(deployment_target_resolution_record(
-                    "ambiguous",
-                    None,
-                    reason,
-                )),
-                target: None,
-                blocker: Some(reason.to_string()),
-            }
-        }
-    }
 }
 
 fn valid_rule_branch(value: &str) -> bool {
@@ -701,12 +840,16 @@ fn valid_kubernetes_namespace(value: &str) -> bool {
 
 fn deployment_target_resolution_record(
     status: &str,
+    selector_kind: &str,
+    selector_value: Option<&str>,
     target: Option<&DeploymentTargetRuleFact>,
     reason: &str,
 ) -> DeploymentTargetResolutionRecord {
     DeploymentTargetResolutionRecord {
-        schema_version: 1,
+        schema_version: 2,
         status: status.to_string(),
+        selector_kind: (!selector_kind.is_empty()).then(|| selector_kind.to_string()),
+        selector_value: selector_value.map(str::to_string),
         matched_label: target.map(|value| value.label.clone()),
         target: target.map(|value| value.target.clone()),
         branch: target.map(|value| value.branch.clone()),
@@ -4793,7 +4936,115 @@ mod tests {
         assert_eq!(target.namespace, "qcash-prerelease");
         let record = preflight.record.expect("resolution retained");
         assert_eq!(record.status, "resolved");
+        assert_eq!(record.selector_kind.as_deref(), Some("ticket_label"));
+        assert_eq!(record.selector_value.as_deref(), Some("NQLA_PRESTAGE"));
         assert_eq!(record.source_line, 10);
+    }
+
+    #[test]
+    fn deployment_target_preflight_resolves_explicit_contract_target_without_ticket_label() {
+        let facts = RuleFactsRecord {
+            deployment_targets: vec![deployment_target_fact(
+                "NQLA_PRESTAGE",
+                "prerelease",
+                "prerelease",
+                "qcash-prerelease",
+            )],
+            ..Default::default()
+        };
+        let preflight = resolve_deployment_target_preflight(
+            &json!({"ticket": {"labels": []}, "deployment": {"target": "prerelease"}}),
+            &facts,
+        );
+
+        assert!(preflight.blocker.is_none());
+        let target = preflight.target.expect("explicit target resolved");
+        assert_eq!(target.branch, "prerelease");
+        assert_eq!(target.namespace, "qcash-prerelease");
+        let record = preflight.record.expect("resolution retained");
+        assert_eq!(record.selector_kind.as_deref(), Some("explicit_target"));
+        assert_eq!(record.selector_value.as_deref(), Some("prerelease"));
+        assert_eq!(record.matched_label.as_deref(), Some("NQLA_PRESTAGE"));
+    }
+
+    #[test]
+    fn deployment_target_preflight_requires_label_and_explicit_target_to_agree() {
+        let facts = RuleFactsRecord {
+            deployment_targets: vec![
+                deployment_target_fact("NQLA_PRESTAGE", "prerelease", "prerelease", "pre"),
+                deployment_target_fact("NQLA_DRC", "drc", "drc", "disaster-recovery"),
+            ],
+            ..Default::default()
+        };
+        let matching = resolve_deployment_target_preflight(
+            &json!({
+                "ticket": {"labels": ["NQLA_PRESTAGE"]},
+                "deployment": {"target": "prerelease"}
+            }),
+            &facts,
+        );
+        assert!(matching.blocker.is_none());
+        assert_eq!(
+            matching
+                .record
+                .expect("combined resolution")
+                .selector_kind
+                .as_deref(),
+            Some("combined")
+        );
+
+        let conflicting = resolve_deployment_target_preflight(
+            &json!({
+                "ticket": {"labels": ["NQLA_PRESTAGE"]},
+                "deployment": {"target": "drc"}
+            }),
+            &facts,
+        );
+        assert!(conflicting.target.is_none());
+        assert_eq!(
+            conflicting.record.expect("conflict retained").status,
+            "conflict"
+        );
+        assert!(conflicting.blocker.is_some());
+    }
+
+    #[test]
+    fn deployment_target_preflight_blocks_unknown_invalid_and_ambiguous_explicit_targets() {
+        let facts = RuleFactsRecord {
+            deployment_targets: vec![
+                deployment_target_fact("NQLA_PRESTAGE", "shared", "prerelease", "pre"),
+                deployment_target_fact("NQLA_DRC", "shared", "drc", "disaster-recovery"),
+            ],
+            ..Default::default()
+        };
+        let unknown = resolve_deployment_target_preflight(
+            &json!({"deployment": {"target": "production"}}),
+            &facts,
+        );
+        assert_eq!(
+            unknown.record.expect("unknown retained").status,
+            "unresolved"
+        );
+
+        let invalid = resolve_deployment_target_preflight(
+            &json!({"deployment": {"target": "../production"}}),
+            &facts,
+        );
+        assert_eq!(invalid.record.expect("invalid retained").status, "invalid");
+
+        let ambiguous = resolve_deployment_target_preflight(
+            &json!({"deployment": {"target": "shared"}}),
+            &facts,
+        );
+        assert_eq!(
+            ambiguous.record.expect("ambiguity retained").status,
+            "ambiguous"
+        );
+        assert!(ambiguous.target.is_none());
+        let contradictions =
+            resolve_rule_contradictions(&json!({"deployment": {"target": "shared"}}), &[], &facts);
+        assert_eq!(contradictions.len(), 1);
+        assert_eq!(contradictions[0].key, "target:shared");
     }
 
     #[test]
