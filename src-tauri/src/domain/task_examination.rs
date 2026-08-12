@@ -168,6 +168,10 @@ pub struct EvidenceVerifierBindingRecord {
     pub resource_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
     pub source: String,
     pub source_line: u32,
     pub reason: String,
@@ -514,7 +518,20 @@ impl TaskExaminationRecord {
                     && record.status == "ready"
                     && (record.resource_kind.as_deref() != Some("deployment")
                         || record.resource_name.is_none()
-                        || record.namespace.is_none()))
+                        || record.namespace.is_none()
+                        || record.poll_interval_seconds.is_some()
+                            != record.timeout_seconds.is_some()
+                        || record
+                            .poll_interval_seconds
+                            .is_some_and(|value| !(1..=30).contains(&value))
+                        || record.timeout_seconds.is_some_and(|value| {
+                            !(1..=600).contains(&value)
+                                || record
+                                    .poll_interval_seconds
+                                    .is_some_and(|interval| interval > value)
+                        })))
+                || (record.provider != "kubernetes"
+                    && (record.poll_interval_seconds.is_some() || record.timeout_seconds.is_some()))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()

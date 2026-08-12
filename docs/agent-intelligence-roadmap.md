@@ -317,6 +317,7 @@ Implemented Kubernetes Deployment availability increment:
 - Spacesly independently reads that exact Deployment through the trusted embedded OCP connector configuration rather than trusting model-controlled MCP output.
 - Availability requires the controller to have observed the current generation and updated, ready, and available replicas all to equal desired replicas.
 - Namespace mismatch and unsafe resource identities fail before credentials are loaded or cluster I/O begins.
+- Optional Rules-controlled polling uses bounded interval/timeout values, rechecks task authority between reads, caps each request by the remaining deadline, and retries progressing state without retrying unavailable connector reads.
 
 Benefits:
 
@@ -326,7 +327,7 @@ Benefits:
 Trade-offs:
 
 - Verification may add connector calls and latency.
-- External eventual consistency requires bounded polling policies.
+- Rollout polling occupies the task worker until success, cancellation, connector failure, or the Rules deadline; asynchronous verification remains future work.
 
 Exit criteria:
 

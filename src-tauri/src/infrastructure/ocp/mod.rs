@@ -20,7 +20,7 @@ use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::ai_worker::AiWorkerMcpServer;
 use super::mcp::{read_stdout_message, write_proxy_message};
@@ -365,6 +365,7 @@ pub fn verify_deployment_available(
     environment: &HashMap<String, String>,
     namespace: &str,
     name: &str,
+    request_timeout: Duration,
 ) -> Result<DeploymentAvailabilityEvidence, String> {
     if !safe_kubernetes_namespace(namespace) || !safe_kubernetes_resource_name(name) {
         return Err(
@@ -395,12 +396,22 @@ pub fn verify_deployment_available(
         bound_namespace: Some(namespace.to_string()),
     };
     let cluster = resolve_cluster(&env).map_err(|error| error.to_string())?;
-    let client =
-        OcpClient::build(&cluster, OcpTimeouts::default()).map_err(|error| error.to_string())?;
+    let timeouts = deployment_verifier_timeouts(request_timeout);
+    let client = OcpClient::build(&cluster, timeouts).map_err(|error| error.to_string())?;
     let deployment = client
         .get_namespaced("apps", "v1", "deployments", name, Some(namespace))
         .map_err(|error| error.to_string())?;
     Ok(deployment_availability_evidence(&deployment))
+}
+
+fn deployment_verifier_timeouts(request_budget: Duration) -> OcpTimeouts {
+    let request = request_budget
+        .min(OcpTimeouts::default().request)
+        .max(Duration::from_millis(1));
+    OcpTimeouts {
+        connect: OcpTimeouts::default().connect.min(request),
+        request,
+    }
 }
 
 fn deployment_availability_evidence(deployment: &Value) -> DeploymentAvailabilityEvidence {
@@ -1314,18 +1325,30 @@ mod tests {
     }
 
     #[test]
+    fn deployment_verifier_request_timeout_never_exceeds_connector_default_or_budget() {
+        let long = deployment_verifier_timeouts(Duration::from_secs(120));
+        assert_eq!(long.request, OcpTimeouts::default().request);
+
+        let short = deployment_verifier_timeouts(Duration::from_secs(3));
+        assert_eq!(short.request, Duration::from_secs(3));
+        assert_eq!(short.connect, Duration::from_secs(3));
+    }
+
+    #[test]
     fn deployment_availability_verifier_requires_exact_task_namespace_before_io() {
         let environment = HashMap::from([
             (ENV_MODE.to_string(), "kubeconfig".to_string()),
             (ENV_KUBECONFIG.to_string(), "/does/not/exist".to_string()),
             (TASK_BOUND_NAMESPACE_ENV.to_string(), "prestage".to_string()),
         ]);
-        let error = verify_deployment_available(&environment, "production", "api")
-            .expect_err("namespace mismatch blocks before kubeconfig access");
+        let error =
+            verify_deployment_available(&environment, "production", "api", Duration::from_secs(1))
+                .expect_err("namespace mismatch blocks before kubeconfig access");
         assert!(error.contains("namespace is not task-bound"));
 
-        let invalid = verify_deployment_available(&environment, "prestage", "../api")
-            .expect_err("unsafe resource identity blocks before kubeconfig access");
+        let invalid =
+            verify_deployment_available(&environment, "prestage", "../api", Duration::from_secs(1))
+                .expect_err("unsafe resource identity blocks before kubeconfig access");
         assert!(invalid.contains("invalid resource identity"));
 
         let invalid_namespace = HashMap::from([
@@ -1336,8 +1359,13 @@ mod tests {
                 "pre.stage".to_string(),
             ),
         ]);
-        let invalid = verify_deployment_available(&invalid_namespace, "pre.stage", "api")
-            .expect_err("invalid namespace blocks before kubeconfig access");
+        let invalid = verify_deployment_available(
+            &invalid_namespace,
+            "pre.stage",
+            "api",
+            Duration::from_secs(1),
+        )
+        .expect_err("invalid namespace blocks before kubeconfig access");
         assert!(invalid.contains("invalid resource identity"));
     }
     use crate::infrastructure::ocp::tools::OcpTool;

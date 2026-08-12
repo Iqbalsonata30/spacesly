@@ -31,10 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_AUTOMATIC_RUNTIME_RETRIES: u8 = 1;
 const MAX_REPOSITORY_DISCOVERY_DEPTH: usize = 4;
 const MAX_REPOSITORY_DISCOVERY_DIRECTORIES: usize = 4_096;
+const MAX_EVIDENCE_POLL_INTERVAL_SECONDS: u64 = 30;
+const MAX_EVIDENCE_TIMEOUT_SECONDS: u64 = 600;
 
 struct RepositoryPreflight {
     record: Option<RepositoryResolutionRecord>,
@@ -349,6 +352,17 @@ fn resolve_evidence_verifier_bindings(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| canonical_connector_token(value));
+        let polling_configured =
+            verifier.poll_interval_seconds.is_some() || verifier.timeout_seconds.is_some();
+        let valid_polling = verifier.polling_configuration_error.is_none()
+            && verifier.poll_interval_seconds.is_some() == verifier.timeout_seconds.is_some()
+            && verifier.poll_interval_seconds.is_none_or(|interval| {
+                (1..=MAX_EVIDENCE_POLL_INTERVAL_SECONDS).contains(&interval)
+                    && verifier.timeout_seconds.is_some_and(|timeout| {
+                        (interval..=MAX_EVIDENCE_TIMEOUT_SECONDS).contains(&timeout)
+                    })
+            })
+            && (verifier.provider == "kubernetes" || !polling_configured);
         let (status, reason) = if !canonical_connector_token(&verifier.id)
             || !canonical_connector_token(&verifier.provider)
             || verifier.required_states.is_empty()
@@ -360,6 +374,11 @@ fn resolve_evidence_verifier_bindings(
             (
                 "invalid_rule",
                 "Evidence Verifier fields must be canonical non-empty identifiers.",
+            )
+        } else if !valid_polling {
+            (
+                "invalid_rule",
+                "Evidence polling requires Kubernetes plus both bounded interval and timeout seconds.",
             )
         } else if !matches!(verifier.provider.as_str(), "git" | "kubernetes") {
             (
@@ -421,6 +440,12 @@ fn resolve_evidence_verifier_bindings(
                 .flatten(),
             namespace: (verifier.provider == "kubernetes")
                 .then(|| deployment_target.map(|target| target.namespace.clone()))
+                .flatten(),
+            poll_interval_seconds: (verifier.provider == "kubernetes")
+                .then_some(verifier.poll_interval_seconds)
+                .flatten(),
+            timeout_seconds: (verifier.provider == "kubernetes")
+                .then_some(verifier.timeout_seconds)
                 .flatten(),
             source: verifier.source.clone(),
             source_line: verifier.source_line,
@@ -499,6 +524,114 @@ fn verify_git_evidence_states(
         }
     }
     (evidence, failures)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeploymentAvailabilityPollStatus {
+    Satisfied,
+    Unsatisfied,
+    TimedOut,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeploymentAvailabilityPollResult {
+    status: DeploymentAvailabilityPollStatus,
+    evidence: Option<crate::infrastructure::ocp::DeploymentAvailabilityEvidence>,
+    attempts: u32,
+}
+
+fn poll_deployment_availability<Read, Ensure, Wait, Elapsed, ControlError>(
+    interval: Option<Duration>,
+    timeout: Option<Duration>,
+    mut read: Read,
+    mut ensure_current: Ensure,
+    mut wait: Wait,
+    mut elapsed: Elapsed,
+) -> Result<DeploymentAvailabilityPollResult, ControlError>
+where
+    Read: FnMut(
+        Duration,
+    ) -> Result<crate::infrastructure::ocp::DeploymentAvailabilityEvidence, String>,
+    Ensure: FnMut() -> Result<(), ControlError>,
+    Wait: FnMut(Duration) -> Result<(), ControlError>,
+    Elapsed: FnMut() -> Duration,
+{
+    let polling = interval.zip(timeout);
+    let mut attempts = 0_u32;
+    let mut last_evidence = None;
+    loop {
+        ensure_current()?;
+        let before_read = elapsed();
+        if attempts > 0 && polling.is_some_and(|(_, deadline)| before_read >= deadline) {
+            return Ok(DeploymentAvailabilityPollResult {
+                status: DeploymentAvailabilityPollStatus::TimedOut,
+                evidence: last_evidence,
+                attempts,
+            });
+        }
+        let request_budget = polling
+            .map(|(_, deadline)| deadline.saturating_sub(before_read))
+            .unwrap_or(Duration::from_secs(30))
+            .max(Duration::from_millis(1));
+        attempts = attempts.saturating_add(1);
+        let evidence = match read(request_budget) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return Ok(DeploymentAvailabilityPollResult {
+                    status: DeploymentAvailabilityPollStatus::Unavailable,
+                    evidence: None,
+                    attempts,
+                });
+            }
+        };
+        let after_read = elapsed();
+        if evidence.available && polling.is_none_or(|(_, deadline)| after_read <= deadline) {
+            return Ok(DeploymentAvailabilityPollResult {
+                status: DeploymentAvailabilityPollStatus::Satisfied,
+                evidence: Some(evidence),
+                attempts,
+            });
+        }
+        last_evidence = Some(evidence);
+        let Some((interval, deadline)) = polling else {
+            return Ok(DeploymentAvailabilityPollResult {
+                status: DeploymentAvailabilityPollStatus::Unsatisfied,
+                evidence: last_evidence,
+                attempts,
+            });
+        };
+        if after_read >= deadline {
+            return Ok(DeploymentAvailabilityPollResult {
+                status: DeploymentAvailabilityPollStatus::TimedOut,
+                evidence: last_evidence,
+                attempts,
+            });
+        }
+        wait(interval.min(deadline.saturating_sub(after_read)))?;
+    }
+}
+
+fn deployment_availability_evidence_json(result: &DeploymentAvailabilityPollResult) -> Value {
+    let status = match result.status {
+        DeploymentAvailabilityPollStatus::Satisfied => "satisfied",
+        DeploymentAvailabilityPollStatus::Unsatisfied => "unsatisfied",
+        DeploymentAvailabilityPollStatus::TimedOut => "timed_out",
+        DeploymentAvailabilityPollStatus::Unavailable => "unavailable",
+    };
+    let mut value = json!({
+        "state": "deployment_available",
+        "status": status,
+        "attempts": result.attempts,
+    });
+    if let Some(evidence) = &result.evidence {
+        value["desired_replicas"] = json!(evidence.desired_replicas);
+        value["updated_replicas"] = json!(evidence.updated_replicas);
+        value["ready_replicas"] = json!(evidence.ready_replicas);
+        value["available_replicas"] = json!(evidence.available_replicas);
+        value["generation_observed"] = json!(evidence.generation_observed);
+    }
+    value
 }
 
 fn matching_connector_tool(
@@ -2156,6 +2289,8 @@ impl TaskExecutor for AgentTaskExecutor {
                     "resource_kind": record.resource_kind,
                     "resource_name": record.resource_name,
                     "namespace": record.namespace,
+                    "poll_interval_seconds": record.poll_interval_seconds,
+                    "timeout_seconds": record.timeout_seconds,
                     "source": record.source,
                     "source_line": record.source_line,
                     "reason": record.reason,
@@ -2667,56 +2802,48 @@ impl TaskExecutor for AgentTaskExecutor {
                 let name = binding.resource_name.as_deref().ok_or_else(|| {
                     TaskExecutionError::blocked("Kubernetes evidence resource is missing.")
                 })?;
-                let result = crate::infrastructure::ocp::verify_deployment_available(
-                    environment,
-                    namespace,
-                    name,
-                );
-                let (status, evidence, failure) = match result {
-                    Ok(evidence) if evidence.available => (
-                        "satisfied",
-                        json!({
-                            "state": "deployment_available",
-                            "status": "satisfied",
-                            "desired_replicas": evidence.desired_replicas,
-                            "updated_replicas": evidence.updated_replicas,
-                            "ready_replicas": evidence.ready_replicas,
-                            "available_replicas": evidence.available_replicas,
-                            "generation_observed": evidence.generation_observed,
-                        }),
-                        None,
-                    ),
-                    Ok(evidence) => (
-                        "blocked",
-                        json!({
-                            "state": "deployment_available",
-                            "status": "unsatisfied",
-                            "desired_replicas": evidence.desired_replicas,
-                            "updated_replicas": evidence.updated_replicas,
-                            "ready_replicas": evidence.ready_replicas,
-                            "available_replicas": evidence.available_replicas,
-                            "generation_observed": evidence.generation_observed,
-                        }),
-                        Some("deployment_available"),
-                    ),
-                    Err(_) => (
-                        "blocked",
-                        json!({"state": "deployment_available", "status": "unavailable"}),
-                        Some("deployment_available"),
-                    ),
-                };
+                let interval = binding.poll_interval_seconds.map(Duration::from_secs);
+                let timeout = binding.timeout_seconds.map(Duration::from_secs);
+                let poll_started = Instant::now();
+                let result = poll_deployment_availability(
+                    interval,
+                    timeout,
+                    |request_timeout| {
+                        crate::infrastructure::ocp::verify_deployment_available(
+                            environment,
+                            namespace,
+                            name,
+                            request_timeout,
+                        )
+                    },
+                    || context.ensure_current(),
+                    |duration| {
+                        let wait_started = Instant::now();
+                        while wait_started.elapsed() < duration {
+                            context.ensure_current()?;
+                            let remaining = duration.saturating_sub(wait_started.elapsed());
+                            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                        }
+                        context.ensure_current()
+                    },
+                    || poll_started.elapsed(),
+                )?;
+                let satisfied = result.status == DeploymentAvailabilityPollStatus::Satisfied;
+                let evidence = deployment_availability_evidence_json(&result);
                 context.emit_event(
                     TaskSessionEventKind::Runtime,
                     json!({
                         "type": "evidence_verifier_result",
                         "schema_version": 1,
                         "provider": "kubernetes",
-                        "status": status,
+                        "status": if satisfied { "satisfied" } else { "blocked" },
                         "resource_kind": "deployment",
+                        "poll_interval_seconds": binding.poll_interval_seconds,
+                        "timeout_seconds": binding.timeout_seconds,
                         "evidence": [evidence],
                     }),
                 )?;
-                if failure.is_some() {
+                if !satisfied {
                     return Err(TaskExecutionError::blocked(
                         "Kubernetes Deployment availability verification blocked completion.",
                     ));
@@ -5127,6 +5254,8 @@ mod tests {
             resource_kind: None,
             resource_name: None,
             namespace: None,
+            poll_interval_seconds: None,
+            timeout_seconds: None,
             source: "global.agent_rules".to_string(),
             source_line: 40,
             reason: "bound".to_string(),
@@ -5150,6 +5279,124 @@ mod tests {
         run_test_git(repository, &["add", name]);
         run_test_git(repository, &["commit", "--quiet", "-m", name]);
         run_test_git(repository, &["rev-parse", "HEAD"])
+    }
+
+    fn deployment_evidence(
+        available: bool,
+    ) -> crate::infrastructure::ocp::DeploymentAvailabilityEvidence {
+        crate::infrastructure::ocp::DeploymentAvailabilityEvidence {
+            desired_replicas: 2,
+            updated_replicas: 2,
+            ready_replicas: if available { 2 } else { 1 },
+            available_replicas: if available { 2 } else { 1 },
+            generation_observed: true,
+            available,
+        }
+    }
+
+    #[test]
+    fn deployment_availability_polling_retries_progress_and_stops_when_satisfied() {
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let budgets = Arc::new(Mutex::new(Vec::new()));
+        let attempts = AtomicUsize::new(0);
+        let result = poll_deployment_availability(
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(15)),
+            {
+                let budgets = budgets.clone();
+                move |budget| {
+                    budgets.lock().expect("budgets lock").push(budget);
+                    Ok(deployment_evidence(
+                        attempts.fetch_add(1, Ordering::SeqCst) > 0,
+                    ))
+                }
+            },
+            || Ok::<(), &'static str>(()),
+            {
+                let elapsed = elapsed.clone();
+                let waits = waits.clone();
+                move |duration| {
+                    *elapsed.lock().expect("elapsed lock") += duration;
+                    waits.lock().expect("waits lock").push(duration);
+                    Ok::<(), &'static str>(())
+                }
+            },
+            {
+                let elapsed = elapsed.clone();
+                move || *elapsed.lock().expect("elapsed lock")
+            },
+        )
+        .expect("polling succeeds");
+        assert_eq!(result.status, DeploymentAvailabilityPollStatus::Satisfied);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(
+            waits.lock().expect("waits lock").as_slice(),
+            &[Duration::from_secs(5)]
+        );
+        assert_eq!(
+            budgets.lock().expect("budgets lock").as_slice(),
+            &[Duration::from_secs(15), Duration::from_secs(10)]
+        );
+    }
+
+    #[test]
+    fn deployment_availability_polling_times_out_with_last_observed_state() {
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let result = poll_deployment_availability(
+            Some(Duration::from_secs(4)),
+            Some(Duration::from_secs(10)),
+            |_| Ok(deployment_evidence(false)),
+            || Ok::<(), &'static str>(()),
+            {
+                let elapsed = elapsed.clone();
+                move |duration| {
+                    *elapsed.lock().expect("elapsed lock") += duration;
+                    Ok::<(), &'static str>(())
+                }
+            },
+            {
+                let elapsed = elapsed.clone();
+                move || *elapsed.lock().expect("elapsed lock")
+            },
+        )
+        .expect("polling completes");
+        assert_eq!(result.status, DeploymentAvailabilityPollStatus::TimedOut);
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.evidence, Some(deployment_evidence(false)));
+    }
+
+    #[test]
+    fn deployment_availability_polling_propagates_cancellation_during_wait() {
+        let result = poll_deployment_availability(
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(15)),
+            |_| Ok(deployment_evidence(false)),
+            || Ok::<(), &'static str>(()),
+            |_| Err("cancelled"),
+            || Duration::ZERO,
+        );
+        assert_eq!(result, Err("cancelled"));
+    }
+
+    #[test]
+    fn deployment_availability_polling_does_not_retry_unavailable_reads() {
+        let attempts = AtomicUsize::new(0);
+        let result = poll_deployment_availability(
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(15)),
+            |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("redacted connector failure".to_string())
+            },
+            || Ok::<(), &'static str>(()),
+            |_| Ok::<(), &'static str>(()),
+            || Duration::ZERO,
+        )
+        .expect("read failure becomes evidence status");
+        assert_eq!(result.status, DeploymentAvailabilityPollStatus::Unavailable);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5227,6 +5474,7 @@ mod tests {
             required_states: vec!["clean_worktree".to_string(), "new_commit".to_string()],
             source: "global.agent_rules".to_string(),
             source_line: 40,
+            ..Default::default()
         };
         let bamboo_rule = crate::domain::governance::EvidenceVerifierRuleFact {
             id: "bamboo-build-state".to_string(),
@@ -5235,6 +5483,7 @@ mod tests {
             required_states: vec!["successful_build".to_string()],
             source: "global.agent_rules".to_string(),
             source_line: 50,
+            ..Default::default()
         };
         let facts = RuleFactsRecord {
             connectors: vec![ConnectorRuleFact {
@@ -5285,6 +5534,26 @@ mod tests {
         );
         assert_eq!(records[0].status, "unsupported_provider");
         assert_eq!(blockers.len(), 1);
+
+        let mut invalid_git_polling = facts.clone();
+        invalid_git_polling.evidence_verifiers[0].poll_interval_seconds = Some(5);
+        invalid_git_polling.evidence_verifiers[0].timeout_seconds = Some(30);
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({
+                "ticket": {"labels": ["RELEASE"]},
+                "repository": {"head_commit": "abc"}
+            }),
+            &["git".to_string()],
+            &[],
+            &invalid_git_polling,
+            Some(directory.path()),
+            None,
+            false,
+        );
+        assert_eq!(records[0].status, "invalid_rule");
+        assert_eq!(records[0].poll_interval_seconds, None);
+        assert_eq!(records[0].timeout_seconds, None);
+        assert_eq!(blockers.len(), 1);
     }
 
     #[test]
@@ -5300,8 +5569,11 @@ mod tests {
                 provider: "kubernetes".to_string(),
                 applies_to_labels: Vec::new(),
                 required_states: vec!["deployment_available".to_string()],
+                poll_interval_seconds: Some(5),
+                timeout_seconds: Some(120),
                 source: "global.agent_rules".to_string(),
                 source_line: 60,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -5321,6 +5593,8 @@ mod tests {
         assert_eq!(records[0].resource_kind.as_deref(), Some("deployment"));
         assert_eq!(records[0].resource_name.as_deref(), Some("payroll-api"));
         assert_eq!(records[0].namespace.as_deref(), Some("qcash-prerelease"));
+        assert_eq!(records[0].poll_interval_seconds, Some(5));
+        assert_eq!(records[0].timeout_seconds, Some(120));
 
         let (missing, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {}}),
@@ -5344,6 +5618,20 @@ mod tests {
             false,
         );
         assert_eq!(unsupported[0].status, "unsupported_provider");
+        assert_eq!(blockers.len(), 1);
+
+        let mut invalid_polling = facts.clone();
+        invalid_polling.evidence_verifiers[0].timeout_seconds = None;
+        let (invalid, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"deployment": {"workload": "payroll-api"}}),
+            &["external_tools:ocp-dev".to_string()],
+            &["ocp-dev".to_string()],
+            &invalid_polling,
+            None,
+            Some(&target),
+            true,
+        );
+        assert_eq!(invalid[0].status, "invalid_rule");
         assert_eq!(blockers.len(), 1);
     }
 

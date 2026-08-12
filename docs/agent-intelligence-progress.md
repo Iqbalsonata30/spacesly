@@ -48,6 +48,8 @@ Implemented Kubernetes Deployment availability vertical slice:
 - Provider: kubernetes
 - Required states:
   - deployment_available
+- Poll interval seconds: 5
+- Timeout seconds: 120
 ```
 
 ```json
@@ -65,14 +67,18 @@ Implemented Kubernetes Deployment availability vertical slice:
 - Availability requires `status.observedGeneration >= metadata.generation` and updated, ready, and available replicas all to equal desired replicas.
 - Durable evidence contains only resource kind, replica counters, generation-observed status, and satisfied/unsatisfied/unavailable state.
 - Missing target/workload authority, unavailable reads, stale generations, and incomplete replicas fail closed.
-- This increment takes one authoritative state snapshot. A progressing rollout blocks the current completion; bounded polling and rollout deadlines remain future work.
+- Rules may optionally provide both a poll interval and rollout timeout. Values are bounded to 1–30 seconds and 1–600 seconds respectively, with the interval no greater than the timeout; invalid or partial policies block during preflight.
+- Rule facts compiler v3 persists the typed polling policy; retained v1/v2 task snapshots remain valid under their original immutable semantics.
+- A progressing Deployment is reread until it becomes available or reaches the deadline. Connector/RBAC failures are not blindly retried, every wait rechecks assignment authority, and each API request is capped by the remaining deadline.
+- Omitting both polling fields preserves the one-snapshot verifier behavior.
 
 Phase 11 regression evidence:
 
 - Focused Rules parser, label binding, missing-baseline, and unsupported-provider tests: 2 passed.
 - Focused clean-worktree/new-commit state-transition and local-upstream containment tests: 2 passed.
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
-- Full Rust suite: 453 passed, 3 ignored, 0 failed in serial mode.
+- Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
+- Full Rust suite: 459 passed, 3 ignored, 0 failed in serial mode.
 - `cargo check` and formatting: passed.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 

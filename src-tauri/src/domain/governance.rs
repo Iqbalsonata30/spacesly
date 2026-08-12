@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
-pub const RULE_FACTS_SCHEMA_VERSION: u32 = 2;
-pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 3;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
+const PREVIOUS_RULE_FACTS_SCHEMA_VERSION: u32 = 2;
+const PREVIOUS_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
 const LEGACY_RULE_FACTS_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v1";
 const MAX_SELECTED_SKILLS: usize = 16;
@@ -145,6 +147,12 @@ pub struct EvidenceVerifierRuleFact {
     pub applies_to_labels: Vec<String>,
     pub required_states: Vec<String>,
     #[serde(default)]
+    pub poll_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling_configuration_error: Option<String>,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub source_line: u32,
@@ -206,6 +214,9 @@ impl GovernanceResolutionRecord {
                 let supported_compiler = (self.rules.facts.schema_version
                     == RULE_FACTS_SCHEMA_VERSION
                     && self.rules.facts.compiler_version == RULE_FACTS_COMPILER_VERSION)
+                    || (self.rules.facts.schema_version == PREVIOUS_RULE_FACTS_SCHEMA_VERSION
+                        && self.rules.facts.compiler_version
+                            == PREVIOUS_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == LEGACY_RULE_FACTS_SCHEMA_VERSION
                         && self.rules.facts.compiler_version == LEGACY_RULE_FACTS_COMPILER_VERSION);
                 if !supported_compiler || self.rules.facts.source_digest != self.rules.final_digest
@@ -564,7 +575,7 @@ fn compile_evidence_verifier_rule_facts(snapshot: &str) -> Vec<EvidenceVerifierR
     let heading = Regex::new(r"(?i)^#{1,6}\s+evidence verifier\s*:\s*([a-z0-9_.-]+)\s*$")
         .expect("valid evidence verifier heading regex");
     let field = Regex::new(
-        r"(?i)^(?:[-*]|\d+[.)])?\s*(provider|applies to labels|required states)\s*:\s*(.*)$",
+        r"(?i)^(?:[-*]|\d+[.)])?\s*(provider|applies to labels|required states|poll interval seconds|timeout seconds)\s*:\s*(.*)$",
     )
     .expect("valid evidence verifier field regex");
     let mut verifiers = Vec::new();
@@ -605,6 +616,20 @@ fn compile_evidence_verifier_rule_facts(snapshot: &str) -> Vec<EvidenceVerifierR
                 "required states" => verifier
                     .required_states
                     .extend(split_rule_operations(&value)),
+                "poll interval seconds" => match value.parse::<u64>() {
+                    Ok(value) => verifier.poll_interval_seconds = Some(value),
+                    Err(_) => {
+                        verifier.polling_configuration_error =
+                            Some("Poll interval seconds must be an integer.".to_string())
+                    }
+                },
+                "timeout seconds" => match value.parse::<u64>() {
+                    Ok(value) => verifier.timeout_seconds = Some(value),
+                    Err(_) => {
+                        verifier.polling_configuration_error =
+                            Some("Timeout seconds must be an integer.".to_string())
+                    }
+                },
                 _ => unreachable!(),
             }
             continue;
@@ -1514,6 +1539,8 @@ mod tests {
 - Provider: kubernetes
 - Required states:
   - deployment_available
+- Poll interval seconds: 5
+- Timeout seconds: 120
 "#,
         );
         assert_eq!(facts.evidence_verifiers.len(), 1);
@@ -1521,6 +1548,31 @@ mod tests {
         assert_eq!(
             facts.evidence_verifiers[0].required_states,
             vec!["deployment_available"]
+        );
+        assert_eq!(facts.evidence_verifiers[0].poll_interval_seconds, Some(5));
+        assert_eq!(facts.evidence_verifiers[0].timeout_seconds, Some(120));
+        assert!(facts.evidence_verifiers[0]
+            .polling_configuration_error
+            .is_none());
+    }
+
+    #[test]
+    fn rule_compiler_retains_invalid_evidence_polling_configuration() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: deployment-health
+- Provider: kubernetes
+- Required states: deployment_available
+- Poll interval seconds: soon
+- Timeout seconds: 120
+"#,
+        );
+        let verifier = &facts.evidence_verifiers[0];
+        assert_eq!(verifier.poll_interval_seconds, None);
+        assert_eq!(verifier.timeout_seconds, Some(120));
+        assert_eq!(
+            verifier.polling_configuration_error.as_deref(),
+            Some("Poll interval seconds must be an integer.")
         );
     }
 
@@ -1553,9 +1605,15 @@ mod tests {
     }
 
     #[test]
-    fn retained_v1_rule_facts_remain_valid_after_v2_compiler_upgrade() {
+    fn retained_prior_rule_facts_remain_valid_after_v3_compiler_upgrade() {
         let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
             .expect("governance resolves");
+        resolution.rules.facts.schema_version = PREVIOUS_RULE_FACTS_SCHEMA_VERSION;
+        resolution.rules.facts.compiler_version = PREVIOUS_RULE_FACTS_COMPILER_VERSION.to_string();
+        resolution
+            .validate_for(5)
+            .expect("retained v2 rule facts remain compatible");
+
         resolution.rules.facts.schema_version = LEGACY_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = LEGACY_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution
