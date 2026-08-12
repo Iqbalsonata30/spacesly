@@ -8,8 +8,8 @@ use crate::domain::governance::{
 };
 use crate::domain::task_examination::{
     examine_task, ConnectorConfigurationPreflightRecord, ConnectorDiscoveryStatus,
-    DeploymentTargetResolutionRecord, RepositoryResolutionRecord, RuleContradictionRecord,
-    VerificationPolicyBindingRecord,
+    DeploymentTargetResolutionRecord, EvidenceVerifierBindingRecord, RepositoryResolutionRecord,
+    RuleContradictionRecord, VerificationPolicyBindingRecord,
 };
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
@@ -62,6 +62,7 @@ fn rule_source_reference(source: &str, source_line: u32) -> String {
 
 fn resolve_rule_contradictions(
     contract: &Value,
+    requested_capabilities: &[String],
     connector_ids: &[String],
     rule_facts: &RuleFactsRecord,
 ) -> Vec<RuleContradictionRecord> {
@@ -229,9 +230,240 @@ fn resolve_rule_contradictions(
             });
         }
     }
+    let applicable_verifiers = rule_facts
+        .evidence_verifiers
+        .iter()
+        .filter(|verifier| {
+            (verifier.provider == "git"
+                && requested_capabilities
+                    .iter()
+                    .any(|capability| capability == "git"))
+                || connector_ids.iter().any(|connector_id| {
+                    rule_facts.connectors.iter().any(|connector| {
+                        connector.id == *connector_id
+                            && connector.connector_type == verifier.provider
+                    })
+                })
+        })
+        .filter(|verifier| {
+            verifier.applies_to_labels.is_empty()
+                || labels.iter().any(|label| {
+                    verifier
+                        .applies_to_labels
+                        .iter()
+                        .any(|required| label.eq_ignore_ascii_case(required))
+                })
+        })
+        .collect::<Vec<_>>();
+    let verifier_ids = applicable_verifiers
+        .iter()
+        .map(|verifier| verifier.id.as_str())
+        .collect::<HashSet<_>>();
+    for verifier_id in verifier_ids {
+        let definitions = applicable_verifiers
+            .iter()
+            .filter(|verifier| verifier.id == verifier_id)
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "evidence_verifier".to_string(),
+                key: verifier_id.to_string(),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason: "Multiple applicable Evidence Verifier Rules use the same ID.".to_string(),
+            });
+        }
+    }
     contradictions
         .sort_by(|left, right| (&left.domain, &left.key).cmp(&(&right.domain, &right.key)));
     contradictions
+}
+
+fn resolve_evidence_verifier_bindings(
+    contract: &Value,
+    requested_capabilities: &[String],
+    connector_ids: &[String],
+    rule_facts: &RuleFactsRecord,
+    repository_root: Option<&Path>,
+) -> (Vec<EvidenceVerifierBindingRecord>, Vec<String>) {
+    let labels = contract
+        .pointer("/ticket/labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut blockers = Vec::new();
+    for verifier in &rule_facts.evidence_verifiers {
+        let provider_requested = if verifier.provider == "git" {
+            requested_capabilities
+                .iter()
+                .any(|capability| capability == "git")
+        } else {
+            connector_ids.iter().any(|connector_id| {
+                rule_facts.connectors.iter().any(|connector| {
+                    connector.id == *connector_id && connector.connector_type == verifier.provider
+                })
+            })
+        };
+        if !provider_requested {
+            continue;
+        }
+        let matched_labels = labels
+            .iter()
+            .filter(|label| {
+                verifier
+                    .applies_to_labels
+                    .iter()
+                    .any(|required| label.eq_ignore_ascii_case(required))
+            })
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>();
+        if !verifier.applies_to_labels.is_empty() && matched_labels.is_empty() {
+            continue;
+        }
+        let valid_states = verifier.provider == "git"
+            && verifier.required_states.iter().all(|state| {
+                matches!(
+                    state.as_str(),
+                    "clean_worktree" | "new_commit" | "pushed_upstream"
+                )
+            });
+        let (status, reason) = if !canonical_connector_token(&verifier.id)
+            || !canonical_connector_token(&verifier.provider)
+            || verifier.required_states.is_empty()
+            || verifier
+                .required_states
+                .iter()
+                .any(|state| !canonical_connector_token(state))
+        {
+            (
+                "invalid_rule",
+                "Evidence Verifier fields must be canonical non-empty identifiers.",
+            )
+        } else if verifier.provider != "git" {
+            (
+                "unsupported_provider",
+                "This evidence verifier provider has no deterministic adapter yet.",
+            )
+        } else if !valid_states {
+            (
+                "invalid_rule",
+                "Git evidence states must be clean_worktree, new_commit, or pushed_upstream.",
+            )
+        } else if repository_root.is_none() {
+            (
+                "missing_repository",
+                "Git evidence verification requires one resolved trusted repository.",
+            )
+        } else if verifier
+            .required_states
+            .iter()
+            .any(|state| state == "new_commit")
+            && contract
+                .pointer("/repository/head_commit")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            ("missing_repository", "The immutable contract must include repository.head_commit for new_commit verification.")
+        } else {
+            (
+                "ready",
+                "The Git terminal-state verifier is bound to the resolved trusted repository.",
+            )
+        };
+        if status != "ready" {
+            blockers.push(format!("{}: {reason}", verifier.id));
+        }
+        records.push(EvidenceVerifierBindingRecord {
+            schema_version: 1,
+            verifier_id: verifier.id.clone(),
+            provider: verifier.provider.clone(),
+            status: status.to_string(),
+            matched_labels,
+            required_states: verifier.required_states.clone(),
+            source: verifier.source.clone(),
+            source_line: verifier.source_line,
+            reason: reason.to_string(),
+        });
+    }
+    records.sort_by(|left, right| left.verifier_id.cmp(&right.verifier_id));
+    blockers.sort();
+    (records, blockers)
+}
+
+fn run_git_evidence_command(repository_root: &Path, arguments: &[&str]) -> Result<String, String> {
+    let git = crate::infrastructure::git::git_executable()?;
+    let output = std::process::Command::new(git)
+        .args(arguments)
+        .current_dir(repository_root)
+        .output()
+        .map_err(|error| format!("Could not run Git evidence verifier: {error}"))?;
+    if !output.status.success() {
+        return Err("Git evidence command did not succeed.".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn verify_git_evidence_states(
+    bindings: &[EvidenceVerifierBindingRecord],
+    repository_root: &Path,
+    contract: &Value,
+) -> (Vec<Value>, Vec<String>) {
+    let required = bindings
+        .iter()
+        .filter(|binding| binding.provider == "git" && binding.status == "ready")
+        .flat_map(|binding| binding.required_states.iter().cloned())
+        .collect::<HashSet<_>>();
+    let mut evidence = Vec::new();
+    let mut failures = Vec::new();
+    for state in ["clean_worktree", "new_commit", "pushed_upstream"] {
+        if !required.contains(state) {
+            continue;
+        }
+        let result = match state {
+            "clean_worktree" => {
+                run_git_evidence_command(repository_root, &["status", "--porcelain"])
+                    .map(|status| status.is_empty())
+            }
+            "new_commit" => {
+                run_git_evidence_command(repository_root, &["rev-parse", "HEAD"]).map(|head| {
+                    contract
+                        .pointer("/repository/head_commit")
+                        .and_then(Value::as_str)
+                        .is_some_and(|baseline| !baseline.trim().eq_ignore_ascii_case(&head))
+                })
+            }
+            "pushed_upstream" => {
+                run_git_evidence_command(repository_root, &["rev-parse", "--verify", "@{u}"])
+                    .and_then(|_| {
+                        run_git_evidence_command(
+                            repository_root,
+                            &["merge-base", "--is-ancestor", "HEAD", "@{u}"],
+                        )
+                    })
+                    .map(|_| true)
+            }
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(true) => evidence.push(json!({"state": state, "status": "satisfied"})),
+            Ok(false) => {
+                evidence.push(json!({"state": state, "status": "unsatisfied"}));
+                failures.push(state.to_string());
+            }
+            Err(_) => {
+                evidence.push(json!({"state": state, "status": "unavailable"}));
+                failures.push(state.to_string());
+            }
+        }
+    }
+    (evidence, failures)
 }
 
 fn matching_connector_tool(
@@ -1572,6 +1804,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 .execution_contract
                 .as_ref()
                 .expect("validated execution contract"),
+            &envelope.requested_capabilities,
             &envelope.connector_ids,
             &resolved.governance.rules.facts,
         );
@@ -1726,16 +1959,33 @@ impl TaskExecutor for AgentTaskExecutor {
                         "schema_version": 1,
                         "status": status,
                         "workspace_root": canonical,
-                        "repository_root": repository_root,
+                        "repository_root": repository_root.clone(),
                         "guidance": guidance,
                     })),
-                    None,
+                    repository_root,
                     None,
                 )
             })
             } else {
                 (None, None, None)
             };
+        let evidence_contract = resolved
+            .task
+            .execution_contract
+            .as_ref()
+            .expect("validated execution contract")
+            .clone();
+        let (evidence_verifier_bindings, evidence_verifier_blockers) =
+            resolve_evidence_verifier_bindings(
+                &evidence_contract,
+                &envelope.requested_capabilities,
+                &envelope.connector_ids,
+                &resolved.governance.rules.facts,
+                default_repository_root.as_deref(),
+            );
+        examination.evidence_verifier_bindings = evidence_verifier_bindings;
+        let bound_evidence_verifiers = examination.evidence_verifier_bindings.clone();
+        let evidence_repository_root = default_repository_root.clone();
         let semantic_objective_mutations = Arc::new(semantic_objective_mutations);
         examination
             .validate(&envelope.context_digest)
@@ -1823,6 +2073,23 @@ impl TaskExecutor for AgentTaskExecutor {
                 }),
             )?;
         }
+        for record in &examination.evidence_verifier_bindings {
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "evidence_verifier_preflight",
+                    "schema_version": 1,
+                    "verifier_id": record.verifier_id,
+                    "provider": record.provider,
+                    "status": record.status,
+                    "matched_labels": record.matched_labels,
+                    "required_states": record.required_states,
+                    "source": record.source,
+                    "source_line": record.source_line,
+                    "reason": record.reason,
+                }),
+            )?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
@@ -1899,6 +2166,21 @@ impl TaskExecutor for AgentTaskExecutor {
             return Err(TaskExecutionError::blocked(format!(
                 "Authoritative Rules contradict each other. {}",
                 rule_contradiction_blockers.join(" ")
+            )));
+        }
+        if !evidence_verifier_blockers.is_empty() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Evidence verifier preflight blocked execution. {}",
+                evidence_verifier_blockers.join(" ")
             )));
         }
         if let Some(blocker) = deployment_target_preflight.blocker.as_ref() {
@@ -2263,6 +2545,35 @@ impl TaskExecutor for AgentTaskExecutor {
                         "policy_count": bound_verification_policies.len(),
                     }),
                 )?;
+            }
+            if !bound_evidence_verifiers.is_empty() {
+                let repository_root = evidence_repository_root.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked(
+                        "Evidence verifier lost its resolved repository authority.",
+                    )
+                })?;
+                let (evidence, failures) = verify_git_evidence_states(
+                    &bound_evidence_verifiers,
+                    repository_root,
+                    &evidence_contract,
+                );
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "evidence_verifier_result",
+                        "schema_version": 1,
+                        "provider": "git",
+                        "status": if failures.is_empty() { "satisfied" } else { "blocked" },
+                        "evidence": evidence,
+                        "failed_states": failures,
+                    }),
+                )?;
+                if !failures.is_empty() {
+                    return Err(TaskExecutionError::blocked(format!(
+                        "Git evidence verification blocked completion; unsatisfied states: {}.",
+                        failures.join(", ")
+                    )));
+                }
             }
         }
         let completion_status = match result.completion_status {
@@ -4658,6 +4969,168 @@ mod tests {
         }
     }
 
+    fn git_evidence_binding(states: &[&str]) -> EvidenceVerifierBindingRecord {
+        EvidenceVerifierBindingRecord {
+            schema_version: 1,
+            verifier_id: "git-release-state".to_string(),
+            provider: "git".to_string(),
+            status: "ready".to_string(),
+            matched_labels: Vec::new(),
+            required_states: states.iter().map(|state| state.to_string()).collect(),
+            source: "global.agent_rules".to_string(),
+            source_line: 40,
+            reason: "bound".to_string(),
+        }
+    }
+
+    fn run_test_git(repository: &Path, arguments: &[&str]) -> String {
+        let output = std::process::Command::new(
+            crate::infrastructure::git::git_executable().expect("git executable"),
+        )
+        .args(arguments)
+        .current_dir(repository)
+        .output()
+        .expect("git command runs");
+        assert!(output.status.success(), "git {:?} failed", arguments);
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn commit_test_file(repository: &Path, name: &str, content: &str) -> String {
+        std::fs::write(repository.join(name), content).expect("test file");
+        run_test_git(repository, &["add", name]);
+        run_test_git(repository, &["commit", "--quiet", "-m", name]);
+        run_test_git(repository, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn git_evidence_verifier_observes_clean_new_commit_and_upstream_state() {
+        let directory = tempdir().expect("workspace");
+        let repository = directory.path().join("repository");
+        initialize_repository(&repository);
+        run_test_git(
+            &repository,
+            &["config", "user.email", "spacesly@example.invalid"],
+        );
+        run_test_git(&repository, &["config", "user.name", "Spacesly Test"]);
+        let baseline = commit_test_file(&repository, "baseline.txt", "baseline");
+        let contract = json!({"repository": {"head_commit": baseline}});
+        let bindings = vec![git_evidence_binding(&["clean_worktree", "new_commit"])];
+
+        let (_, initial_failures) = verify_git_evidence_states(&bindings, &repository, &contract);
+        assert_eq!(initial_failures, vec!["new_commit"]);
+
+        commit_test_file(&repository, "change.txt", "change");
+        let (evidence, failures) = verify_git_evidence_states(&bindings, &repository, &contract);
+        assert!(failures.is_empty());
+        assert!(evidence.iter().all(|item| item["status"] == "satisfied"));
+
+        std::fs::write(repository.join("change.txt"), "dirty").expect("dirty file");
+        let (_, failures) = verify_git_evidence_states(&bindings, &repository, &contract);
+        assert_eq!(failures, vec!["clean_worktree"]);
+    }
+
+    #[test]
+    fn git_evidence_verifier_requires_head_to_be_contained_by_upstream() {
+        let directory = tempdir().expect("workspace");
+        let remote = directory.path().join("remote.git");
+        std::fs::create_dir_all(&remote).expect("remote directory");
+        run_test_git(&remote, &["init", "--quiet", "--bare"]);
+        let repository = directory.path().join("repository");
+        initialize_repository(&repository);
+        run_test_git(
+            &repository,
+            &["config", "user.email", "spacesly@example.invalid"],
+        );
+        run_test_git(&repository, &["config", "user.name", "Spacesly Test"]);
+        commit_test_file(&repository, "baseline.txt", "baseline");
+        run_test_git(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        run_test_git(&repository, &["push", "--quiet", "-u", "origin", "HEAD"]);
+        let bindings = vec![git_evidence_binding(&["pushed_upstream"])];
+        let contract = json!({});
+        assert!(
+            verify_git_evidence_states(&bindings, &repository, &contract)
+                .1
+                .is_empty()
+        );
+
+        commit_test_file(&repository, "local.txt", "local only");
+        assert_eq!(
+            verify_git_evidence_states(&bindings, &repository, &contract).1,
+            vec!["pushed_upstream"]
+        );
+    }
+
+    #[test]
+    fn evidence_verifier_binding_is_label_scoped_and_fails_closed_for_unsupported_provider() {
+        let git_rule = crate::domain::governance::EvidenceVerifierRuleFact {
+            id: "git-release-state".to_string(),
+            provider: "git".to_string(),
+            applies_to_labels: vec!["release".to_string()],
+            required_states: vec!["clean_worktree".to_string(), "new_commit".to_string()],
+            source: "global.agent_rules".to_string(),
+            source_line: 40,
+        };
+        let bamboo_rule = crate::domain::governance::EvidenceVerifierRuleFact {
+            id: "bamboo-build-state".to_string(),
+            provider: "bamboo".to_string(),
+            applies_to_labels: Vec::new(),
+            required_states: vec!["successful_build".to_string()],
+            source: "global.agent_rules".to_string(),
+            source_line: 50,
+        };
+        let facts = RuleFactsRecord {
+            connectors: vec![ConnectorRuleFact {
+                id: "corporate-bamboo".to_string(),
+                connector_type: "bamboo".to_string(),
+                ..Default::default()
+            }],
+            evidence_verifiers: vec![git_rule, bamboo_rule],
+            ..Default::default()
+        };
+        let directory = tempdir().expect("repository");
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({
+                "ticket": {"labels": ["RELEASE"]},
+                "repository": {"head_commit": "abc"}
+            }),
+            &["git".to_string()],
+            &[],
+            &facts,
+            Some(directory.path()),
+        );
+        assert!(blockers.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "ready");
+
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"ticket": {"labels": ["RELEASE"]}, "repository": {}}),
+            &["git".to_string()],
+            &[],
+            &facts,
+            Some(directory.path()),
+        );
+        assert_eq!(records[0].status, "missing_repository");
+        assert_eq!(blockers.len(), 1);
+
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({}),
+            &["external_tools:corporate-bamboo".to_string()],
+            &["corporate-bamboo".to_string()],
+            &facts,
+            None,
+        );
+        assert_eq!(records[0].status, "unsupported_provider");
+        assert_eq!(blockers.len(), 1);
+    }
+
     #[test]
     fn verification_policy_binds_only_for_matching_task_label() {
         let facts = RuleFactsRecord {
@@ -4762,6 +5235,7 @@ mod tests {
                 "repository": {"id": "qcash-deployment"},
                 "ticket": {"labels": ["NQLA_PRESTAGE"]}
             }),
+            &["git".to_string()],
             &["corporate-confluence".to_string()],
             &facts,
         );
@@ -4790,6 +5264,7 @@ mod tests {
         unrelated_facts.repositories[1].id = "other-repository".to_string();
         let unrelated = resolve_rule_contradictions(
             &json!({"ticket": {"labels": ["NQLA_DEV"]}}),
+            &[],
             &[],
             &unrelated_facts,
         );
@@ -5041,8 +5516,12 @@ mod tests {
             "ambiguous"
         );
         assert!(ambiguous.target.is_none());
-        let contradictions =
-            resolve_rule_contradictions(&json!({"deployment": {"target": "shared"}}), &[], &facts);
+        let contradictions = resolve_rule_contradictions(
+            &json!({"deployment": {"target": "shared"}}),
+            &[],
+            &[],
+            &facts,
+        );
         assert_eq!(contradictions.len(), 1);
         assert_eq!(contradictions[0].key, "target:shared");
     }

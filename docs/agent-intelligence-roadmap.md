@@ -299,9 +299,17 @@ Exit criteria:
 
 ### Phase 11 — Evidence Verifiers
 
-Status: planned.
+Status: in progress.
 
 Add connector-aware verification policies: build state from Bamboo, deployment health from Kubernetes, commit/upstream state from Git, and exact issue/comment state from Jira.
+
+Implemented Git evidence-verifier increment:
+
+- User Rules can bind a Git evidence verifier globally or by exact task label and require `clean_worktree`, `new_commit`, and/or `pushed_upstream`.
+- Spacesly evaluates those states directly in the resolved trusted repository after the worker returns but before accepting completion.
+- `new_commit` compares current `HEAD` with the immutable contract `repository.head_commit`; `pushed_upstream` requires an upstream and proves that upstream contains `HEAD`.
+- Results persist as secret-free state/status evidence. Unsatisfied or unavailable required states block completion independently of the model summary.
+- Unsupported providers fail closed when an applicable rule is requested; Bamboo, Kubernetes, and Jira semantic adapters remain planned.
 
 Benefits:
 

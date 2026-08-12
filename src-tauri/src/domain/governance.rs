@@ -136,6 +136,20 @@ pub struct VerificationRuleFact {
     pub source_line: u32,
 }
 
+/// User-authored terminal state checks executed independently of the model.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvidenceVerifierRuleFact {
+    pub id: String,
+    pub provider: String,
+    #[serde(default)]
+    pub applies_to_labels: Vec<String>,
+    pub required_states: Vec<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub source_line: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuleFactsRecord {
     pub schema_version: u32,
@@ -148,6 +162,8 @@ pub struct RuleFactsRecord {
     pub connectors: Vec<ConnectorRuleFact>,
     #[serde(default)]
     pub verification_policies: Vec<VerificationRuleFact>,
+    #[serde(default)]
+    pub evidence_verifiers: Vec<EvidenceVerifierRuleFact>,
     pub warnings: Vec<String>,
 }
 
@@ -202,6 +218,7 @@ impl GovernanceResolutionRecord {
                 || self.rules.facts.deployment_targets.len() > 64
                 || self.rules.facts.connectors.len() > 32
                 || self.rules.facts.verification_policies.len() > 64
+                || self.rules.facts.evidence_verifiers.len() > 64
                 || self.rules.facts.warnings.len() > 32
             {
                 return Err("Governance Rule facts exceed bounded limits.".to_string());
@@ -393,6 +410,7 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     let mut in_deployment_table = false;
     let connectors = compile_connector_rule_facts(snapshot);
     let verification_policies = compile_verification_rule_facts(snapshot);
+    let evidence_verifiers = compile_evidence_verifier_rule_facts(snapshot);
 
     for (line_index, line) in snapshot.lines().enumerate() {
         for matched in url_pattern.find_iter(line) {
@@ -537,8 +555,90 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
         deployment_targets,
         connectors,
         verification_policies,
+        evidence_verifiers,
         warnings,
     }
+}
+
+fn compile_evidence_verifier_rule_facts(snapshot: &str) -> Vec<EvidenceVerifierRuleFact> {
+    let heading = Regex::new(r"(?i)^#{1,6}\s+evidence verifier\s*:\s*([a-z0-9_.-]+)\s*$")
+        .expect("valid evidence verifier heading regex");
+    let field = Regex::new(
+        r"(?i)^(?:[-*]|\d+[.)])?\s*(provider|applies to labels|required states)\s*:\s*(.*)$",
+    )
+    .expect("valid evidence verifier field regex");
+    let mut verifiers = Vec::new();
+    let mut current: Option<EvidenceVerifierRuleFact> = None;
+    let mut collecting = None::<String>;
+    for (line_index, line) in snapshot.lines().enumerate() {
+        if let Some(id) = heading.captures(line).and_then(|captures| captures.get(1)) {
+            if let Some(verifier) = current.take() {
+                verifiers.push(verifier);
+            }
+            current = Some(EvidenceVerifierRuleFact {
+                id: id.as_str().to_ascii_lowercase(),
+                source: "global.agent_rules".to_string(),
+                source_line: (line_index + 1) as u32,
+                ..Default::default()
+            });
+            collecting = None;
+            continue;
+        }
+        let Some(verifier) = current.as_mut() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            verifiers.push(current.take().expect("evidence verifier exists"));
+            collecting = None;
+            continue;
+        }
+        if let Some(captures) = field.captures(line) {
+            let name = captures[1].to_ascii_lowercase();
+            let value = clean_rule_scalar(&captures[2]);
+            collecting = matches!(name.as_str(), "applies to labels" | "required states")
+                .then_some(name.clone());
+            match name.as_str() {
+                "provider" => verifier.provider = value.to_ascii_lowercase(),
+                "applies to labels" => verifier
+                    .applies_to_labels
+                    .extend(split_rule_operations(&value)),
+                "required states" => verifier
+                    .required_states
+                    .extend(split_rule_operations(&value)),
+                _ => unreachable!(),
+            }
+            continue;
+        }
+        if let Some(field) = collecting.as_deref() {
+            let value = line
+                .trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .trim_matches('`');
+            if !value.is_empty() && !value.contains(':') {
+                match field {
+                    "applies to labels" => verifier
+                        .applies_to_labels
+                        .extend(split_rule_operations(value)),
+                    "required states" => verifier
+                        .required_states
+                        .extend(split_rule_operations(value)),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    if let Some(verifier) = current {
+        verifiers.push(verifier);
+    }
+    for verifier in &mut verifiers {
+        verifier.applies_to_labels.sort();
+        verifier.applies_to_labels.dedup();
+        verifier.required_states.sort();
+        verifier.required_states.dedup();
+    }
+    verifiers.sort_by(|left, right| left.id.cmp(&right.id));
+    verifiers
 }
 
 fn compile_verification_rule_facts(snapshot: &str) -> Vec<VerificationRuleFact> {
@@ -1377,6 +1477,32 @@ mod tests {
         assert_eq!(policy.required_operations, vec!["get_page", "search"]);
         assert_eq!(policy.source, "global.agent_rules");
         assert_eq!(policy.source_line, 2);
+    }
+
+    #[test]
+    fn rule_compiler_extracts_git_evidence_verifier() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: git-release-state
+- Provider: git
+- Applies to labels:
+  - RELEASE
+- Required states:
+  - clean_worktree
+  - new_commit
+  - pushed_upstream
+"#,
+        );
+        assert_eq!(facts.evidence_verifiers.len(), 1);
+        let verifier = &facts.evidence_verifiers[0];
+        assert_eq!(verifier.id, "git-release-state");
+        assert_eq!(verifier.provider, "git");
+        assert_eq!(verifier.applies_to_labels, vec!["release"]);
+        assert_eq!(
+            verifier.required_states,
+            vec!["clean_worktree", "new_commit", "pushed_upstream"]
+        );
+        assert_eq!(verifier.source_line, 2);
     }
 
     #[test]

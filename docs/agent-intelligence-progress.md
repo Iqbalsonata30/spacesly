@@ -10,7 +10,43 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
-- Phase 11 evidence verifiers are next.
+- Phase 11 is in progress with the first independent Git terminal-state verifier.
+
+## Phase 11 In Progress
+
+Implemented Git evidence-verifier vertical slice:
+
+```markdown
+## Evidence Verifier: git-release-state
+
+- Provider: git
+- Applies to labels:
+  - RELEASE
+- Required states:
+  - clean_worktree
+  - new_commit
+  - pushed_upstream
+```
+
+- Evidence Verifier Rules are compiled with source provenance and bound only when their provider and optional labels apply to the immutable task.
+- The initial provider adapter is Git because Spacesly can independently inspect the exact repository already resolved inside workspace authority.
+- `clean_worktree` checks porcelain status, `new_commit` compares `HEAD` with immutable `repository.head_commit`, and `pushed_upstream` verifies that the configured upstream contains `HEAD`.
+- Terminal evidence contains only state names and `satisfied`, `unsatisfied`, or `unavailable` status. Command output, file content, remote URLs, and credentials are never retained.
+- Missing repository authority, missing commit baseline, invalid states, duplicate verifier IDs, and applicable unsupported providers block before execution.
+- Unsatisfied terminal states retain prior mutation/tool events and block acceptance of the model's completed result.
+
+Known limitation of this slice:
+
+- `new_commit` proves that repository `HEAD` changed from the immutable task baseline, but does not yet attribute the commit contents to a specific semantic objective.
+- Bamboo build status, Kubernetes rollout health, and exact Jira issue/comment state still require provider-specific response adapters.
+
+Phase 11 regression evidence:
+
+- Focused Rules parser, label binding, missing-baseline, and unsupported-provider tests: 2 passed.
+- Focused clean-worktree/new-commit state-transition and local-upstream containment tests: 2 passed.
+- Full Rust suite: 449 passed, 3 ignored, 0 failed in serial mode.
+- `cargo check` and formatting: passed.
+- Clippy: 0 errors; the same 3 pre-existing warnings remain.
 
 ## Phase 10 Completed
 

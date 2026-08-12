@@ -153,6 +153,20 @@ pub struct RuleContradictionRecord {
     pub reason: String,
 }
 
+/// Task-bound terminal state verifier compiled from user Rules.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvidenceVerifierBindingRecord {
+    pub schema_version: u32,
+    pub verifier_id: String,
+    pub provider: String,
+    pub status: String,
+    pub matched_labels: Vec<String>,
+    pub required_states: Vec<String>,
+    pub source: String,
+    pub source_line: u32,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -178,6 +192,8 @@ pub struct TaskExaminationRecord {
     pub verification_policy_bindings: Vec<VerificationPolicyBindingRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_contradictions: Vec<RuleContradictionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_verifier_bindings: Vec<EvidenceVerifierBindingRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -221,6 +237,7 @@ impl TaskExaminationRecord {
             self.connector_configuration_preflights.len(),
             self.verification_policy_bindings.len(),
             self.rule_contradictions.len(),
+            self.evidence_verifier_bindings.len(),
             self.objective_checkpoints.len(),
             self.required_capabilities.len(),
             self.unresolved_requirements.len(),
@@ -434,7 +451,11 @@ impl TaskExaminationRecord {
                 record.schema_version != 1
                     || !matches!(
                         record.domain.as_str(),
-                        "repository" | "deployment_target" | "connector" | "verification"
+                        "repository"
+                            | "deployment_target"
+                            | "connector"
+                            | "verification"
+                            | "evidence_verifier"
                     )
                     || record.key.trim().is_empty()
                     || record.key.len() > 128
@@ -451,6 +472,28 @@ impl TaskExaminationRecord {
             })
         {
             return Err("Task Examination Rule contradiction record is invalid.".to_string());
+        }
+        if self.evidence_verifier_bindings.iter().any(|record| {
+            record.schema_version != 1
+                || !canonical_inventory_name(&record.verifier_id, false)
+                || !canonical_inventory_name(&record.provider, false)
+                || !matches!(
+                    record.status.as_str(),
+                    "ready" | "invalid_rule" | "unsupported_provider" | "missing_repository"
+                )
+                || record.matched_labels.len() > MAX_EXAMINATION_ITEMS
+                || record.required_states.is_empty()
+                || record.required_states.len() > MAX_EXAMINATION_ITEMS
+                || record
+                    .required_states
+                    .iter()
+                    .any(|state| !canonical_inventory_name(state, false))
+                || record.source.trim().is_empty()
+                || record.source.len() > 128
+                || record.reason.trim().is_empty()
+                || record.reason.len() > 512
+        }) {
+            return Err("Task Examination evidence verifier binding is invalid.".to_string());
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -723,6 +766,7 @@ pub fn examine_task(
         connector_configuration_preflights: Vec::new(),
         verification_policy_bindings: Vec::new(),
         rule_contradictions: Vec::new(),
+        evidence_verifier_bindings: Vec::new(),
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,
