@@ -272,6 +272,7 @@ Implemented repository-resolution increment:
 - User-defined `Verification` blocks bind required successful connector operations globally or to exact ticket labels. The bound operation names are resolved against the live inventory and retained with Rules provenance.
 - A runtime `completed` claim is accepted only when every bound operation has a successful tool receipt from the current attempt, an automatic retry, or a durable objective checkpoint from an earlier assignment.
 - Missing evidence fails closed as an explicit blocked result; the worker summary cannot override the receipt check.
+- Task-scoped contradiction analysis preserves conflicting deployment rows and detects duplicate authoritative repository IDs, deployment labels, connector IDs, and applicable verification-policy IDs. It persists secret-free source references and blocks before worker execution.
 
 Current limitations:
 

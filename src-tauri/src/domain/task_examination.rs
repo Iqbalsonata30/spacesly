@@ -139,6 +139,16 @@ pub struct VerificationPolicyBindingRecord {
     pub reason: String,
 }
 
+/// Secret-free explanation of contradictory authoritative facts relevant to one task.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuleContradictionRecord {
+    pub schema_version: u32,
+    pub domain: String,
+    pub key: String,
+    pub source_references: Vec<String>,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskExaminationRecord {
     pub schema_version: u32,
@@ -162,6 +172,8 @@ pub struct TaskExaminationRecord {
     pub connector_configuration_preflights: Vec<ConnectorConfigurationPreflightRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_policy_bindings: Vec<VerificationPolicyBindingRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_contradictions: Vec<RuleContradictionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_repair: Option<CapabilityRepairGuidance>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -400,6 +412,29 @@ impl TaskExaminationRecord {
                 || record.reason.len() > 512
         }) {
             return Err("Task Examination verification policy binding is invalid.".to_string());
+        }
+        if self.rule_contradictions.len() > MAX_EXAMINATION_ITEMS
+            || self.rule_contradictions.iter().any(|record| {
+                record.schema_version != 1
+                    || !matches!(
+                        record.domain.as_str(),
+                        "repository" | "deployment_target" | "connector" | "verification"
+                    )
+                    || record.key.trim().is_empty()
+                    || record.key.len() > 128
+                    || record.key.chars().any(char::is_control)
+                    || record.source_references.len() < 2
+                    || record.source_references.len() > MAX_EXAMINATION_ITEMS
+                    || record.source_references.iter().any(|source| {
+                        source.trim().is_empty()
+                            || source.len() > 160
+                            || source.chars().any(char::is_control)
+                    })
+                    || record.reason.trim().is_empty()
+                    || record.reason.len() > 512
+            })
+        {
+            return Err("Task Examination Rule contradiction record is invalid.".to_string());
         }
         if self.runtime_repair.as_ref().is_some_and(|repair| {
             repair.schema_version != 1
@@ -671,6 +706,7 @@ pub fn examine_task(
         deployment_target_resolution: None,
         connector_configuration_preflights: Vec::new(),
         verification_policy_bindings: Vec::new(),
+        rule_contradictions: Vec::new(),
         runtime_repair: None,
         objective_checkpoints: Vec::new(),
         required_capabilities,

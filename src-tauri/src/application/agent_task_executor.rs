@@ -8,7 +8,8 @@ use crate::domain::governance::{
 };
 use crate::domain::task_examination::{
     examine_task, ConnectorConfigurationPreflightRecord, ConnectorDiscoveryStatus,
-    DeploymentTargetResolutionRecord, RepositoryResolutionRecord, VerificationPolicyBindingRecord,
+    DeploymentTargetResolutionRecord, RepositoryResolutionRecord, RuleContradictionRecord,
+    VerificationPolicyBindingRecord,
 };
 use crate::domain::task_recovery::{
     decide_capability_repair, decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction,
@@ -45,6 +46,167 @@ struct DeploymentTargetPreflight {
     record: Option<DeploymentTargetResolutionRecord>,
     target: Option<DeploymentTargetRuleFact>,
     blocker: Option<String>,
+}
+
+fn rule_source_reference(source: &str, source_line: u32) -> String {
+    format!(
+        "{}:{}",
+        if source.trim().is_empty() {
+            "global.agent_rules"
+        } else {
+            source
+        },
+        source_line
+    )
+}
+
+fn resolve_rule_contradictions(
+    contract: &Value,
+    connector_ids: &[String],
+    rule_facts: &RuleFactsRecord,
+) -> Vec<RuleContradictionRecord> {
+    let contract_text = serde_json::to_string(contract)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let labels = contract
+        .pointer("/ticket/labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut contradictions = Vec::new();
+
+    let distinct_repository_ids = rule_facts
+        .repositories
+        .iter()
+        .map(|repository| repository.id.as_str())
+        .collect::<HashSet<_>>();
+    let repository_ids = rule_facts
+        .repositories
+        .iter()
+        .filter(|repository| {
+            distinct_repository_ids.len() == 1
+                || contract_text.contains(&repository.id.to_ascii_lowercase())
+                || contract_text.contains(&repository.remote_url.to_ascii_lowercase())
+        })
+        .map(|repository| repository.id.as_str())
+        .collect::<HashSet<_>>();
+    for id in repository_ids {
+        let definitions = rule_facts
+            .repositories
+            .iter()
+            .filter(|repository| repository.id == id)
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "repository".to_string(),
+                key: id.to_string(),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason: "Multiple authoritative repository definitions use the same repository ID."
+                    .to_string(),
+            });
+        }
+    }
+
+    let selected_labels = rule_facts
+        .deployment_targets
+        .iter()
+        .filter(|target| {
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(&target.label))
+        })
+        .map(|target| target.label.as_str())
+        .collect::<HashSet<_>>();
+    for label in selected_labels {
+        let definitions = rule_facts
+            .deployment_targets
+            .iter()
+            .filter(|target| target.label.eq_ignore_ascii_case(label))
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "deployment_target".to_string(),
+                key: label.to_string(),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason:
+                    "One ticket label maps to multiple deployment targets, branches, or namespaces."
+                        .to_string(),
+            });
+        }
+    }
+
+    for connector_id in connector_ids {
+        let definitions = rule_facts
+            .connectors
+            .iter()
+            .filter(|connector| connector.id == *connector_id)
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "connector".to_string(),
+                key: connector_id.clone(),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason:
+                    "Multiple authoritative Connector Rules use the same configured connector ID."
+                        .to_string(),
+            });
+        }
+    }
+
+    let applicable_policies = rule_facts
+        .verification_policies
+        .iter()
+        .filter(|policy| connector_ids.iter().any(|id| id == &policy.connector_id))
+        .filter(|policy| {
+            policy.applies_to_labels.is_empty()
+                || labels.iter().any(|label| {
+                    policy
+                        .applies_to_labels
+                        .iter()
+                        .any(|required| label.eq_ignore_ascii_case(required))
+                })
+        })
+        .collect::<Vec<_>>();
+    let policy_ids = applicable_policies
+        .iter()
+        .map(|policy| policy.id.as_str())
+        .collect::<HashSet<_>>();
+    for policy_id in policy_ids {
+        let definitions = applicable_policies
+            .iter()
+            .filter(|policy| policy.id == policy_id)
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            contradictions.push(RuleContradictionRecord {
+                schema_version: 1,
+                domain: "verification".to_string(),
+                key: policy_id.to_string(),
+                source_references: definitions
+                    .iter()
+                    .map(|fact| rule_source_reference(&fact.source, fact.source_line))
+                    .collect(),
+                reason: "Multiple applicable Verification Rules use the same policy ID."
+                    .to_string(),
+            });
+        }
+    }
+    contradictions
+        .sort_by(|left, right| (&left.domain, &left.key).cmp(&(&right.domain, &right.key)));
+    contradictions
 }
 
 fn matching_connector_tool(
@@ -1261,6 +1423,20 @@ impl TaskExecutor for AgentTaskExecutor {
             );
         examination.verification_policy_bindings = verification_policy_bindings;
         let bound_verification_policies = examination.verification_policy_bindings.clone();
+        examination.rule_contradictions = resolve_rule_contradictions(
+            resolved
+                .task
+                .execution_contract
+                .as_ref()
+                .expect("validated execution contract"),
+            &envelope.connector_ids,
+            &resolved.governance.rules.facts,
+        );
+        let rule_contradiction_blockers = examination
+            .rule_contradictions
+            .iter()
+            .map(|record| format!("{} '{}': {}", record.domain, record.key, record.reason))
+            .collect::<Vec<_>>();
         let objective_checkpoints = context.objective_checkpoints()?;
         let protected_mutations = Arc::new(Mutex::new(
             objective_checkpoints
@@ -1491,6 +1667,19 @@ impl TaskExecutor for AgentTaskExecutor {
                 }),
             )?;
         }
+        for record in &examination.rule_contradictions {
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "rule_contradiction",
+                    "schema_version": 1,
+                    "domain": record.domain,
+                    "key": record.key,
+                    "source_references": record.source_references,
+                    "reason": record.reason,
+                }),
+            )?;
+        }
         let mut connector_preflight_blockers = examination
             .connector_capabilities
             .iter()
@@ -1554,6 +1743,21 @@ impl TaskExecutor for AgentTaskExecutor {
                 "mcp_connection_ids".to_string(),
             ],
         })?;
+        if !rule_contradiction_blockers.is_empty() {
+            let runtime_preparation_duration = runtime_preparation.finish();
+            emit_execution_trace_stage(
+                context,
+                "runtime_preparation",
+                runtime_preparation_duration,
+                "blocked",
+                &runtime_attempt_id,
+                opencode_session_id.as_deref(),
+            );
+            return Err(TaskExecutionError::blocked(format!(
+                "Authoritative Rules contradict each other. {}",
+                rule_contradiction_blockers.join(" ")
+            )));
+        }
         if let Some(blocker) = deployment_target_preflight.blocker.as_ref() {
             let runtime_preparation_duration = runtime_preparation.finish();
             emit_execution_trace_stage(
@@ -4370,6 +4574,83 @@ mod tests {
             &[read_receipt("confluence_get_page")],
         )
         .is_empty());
+    }
+
+    #[test]
+    fn rule_contradictions_are_task_scoped_and_cover_authoritative_identifiers() {
+        let mut repository_a = repository_fact(Some("/workspace/a".to_string()));
+        repository_a.source_line = 2;
+        let mut repository_b = repository_fact(Some("/workspace/b".to_string()));
+        repository_b.source_line = 3;
+        let mut target_a = deployment_target_fact(
+            "NQLA_PRESTAGE",
+            "prerelease",
+            "prerelease",
+            "qcash-prerelease",
+        );
+        target_a.source_line = 10;
+        let mut target_b = deployment_target_fact("NQLA_PRESTAGE", "drc", "drc", "qcash-drc");
+        target_b.source_line = 11;
+        let mut connector_a = connector_rule("https://confluence.example", &["get_page"]);
+        connector_a.source_line = 20;
+        let mut connector_b = connector_rule("https://other.example", &["search"]);
+        connector_b.source_line = 21;
+        let policy = crate::domain::governance::VerificationRuleFact {
+            id: "source-read".to_string(),
+            connector_id: "corporate-confluence".to_string(),
+            applies_to_labels: vec!["nqla_prestage".to_string()],
+            required_operations: vec!["get_page".to_string()],
+            source: "global.agent_rules".to_string(),
+            source_line: 30,
+        };
+        let mut conflicting_policy = policy.clone();
+        conflicting_policy.required_operations = vec!["search".to_string()];
+        conflicting_policy.source_line = 31;
+        let facts = RuleFactsRecord {
+            repositories: vec![repository_a, repository_b],
+            deployment_targets: vec![target_a, target_b],
+            connectors: vec![connector_a, connector_b],
+            verification_policies: vec![policy, conflicting_policy],
+            ..Default::default()
+        };
+
+        let contradictions = resolve_rule_contradictions(
+            &json!({
+                "repository": {"id": "qcash-deployment"},
+                "ticket": {"labels": ["NQLA_PRESTAGE"]}
+            }),
+            &["corporate-confluence".to_string()],
+            &facts,
+        );
+        assert_eq!(contradictions.len(), 4);
+        assert_eq!(
+            contradictions
+                .iter()
+                .map(|record| record.domain.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "connector",
+                "deployment_target",
+                "repository",
+                "verification"
+            ]
+        );
+        assert!(contradictions.iter().all(|record| {
+            record.source_references.len() == 2
+                && record
+                    .source_references
+                    .iter()
+                    .all(|source| source.starts_with("global.agent_rules:"))
+        }));
+
+        let mut unrelated_facts = facts.clone();
+        unrelated_facts.repositories[1].id = "other-repository".to_string();
+        let unrelated = resolve_rule_contradictions(
+            &json!({"ticket": {"labels": ["NQLA_DEV"]}}),
+            &[],
+            &unrelated_facts,
+        );
+        assert!(unrelated.is_empty());
     }
 
     fn initialize_repository(path: &Path) {

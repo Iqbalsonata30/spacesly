@@ -1,6 +1,6 @@
 # Spacesly Agent Intelligence Progress
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 Branch: `feat/agent-task-v2-foundation`
 
@@ -9,7 +9,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 ## Current Position
 
 - Completed through Phase 9: resource-level idempotency foundation.
-- Phase 10 is in progress with authoritative Helm repository and deployment-target resolution.
+- Phase 10 is in progress with authoritative scope resolution, connector preflight, verification receipts, and contradiction detection.
 
 ## Phase 10 In Progress
 
@@ -72,6 +72,14 @@ Implemented structured verification-policy increment:
 - A worker `completed` result is changed to an explicit blocked outcome when any bound successful-operation receipt is absent; model-authored summaries are not accepted as proof.
 - Current limitation: a receipt proves that the bound tool succeeded, but does not yet prove it read the intended resource or that returned external state satisfies a semantic predicate. Phase 11 adds connector-aware state verifiers.
 
+Implemented cross-rule contradiction increment:
+
+- Conflicting deployment table rows are preserved instead of being silently collapsed by label; exact duplicate rows remain deduplicated.
+- Before worker execution, task-scoped analysis detects duplicate authoritative repository IDs, selected deployment labels, requested connector IDs, and applicable verification-policy IDs.
+- Contradiction records contain only domain, logical key, Rules source-line references, and a corrective reason. URLs, connector environment values, arguments, responses, and secrets are excluded.
+- Contradictions are retained in Task Examination, emitted as structured runtime events, and block before OpenCode can choose between competing facts.
+- Unrelated connector, environment, verification, and repository definitions do not block a task that does not select them.
+
 Regression evidence:
 
 - Focused repository discovery, redaction, ambiguity, conflict, and containment tests: 3 passed.
@@ -82,13 +90,13 @@ Regression evidence:
 - Focused connector Rule compilation/provenance test: passed.
 - Focused connector URL, live-operation, missing, mismatch, and ambiguity tests: 2 passed.
 - Focused verification Rule parsing, label binding, missing-receipt, and checkpoint/resume receipt tests: 4 passed.
-- Full Rust suite: 439 passed, 3 ignored, 0 failed.
+- Focused conflicting-row preservation and task-scoped contradiction tests: 2 passed.
+- Full Rust suite: 441 passed, 3 ignored, 0 failed.
 
 Remaining Phase 10 scope:
 
-1. Detect cross-rule contradictions beyond repository path, deployment-label, connector selection, and verification references.
-2. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
-3. Add connector-aware semantic state verification beyond successful-operation receipts.
+1. Add explicit environment selectors for tasks that do not originate from a mapped ticket label.
+2. Add connector-aware semantic state verification beyond successful-operation receipts.
 
 ## Phase 9 Completed
 

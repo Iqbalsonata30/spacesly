@@ -460,8 +460,20 @@ pub fn compile_rule_facts(snapshot: &str) -> RuleFactsRecord {
     }
     protected_branches.sort();
     protected_branches.dedup();
-    deployment_targets.sort_by(|left, right| left.label.cmp(&right.label));
-    deployment_targets.dedup_by(|left, right| left.label == right.label);
+    deployment_targets.sort_by(|left, right| {
+        (&left.label, &left.target, &left.branch, &left.namespace).cmp(&(
+            &right.label,
+            &right.target,
+            &right.branch,
+            &right.namespace,
+        ))
+    });
+    deployment_targets.dedup_by(|left, right| {
+        left.label == right.label
+            && left.target == right.target
+            && left.branch == right.branch
+            && left.namespace == right.namespace
+    });
 
     let repositories = remote_urls
         .into_iter()
@@ -1274,6 +1286,22 @@ mod tests {
         assert!(facts.deployment_targets[0].source_line > 0);
         assert_eq!(facts.deployment_targets[1].label, "NQLA_PRESTAGE");
         assert!(facts.warnings.is_empty());
+    }
+
+    #[test]
+    fn rule_compiler_preserves_conflicting_rows_for_preflight_diagnostics() {
+        let facts = compile_rule_facts(
+            r#"
+| Jira Label | Environment | Git Branch | OpenShift Namespace |
+|------------|-------------|------------|---------------------|
+| NQLA_PRESTAGE | prerelease | prerelease | qcash-prerelease |
+| NQLA_PRESTAGE | drc | drc | qcash-drc |
+| NQLA_PRESTAGE | drc | drc | qcash-drc |
+"#,
+        );
+        assert_eq!(facts.deployment_targets.len(), 2);
+        assert_eq!(facts.deployment_targets[0].target, "drc");
+        assert_eq!(facts.deployment_targets[1].target, "prerelease");
     }
 
     #[test]
