@@ -137,3 +137,21 @@ export async function addJiraComment(
     IPC_POLICIES.jiraMutation,
   );
 }
+
+export type JiraFinalResultCommentResult = {
+  status: "created" | "already_complete";
+  comment_id: string;
+};
+
+export async function addJiraFinalResultComment(
+  config: JiraMcpConfig,
+  executionRunId: string,
+  issueKey: string,
+  comment: string,
+): Promise<JiraFinalResultCommentResult> {
+  return invokeWithPolicy<JiraFinalResultCommentResult>(
+    "add_jira_final_result_comment",
+    { config, executionRunId, issueKey, comment },
+    IPC_POLICIES.jiraMutation,
+  );
+}

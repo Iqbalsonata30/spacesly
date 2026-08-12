@@ -152,7 +152,11 @@ pub fn assign_issue(auth: &JiraAuthConfig, issue_key: &str) -> Result<(), String
 }
 
 /// Adds a Jira comment to an issue.
-pub fn add_comment(auth: &JiraAuthConfig, issue_key: &str, comment: &str) -> Result<(), String> {
+pub fn add_comment(
+    auth: &JiraAuthConfig,
+    issue_key: &str,
+    comment: &str,
+) -> Result<String, String> {
     if comment.trim().is_empty() {
         return Err("Cannot add an empty Jira comment.".to_string());
     }
@@ -164,7 +168,12 @@ pub fn add_comment(auth: &JiraAuthConfig, issue_key: &str, comment: &str) -> Res
         "body": comment
     });
 
-    send_empty(auth, client.post(&comment_url).json(&body))
+    let created: RestComment = send(auth, client.post(&comment_url).json(&body))?;
+    let id = created.id.trim().to_string();
+    if !super::jira::canonical_jira_comment_id(&id) {
+        return Err("Jira created a comment but returned an invalid comment identity.".to_string());
+    }
+    Ok(id)
 }
 
 /// Fetches issues from a Jira agile board with bounded pagination.
@@ -411,4 +420,24 @@ struct Transition {
     id: String,
     name: String,
     to: NamedValue,
+}
+
+#[derive(Deserialize)]
+struct RestComment {
+    #[serde(deserialize_with = "string_or_number")]
+    id: String,
+}
+
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => Err(serde::de::Error::custom(
+            "expected string or numeric Jira ID",
+        )),
+    }
 }

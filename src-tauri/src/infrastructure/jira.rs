@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::domain::resource_idempotency::{ResourceIdentity, ResourceOperationIdentity};
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct JiraIssueStatusEvidence {
     pub issue_key: String,
@@ -12,6 +14,12 @@ pub struct JiraIssueStatusEvidence {
 pub struct JiraCommentReference {
     pub issue_key: String,
     pub comment_id: String,
+    pub content_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JiraCommentMutationTarget {
+    pub issue_key: String,
     pub content_fingerprint: String,
 }
 
@@ -75,11 +83,35 @@ pub fn trusted_jira_comment_tool(tool_name: &str) -> bool {
         || tool_name.ends_with("_jira_create_comment")
 }
 
-/// Captures the exact Jira comment identity and a one-way fingerprint of its desired content.
-pub fn extract_created_jira_comment_reference(
+/// Derives a Jira comment mutation identity without retaining the comment body.
+pub fn jira_comment_operation_identity(
+    connector_binding: &str,
+    tool_name: &str,
     arguments: &Value,
-    response: &Value,
-) -> Option<JiraCommentReference> {
+) -> Result<Option<ResourceOperationIdentity>, String> {
+    if !trusted_jira_comment_tool(tool_name) {
+        return Ok(None);
+    }
+    let target = jira_comment_mutation_target(arguments).ok_or_else(|| {
+        "Jira comment mutation requires one canonical issue key and one non-empty comment body."
+            .to_string()
+    })?;
+    ResourceOperationIdentity::new(
+        "jira",
+        "add_comment",
+        ResourceIdentity {
+            api_version: "jira/rest/api/2".to_string(),
+            kind: "Comment".to_string(),
+            namespace: None,
+            name: target.issue_key,
+        },
+        connector_binding,
+        &serde_json::json!({ "content_fingerprint": target.content_fingerprint }),
+    )
+    .map(Some)
+}
+
+pub fn jira_comment_mutation_target(arguments: &Value) -> Option<JiraCommentMutationTarget> {
     let arguments = arguments.as_object()?;
     let issue_key = ["issue_key", "issueKey", "key"]
         .iter()
@@ -95,19 +127,32 @@ pub fn extract_created_jira_comment_reference(
         .filter_map(normalized_comment_text)
         .collect::<Vec<_>>();
     let body = unique_value(bodies)?;
+    Some(JiraCommentMutationTarget {
+        issue_key,
+        content_fingerprint: comment_fingerprint(&body),
+    })
+}
+
+pub fn extract_created_jira_comment_id(response: &Value) -> Option<String> {
     let mut ids = structured_jira_objects(response)
         .iter()
         .filter_map(jira_comment_id)
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids.dedup();
-    if ids.len() != 1 {
-        return None;
-    }
+    (ids.len() == 1).then(|| ids.remove(0))
+}
+
+/// Captures the exact Jira comment identity and a one-way fingerprint of its desired content.
+pub fn extract_created_jira_comment_reference(
+    arguments: &Value,
+    response: &Value,
+) -> Option<JiraCommentReference> {
+    let target = jira_comment_mutation_target(arguments)?;
     Some(JiraCommentReference {
-        issue_key,
-        comment_id: ids.remove(0),
-        content_fingerprint: comment_fingerprint(&body),
+        issue_key: target.issue_key,
+        comment_id: extract_created_jira_comment_id(response)?,
+        content_fingerprint: target.content_fingerprint,
     })
 }
 
@@ -401,6 +446,38 @@ mod tests {
         )
         .expect("comment evidence parses");
         assert!(evidence.content_matches);
+    }
+
+    #[test]
+    fn comment_operation_identity_is_stable_and_secret_free() {
+        let first = jira_comment_operation_identity(
+            &"a".repeat(64),
+            "corporate_jira_add_comment",
+            &json!({"issue_key": "ops-42", "comment": "Deployment  completed"}),
+        )
+        .expect("identity derives")
+        .expect("trusted Jira tool");
+        let equivalent = jira_comment_operation_identity(
+            &"a".repeat(64),
+            "jira_add_comment",
+            &json!({"issueKey": "OPS-42", "body": "Deployment completed"}),
+        )
+        .expect("identity derives")
+        .expect("trusted Jira tool");
+        let changed = jira_comment_operation_identity(
+            &"a".repeat(64),
+            "jira_add_comment",
+            &json!({"issue_key": "OPS-42", "comment": "Deployment failed"}),
+        )
+        .expect("identity derives")
+        .expect("trusted Jira tool");
+
+        assert_eq!(first.key, equivalent.key);
+        assert_ne!(first.key, changed.key);
+        assert_eq!(first.resource.name, "OPS-42");
+        let encoded = serde_json::to_string(&first).expect("identity serializes");
+        assert!(!encoded.contains("Deployment"));
+        assert!(!encoded.contains("completed"));
     }
 
     #[test]

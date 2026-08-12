@@ -976,7 +976,10 @@ impl SchedulerStore {
                 (tool_name, identity.operation.as_str()),
                 ("ocp_restart_deployment", "restart_deployment")
                     | ("ocp_scale_deployment", "scale_deployment")
-            );
+            )
+            || (identity.connector == "jira"
+                && identity.operation == "add_comment"
+                && crate::infrastructure::jira::trusted_jira_comment_tool(tool_name));
         if !supported_operation {
             return Err(
                 "Resource mutation ledger does not support this connector operation.".to_string(),
@@ -996,6 +999,12 @@ impl SchedulerStore {
         let mut reconciled_mutation_id = None;
         if let Some(record) = resource_mutation_by_active_key_on(&transaction, &identity.key)? {
             if record.state == ResourceMutationState::Succeeded {
+                if identity.connector == "jira" {
+                    transaction.commit().map_err(|error| {
+                        format!("Failed to commit resource mutation lookup: {error}")
+                    })?;
+                    return Ok(ResourceMutationReservation::Blocked(record));
+                }
                 if record.checkpoint_objective_id.is_some() {
                     transaction.commit().map_err(|error| {
                         format!("Failed to commit resource mutation lookup: {error}")
@@ -1714,10 +1723,12 @@ impl SchedulerStore {
                         "ocp_restart_deployment" | "ocp_scale_deployment"
                     ) && receipt.resource_operation_key.is_none())
                     || (receipt.resource_operation_key.is_some()
-                        && !matches!(
+                        && !(matches!(
                             receipt.tool_name.as_str(),
                             "ocp_restart_deployment" | "ocp_scale_deployment"
-                        ))
+                        ) || crate::infrastructure::jira::trusted_jira_comment_tool(
+                            &receipt.tool_name,
+                        )))
                     || receipt.external_resource.as_ref().is_some_and(|resource| {
                         match resource.provider.as_str() {
                             "bamboo" => {
@@ -1764,7 +1775,13 @@ impl SchedulerStore {
                                     ))
                         }))
                     || (receipt.external_resource.is_some()
-                        && receipt.resource_operation_key.is_some())
+                        && receipt.resource_operation_key.is_some()
+                        && !receipt.external_resource.as_ref().is_some_and(|resource| {
+                            resource.provider == "jira"
+                                && crate::infrastructure::jira::trusted_jira_comment_tool(
+                                    &receipt.tool_name,
+                                )
+                        }))
             })
         {
             return Err("Objective checkpoint payload is invalid.".to_string());
@@ -4157,11 +4174,15 @@ fn bind_resource_mutation_checkpoint_on(
             "Objective checkpoint resource mutation receipt has no active ledger record."
                 .to_string()
         })?;
+    let current_attempt = record.attempt_id == fence.attempt_id
+        && record.attempt == fence.attempt
+        && record.fencing_token == fence.fencing_token;
+    let jira_replay_adoption = record.identity.connector == "jira"
+        && record.identity.operation == "add_comment"
+        && crate::infrastructure::jira::trusted_jira_comment_tool(&record.tool_name);
     if record.state != ResourceMutationState::Succeeded
         || record.session_id != fence.session_id
-        || record.attempt_id != fence.attempt_id
-        || record.attempt != fence.attempt
-        || record.fencing_token != fence.fencing_token
+        || (!current_attempt && !jira_replay_adoption)
         || record.tool_name != receipt.tool_name
     {
         return Err(
@@ -4193,8 +4214,7 @@ fn bind_resource_mutation_checkpoint_on(
                 SET checkpoint_objective_id = ?2, checkpoint_tool_call_id = ?3,
                     checkpoint_recorded_at = ?4, revision = revision + 1
               WHERE mutation_id = ?1 AND operation_key = ?5 AND state = 'succeeded'
-                AND session_id = ?6 AND attempt_id = ?7 AND attempt_number = ?8
-                AND fencing_token = ?9 AND tool_name = ?10
+                AND session_id = ?6 AND tool_name = ?7
                 AND checkpoint_objective_id IS NULL
                 AND checkpoint_tool_call_id IS NULL
                 AND checkpoint_recorded_at IS NULL",
@@ -4205,9 +4225,6 @@ fn bind_resource_mutation_checkpoint_on(
                 to_i64(recorded_at)?,
                 operation_key,
                 to_i64(fence.session_id.0)?,
-                to_i64(fence.attempt_id)?,
-                i64::from(fence.attempt),
-                to_i64(fence.fencing_token)?,
                 receipt.tool_name,
             ],
         )
@@ -7085,6 +7102,35 @@ mod tests {
         }
     }
 
+    fn jira_comment_identity() -> ResourceOperationIdentity {
+        crate::infrastructure::jira::jira_comment_operation_identity(
+            &"a".repeat(64),
+            "jira_add_comment",
+            &json!({"issue_key": "OPS-42", "comment": "private completion detail"}),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn jira_comment_mutation_evidence(
+        identity: &ResourceOperationIdentity,
+    ) -> ResourceMutationEvidence {
+        ResourceMutationEvidence {
+            identity: identity.clone(),
+            lookup: ResourceLookupResult {
+                status: ResourceLookupStatus::DriftDetected,
+                observed_fingerprint: None,
+                observed_version: None,
+            },
+            execution: ResourceExecutionResult {
+                status: ResourceExecutionStatus::Executed,
+                resulting_fingerprint: Some(identity.mutation_fingerprint.clone()),
+                resulting_version: Some("10042".to_string()),
+            },
+            retry_resume_status: ResourceRetryResumeStatus::FirstExecution,
+        }
+    }
+
     fn external_mutation_assignment(
         path: PathBuf,
         worker_id: usize,
@@ -7562,6 +7608,110 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn confirmed_jira_comment_is_replayable_but_unconfirmed_intent_remains_fenced() {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _, authority) =
+            external_mutation_assignment(directory.path().join("jira-ledger.db"), 1);
+        let identity = jira_comment_identity();
+        let reserved = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "jira_add_comment",
+            &identity,
+        )
+        .unwrap()
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        let succeeded = SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            reserved.mutation_id,
+            ResourceMutationResolution::Succeeded(jira_comment_mutation_evidence(&identity)),
+        )
+        .unwrap();
+        assert_eq!(succeeded.state, ResourceMutationState::Succeeded);
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "jira_add_comment",
+                &identity,
+            )
+            .unwrap(),
+            ResourceMutationReservation::Blocked(ResourceMutationRecord {
+                state: ResourceMutationState::Succeeded,
+                ..
+            })
+        ));
+        let mut receipt = jira_comment_receipt("10042");
+        receipt.tool_name = "jira_add_comment".to_string();
+        receipt.resource_operation_key = Some(identity.key.clone());
+        store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "jira-comment-objective",
+                &["Exact Jira comment confirmed.".to_string()],
+                &[receipt],
+            )
+            .unwrap();
+        let bound = store
+            .resource_mutation(succeeded.mutation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound.checkpoint_objective_id.as_deref(),
+            Some("jira-comment-objective")
+        );
+
+        let different = crate::infrastructure::jira::jira_comment_operation_identity(
+            &"a".repeat(64),
+            "jira_add_comment",
+            &json!({"issue_key": "OPS-42", "comment": "different detail"}),
+        )
+        .unwrap()
+        .unwrap();
+        let pending = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "jira_add_comment",
+            &different,
+        )
+        .unwrap()
+        {
+            ResourceMutationReservation::Reserved(record) => record,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        SchedulerStore::resolve_external_resource_mutation(
+            &authority,
+            pending.mutation_id,
+            ResourceMutationResolution::Uncertain {
+                evidence: None,
+                kind: "transport".to_string(),
+                code: "response_lost".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            SchedulerStore::reserve_external_resource_mutation(
+                &authority,
+                "jira_add_comment",
+                &different,
+            )
+            .unwrap(),
+            ResourceMutationReservation::Blocked(ResourceMutationRecord {
+                state: ResourceMutationState::Uncertain,
+                ..
+            })
+        ));
+        let encoded = serde_json::to_string(
+            &store
+                .resource_mutations_for_session(authority.session_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!encoded.contains("private completion detail"));
+        assert!(!encoded.contains("different detail"));
     }
 
     #[test]

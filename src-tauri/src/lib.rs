@@ -53,6 +53,7 @@ use infrastructure::ai_worker::{
 };
 use infrastructure::execution_store::{
     ConversationImportInput, ConversationMessageInput, ExecutionStore,
+    JiraCommentWritebackReservation,
 };
 use infrastructure::file_watcher::FileWatchRegistry;
 use infrastructure::files::{
@@ -511,11 +512,58 @@ async fn add_jira_comment(
 ) -> Result<(), String> {
     resolve_jira_secrets(&mut config, secrets.inner())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        JiraService::new().add_comment(config, issue_key, comment)
+        JiraService::new()
+            .add_comment(config, issue_key, comment)
+            .map(|_| ())
     })
     .await
     .map_err(|error| mcp_ipc_error("Jira comment task failed", error))?;
     result.map_err(|error| mcp_ipc_error("Jira comment failed", error))
+}
+
+#[tauri::command]
+async fn add_jira_final_result_comment(
+    mut config: JiraMcpConfig,
+    execution_run_id: String,
+    issue_key: String,
+    comment: String,
+    secrets: State<'_, AppSecretsStore>,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<serde_json::Value, String> {
+    resolve_jira_secrets(&mut config, secrets.inner())?;
+    let target = infrastructure::jira::jira_comment_mutation_target(&serde_json::json!({
+        "issue_key": issue_key,
+        "comment": comment,
+    }))
+    .ok_or_else(|| "Jira final-result comment identity is invalid.".to_string())?;
+    let store = execution_store.inner().clone();
+    match store.reserve_jira_comment_writeback(
+        &execution_run_id,
+        &target.issue_key,
+        &target.content_fingerprint,
+    )? {
+        JiraCommentWritebackReservation::AlreadyComplete { comment_id } => Ok(serde_json::json!({
+            "status": "already_complete",
+            "comment_id": comment_id,
+        })),
+        JiraCommentWritebackReservation::Ambiguous => Err(
+            "Jira final-result comment has an ambiguous prior outcome. Spacesly will not replay it automatically; reconcile the retained writeback before retrying."
+                .to_string(),
+        ),
+        JiraCommentWritebackReservation::Reserved { operation_key } => {
+            let comment_id = tauri::async_runtime::spawn_blocking(move || {
+                JiraService::new().add_comment(config, issue_key, comment)
+            })
+            .await
+            .map_err(|error| mcp_ipc_error("Jira final-result comment task failed", error))?
+            .map_err(|error| mcp_ipc_error("Jira final-result comment failed", error))?;
+            store.confirm_jira_comment_writeback(&operation_key, &comment_id)?;
+            Ok(serde_json::json!({
+                "status": "created",
+                "comment_id": comment_id,
+            }))
+        }
+    }
 }
 
 #[tauri::command]
@@ -3335,6 +3383,7 @@ pub fn run() {
             transition_jira_issue,
             assign_jira_issue,
             add_jira_comment,
+            add_jira_final_result_comment,
             test_ai_worker,
             plan_agent_task,
             reserve_ai_worker_run,

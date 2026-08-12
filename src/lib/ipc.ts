@@ -145,9 +145,11 @@ export type {
   JiraMcpServerConfig,
   McpConnectionStatus,
   McpToolMetadata,
+  JiraFinalResultCommentResult,
 } from "$lib/ipc/jira";
 export {
   addJiraComment,
+  addJiraFinalResultComment,
   assignJiraIssue,
   disconnectMcpServer,
   getJiraBoards,

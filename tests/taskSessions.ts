@@ -1233,6 +1233,11 @@ assertEqual(
       },
     },
   }),
-  "jira_writeback_started",
-  "an unconfirmed Jira comment must recover as ambiguous and never replay automatically",
+  "jira_comment_started",
+  "a durably reserved Jira comment should enter idempotent reconciliation on recovery",
+);
+assertEqual(
+  agentWorkflowRecoveryDecision("jira_comment_started").safe,
+  true,
+  "a durably reserved Jira comment should be safe to reconcile through the backend fence",
 );

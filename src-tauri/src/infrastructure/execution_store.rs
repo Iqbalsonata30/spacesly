@@ -64,6 +64,13 @@ pub struct ExecutionStore {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JiraCommentWritebackReservation {
+    Reserved { operation_key: String },
+    AlreadyComplete { comment_id: String },
+    Ambiguous,
+}
+
 impl CompletionProjector for ExecutionStore {
     fn project(&self, completion: &StagedCompletion) -> Result<(), CompletionProjectionError> {
         match &completion.output {
@@ -241,7 +248,20 @@ impl ExecutionStore {
                     message_id TEXT NOT NULL UNIQUE,
                     output_json TEXT NOT NULL,
                     projected_at INTEGER NOT NULL
-                  );",
+                  );
+                  CREATE TABLE IF NOT EXISTS jira_comment_writebacks (
+                    operation_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    issue_key TEXT NOT NULL,
+                    content_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    comment_id TEXT,
+                    reserved_at INTEGER NOT NULL,
+                    resolved_at INTEGER,
+                    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id) ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_jira_comment_writebacks_run
+                    ON jira_comment_writebacks(run_id, operation_key);",
             )
             .map_err(|error| format!("Failed to initialize execution database: {error}"))?;
         connection
@@ -375,6 +395,112 @@ impl ExecutionStore {
         drop(connection);
         self.get(&run.run_id)?
             .ok_or_else(|| "Execution run disappeared after save.".to_string())
+    }
+
+    pub fn reserve_jira_comment_writeback(
+        &self,
+        run_id: &str,
+        issue_key: &str,
+        content_fingerprint: &str,
+    ) -> Result<JiraCommentWritebackReservation, String> {
+        validate_writeback_identity(run_id, issue_key, content_fingerprint)?;
+        let operation_key = jira_writeback_operation_key(run_id, issue_key, content_fingerprint);
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start Jira writeback reservation: {error}"))?;
+        let contract_payload = transaction
+            .query_row(
+                "SELECT contracts.payload_json
+                   FROM execution_runs runs
+                   JOIN execution_contracts contracts ON contracts.contract_id = runs.contract_id
+                  WHERE runs.run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate Jira writeback run: {error}"))?
+            .ok_or_else(|| {
+                "Jira writeback requires an existing durable execution run.".to_string()
+            })?;
+        let contract: Value = serde_json::from_str(&contract_payload)
+            .map_err(|_| "Jira writeback execution contract is invalid.".to_string())?;
+        if contract.pointer("/ticket/provider").and_then(Value::as_str) != Some("jira")
+            || contract.pointer("/ticket/key").and_then(Value::as_str) != Some(issue_key)
+        {
+            return Err(
+                "Jira writeback issue does not match the immutable execution contract.".to_string(),
+            );
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT state, comment_id FROM jira_comment_writebacks
+                  WHERE operation_key = ?1",
+                params![operation_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect Jira writeback intent: {error}"))?;
+        let reservation = match existing {
+            Some((state, Some(comment_id))) if state == "succeeded" => {
+                JiraCommentWritebackReservation::AlreadyComplete { comment_id }
+            }
+            Some(_) => JiraCommentWritebackReservation::Ambiguous,
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO jira_comment_writebacks
+                           (operation_key, run_id, issue_key, content_fingerprint, state, reserved_at)
+                         VALUES (?1, ?2, ?3, ?4, 'reserved', ?5)",
+                        params![
+                            operation_key,
+                            run_id,
+                            issue_key,
+                            content_fingerprint,
+                            timestamp_i64(now_millis()?)?
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to reserve Jira writeback: {error}"))?;
+                JiraCommentWritebackReservation::Reserved {
+                    operation_key: operation_key.clone(),
+                }
+            }
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit Jira writeback reservation: {error}"))?;
+        Ok(reservation)
+    }
+
+    pub fn confirm_jira_comment_writeback(
+        &self,
+        operation_key: &str,
+        comment_id: &str,
+    ) -> Result<(), String> {
+        if operation_key.len() != 72
+            || !operation_key.starts_with("jira_v1_")
+            || !operation_key[8..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !crate::infrastructure::jira::canonical_jira_comment_id(comment_id)
+        {
+            return Err("Jira writeback confirmation identity is invalid.".to_string());
+        }
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let updated = connection
+            .execute(
+                "UPDATE jira_comment_writebacks
+                    SET state = 'succeeded', comment_id = ?2, resolved_at = ?3
+                  WHERE operation_key = ?1 AND state = 'reserved' AND comment_id IS NULL",
+                params![operation_key, comment_id, timestamp_i64(now_millis()?)?],
+            )
+            .map_err(|error| format!("Failed to confirm Jira writeback: {error}"))?;
+        if updated != 1 {
+            return Err(
+                "Jira writeback confirmation did not match one reserved intent.".to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Idempotently projects one scheduler-staged Agent completion in a single executions.db transaction.
@@ -1763,11 +1889,41 @@ fn database_path() -> Result<PathBuf, String> {
     Ok(base.join("spacesly").join("executions.db"))
 }
 
+fn validate_writeback_identity(
+    run_id: &str,
+    issue_key: &str,
+    content_fingerprint: &str,
+) -> Result<(), String> {
+    if run_id.trim() != run_id
+        || run_id.is_empty()
+        || run_id.len() > 256
+        || run_id.chars().any(char::is_control)
+        || !crate::infrastructure::jira::canonical_jira_issue_key(issue_key)
+        || !crate::infrastructure::jira::canonical_state_fingerprint(content_fingerprint)
+    {
+        return Err("Jira writeback identity is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn jira_writeback_operation_key(
+    run_id: &str,
+    issue_key: &str,
+    content_fingerprint: &str,
+) -> String {
+    let identity = format!("jira-final-result-v1\n{run_id}\n{issue_key}\n{content_fingerprint}");
+    format!("jira_v1_{:x}", Sha256::digest(identity.as_bytes()))
+}
+
 fn now_millis() -> Result<u64, String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
         .as_millis() as u64)
+}
+
+fn timestamp_i64(value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| "Timestamp exceeds durable storage range.".to_string())
 }
 
 #[cfg(test)]
@@ -1796,6 +1952,11 @@ mod tests {
                    lease_owner TEXT, lease_expires_at INTEGER, result_json TEXT,
                    task_session_projection_id TEXT, updated_at TEXT NOT NULL,
                    PRIMARY KEY (run_id, step_id)
+                 );
+                 CREATE TABLE jira_comment_writebacks (
+                   operation_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, issue_key TEXT NOT NULL,
+                   content_fingerprint TEXT NOT NULL, state TEXT NOT NULL, comment_id TEXT,
+                   reserved_at INTEGER NOT NULL, resolved_at INTEGER
                  );"
             ))
             .unwrap();
@@ -2710,5 +2871,55 @@ mod tests {
         );
         assert_eq!(store.list_conversations("workspace-a").unwrap().len(), 1);
         assert_eq!(store.list_conversations("workspace-b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn jira_final_result_writeback_reserves_before_dispatch_and_replays_confirmed_success() {
+        let store = test_store();
+        let mut run = ready_run("run-jira-writeback");
+        run.contract["ticket"] = serde_json::json!({"provider": "jira", "key": "OPS-42"});
+        store.save(&run).unwrap();
+        let fingerprint = "a".repeat(64);
+        assert!(store
+            .reserve_jira_comment_writeback("run-jira-writeback", "OPS-43", &fingerprint)
+            .unwrap_err()
+            .contains("immutable execution contract"));
+        let operation_key = match store
+            .reserve_jira_comment_writeback("run-jira-writeback", "OPS-42", &fingerprint)
+            .unwrap()
+        {
+            JiraCommentWritebackReservation::Reserved { operation_key } => operation_key,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        assert_eq!(
+            store
+                .reserve_jira_comment_writeback("run-jira-writeback", "OPS-42", &fingerprint)
+                .unwrap(),
+            JiraCommentWritebackReservation::Ambiguous
+        );
+
+        store
+            .confirm_jira_comment_writeback(&operation_key, "10042")
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_jira_comment_writeback("run-jira-writeback", "OPS-42", &fingerprint)
+                .unwrap(),
+            JiraCommentWritebackReservation::AlreadyComplete {
+                comment_id: "10042".to_string()
+            }
+        );
+
+        let connection = store.connection.lock().unwrap();
+        let persisted: String = connection
+            .query_row(
+                "SELECT content_fingerprint FROM jira_comment_writebacks WHERE operation_key = ?1",
+                params![operation_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, fingerprint);
+        let dump = format!("{operation_key}{persisted}");
+        assert!(!dump.contains("completion comment body"));
     }
 }

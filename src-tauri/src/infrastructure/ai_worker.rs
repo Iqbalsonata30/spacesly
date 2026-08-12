@@ -3444,6 +3444,7 @@ fn successful_resource_operation_key(tool_name: &str, output: Option<&Value>) ->
 
 fn trusted_resource_mutation_tool(tool_name: &str) -> bool {
     matches!(tool_name, "ocp_restart_deployment" | "ocp_scale_deployment")
+        || super::jira::trusted_jira_comment_tool(tool_name)
 }
 
 fn successful_external_resource_reference(
@@ -4852,6 +4853,31 @@ mod tests {
 
     #[test]
     fn captures_jira_comment_identity_without_retaining_content() {
+        let identity = super::super::jira::jira_comment_operation_identity(
+            &"a".repeat(64),
+            "corporate_jira_add_comment",
+            &serde_json::json!({
+                "issue_key": "OPS-42",
+                "comment": "sensitive deployment evidence"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let resource_mutation = ResourceMutationEvidence {
+            identity: identity.clone(),
+            lookup: crate::domain::resource_idempotency::ResourceLookupResult {
+                status: crate::domain::resource_idempotency::ResourceLookupStatus::DriftDetected,
+                observed_fingerprint: None,
+                observed_version: None,
+            },
+            execution: crate::domain::resource_idempotency::ResourceExecutionResult {
+                status: ResourceExecutionStatus::Executed,
+                resulting_fingerprint: Some(identity.mutation_fingerprint.clone()),
+                resulting_version: Some("10042".to_string()),
+            },
+            retry_resume_status:
+                crate::domain::resource_idempotency::ResourceRetryResumeStatus::FirstExecution,
+        };
         let captured = parse_opencode_stream_event(
             &serde_json::json!({
                 "part": {
@@ -4864,7 +4890,10 @@ mod tests {
                             "issue_key": "OPS-42",
                             "comment": "sensitive deployment evidence"
                         },
-                        "output": "{\"commentId\":\"10042\"}"
+                        "output": serde_json::json!({
+                            "commentId": "10042",
+                            "resource_mutation": resource_mutation
+                        }).to_string()
                     }
                 }
             })
@@ -4875,6 +4904,7 @@ mod tests {
             captured,
             Some(AiWorkerStreamEvent::ToolCompleted {
                 success: true,
+                resource_operation_key: Some(ref operation_key),
                 external_resource: Some(ExternalResourceReference {
                     ref provider,
                     ref resource_kind,
@@ -4884,6 +4914,7 @@ mod tests {
                 }),
                 ..
             }) if provider == "jira"
+                && operation_key == &identity.key
                 && resource_kind == "comment"
                 && resource_id == "10042"
                 && issue_key == "OPS-42"
@@ -4901,7 +4932,7 @@ mod tests {
                 error: Some(ref error),
                 external_resource: None,
                 ..
-            }) if error.contains("missing_external_resource")
+            }) if error.contains("missing_resource_operation_key")
         ));
     }
 

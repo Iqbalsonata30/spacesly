@@ -14,13 +14,13 @@ use super::jira_rest;
 use super::ocp::trusted_resource_operation_identity_from_environment;
 use super::scheduler_store::{
     ExternalAssignmentAuthority, ResourceMutationRecord, ResourceMutationReservation,
-    ResourceMutationResolution, SchedulerStore,
+    ResourceMutationResolution, ResourceMutationState, SchedulerStore,
 };
 use super::shell_env::inject_shell_env;
 use super::tool_broker::ToolBroker;
 use crate::domain::resource_idempotency::{
-    ResourceExecutionStatus, ResourceLookupStatus, ResourceMutationEvidence,
-    ResourceOperationIdentity,
+    ResourceExecutionResult, ResourceExecutionStatus, ResourceLookupResult, ResourceLookupStatus,
+    ResourceMutationEvidence, ResourceOperationIdentity, ResourceRetryResumeStatus,
 };
 use crate::domain::task_examination::{
     ConnectorCapabilitySnapshot, ConnectorDiscoveryStatus, DiscoveredToolCapability,
@@ -129,6 +129,7 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
     let connector_binding = required_unicode_environment(MCP_PROXY_CONNECTOR_BINDING_ENV)?;
     validate_connector_binding_value(&connector_binding)?;
 
+    let identity_connector_binding = connector_binding.clone();
     run_mcp_proxy_with_io(
         command_parts,
         authority,
@@ -136,7 +137,19 @@ pub fn run_mcp_proxy_from_env() -> Result<(), String> {
         connector_binding,
         std::io::stdin(),
         std::io::stdout(),
-        trusted_resource_operation_identity_from_environment,
+        move |command, tool_name, arguments| {
+            trusted_resource_operation_identity_from_environment(command, tool_name, arguments)?
+                .map_or_else(
+                    || {
+                        super::jira::jira_comment_operation_identity(
+                            &identity_connector_binding,
+                            tool_name,
+                            arguments,
+                        )
+                    },
+                    |identity| Ok(Some(identity)),
+                )
+        },
     )
 }
 
@@ -287,6 +300,16 @@ where
                         match reservation {
                             ResourceMutationReservation::Blocked(record) => {
                                 drop(activity);
+                                if record.state == ResourceMutationState::Succeeded
+                                    && record.identity.connector == "jira"
+                                    && write_succeeded_jira_comment_replay(
+                                        &request_stdout,
+                                        &request_id,
+                                        &record,
+                                    )?
+                                {
+                                    continue;
+                                }
                                 write_resource_mutation_result(
                                     &request_stdout,
                                     &request_id,
@@ -416,7 +439,7 @@ where
 
     let mut upstream_reader = BufReader::new(upstream_stdout);
     loop {
-        let message = match read_stdout_message(&mut upstream_reader) {
+        let mut message = match read_stdout_message(&mut upstream_reader) {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {
@@ -465,6 +488,9 @@ where
                 .remove(&id.to_string())
             {
                 let resolution = classify_resource_mutation_response(&message, &pending.record);
+                if let ResourceMutationResolution::Succeeded(evidence) = &resolution {
+                    enrich_resource_mutation_response(&mut message, evidence);
+                }
                 if let Err(resolution_error) = SchedulerStore::resolve_external_resource_mutation(
                     &pending.authority,
                     pending.record.mutation_id,
@@ -779,6 +805,36 @@ fn classify_resource_mutation_response(
     message: &Value,
     expected: &ResourceMutationRecord,
 ) -> ResourceMutationResolution {
+    if expected.identity.connector == "jira"
+        && expected.identity.operation == "add_comment"
+        && super::jira::trusted_jira_comment_tool(&expected.tool_name)
+        && message.get("error").is_none()
+    {
+        let jira_payload = mcp_text_json_payload(message).unwrap_or_else(|| message.clone());
+        if let Some(comment_id) = super::jira::extract_created_jira_comment_id(&jira_payload) {
+            let evidence = ResourceMutationEvidence {
+                identity: expected.identity.clone(),
+                lookup: ResourceLookupResult {
+                    status: ResourceLookupStatus::DriftDetected,
+                    observed_fingerprint: None,
+                    observed_version: None,
+                },
+                execution: ResourceExecutionResult {
+                    status: ResourceExecutionStatus::Executed,
+                    resulting_fingerprint: Some(format!(
+                        "sha256:{}",
+                        expected
+                            .identity
+                            .mutation_fingerprint
+                            .trim_start_matches("sha256:")
+                    )),
+                    resulting_version: Some(comment_id),
+                },
+                retry_resume_status: ResourceRetryResumeStatus::FirstExecution,
+            };
+            return ResourceMutationResolution::Succeeded(evidence);
+        }
+    }
     if let Some(payload) = mcp_text_json_payload(message) {
         if payload.get("status").and_then(Value::as_str) == Some("approval_required") {
             let identity = payload
@@ -826,6 +882,73 @@ fn classify_resource_mutation_response(
         return classify_resource_mutation_evidence(evidence, expected, true, definitive_error);
     }
     uncertain_resolution("protocol", "missing_resource_mutation_evidence")
+}
+
+fn enrich_resource_mutation_response(message: &mut Value, evidence: &ResourceMutationEvidence) {
+    let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+        if content.len() == 1 {
+            if let Some(text) = content[0].get_mut("text") {
+                if let Some(mut payload) = text
+                    .as_str()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                {
+                    if let Some(payload) = payload.as_object_mut() {
+                        payload.insert(
+                            "resource_mutation".to_string(),
+                            serde_json::to_value(evidence).unwrap_or(Value::Null),
+                        );
+                        *text = Value::String(Value::Object(payload.clone()).to_string());
+                    }
+                }
+            }
+        }
+    }
+    result.insert(
+        "resource_mutation".to_string(),
+        serde_json::to_value(evidence).unwrap_or(Value::Null),
+    );
+}
+
+fn write_succeeded_jira_comment_replay<W: Write>(
+    stdout: &Mutex<W>,
+    request_id: &Value,
+    record: &ResourceMutationRecord,
+) -> Result<bool, String> {
+    if record.checkpoint_objective_id.is_some() {
+        return Ok(false);
+    }
+    let Some(mut evidence) = record.evidence.clone() else {
+        return Ok(false);
+    };
+    let Some(comment_id) = evidence.execution.resulting_version.clone() else {
+        return Ok(false);
+    };
+    if !super::jira::canonical_jira_comment_id(&comment_id) {
+        return Ok(false);
+    }
+    evidence.lookup.status = ResourceLookupStatus::AlreadySatisfied;
+    evidence.execution.status = ResourceExecutionStatus::Skipped;
+    evidence.retry_resume_status = ResourceRetryResumeStatus::AlreadyComplete;
+    let payload = json!({
+        "commentId": comment_id,
+        "resource_mutation": evidence,
+        "idempotency_status": "already_complete"
+    });
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{ "type": "text", "text": payload.to_string() }],
+            "structuredContent": payload,
+            "resource_mutation": evidence
+        }
+    });
+    let mut stdout = stdout.lock().map_err(|error| error.to_string())?;
+    write_proxy_message(&mut *stdout, &response)?;
+    Ok(true)
 }
 
 fn classify_resource_mutation_evidence(
@@ -2361,8 +2484,6 @@ mod tests {
     use crate::domain::resource_idempotency::{
         ResourceExecutionResult, ResourceIdentity, ResourceLookupResult, ResourceRetryResumeStatus,
     };
-    use crate::infrastructure::scheduler_store::ResourceMutationState;
-
     #[cfg(unix)]
     use std::net::Shutdown;
     #[cfg(unix)]
@@ -3174,6 +3295,51 @@ done
             classify_resource_mutation_response(&response, &proxy_test_record(&identity)),
             ResourceMutationResolution::Succeeded(_)
         ));
+    }
+
+    #[test]
+    fn proxy_classifies_and_replays_confirmed_jira_comment_without_body_persistence() {
+        let identity = crate::infrastructure::jira::jira_comment_operation_identity(
+            &"a".repeat(64),
+            "jira_add_comment",
+            &json!({"issue_key": "OPS-42", "comment": "private completion detail"}),
+        )
+        .unwrap()
+        .unwrap();
+        let mut record = proxy_test_record(&identity);
+        record.connector_id = "corporate-jira".to_string();
+        record.tool_name = "jira_add_comment".to_string();
+        let response = json!({
+            "id": 1,
+            "result": { "content": [{
+                "type": "text",
+                "text": json!({ "commentId": "10042" }).to_string()
+            }]}
+        });
+        let ResourceMutationResolution::Succeeded(evidence) =
+            classify_resource_mutation_response(&response, &record)
+        else {
+            panic!("Jira comment response must be a confirmed success");
+        };
+        assert_eq!(
+            evidence.execution.resulting_version.as_deref(),
+            Some("10042")
+        );
+        assert!(!serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("private completion detail"));
+
+        record.state = ResourceMutationState::Succeeded;
+        record.evidence = Some(evidence);
+        let output = Mutex::new(Vec::new());
+        assert!(write_succeeded_jira_comment_replay(&output, &json!(7), &record).unwrap());
+        let replay: Value = serde_json::from_slice(&output.into_inner().unwrap()).unwrap();
+        assert_eq!(replay["id"], 7);
+        assert_eq!(replay["result"]["structuredContent"]["commentId"], "10042");
+        assert_eq!(
+            replay["result"]["structuredContent"]["idempotency_status"],
+            "already_complete"
+        );
     }
 
     #[test]

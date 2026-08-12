@@ -10,6 +10,7 @@ export type AgentWorkflowCheckpoint =
   | "verification_completed"
   | "jira_writeback_started"
   | "jira_transition_completed"
+  | "jira_comment_started"
   | "jira_writeback_completed"
   | "workflow_completed";
 
@@ -236,6 +237,12 @@ export function agentWorkflowCheckpoint(run: ExecutionRun): AgentWorkflowCheckpo
   ) {
     return "jira_transition_completed";
   }
+  if (
+    (jira?.status === "running" || jira?.status === "interrupted") &&
+    jira.summary === "Jira completion comment started; confirmation pending."
+  ) {
+    return "jira_comment_started";
+  }
   if (jira?.status === "running" || jira?.status === "interrupted") return "jira_writeback_started";
   if (run.step_runs["worker.verify"]?.status === "completed") return "verification_completed";
   if (["completed", "blocked"].includes(run.step_runs["worker.execute"]?.status ?? "")) {
@@ -248,6 +255,7 @@ export function agentWorkflowCheckpoint(run: ExecutionRun): AgentWorkflowCheckpo
 export function agentWorkflowRecoveryDecision(
   checkpoint: AgentWorkflowCheckpoint,
 ): AgentWorkflowRecoveryDecision {
+  if (checkpoint === "jira_comment_started") return { safe: true };
   if (checkpoint !== "jira_writeback_started") return { safe: true };
   return {
     safe: false,

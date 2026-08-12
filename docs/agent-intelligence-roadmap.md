@@ -344,7 +344,16 @@ Implemented Jira exact comment-state increment:
 - The receipt persists only provider, resource kind, comment ID, parent issue key, and content fingerprint. The comment body, raw tool arguments, connector response, and diagnostics are not retained.
 - Current and retained objective-checkpoint receipts can supply the dynamic comment identity on continuation. Missing, malformed, cross-issue, or multiple different comment receipts block instead of guessing.
 - After execution, Spacesly independently rereads the exact issue and requires the exact comment ID to exist with matching normalized plain-text or Atlassian Document Format content.
-- This covers fenced worker-issued comments and strengthens exact checkpoint replay fencing. It does not cover the later UI-level final-result writeback or claim provider-level idempotency when execution is interrupted after Jira accepts the comment and before an objective checkpoint commits.
+- The fenced MCP proxy derives a stable pre-dispatch identity from the connector binding, canonical issue key, and normalized-content fingerprint, then reserves it in the scheduler mutation ledger before connector dispatch.
+- Confirmed creation persists the connector-returned comment ID and trusted mutation evidence before the result reaches the worker. An identical retry before objective checkpointing adopts that retained success without another create call, and the later checkpoint binds the retained mutation to the objective.
+- Connector EOF, malformed output, lost response, assignment recovery, or process interruption leaves the pre-dispatch reservation `uncertain`. That state is a hard replay fence: Spacesly blocks instead of risking a duplicate.
+- UI-level final-result writeback now uses a separate durable backend intent keyed by execution run, issue key, and normalized-content fingerprint. Confirmed retries return the retained comment ID; an unconfirmed prior REST request blocks automatic replay.
+- Neither ledger stores the comment body, connector environment, credentials, or raw Jira response. Only hashes, canonical resource identity, state, and confirmed comment ID are retained.
+
+Current Jira comment limitation:
+
+- Jira REST and the supported MCP comment operations do not expose a provider-native idempotency key through this integration. An `uncertain` outcome therefore prevents duplicates but still requires operator reconciliation; Spacesly does not yet search paginated Jira comments by a durable marker and automatically convert that fence to confirmed success.
+- Automatic Jira status transition remains a separate idempotent state transition with its existing conservative recovery boundary.
 
 Benefits:
 

@@ -152,6 +152,7 @@
   import "./page.css";
   import {
     addJiraComment,
+    addJiraFinalResultComment,
     appendConversationMessage,
     aiWorkspaceTrustStatus,
     applyWorkspaceReplace,
@@ -8405,7 +8406,10 @@
           return;
         }
         if (jiraConfig && resumeCheckpoint !== "jira_writeback_completed") {
-          if (resumeCheckpoint !== "jira_transition_completed") {
+          const transitionAlreadyCompleted =
+            resumeCheckpoint === "jira_transition_completed" ||
+            resumeCheckpoint === "jira_comment_started";
+          if (!transitionAlreadyCompleted) {
             await persistExecutionRunUpdateForCard(cardId, (run) => ({
               ...updateExecutionStep(
                 run,
@@ -8426,7 +8430,7 @@
             ["Wait for the Jira transition result before finalizing the run."],
           );
           setAgentProgressForCard(cardId, 88);
-          if (resumeCheckpoint !== "jira_transition_completed") {
+          if (!transitionAlreadyCompleted) {
             await transitionJiraIssue(jiraConfig, issueKey, "Done");
             await persistExecutionRunUpdateForCard(cardId, (run) =>
               updateExecutionStep(
@@ -8464,8 +8468,9 @@
               "Jira completion comment started; confirmation pending.",
             ),
           );
-          await addJiraComment(
+          await addJiraFinalResultComment(
             jiraConfig,
+            executionRun.run_id,
             issueKey,
             agentJiraComment(result, config, card.title, gitWritebackInfo),
           );

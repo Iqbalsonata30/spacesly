@@ -144,7 +144,14 @@ Implemented Jira exact comment-state vertical slice:
 - Objective checkpoints durably retain the issue/comment/fingerprint evidence and exact replay remains idempotent. Continuations resolve the same reference from current or retained receipts; multiple comments or a cross-issue receipt block.
 - Terminal verification rereads the exact Jira issue through the Rules-bound read-only tool and requires the exact comment ID plus matching normalized plain-text or Atlassian Document Format content.
 - Durable result evidence contains only connector ID, issue key, comment ID, and satisfied/content-mismatch/conflict/unavailable state. Raw connector responses and errors are discarded.
-- Known limitation: this verifier covers Jira comments issued by the fenced worker, not the later UI-level final-result writeback. Issue reads must also return the target comment (including through any connector-side pagination). Interruption after Jira accepts a comment but before its objective checkpoint commits still lacks a provider-owned uncertain-mutation ledger and pre-mutation reconciliation, so this increment does not claim full Jira comment idempotency.
+- Worker-issued Jira add/create-comment calls now derive a deterministic resource mutation identity before connector dispatch from the connector binding, canonical issue key, and normalized-content fingerprint.
+- The fenced MCP proxy reserves that identity in the scheduler ledger before forwarding the call. It resolves confirmed structured comment IDs before returning output to the worker and injects trusted mutation evidence into the structured connector result.
+- An identical retry before objective checkpointing receives the retained comment ID as `already_complete` without a second connector mutation. The resulting receipt carries both the exact Jira resource reference and scheduler operation key, and checkpoint persistence binds the retained success to the objective.
+- If the connector response is missing, malformed, lost, or interrupted, the reservation becomes or remains `uncertain`; subsequent identical calls are hard-fenced and require operator reconciliation rather than risking a duplicate.
+- UI-level final-result comments now call a backend-owned idempotent IPC. The execution database reserves an intent keyed by the durable execution run, issue key, and content fingerprint before Jira REST dispatch, persists the returned comment ID on confirmation, and reuses it on identical retry.
+- The frontend recognizes a distinct `jira_comment_started` durable boundary. Recovery skips the already-completed Jira status transition and re-enters the backend comment fence; confirmed attempts complete idempotently and ambiguous attempts block.
+- Comment text, raw arguments, raw connector/REST responses, connector environments, and credentials are absent from both ledgers. Only canonical identity, fingerprints, state, and confirmed comment IDs persist.
+- Known limitation: Jira does not receive a provider-native idempotency key in these supported calls. A crash after Jira accepts a comment but before Spacesly durably confirms its response can no longer create a duplicate automatically, but it remains an `uncertain` operator-reconciliation case rather than being automatically adopted from Jira. Connector-side pagination must still expose the exact comment to the terminal verifier.
 
 Phase 11 regression evidence:
 
@@ -153,10 +160,12 @@ Phase 11 regression evidence:
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
 - Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
-- Full Rust suite: 488 passed, 3 ignored, 0 failed in serial mode.
+- Full Rust suite: 492 passed, 3 ignored, 0 failed in serial mode.
 - Focused Jira Rules compilation/binding, strict identity/status parsing, mismatch/conflict handling, schema compatibility, and diagnostic redaction tests: 7 passed.
 - Focused Jira comment capture, ambiguity, content drift, ADF normalization, checkpoint replay, continuation resolution, and redaction tests: 6 passed.
+- Focused Jira identity, mutation-ledger replay/uncertainty, proxy response enrichment, final-writeback durability, recovery, and redaction tests: 12 passed.
 - `cargo check` and formatting: passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 
 ## Phase 10 Completed

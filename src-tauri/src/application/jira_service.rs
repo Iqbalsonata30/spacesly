@@ -93,7 +93,7 @@ impl JiraService {
         config: JiraMcpConfig,
         issue_key: String,
         comment: String,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         add_comment(&config.auth, &issue_key, &comment)
     }
 }
