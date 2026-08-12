@@ -864,6 +864,10 @@ pub struct ExternalResourceReference {
     pub provider: String,
     pub resource_kind: String,
     pub resource_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_fingerprint: Option<String>,
 }
 
 /// Secret-free identity of a successful tool call supporting an objective checkpoint.

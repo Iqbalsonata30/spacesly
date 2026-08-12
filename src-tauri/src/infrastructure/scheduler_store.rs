@@ -1719,19 +1719,50 @@ impl SchedulerStore {
                             "ocp_restart_deployment" | "ocp_scale_deployment"
                         ))
                     || receipt.external_resource.as_ref().is_some_and(|resource| {
-                        resource.provider != "bamboo"
-                            || resource.resource_kind != "build"
-                            || !crate::infrastructure::bamboo::canonical_bamboo_result_key(
-                                &resource.resource_id,
-                            )
+                        match resource.provider.as_str() {
+                            "bamboo" => {
+                                resource.resource_kind != "build"
+                                    || !crate::infrastructure::bamboo::canonical_bamboo_result_key(
+                                        &resource.resource_id,
+                                    )
+                                    || resource.parent_resource_id.is_some()
+                                    || resource.state_fingerprint.is_some()
+                            }
+                            "jira" => {
+                                resource.resource_kind != "comment"
+                                    || !crate::infrastructure::jira::canonical_jira_comment_id(
+                                        &resource.resource_id,
+                                    )
+                                    || resource.parent_resource_id.as_deref().is_none_or(|value| {
+                                        !crate::infrastructure::jira::canonical_jira_issue_key(
+                                            value,
+                                        )
+                                    })
+                                    || resource.state_fingerprint.as_deref().is_none_or(|value| {
+                                        !crate::infrastructure::jira::canonical_state_fingerprint(
+                                            value,
+                                        )
+                                    })
+                            }
+                            _ => true,
+                        }
                     })
-                    || (crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
+                    || ((crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
                         &receipt.tool_name,
-                    ) && receipt.external_resource.is_none())
+                    ) || crate::infrastructure::jira::trusted_jira_comment_tool(
+                        &receipt.tool_name,
+                    )) && receipt.external_resource.is_none())
                     || (receipt.external_resource.is_some()
-                        && !crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
-                            &receipt.tool_name,
-                        ))
+                        && !receipt.external_resource.as_ref().is_some_and(|resource| {
+                            (resource.provider == "bamboo"
+                                && crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
+                                    &receipt.tool_name,
+                                ))
+                                || (resource.provider == "jira"
+                                    && crate::infrastructure::jira::trusted_jira_comment_tool(
+                                        &receipt.tool_name,
+                                    ))
+                        }))
                     || (receipt.external_resource.is_some()
                         && receipt.resource_operation_key.is_some())
             })
@@ -7131,8 +7162,85 @@ mod tests {
                 provider: "bamboo".to_string(),
                 resource_kind: "build".to_string(),
                 resource_id: result_key.to_string(),
+                parent_resource_id: None,
+                state_fingerprint: None,
             }),
         }
+    }
+
+    fn jira_comment_receipt(comment_id: &str) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: "jira-comment-call-1".to_string(),
+            tool_name: "corporate_jira_add_comment".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "d".repeat(64),
+            resource_operation_key: None,
+            external_resource: Some(crate::domain::task_session::ExternalResourceReference {
+                provider: "jira".to_string(),
+                resource_kind: "comment".to_string(),
+                resource_id: comment_id.to_string(),
+                parent_resource_id: Some("OPS-42".to_string()),
+                state_fingerprint: Some("e".repeat(64)),
+            }),
+        }
+    }
+
+    #[test]
+    fn jira_comment_identity_persists_replays_and_rejects_malformed_receipts() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let receipt = jira_comment_receipt("10042");
+        let evidence = vec!["Jira comment 10042 verified".to_string()];
+        store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-comment",
+                &evidence,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("comment checkpoint recorded");
+        let retained = store
+            .objective_checkpoints(session_id)
+            .expect("checkpoints read");
+        assert_eq!(retained[0].tool_receipts, vec![receipt.clone()]);
+        let replay = store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-comment",
+                &evidence,
+                &[receipt],
+            )
+            .expect("exact replay accepted");
+        assert_eq!(replay.payload["new_checkpoint"], false);
+
+        let mut malformed = jira_comment_receipt("10043");
+        malformed
+            .external_resource
+            .as_mut()
+            .expect("external resource")
+            .state_fingerprint = Some("raw-comment-content".to_string());
+        assert!(store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-malformed-comment",
+                &evidence,
+                &[malformed],
+            )
+            .expect_err("raw content is not a valid fingerprint")
+            .contains("payload is invalid"));
+
+        let mut missing = jira_comment_receipt("10044");
+        missing.external_resource = None;
+        assert!(store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-missing-comment",
+                &evidence,
+                &[missing],
+            )
+            .expect_err("trusted comment tool requires resource evidence")
+            .contains("payload is invalid"));
     }
 
     #[test]

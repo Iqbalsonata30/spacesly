@@ -3319,7 +3319,8 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             Some(format!("{marker}: {output}"))
         });
     let resource_operation_key = successful_resource_operation_key(&tool_name, tool_output);
-    let external_resource = successful_external_resource_reference(&tool_name, tool_output);
+    let external_resource =
+        successful_external_resource_reference(&tool_name, &arguments, tool_output);
     match status {
         "completed" if blocked_tool_result.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3447,6 +3448,7 @@ fn trusted_resource_mutation_tool(tool_name: &str) -> bool {
 
 fn successful_external_resource_reference(
     tool_name: &str,
+    arguments: &Value,
     output: Option<&Value>,
 ) -> Option<ExternalResourceReference> {
     if !trusted_external_resource_tool(tool_name) {
@@ -3456,16 +3458,29 @@ fn successful_external_resource_reference(
         Value::String(value) => serde_json::from_str::<Value>(value).ok()?,
         value => value.clone(),
     };
-    let resource_id = super::bamboo::extract_triggered_build_result_key(&payload)?;
+    if super::bamboo::trusted_bamboo_trigger_tool(tool_name) {
+        let resource_id = super::bamboo::extract_triggered_build_result_key(&payload)?;
+        return Some(ExternalResourceReference {
+            provider: "bamboo".to_string(),
+            resource_kind: "build".to_string(),
+            resource_id,
+            parent_resource_id: None,
+            state_fingerprint: None,
+        });
+    }
+    let reference = super::jira::extract_created_jira_comment_reference(arguments, &payload)?;
     Some(ExternalResourceReference {
-        provider: "bamboo".to_string(),
-        resource_kind: "build".to_string(),
-        resource_id,
+        provider: "jira".to_string(),
+        resource_kind: "comment".to_string(),
+        resource_id: reference.comment_id,
+        parent_resource_id: Some(reference.issue_key),
+        state_fingerprint: Some(reference.content_fingerprint),
     })
 }
 
 fn trusted_external_resource_tool(tool_name: &str) -> bool {
     super::bamboo::trusted_bamboo_trigger_tool(tool_name)
+        || super::jira::trusted_jira_comment_tool(tool_name)
 }
 
 fn objective_checkpoint_from_text(text: &str) -> Option<AiWorkerStreamEvent> {
@@ -4800,6 +4815,7 @@ mod tests {
                     ref provider,
                     ref resource_kind,
                     ref resource_id,
+                    ..
                 }),
                 ..
             }) if provider == "bamboo"
@@ -4832,6 +4848,61 @@ mod tests {
                 }) if error.contains("missing_external_resource")
             ));
         }
+    }
+
+    #[test]
+    fn captures_jira_comment_identity_without_retaining_content() {
+        let captured = parse_opencode_stream_event(
+            &serde_json::json!({
+                "part": {
+                    "type": "tool",
+                    "callID": "comment-call",
+                    "tool": "corporate_jira_add_comment",
+                    "state": {
+                        "status": "completed",
+                        "input": {
+                            "issue_key": "OPS-42",
+                            "comment": "sensitive deployment evidence"
+                        },
+                        "output": "{\"commentId\":\"10042\"}"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let captured_debug = format!("{captured:?}");
+        assert!(matches!(
+            captured,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: true,
+                external_resource: Some(ExternalResourceReference {
+                    ref provider,
+                    ref resource_kind,
+                    ref resource_id,
+                    parent_resource_id: Some(ref issue_key),
+                    state_fingerprint: Some(ref fingerprint),
+                }),
+                ..
+            }) if provider == "jira"
+                && resource_kind == "comment"
+                && resource_id == "10042"
+                && issue_key == "OPS-42"
+                && super::super::jira::canonical_state_fingerprint(fingerprint)
+        ));
+        assert!(!captured_debug.contains("sensitive deployment evidence"));
+
+        let missing_identity = parse_opencode_stream_event(
+            r#"{"part":{"type":"tool","callID":"comment-call","tool":"jira_add_comment","state":{"status":"completed","input":{"issue_key":"OPS-42","comment":"done"},"output":"{}"}}}"#,
+        );
+        assert!(matches!(
+            missing_identity,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: false,
+                error: Some(ref error),
+                external_resource: None,
+                ..
+            }) if error.contains("missing_external_resource")
+        ));
     }
 
     #[test]

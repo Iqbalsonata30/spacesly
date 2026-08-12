@@ -30,8 +30,8 @@ use crate::infrastructure::bamboo::{
 };
 use crate::infrastructure::git::repository_root_at;
 use crate::infrastructure::jira::{
-    canonical_jira_issue_key, parse_jira_issue_status_evidence, valid_jira_status,
-    JiraEvidenceError,
+    canonical_jira_issue_key, parse_jira_comment_evidence, parse_jira_issue_status_evidence,
+    valid_jira_status, JiraEvidenceError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -373,7 +373,10 @@ fn resolve_evidence_verifier_bindings(
             }),
             "kubernetes" => verifier.required_states == ["deployment_available"],
             "bamboo" => verifier.required_states == ["successful_build"],
-            "jira" => verifier.required_states == ["expected_status"],
+            "jira" => matches!(
+                verifier.required_states.as_slice(),
+                [state] if matches!(state.as_str(), "expected_status" | "comment_matches")
+            ),
             _ => false,
         };
         let workload = contract
@@ -580,6 +583,15 @@ fn resolve_evidence_verifier_bindings(
                 "Jira status verification requires an exact immutable Jira ticket key.",
             )
         } else if verifier.provider == "jira"
+            && verifier.required_states == ["comment_matches"]
+            && verifier.expected_status.is_some()
+        {
+            (
+                "invalid_rule",
+                "Jira comment verification derives content from the trusted mutation receipt and must not define Expected status.",
+            )
+        } else if verifier.provider == "jira"
+            && verifier.required_states == ["expected_status"]
             && verifier
                 .expected_status
                 .as_deref()
@@ -599,7 +611,11 @@ fn resolve_evidence_verifier_bindings(
                     "The Bamboo verifier is bound to one live read tool and requires a trusted trigger receipt before verification."
                 }
             } else if verifier.provider == "jira" {
-                "The Jira verifier is bound to one live read tool, exact immutable issue key, and Rules-defined expected status."
+                if verifier.required_states == ["comment_matches"] {
+                    "The Jira verifier is bound to one live read tool and requires a trusted comment receipt before verification."
+                } else {
+                    "The Jira verifier is bound to one live read tool, exact immutable issue key, and Rules-defined expected status."
+                }
             } else {
                 "The Git terminal-state verifier is bound to the resolved trusted repository."
             };
@@ -636,9 +652,10 @@ fn resolve_evidence_verifier_bindings(
                 "jira" => jira_issue_key,
                 _ => None,
             },
-            expected_status: (verifier.provider == "jira")
-                .then(|| verifier.expected_status.clone())
-                .flatten(),
+            expected_status: (verifier.provider == "jira"
+                && verifier.required_states == ["expected_status"])
+            .then(|| verifier.expected_status.clone())
+            .flatten(),
             namespace: (verifier.provider == "kubernetes")
                 .then(|| deployment_target.map(|target| target.namespace.clone()))
                 .flatten(),
@@ -991,6 +1008,49 @@ struct JiraIssueStatusVerification {
     state: &'static str,
     observed_status: Option<String>,
     satisfied: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResolvedJiraCommentReference {
+    issue_key: String,
+    comment_id: String,
+    content_fingerprint: String,
+}
+
+fn resolve_jira_comment_reference(
+    issue_key: &str,
+    current_receipts: &[AgentTaskObjectiveToolReceipt],
+    checkpoints: &[crate::domain::task_session::AgentTaskObjectiveCheckpoint],
+) -> Result<ResolvedJiraCommentReference, &'static str> {
+    let references = current_receipts
+        .iter()
+        .chain(
+            checkpoints
+                .iter()
+                .flat_map(|checkpoint| checkpoint.tool_receipts.iter()),
+        )
+        .filter_map(|receipt| receipt.external_resource.as_ref())
+        .filter(|resource| resource.provider == "jira" && resource.resource_kind == "comment")
+        .map(|resource| {
+            Some(ResolvedJiraCommentReference {
+                issue_key: resource.parent_resource_id.as_ref()?.to_ascii_uppercase(),
+                comment_id: resource.resource_id.clone(),
+                content_fingerprint: resource.state_fingerprint.clone()?,
+            })
+        })
+        .collect::<Option<HashSet<_>>>()
+        .ok_or("malformed_comment_receipt")?;
+    if references.len() > 1 {
+        return Err("conflicting_comment_receipts");
+    }
+    let reference = references
+        .into_iter()
+        .next()
+        .ok_or("missing_comment_identity")?;
+    if reference.issue_key != issue_key.to_ascii_uppercase() {
+        return Err("comment_issue_conflict");
+    }
+    Ok(reference)
 }
 
 fn verify_jira_issue_status(
@@ -3405,9 +3465,42 @@ impl TaskExecutor for AgentTaskExecutor {
                 let issue_key = binding.resource_name.as_deref().ok_or_else(|| {
                     TaskExecutionError::blocked("Jira evidence issue identity is missing.")
                 })?;
-                let expected_status = binding.expected_status.as_deref().ok_or_else(|| {
-                    TaskExecutionError::blocked("Jira expected status is missing.")
-                })?;
+                let comment_reference = if binding.required_states == ["comment_matches"] {
+                    let current_receipts = successful_receipts
+                        .lock()
+                        .map_err(|error| TaskExecutionError::new(error.to_string()))?
+                        .clone();
+                    match resolve_jira_comment_reference(
+                        issue_key,
+                        &current_receipts,
+                        &objective_checkpoints,
+                    ) {
+                        Ok(reference) => Some(reference),
+                        Err(reason) => {
+                            context.emit_event(
+                                TaskSessionEventKind::Runtime,
+                                json!({
+                                    "type": "evidence_verifier_result",
+                                    "schema_version": 1,
+                                    "provider": "jira",
+                                    "status": "blocked",
+                                    "connector_id": connector_id,
+                                    "resource_kind": "comment",
+                                    "resource_name": issue_key,
+                                    "evidence": [{
+                                        "state": "comment_matches",
+                                        "status": reason,
+                                    }],
+                                }),
+                            )?;
+                            return Err(TaskExecutionError::blocked(
+                                "Jira comment identity resolution blocked completion.",
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
                 context.authorize_capability(&format!("external_tools:{connector_id}"))?;
                 let (command, environment) =
                     evidence_mcp_connectors.get(connector_id).ok_or_else(|| {
@@ -3429,29 +3522,72 @@ impl TaskExecutor for AgentTaskExecutor {
                     Duration::from_secs(45),
                 );
                 context.ensure_current()?;
-                let verification = verify_jira_issue_status(response, issue_key, expected_status);
-                context.emit_event(
-                    TaskSessionEventKind::Runtime,
-                    json!({
-                        "type": "evidence_verifier_result",
-                        "schema_version": 1,
-                        "provider": "jira",
-                        "status": if verification.satisfied { "satisfied" } else { "blocked" },
-                        "connector_id": connector_id,
-                        "resource_kind": "issue",
-                        "resource_name": issue_key,
-                        "evidence": [{
-                            "state": "expected_status",
-                            "status": verification.state,
-                            "expected_status": expected_status,
-                            "observed_status": verification.observed_status,
-                        }],
-                    }),
-                )?;
-                if !verification.satisfied {
-                    return Err(TaskExecutionError::blocked(
-                        "Jira issue-status verification blocked completion.",
-                    ));
+                if let Some(reference) = comment_reference {
+                    let verification = match response {
+                        Ok(response) => match parse_jira_comment_evidence(
+                            &response,
+                            issue_key,
+                            &reference.comment_id,
+                            &reference.content_fingerprint,
+                        ) {
+                            Ok(evidence) if evidence.content_matches => ("satisfied", true),
+                            Ok(_) => ("content_mismatch", false),
+                            Err(JiraEvidenceError::Conflict) => ("conflict", false),
+                            Err(JiraEvidenceError::Unavailable) => ("unavailable", false),
+                        },
+                        Err(_) => ("unavailable", false),
+                    };
+                    context.emit_event(
+                        TaskSessionEventKind::Runtime,
+                        json!({
+                            "type": "evidence_verifier_result",
+                            "schema_version": 1,
+                            "provider": "jira",
+                            "status": if verification.1 { "satisfied" } else { "blocked" },
+                            "connector_id": connector_id,
+                            "resource_kind": "comment",
+                            "resource_name": reference.comment_id,
+                            "parent_resource_name": issue_key,
+                            "evidence": [{
+                                "state": "comment_matches",
+                                "status": verification.0,
+                            }],
+                        }),
+                    )?;
+                    if !verification.1 {
+                        return Err(TaskExecutionError::blocked(
+                            "Jira comment verification blocked completion.",
+                        ));
+                    }
+                } else {
+                    let expected_status = binding.expected_status.as_deref().ok_or_else(|| {
+                        TaskExecutionError::blocked("Jira expected status is missing.")
+                    })?;
+                    let verification =
+                        verify_jira_issue_status(response, issue_key, expected_status);
+                    context.emit_event(
+                        TaskSessionEventKind::Runtime,
+                        json!({
+                            "type": "evidence_verifier_result",
+                            "schema_version": 1,
+                            "provider": "jira",
+                            "status": if verification.satisfied { "satisfied" } else { "blocked" },
+                            "connector_id": connector_id,
+                            "resource_kind": "issue",
+                            "resource_name": issue_key,
+                            "evidence": [{
+                                "state": "expected_status",
+                                "status": verification.state,
+                                "expected_status": expected_status,
+                                "observed_status": verification.observed_status,
+                            }],
+                        }),
+                    )?;
+                    if !verification.satisfied {
+                        return Err(TaskExecutionError::blocked(
+                            "Jira issue-status verification blocked completion.",
+                        ));
+                    }
                 }
             }
         }
@@ -3728,6 +3864,8 @@ mod tests {
             provider: "bamboo".to_string(),
             resource_kind: "build".to_string(),
             resource_id: result_key.to_string(),
+            parent_resource_id: None,
+            state_fingerprint: None,
         }
     }
 
@@ -3739,6 +3877,23 @@ mod tests {
             arguments_digest: "d".repeat(64),
             resource_operation_key: None,
             external_resource: Some(bamboo_external_resource(result_key)),
+        }
+    }
+
+    fn jira_comment_receipt(issue_key: &str, comment_id: &str) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: format!("jira-comment-{comment_id}"),
+            tool_name: "jira_add_comment".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "f".repeat(64),
+            resource_operation_key: None,
+            external_resource: Some(ExternalResourceReference {
+                provider: "jira".to_string(),
+                resource_kind: "comment".to_string(),
+                resource_id: comment_id.to_string(),
+                parent_resource_id: Some(issue_key.to_string()),
+                state_fingerprint: Some("a".repeat(64)),
+            }),
         }
     }
 
@@ -6299,6 +6454,52 @@ mod tests {
     }
 
     #[test]
+    fn jira_comment_reference_resolves_current_or_retained_receipt_and_rejects_conflicts() {
+        let receipt = jira_comment_receipt("OPS-42", "10042");
+        let current = resolve_jira_comment_reference("OPS-42", std::slice::from_ref(&receipt), &[])
+            .expect("current comment resolves");
+        assert_eq!(current.comment_id, "10042");
+        assert_eq!(current.content_fingerprint, "a".repeat(64));
+
+        let checkpoint = AgentTaskObjectiveCheckpoint {
+            objective_id: "objective-comment".to_string(),
+            evidence: vec!["comment verified".to_string()],
+            tool_receipts: vec![receipt],
+            source_attempt_id: 1,
+            recorded_at: 1,
+        };
+        assert_eq!(
+            resolve_jira_comment_reference("OPS-42", &[], &[checkpoint])
+                .expect("retained comment resolves")
+                .comment_id,
+            "10042"
+        );
+        assert_eq!(
+            resolve_jira_comment_reference(
+                "OPS-42",
+                &[jira_comment_receipt("OPS-43", "10042")],
+                &[],
+            ),
+            Err("comment_issue_conflict")
+        );
+        assert_eq!(
+            resolve_jira_comment_reference(
+                "OPS-42",
+                &[
+                    jira_comment_receipt("OPS-42", "10042"),
+                    jira_comment_receipt("OPS-42", "10043"),
+                ],
+                &[],
+            ),
+            Err("conflicting_comment_receipts")
+        );
+        assert_eq!(
+            resolve_jira_comment_reference("OPS-42", &[], &[]),
+            Err("missing_comment_identity")
+        );
+    }
+
+    #[test]
     fn git_evidence_verifier_observes_clean_new_commit_and_upstream_state() {
         let directory = tempdir().expect("workspace");
         let repository = directory.path().join("repository");
@@ -6607,6 +6808,28 @@ mod tests {
         );
         assert_eq!(missing[0].status, "missing_resource");
         assert_eq!(blockers.len(), 1);
+
+        let mut comment_facts = facts.clone();
+        comment_facts.evidence_verifiers[0].required_states = vec!["comment_matches".to_string()];
+        comment_facts.evidence_verifiers[0].expected_status = None;
+        let (comment_records, blockers) = resolve_evidence_verifier_bindings(
+            &contract,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-jira".to_string()],
+                connector_ids: &["corporate-jira".to_string()],
+                rule_facts: &comment_facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: std::slice::from_ref(&capability),
+            },
+        );
+        assert!(blockers.is_empty());
+        assert_eq!(comment_records[0].status, "ready");
+        assert_eq!(comment_records[0].expected_status, None);
+        assert!(comment_records[0]
+            .reason
+            .contains("trusted comment receipt"));
 
         let mut invalid = facts;
         invalid.evidence_verifiers[0].expected_status = Some("\nsecret".to_string());

@@ -522,6 +522,8 @@ export type TaskExecutionManifest = {
           provider: string;
           resource_kind: string;
           resource_id: string;
+          parent_resource_id?: string;
+          state_fingerprint?: string;
         };
       }>;
       source_attempt_id: number;

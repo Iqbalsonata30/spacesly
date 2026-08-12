@@ -9,16 +9,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
-pub const RULE_FACTS_SCHEMA_VERSION: u32 = 6;
-pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v6";
-const RECENT_RULE_FACTS_SCHEMA_VERSION: u32 = 5;
-const RECENT_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v5";
-const PRIOR_RULE_FACTS_SCHEMA_VERSION: u32 = 4;
-const PRIOR_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v4";
-const PREVIOUS_RULE_FACTS_SCHEMA_VERSION: u32 = 3;
-const PREVIOUS_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
-const OLDER_RULE_FACTS_SCHEMA_VERSION: u32 = 2;
-const OLDER_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 7;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v7";
+const RECENT_RULE_FACTS_SCHEMA_VERSION: u32 = 6;
+const RECENT_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v6";
+const PRIOR_RULE_FACTS_SCHEMA_VERSION: u32 = 5;
+const PRIOR_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v5";
+const PREVIOUS_RULE_FACTS_SCHEMA_VERSION: u32 = 4;
+const PREVIOUS_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v4";
+const OLDER_RULE_FACTS_SCHEMA_VERSION: u32 = 3;
+const OLDER_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
+const ANCIENT_RULE_FACTS_SCHEMA_VERSION: u32 = 2;
+const ANCIENT_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v2";
 const LEGACY_RULE_FACTS_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v1";
 const MAX_SELECTED_SKILLS: usize = 16;
@@ -235,6 +237,9 @@ impl GovernanceResolutionRecord {
                             == PREVIOUS_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == OLDER_RULE_FACTS_SCHEMA_VERSION
                         && self.rules.facts.compiler_version == OLDER_RULE_FACTS_COMPILER_VERSION)
+                    || (self.rules.facts.schema_version == ANCIENT_RULE_FACTS_SCHEMA_VERSION
+                        && self.rules.facts.compiler_version
+                            == ANCIENT_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == LEGACY_RULE_FACTS_SCHEMA_VERSION
                         && self.rules.facts.compiler_version == LEGACY_RULE_FACTS_COMPILER_VERSION);
                 if !supported_compiler || self.rules.facts.source_digest != self.rules.final_digest
@@ -1642,6 +1647,23 @@ mod tests {
     }
 
     #[test]
+    fn rule_compiler_extracts_jira_comment_verifier() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: jira-comment
+- Provider: jira
+- Connector: corporate-jira
+- Read operation: get_issue
+- Required states: comment_matches
+"#,
+        );
+        let verifier = &facts.evidence_verifiers[0];
+        assert_eq!(verifier.provider, "jira");
+        assert_eq!(verifier.required_states, vec!["comment_matches"]);
+        assert_eq!(verifier.expected_status, None);
+    }
+
+    #[test]
     fn retained_resolution_is_self_consistent_and_catalog_independent() {
         let initial = profile(vec![skill("kubernetes", "infrastructure", "automatic", 90)]);
         let resolution = resolve_governance(5, &initial, &contract("Run diagnostics"))
@@ -1670,29 +1692,35 @@ mod tests {
     }
 
     #[test]
-    fn retained_prior_rule_facts_remain_valid_after_v6_compiler_upgrade() {
+    fn retained_prior_rule_facts_remain_valid_after_v7_compiler_upgrade() {
         let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
             .expect("governance resolves");
         resolution.rules.facts.schema_version = RECENT_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = RECENT_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution
             .validate_for(5)
-            .expect("retained v5 rule facts remain compatible");
+            .expect("retained v6 rule facts remain compatible");
 
         resolution.rules.facts.schema_version = PRIOR_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = PRIOR_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution
             .validate_for(5)
-            .expect("retained v4 rule facts remain compatible");
+            .expect("retained v5 rule facts remain compatible");
 
         resolution.rules.facts.schema_version = PREVIOUS_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = PREVIOUS_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution
             .validate_for(5)
-            .expect("retained v3 rule facts remain compatible");
+            .expect("retained v4 rule facts remain compatible");
 
         resolution.rules.facts.schema_version = OLDER_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = OLDER_RULE_FACTS_COMPILER_VERSION.to_string();
+        resolution
+            .validate_for(5)
+            .expect("retained v3 rule facts remain compatible");
+
+        resolution.rules.facts.schema_version = ANCIENT_RULE_FACTS_SCHEMA_VERSION;
+        resolution.rules.facts.compiler_version = ANCIENT_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution
             .validate_for(5)
             .expect("retained v2 rule facts remain compatible");

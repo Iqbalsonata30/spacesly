@@ -576,9 +576,16 @@ impl TaskExaminationRecord {
                         || record.resource_name.as_deref().is_none_or(|value| {
                             !crate::infrastructure::jira::canonical_jira_issue_key(value)
                         })
-                        || record.expected_status.as_deref().is_none_or(|value| {
-                            !crate::infrastructure::jira::valid_jira_status(value)
-                        })))
+                        || (!matches!(
+                            record.required_states.as_slice(),
+                            [state] if matches!(state.as_str(), "expected_status" | "comment_matches")
+                        ))
+                        || (record.required_states == ["expected_status"]
+                            && record.expected_status.as_deref().is_none_or(|value| {
+                                !crate::infrastructure::jira::valid_jira_status(value)
+                            }))
+                        || (record.required_states == ["comment_matches"]
+                            && record.expected_status.is_some())))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()

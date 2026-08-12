@@ -337,6 +337,15 @@ Implemented Jira exact issue-status increment:
 - After execution, Spacesly independently reads that exact issue and strictly accepts only structured JSON containing the same key and one unambiguous status equal to the Rules value.
 - A different issue key, multiple statuses, status mismatch, prose-only output, unknown response shape, mutation-classified tool, or connector failure blocks completion without retaining raw output or diagnostics.
 
+Implemented Jira exact comment-state increment:
+
+- User Rules select `comment_matches` with one Jira connector and exact issue-read operation; the immutable ticket key remains the parent-resource authority.
+- Successful canonical or MCP-namespaced Jira add/create-comment calls must return one structured comment ID. Spacesly combines it with the issue key from trusted tool arguments and a normalized SHA-256 fingerprint of the requested comment body.
+- The receipt persists only provider, resource kind, comment ID, parent issue key, and content fingerprint. The comment body, raw tool arguments, connector response, and diagnostics are not retained.
+- Current and retained objective-checkpoint receipts can supply the dynamic comment identity on continuation. Missing, malformed, cross-issue, or multiple different comment receipts block instead of guessing.
+- After execution, Spacesly independently rereads the exact issue and requires the exact comment ID to exist with matching normalized plain-text or Atlassian Document Format content.
+- This covers fenced worker-issued comments and strengthens exact checkpoint replay fencing. It does not cover the later UI-level final-result writeback or claim provider-level idempotency when execution is interrupted after Jira accepts the comment and before an objective checkpoint commits.
+
 Benefits:
 
 - Evidence becomes independently checkable rather than descriptive text.
@@ -349,7 +358,7 @@ Trade-offs:
 
 Exit criteria:
 
-- High-risk objective types have an authoritative verifier; exact Jira comment-state verification remains open.
+- Git, Kubernetes Deployment, Bamboo build, Jira issue-status, and Jira comment-state slices have authoritative verifiers; broader connector coverage remains incremental.
 - Verification failures retain the mutation receipt and block safely.
 
 ### Phase 12 — Evaluation and Regression Harness

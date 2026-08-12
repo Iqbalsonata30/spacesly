@@ -11,7 +11,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
-- Phase 11 now also includes a Rules-bound exact Jira issue-status verifier; Jira comment-state verification remains open.
+- Phase 11 now also includes Rules-bound exact Jira issue-status and dynamic Jira comment-state verifiers.
 
 ## Phase 11 In Progress
 
@@ -69,7 +69,7 @@ Implemented Kubernetes Deployment availability vertical slice:
 - Durable evidence contains only resource kind, replica counters, generation-observed status, and satisfied/unsatisfied/unavailable state.
 - Missing target/workload authority, unavailable reads, stale generations, and incomplete replicas fail closed.
 - Rules may optionally provide both a poll interval and rollout timeout. Values are bounded to 1–30 seconds and 1–600 seconds respectively, with the interval no greater than the timeout; invalid or partial policies block during preflight.
-- Rule facts compiler v6 persists typed polling plus external connector/read-operation bindings; retained v1–v5 task snapshots remain valid under their original immutable semantics.
+- Rule facts compiler v7 persists typed polling plus external connector/read-operation bindings; retained v1–v6 task snapshots remain valid under their original immutable semantics.
 - A progressing Deployment is reread until it becomes available or reaches the deadline. Connector/RBAC failures are not blindly retried, every wait rechecks assignment authority, and each API request is capped by the remaining deadline.
 - Omitting both polling fields preserves the one-snapshot verifier behavior.
 
@@ -104,7 +104,7 @@ Implemented Bamboo exact build-result vertical slice:
 - Optional Rules-controlled polling rereads only an in-progress build. Interval and timeout use the existing 1–30 and 1–600 second bounds, every wait rechecks assignment authority, and every MCP request is capped by the remaining deadline.
 - Failed builds, timeouts, mismatched identities, unknown/prose responses, mutation-classified read tools, missing connector capability, and transport errors block completion. Connector errors are not blindly retried.
 - Durable evidence contains only connector ID, exact build result key, identity source, attempt count, and normalized state. Raw MCP output, connector diagnostics, credentials, and unrelated response fields are not retained.
-- Rule facts compiler v6 persists Bamboo polling and Jira expected status; retained v1–v5 task snapshots remain valid under their original immutable semantics.
+- Rule facts compiler v7 persists Bamboo polling and Jira state predicates; retained v1–v6 task snapshots remain valid under their original immutable semantics.
 - Known limitation: trigger recognition currently covers the canonical `bamboo_trigger_build` adapter name and MCP namespace prefixes. The event is durable immediately, but its identity becomes authoritative continuation input only when an objective checkpoint is committed; this increment does not yet provide pre-trigger lookup or an uncertain-mutation fence if execution is interrupted before that checkpoint.
 
 Implemented Jira exact issue-status vertical slice:
@@ -124,8 +124,27 @@ Implemented Jira exact issue-status vertical slice:
 - Spacesly reads the issue independently after the worker returns and accepts completion only when structured JSON contains the exact issue key and one unambiguous status matching the Rules value case-insensitively.
 - Different issue identities, multiple statuses, mismatches, prose-only output, unknown shapes, missing resources, invalid Rules, and connector errors block safely.
 - Durable evidence contains only connector ID, issue key, expected status, normalized observed status, and satisfied/blocked state. Raw responses and connector diagnostics are discarded.
-- Rule facts compiler v6 persists the Jira expected-status policy; retained v1–v5 snapshots remain valid under their original immutable semantics.
-- Known limitation: the expected status is currently Rules-defined, so dynamic per-task transition targets require separate Rules scoped by labels. Exact Jira comment identity/content verification and Jira mutation idempotency remain future increments.
+- Rule facts compiler v7 persists Jira issue-status and comment-state policies; retained v1–v6 snapshots remain valid under their original immutable semantics.
+- Known limitation: the expected issue status is currently Rules-defined, so dynamic per-task transition targets require separate Rules scoped by labels.
+
+Implemented Jira exact comment-state vertical slice:
+
+```markdown
+## Evidence Verifier: jira-comment
+
+- Provider: jira
+- Connector: corporate-jira
+- Read operation: get_issue
+- Required states: comment_matches
+```
+
+- Canonical and MCP-namespaced `jira_add_comment` or `jira_create_comment` tool results must provide one structured comment ID. Prose-only, missing, or multiple IDs make the completed mutation event fail closed.
+- Spacesly derives the parent issue key and normalized desired-content fingerprint from trusted structured tool arguments. Only the SHA-256 fingerprint is retained; the comment body is absent from events, receipts, checkpoints, and verifier evidence.
+- The provider-neutral external-resource receipt now supports an optional parent resource and state fingerprint. Scheduler validation permits that shape only for a trusted Jira comment tool and rejects raw content, malformed IDs/fingerprints, mismatched providers, or missing evidence.
+- Objective checkpoints durably retain the issue/comment/fingerprint evidence and exact replay remains idempotent. Continuations resolve the same reference from current or retained receipts; multiple comments or a cross-issue receipt block.
+- Terminal verification rereads the exact Jira issue through the Rules-bound read-only tool and requires the exact comment ID plus matching normalized plain-text or Atlassian Document Format content.
+- Durable result evidence contains only connector ID, issue key, comment ID, and satisfied/content-mismatch/conflict/unavailable state. Raw connector responses and errors are discarded.
+- Known limitation: this verifier covers Jira comments issued by the fenced worker, not the later UI-level final-result writeback. Issue reads must also return the target comment (including through any connector-side pagination). Interruption after Jira accepts a comment but before its objective checkpoint commits still lacks a provider-owned uncertain-mutation ledger and pre-mutation reconciliation, so this increment does not claim full Jira comment idempotency.
 
 Phase 11 regression evidence:
 
@@ -134,8 +153,9 @@ Phase 11 regression evidence:
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
 - Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
-- Full Rust suite: 482 passed, 3 ignored, 0 failed in serial mode.
+- Full Rust suite: 488 passed, 3 ignored, 0 failed in serial mode.
 - Focused Jira Rules compilation/binding, strict identity/status parsing, mismatch/conflict handling, schema compatibility, and diagnostic redaction tests: 7 passed.
+- Focused Jira comment capture, ambiguity, content drift, ADF normalization, checkpoint replay, continuation resolution, and redaction tests: 6 passed.
 - `cargo check` and formatting: passed.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 
