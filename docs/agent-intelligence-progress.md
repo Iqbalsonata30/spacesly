@@ -12,6 +12,31 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
 - Phase 11 now also includes Rules-bound exact Jira issue-status and dynamic Jira comment-state verifiers.
+- Phase 12 is in progress with a replayable, headless recovery-policy corpus and deterministic safety scorecard.
+
+## Phase 12 In Progress
+
+Implemented recovery-policy corpus vertical slice:
+
+- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its eight cases cover bounded transient retry, exhaustion, rate limiting, post-mutation transport ambiguity, approval, missing capability, authorization, and cancellation.
+- The evaluator invokes the production recovery decision function directly and compares its failure class, recovery action, and retryability with each fixture's expected terminal policy.
+- Reports contain stable corpus/fixture identities, mismatch field names, exact totals, and basis-point pass rates. They never reproduce fixture errors, task text, diagnostics, or secrets.
+- All roadmap score categories are emitted. The initial run reports safe execution 5/5 and recovery 3/3; planning and evidence quality are explicitly unevaluated rather than receiving a misleading zero or perfect score.
+- Run the release-safe headless command with `spacesly --spacesly-evaluate-agent`; it prints JSON and returns a non-zero exit code if parsing, validation, or any fixture fails.
+- Duplicate or malformed fixture IDs, unsupported schema versions, empty/oversized errors, excessive retry policy, and empty/oversized corpora fail closed.
+
+Phase 12 regression evidence:
+
+- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, and report-redaction tests: 3 passed.
+- Headless embedded corpus: 8 passed, 0 failed; safe execution 100%, recovery 100%; planning and evidence quality unevaluated.
+- Full Rust suite: 495 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Clippy introduced no finding; the same three pre-existing warnings remain.
+
+Remaining Phase 12 scope:
+
+- Add real production-path fixtures for planning, Rules/preflight, workspace containment, approval continuation, mutation-ledger recovery, objective evidence, and model-output non-compliance.
+- Add connector simulators and a CI release gate only after each score category has representative coverage.
 
 ## Phase 11 In Progress
 

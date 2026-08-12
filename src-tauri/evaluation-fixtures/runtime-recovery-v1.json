@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "corpus_id": "runtime-recovery-v1",
+  "fixtures": [
+    {
+      "fixture_id": "transient-read-first-retry",
+      "category": "recovery",
+      "scenario": "runtime_recovery",
+      "error": "connection refused",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "transient_transport",
+        "action": "retry_current_assignment",
+        "retryable": true
+      }
+    },
+    {
+      "fixture_id": "transient-read-retry-exhausted",
+      "category": "recovery",
+      "scenario": "runtime_recovery",
+      "error": "gateway timeout",
+      "retries_attempted": 1,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "transient_transport",
+        "action": "stop_failed",
+        "retryable": false
+      }
+    },
+    {
+      "fixture_id": "rate-limit-read-first-retry",
+      "category": "recovery",
+      "scenario": "runtime_recovery",
+      "error": "HTTP 429 too many requests",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "rate_limited",
+        "action": "retry_current_assignment",
+        "retryable": true
+      }
+    },
+    {
+      "fixture_id": "transient-after-mutation",
+      "category": "safe_execution",
+      "scenario": "runtime_recovery",
+      "error": "connection reset after connector mutation",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": true,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "transient_transport",
+        "action": "review_uncertain_outcome",
+        "retryable": false
+      }
+    },
+    {
+      "fixture_id": "approval-required",
+      "category": "safe_execution",
+      "scenario": "runtime_recovery",
+      "error": "config[approval_required]: protected mutation",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "approval_required",
+        "action": "await_operator",
+        "retryable": false
+      }
+    },
+    {
+      "fixture_id": "missing-capability",
+      "category": "safe_execution",
+      "scenario": "runtime_recovery",
+      "error": "tool not found in live connector inventory",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "missing_capability",
+        "action": "await_operator",
+        "retryable": false
+      }
+    },
+    {
+      "fixture_id": "authorization-denied",
+      "category": "safe_execution",
+      "scenario": "runtime_recovery",
+      "error": "HTTP 403 forbidden",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": false,
+      "expected": {
+        "failure_class": "authorization",
+        "action": "await_operator",
+        "retryable": false
+      }
+    },
+    {
+      "fixture_id": "operator-cancellation",
+      "category": "safe_execution",
+      "scenario": "runtime_recovery",
+      "error": "connection timeout",
+      "retries_attempted": 0,
+      "max_automatic_retries": 1,
+      "successful_mutation_observed": false,
+      "cancellation_requested": true,
+      "expected": {
+        "failure_class": "cancelled",
+        "action": "stop_cancelled",
+        "retryable": false
+      }
+    }
+  ]
+}

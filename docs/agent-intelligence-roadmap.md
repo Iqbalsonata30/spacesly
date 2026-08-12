@@ -372,9 +372,22 @@ Exit criteria:
 
 ### Phase 12 — Evaluation and Regression Harness
 
-Status: planned.
+Status: in progress.
 
 Create replayable task fixtures covering dynamic connectors, missing tools, malformed rules, workspace escapes, approval pauses, partial mutations, continuation, and model non-compliance.
+
+Implemented recovery-policy corpus increment:
+
+- A versioned, provider-neutral JSON fixture schema replays production `decide_runtime_recovery` policy rather than duplicating its logic in a test-only evaluator.
+- The initial corpus covers bounded transient retries, retry exhaustion, rate limiting, mutation-followed-by-transport-failure, approval pauses, missing capabilities, authorization denial, and operator cancellation.
+- A deterministic report publishes total and per-category counts plus pass rates in basis points. Planning, safe execution, recovery, and evidence quality are always present; categories without fixtures are explicitly `evaluated: false` with no pass rate.
+- `spacesly --spacesly-evaluate-agent` runs the embedded corpus without starting the desktop UI, prints machine-readable JSON, and exits unsuccessfully when any fixture fails.
+- Failure reports retain fixture IDs and mismatched output field names only. Fixture error text, connector diagnostics, credentials, and task content are not copied into the report.
+
+Current limitations:
+
+- This first corpus scores safe-execution and recovery policy only. Planning and evidence-quality remain visibly unevaluated.
+- Connector simulation, malformed Rules, workspace escape, approval continuation, partial external mutations, objective evidence, and model non-compliance fixtures remain incremental Phase 12 work.
 
 Benefits:
 

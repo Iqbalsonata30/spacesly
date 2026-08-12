@@ -1,3 +1,4 @@
+pub mod agent_evaluation;
 pub mod entity;
 pub mod execution;
 pub mod execution_manifest;

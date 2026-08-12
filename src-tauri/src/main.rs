@@ -24,5 +24,12 @@ fn main() {
         }
         return;
     }
+    if std::env::args().any(|argument| argument == "--spacesly-evaluate-agent") {
+        if let Err(error) = spacesly_lib::run_agent_evaluation() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     spacesly_lib::run()
 }

@@ -18,6 +18,24 @@ pub fn run_ocp_connector() -> Result<(), String> {
     infrastructure::ocp::run_ocp_mcp_server()
 }
 
+pub fn run_agent_evaluation() -> Result<(), String> {
+    let corpus = domain::agent_evaluation::embedded_agent_evaluation_corpus()?;
+    let report = domain::agent_evaluation::evaluate_agent_corpus(&corpus)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("Failed to encode Agent evaluation report: {error}"))?
+    );
+    if report.failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Agent evaluation failed {} of {} fixtures.",
+            report.failed, report.total
+        ))
+    }
+}
+
 use application::agent_task_executor::{
     execution_contract_digest, AgentTaskExecutor, AiWorkerRuntimeRunner,
 };
