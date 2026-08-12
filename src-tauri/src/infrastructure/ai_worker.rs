@@ -1804,6 +1804,54 @@ fn result_from_structured_response(
     }
 }
 
+pub(crate) fn evaluate_model_result_fixture(
+    response: &str,
+    expected_objective_ids: &[String],
+    sensitive_approval_required: bool,
+    approval_granted: bool,
+) -> crate::domain::agent_evaluation::ModelResultObservation {
+    let task = AiWorkerTask {
+        execution_contract: Some(serde_json::json!({
+            "objective": {
+                "summary": if sensitive_approval_required {
+                    "Update secret configuration"
+                } else {
+                    "Evaluate model result"
+                }
+            },
+            "task_context": {
+                "description": if sensitive_approval_required {
+                    "Change credential handling."
+                } else {
+                    "Validate objective evidence."
+                }
+            },
+            "runtime_inputs": {
+                "operator_notes": approval_granted.then_some("approval granted")
+            },
+            "semantic_plan": {
+                "objectives": expected_objective_ids
+                    .iter()
+                    .map(|id| serde_json::json!({ "id": id }))
+                    .collect::<Vec<_>>()
+            }
+        })),
+        task_examination: None,
+        session_key: None,
+        opencode_session_id: None,
+    };
+    let result = result_from_structured_response(response.to_string(), Some(&task));
+    crate::domain::agent_evaluation::ModelResultObservation {
+        completion_status: match result.completion_status {
+            AiWorkerCompletionStatus::Completed => "completed",
+            AiWorkerCompletionStatus::Blocked => "blocked",
+        }
+        .to_string(),
+        objective_result_count: result.objective_results.len(),
+        blocked_reason_present: result.blocked_reason.is_some(),
+    }
+}
+
 fn parse_structured_result(response: &str) -> Result<AiWorkerTaskResult, String> {
     let raw = extract_json_object(response)
         .ok_or_else(|| "response did not contain a JSON object".to_string())?;
@@ -4397,6 +4445,26 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("needs explicit operator approval"));
+    }
+
+    #[test]
+    fn embedded_agent_evaluation_uses_production_model_result_validation() {
+        let corpus = crate::domain::agent_evaluation::embedded_agent_evaluation_corpus()
+            .expect("embedded evaluation corpus");
+        let report = crate::domain::agent_evaluation::evaluate_agent_corpus(
+            &corpus,
+            evaluate_model_result_fixture,
+        )
+        .expect("production evaluation completes");
+        assert_eq!(report.total, 14);
+        assert_eq!(report.passed, 14);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.categories
+                [&crate::domain::agent_evaluation::AgentEvaluationCategory::EvidenceQuality]
+                .passed,
+            5
+        );
     }
 
     #[test]

@@ -60,6 +60,13 @@ pub enum AgentEvaluationScenario {
         cancellation_requested: bool,
         expected: RuntimeRecoveryExpectation,
     },
+    ModelResult {
+        response: String,
+        expected_objective_ids: Vec<String>,
+        sensitive_approval_required: bool,
+        approval_granted: bool,
+        expected: ModelResultExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -67,6 +74,20 @@ pub struct RuntimeRecoveryExpectation {
     pub failure_class: RuntimeFailureClass,
     pub action: RuntimeRecoveryAction,
     pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelResultExpectation {
+    pub completion_status: String,
+    pub objective_result_count: usize,
+    pub blocked_reason_present: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResultObservation {
+    pub completion_status: String,
+    pub objective_result_count: usize,
+    pub blocked_reason_present: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,12 +131,13 @@ pub fn parse_agent_evaluation_corpus(value: &str) -> Result<AgentEvaluationCorpu
 
 pub fn evaluate_agent_corpus(
     corpus: &AgentEvaluationCorpus,
+    model_result_validator: impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
 ) -> Result<AgentEvaluationReport, String> {
     validate_corpus(corpus)?;
     let mut failures = Vec::new();
     let mut category_counts = BTreeMap::<AgentEvaluationCategory, (usize, usize)>::new();
     for fixture in &corpus.fixtures {
-        let mismatches = evaluate_fixture(fixture);
+        let mismatches = evaluate_fixture(fixture, &model_result_validator);
         let counts = category_counts.entry(fixture.category).or_default();
         counts.0 += 1;
         if mismatches.is_empty() {
@@ -160,7 +182,10 @@ pub fn evaluate_agent_corpus(
     })
 }
 
-fn evaluate_fixture(fixture: &AgentEvaluationFixture) -> Vec<String> {
+fn evaluate_fixture(
+    fixture: &AgentEvaluationFixture,
+    model_result_validator: &impl Fn(&str, &[String], bool, bool) -> ModelResultObservation,
+) -> Vec<String> {
     match &fixture.scenario {
         AgentEvaluationScenario::RuntimeRecovery {
             error,
@@ -188,6 +213,31 @@ fn evaluate_fixture(fixture: &AgentEvaluationFixture) -> Vec<String> {
             }
             if observed.retryable != expected.retryable {
                 mismatches.push("retryable".to_string());
+            }
+            mismatches
+        }
+        AgentEvaluationScenario::ModelResult {
+            response,
+            expected_objective_ids,
+            sensitive_approval_required,
+            approval_granted,
+            expected,
+        } => {
+            let observed = model_result_validator(
+                response,
+                expected_objective_ids,
+                *sensitive_approval_required,
+                *approval_granted,
+            );
+            let mut mismatches = Vec::new();
+            if observed.completion_status != expected.completion_status {
+                mismatches.push("completion_status".to_string());
+            }
+            if observed.objective_result_count != expected.objective_result_count {
+                mismatches.push("objective_result_count".to_string());
+            }
+            if observed.blocked_reason_present != expected.blocked_reason_present {
+                mismatches.push("blocked_reason_present".to_string());
             }
             mismatches
         }
@@ -223,6 +273,24 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent runtime-recovery fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::ModelResult {
+                response,
+                expected_objective_ids,
+                expected,
+                ..
+            } => {
+                if response.trim().is_empty()
+                    || response.len() > 64 * 1024
+                    || expected_objective_ids.len() > 8
+                    || expected_objective_ids
+                        .iter()
+                        .any(|id| !valid_identifier(id))
+                    || !matches!(expected.completion_status.as_str(), "completed" | "blocked")
+                    || expected.objective_result_count > 8
+                {
+                    return Err("Agent model-result fixture is invalid.".to_string());
+                }
+            }
         }
     }
     Ok(())
@@ -247,12 +315,65 @@ fn pass_rate(passed: usize, total: usize) -> u16 {
 mod tests {
     use super::*;
 
+    fn fixture_model_validator(
+        response: &str,
+        expected_objective_ids: &[String],
+        sensitive_approval_required: bool,
+        _approval_granted: bool,
+    ) -> ModelResultObservation {
+        let parsed = serde_json::from_str::<serde_json::Value>(response).ok();
+        let objective_result_count = parsed
+            .as_ref()
+            .and_then(|value| value.get("objective_results"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let missing_objective_evidence = parsed
+            .as_ref()
+            .and_then(|value| value.get("objective_results"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|objectives| {
+                objectives.iter().any(|objective| {
+                    objective
+                        .get("evidence")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                })
+            });
+        let observed_ids = parsed
+            .as_ref()
+            .and_then(|value| value.get("objective_results"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|objective| objective.get("objective_id"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        let unique_ids = observed_ids.iter().copied().collect::<HashSet<_>>();
+        let coverage_invalid = observed_ids.len() != expected_objective_ids.len()
+            || unique_ids.len() != observed_ids.len();
+        let invalid = parsed.is_none()
+            || sensitive_approval_required
+            || missing_objective_evidence
+            || coverage_invalid;
+        ModelResultObservation {
+            completion_status: if invalid { "blocked" } else { "completed" }.to_string(),
+            objective_result_count: if missing_objective_evidence {
+                0
+            } else {
+                objective_result_count
+            },
+            blocked_reason_present: invalid,
+        }
+    }
+
     #[test]
     fn embedded_recovery_corpus_passes_and_never_invents_uncovered_scores() {
         let corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
-        let report = evaluate_agent_corpus(&corpus).expect("corpus evaluates");
-        assert_eq!(report.total, 8);
-        assert_eq!(report.passed, 8);
+        let report =
+            evaluate_agent_corpus(&corpus, fixture_model_validator).expect("corpus evaluates");
+        assert_eq!(report.total, 14);
+        assert_eq!(report.passed, 14);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
@@ -262,7 +383,7 @@ mod tests {
             report.categories[&AgentEvaluationCategory::Planning].pass_rate_basis_points,
             None
         );
-        assert!(!report.categories[&AgentEvaluationCategory::EvidenceQuality].evaluated);
+        assert!(report.categories[&AgentEvaluationCategory::EvidenceQuality].evaluated);
     }
 
     #[test]
@@ -270,10 +391,14 @@ mod tests {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         let AgentEvaluationScenario::RuntimeRecovery {
             expected, error, ..
-        } = &mut corpus.fixtures[0].scenario;
+        } = &mut corpus.fixtures[0].scenario
+        else {
+            panic!("first fixture must exercise runtime recovery");
+        };
         *error = "timeout token=private-value".to_string();
         expected.action = RuntimeRecoveryAction::StopFailed;
-        let report = evaluate_agent_corpus(&corpus).expect("corpus evaluates");
+        let report =
+            evaluate_agent_corpus(&corpus, fixture_model_validator).expect("corpus evaluates");
         assert_eq!(report.failed, 1);
         assert_eq!(report.failures[0].mismatches, ["action"]);
         let encoded = serde_json::to_string(&report).expect("report serializes");
@@ -285,7 +410,7 @@ mod tests {
     fn malformed_or_duplicate_fixtures_fail_closed() {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         corpus.fixtures[1].fixture_id = corpus.fixtures[0].fixture_id.clone();
-        assert!(evaluate_agent_corpus(&corpus)
+        assert!(evaluate_agent_corpus(&corpus, fixture_model_validator)
             .expect_err("duplicate fixture rejected")
             .contains("unique"));
         assert!(parse_agent_evaluation_corpus(r#"{"schema_version":2}"#).is_err());

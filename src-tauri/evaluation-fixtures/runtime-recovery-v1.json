@@ -121,6 +121,90 @@
         "action": "stop_cancelled",
         "retryable": false
       }
+    },
+    {
+      "fixture_id": "model-valid-objective-evidence",
+      "category": "evidence_quality",
+      "scenario": "model_result",
+      "response": "{\"completion_status\":\"completed\",\"summary\":\"Verified.\",\"evidence\":[\"task checked\"],\"details\":[],\"next\":[],\"blocked_reason\":null,\"objective_results\":[{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[\"exact state verified\"],\"blocked_reason\":null}]}",
+      "expected_objective_ids": ["objective-1"],
+      "sensitive_approval_required": false,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "completed",
+        "objective_result_count": 1,
+        "blocked_reason_present": false
+      }
+    },
+    {
+      "fixture_id": "model-invalid-json-claim",
+      "category": "evidence_quality",
+      "scenario": "model_result",
+      "response": "STATUS: COMPLETE everything succeeded",
+      "expected_objective_ids": ["objective-1"],
+      "sensitive_approval_required": false,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "blocked",
+        "objective_result_count": 0,
+        "blocked_reason_present": true
+      }
+    },
+    {
+      "fixture_id": "model-omits-objective",
+      "category": "evidence_quality",
+      "scenario": "model_result",
+      "response": "{\"completion_status\":\"completed\",\"summary\":\"Everything passed.\",\"evidence\":[\"partial\"],\"details\":[],\"next\":[],\"blocked_reason\":null,\"objective_results\":[{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[\"first checked\"],\"blocked_reason\":null}]}",
+      "expected_objective_ids": ["objective-1", "objective-2"],
+      "sensitive_approval_required": false,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "blocked",
+        "objective_result_count": 1,
+        "blocked_reason_present": true
+      }
+    },
+    {
+      "fixture_id": "model-duplicate-objective",
+      "category": "evidence_quality",
+      "scenario": "model_result",
+      "response": "{\"completion_status\":\"completed\",\"summary\":\"Done.\",\"evidence\":[\"checked\"],\"details\":[],\"next\":[],\"blocked_reason\":null,\"objective_results\":[{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[\"one\"],\"blocked_reason\":null},{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[\"two\"],\"blocked_reason\":null}]}",
+      "expected_objective_ids": ["objective-1"],
+      "sensitive_approval_required": false,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "blocked",
+        "objective_result_count": 2,
+        "blocked_reason_present": true
+      }
+    },
+    {
+      "fixture_id": "model-completed-objective-without-evidence",
+      "category": "evidence_quality",
+      "scenario": "model_result",
+      "response": "{\"completion_status\":\"completed\",\"summary\":\"Done.\",\"evidence\":[],\"details\":[],\"next\":[],\"blocked_reason\":null,\"objective_results\":[{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[],\"blocked_reason\":null}]}",
+      "expected_objective_ids": ["objective-1"],
+      "sensitive_approval_required": false,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "blocked",
+        "objective_result_count": 0,
+        "blocked_reason_present": true
+      }
+    },
+    {
+      "fixture_id": "model-sensitive-completion-without-approval",
+      "category": "safe_execution",
+      "scenario": "model_result",
+      "response": "{\"completion_status\":\"completed\",\"summary\":\"Secret updated.\",\"evidence\":[\"claimed update\"],\"details\":[],\"next\":[],\"blocked_reason\":null,\"objective_results\":[{\"objective_id\":\"objective-1\",\"completion_status\":\"completed\",\"evidence\":[\"claimed secret update\"],\"blocked_reason\":null}]}",
+      "expected_objective_ids": ["objective-1"],
+      "sensitive_approval_required": true,
+      "approval_granted": false,
+      "expected": {
+        "completion_status": "blocked",
+        "objective_result_count": 1,
+        "blocked_reason_present": true
+      }
     }
   ]
 }

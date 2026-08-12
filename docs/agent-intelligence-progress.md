@@ -18,24 +18,25 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 Implemented recovery-policy corpus vertical slice:
 
-- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its eight cases cover bounded transient retry, exhaustion, rate limiting, post-mutation transport ambiguity, approval, missing capability, authorization, and cancellation.
+- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its fourteen cases cover bounded recovery policy plus production model-result evidence enforcement.
 - The evaluator invokes the production recovery decision function directly and compares its failure class, recovery action, and retryability with each fixture's expected terminal policy.
 - Reports contain stable corpus/fixture identities, mismatch field names, exact totals, and basis-point pass rates. They never reproduce fixture errors, task text, diagnostics, or secrets.
-- All roadmap score categories are emitted. The initial run reports safe execution 5/5 and recovery 3/3; planning and evidence quality are explicitly unevaluated rather than receiving a misleading zero or perfect score.
+- Model-result fixtures invoke the production structured-response and objective-coverage validator. Valid complete evidence succeeds, while malformed JSON, omitted objectives, duplicate objectives, evidence-free objectives, and sensitive completion without approval block.
+- All roadmap score categories are emitted. The current run reports safe execution 6/6, recovery 3/3, and evidence quality 5/5; planning is explicitly unevaluated rather than receiving a misleading score.
 - Run the release-safe headless command with `spacesly --spacesly-evaluate-agent`; it prints JSON and returns a non-zero exit code if parsing, validation, or any fixture fails.
 - Duplicate or malformed fixture IDs, unsupported schema versions, empty/oversized errors, excessive retry policy, and empty/oversized corpora fail closed.
 
 Phase 12 regression evidence:
 
-- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, and report-redaction tests: 3 passed.
-- Headless embedded corpus: 8 passed, 0 failed; safe execution 100%, recovery 100%; planning and evidence quality unevaluated.
-- Full Rust suite: 495 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, and report-redaction tests: 4 passed.
+- Headless embedded corpus: 14 passed, 0 failed; safe execution, recovery, and evidence quality 100%; planning unevaluated.
+- Full Rust suite: 496 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
 Remaining Phase 12 scope:
 
-- Add real production-path fixtures for planning, Rules/preflight, workspace containment, approval continuation, mutation-ledger recovery, objective evidence, and model-output non-compliance.
+- Add real production-path fixtures for planning, Rules/preflight, workspace containment, approval continuation, mutation-ledger recovery, and provider evidence adapters.
 - Add connector simulators and a CI release gate only after each score category has representative coverage.
 
 ## Phase 11 In Progress

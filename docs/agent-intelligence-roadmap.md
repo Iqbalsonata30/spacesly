@@ -383,11 +383,12 @@ Implemented recovery-policy corpus increment:
 - A deterministic report publishes total and per-category counts plus pass rates in basis points. Planning, safe execution, recovery, and evidence quality are always present; categories without fixtures are explicitly `evaluated: false` with no pass rate.
 - `spacesly --spacesly-evaluate-agent` runs the embedded corpus without starting the desktop UI, prints machine-readable JSON, and exits unsuccessfully when any fixture fails.
 - Failure reports retain fixture IDs and mismatched output field names only. Fixture error text, connector diagnostics, credentials, and task content are not copied into the report.
+- Model-result fixtures execute the production structured-response and objective-coverage validator. They cover valid evidence, malformed non-JSON completion claims, omitted and duplicate objectives, evidence-free completed objectives, and sensitive completion claims without operator approval.
 
 Current limitations:
 
-- This first corpus scores safe-execution and recovery policy only. Planning and evidence-quality remain visibly unevaluated.
-- Connector simulation, malformed Rules, workspace escape, approval continuation, partial external mutations, objective evidence, and model non-compliance fixtures remain incremental Phase 12 work.
+- Planning remains visibly unevaluated. Safe execution, recovery, and evidence quality have initial coverage but are not yet release-grade corpora.
+- Connector simulation, malformed Rules, workspace escape, approval continuation, partial external mutations, provider evidence adapters, and semantic-planner fixtures remain incremental Phase 12 work.
 
 Benefits:
 

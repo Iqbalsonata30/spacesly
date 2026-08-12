@@ -20,7 +20,10 @@ pub fn run_ocp_connector() -> Result<(), String> {
 
 pub fn run_agent_evaluation() -> Result<(), String> {
     let corpus = domain::agent_evaluation::embedded_agent_evaluation_corpus()?;
-    let report = domain::agent_evaluation::evaluate_agent_corpus(&corpus)?;
+    let report = domain::agent_evaluation::evaluate_agent_corpus(
+        &corpus,
+        infrastructure::ai_worker::evaluate_model_result_fixture,
+    )?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report)
