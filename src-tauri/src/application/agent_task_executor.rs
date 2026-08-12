@@ -288,6 +288,8 @@ fn resolve_evidence_verifier_bindings(
     connector_ids: &[String],
     rule_facts: &RuleFactsRecord,
     repository_root: Option<&Path>,
+    deployment_target: Option<&DeploymentTargetRuleFact>,
+    trusted_kubernetes_connector: bool,
 ) -> (Vec<EvidenceVerifierBindingRecord>, Vec<String>) {
     let labels = contract
         .pointer("/ticket/labels")
@@ -306,7 +308,13 @@ fn resolve_evidence_verifier_bindings(
         } else {
             connector_ids.iter().any(|connector_id| {
                 rule_facts.connectors.iter().any(|connector| {
-                    connector.id == *connector_id && connector.connector_type == verifier.provider
+                    connector.id == *connector_id
+                        && (connector.connector_type == verifier.provider
+                            || (verifier.provider == "kubernetes"
+                                && matches!(
+                                    connector.connector_type.as_str(),
+                                    "ocp" | "openshift"
+                                )))
                 })
             })
         };
@@ -326,13 +334,21 @@ fn resolve_evidence_verifier_bindings(
         if !verifier.applies_to_labels.is_empty() && matched_labels.is_empty() {
             continue;
         }
-        let valid_states = verifier.provider == "git"
-            && verifier.required_states.iter().all(|state| {
+        let valid_states = match verifier.provider.as_str() {
+            "git" => verifier.required_states.iter().all(|state| {
                 matches!(
                     state.as_str(),
                     "clean_worktree" | "new_commit" | "pushed_upstream"
                 )
-            });
+            }),
+            "kubernetes" => verifier.required_states == ["deployment_available"],
+            _ => false,
+        };
+        let workload = contract
+            .pointer("/deployment/workload")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| canonical_connector_token(value));
         let (status, reason) = if !canonical_connector_token(&verifier.id)
             || !canonical_connector_token(&verifier.provider)
             || verifier.required_states.is_empty()
@@ -345,7 +361,7 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Evidence Verifier fields must be canonical non-empty identifiers.",
             )
-        } else if verifier.provider != "git" {
+        } else if !matches!(verifier.provider.as_str(), "git" | "kubernetes") {
             (
                 "unsupported_provider",
                 "This evidence verifier provider has no deterministic adapter yet.",
@@ -353,17 +369,23 @@ fn resolve_evidence_verifier_bindings(
         } else if !valid_states {
             (
                 "invalid_rule",
-                "Git evidence states must be clean_worktree, new_commit, or pushed_upstream.",
+                "Evidence Verifier required states are not supported by this provider adapter.",
             )
-        } else if repository_root.is_none() {
+        } else if verifier.provider == "kubernetes" && !trusted_kubernetes_connector {
+            (
+                "unsupported_provider",
+                "Kubernetes evidence verification requires the trusted embedded connector adapter.",
+            )
+        } else if verifier.provider == "git" && repository_root.is_none() {
             (
                 "missing_repository",
                 "Git evidence verification requires one resolved trusted repository.",
             )
-        } else if verifier
-            .required_states
-            .iter()
-            .any(|state| state == "new_commit")
+        } else if verifier.provider == "git"
+            && verifier
+                .required_states
+                .iter()
+                .any(|state| state == "new_commit")
             && contract
                 .pointer("/repository/head_commit")
                 .and_then(Value::as_str)
@@ -371,11 +393,17 @@ fn resolve_evidence_verifier_bindings(
                 .is_none_or(str::is_empty)
         {
             ("missing_repository", "The immutable contract must include repository.head_commit for new_commit verification.")
+        } else if verifier.provider == "kubernetes"
+            && (deployment_target.is_none() || workload.is_none())
+        {
+            ("missing_resource", "Kubernetes deployment availability requires a resolved deployment target and canonical deployment.workload.")
         } else {
-            (
-                "ready",
-                "The Git terminal-state verifier is bound to the resolved trusted repository.",
-            )
+            let reason = if verifier.provider == "kubernetes" {
+                "The Deployment verifier is bound to the trusted connector and resolved resource identity."
+            } else {
+                "The Git terminal-state verifier is bound to the resolved trusted repository."
+            };
+            ("ready", reason)
         };
         if status != "ready" {
             blockers.push(format!("{}: {reason}", verifier.id));
@@ -387,6 +415,13 @@ fn resolve_evidence_verifier_bindings(
             status: status.to_string(),
             matched_labels,
             required_states: verifier.required_states.clone(),
+            resource_kind: (verifier.provider == "kubernetes").then(|| "deployment".to_string()),
+            resource_name: (verifier.provider == "kubernetes")
+                .then(|| workload.map(str::to_string))
+                .flatten(),
+            namespace: (verifier.provider == "kubernetes")
+                .then(|| deployment_target.map(|target| target.namespace.clone()))
+                .flatten(),
             source: verifier.source.clone(),
             source_line: verifier.source_line,
             reason: reason.to_string(),
@@ -1975,6 +2010,38 @@ impl TaskExecutor for AgentTaskExecutor {
             .as_ref()
             .expect("validated execution contract")
             .clone();
+        let expected_ocp_command = crate::infrastructure::ocp::ocp_worker_command().ok();
+        let trusted_kubernetes_connector_ids = expected_ocp_command
+            .as_ref()
+            .into_iter()
+            .flat_map(|expected| {
+                resolved
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .filter(move |server| &server.command == expected)
+            })
+            .filter(|server| envelope.connector_ids.contains(&server.secret_id))
+            .filter(|server| {
+                resolved
+                    .governance
+                    .rules
+                    .facts
+                    .connectors
+                    .iter()
+                    .any(|rule| {
+                        rule.id == server.secret_id
+                            && matches!(
+                                rule.connector_type.as_str(),
+                                "kubernetes" | "ocp" | "openshift"
+                            )
+                    })
+            })
+            .map(|server| server.secret_id.clone())
+            .collect::<Vec<_>>();
+        let trusted_kubernetes_connector_id = (trusted_kubernetes_connector_ids.len() == 1)
+            .then(|| trusted_kubernetes_connector_ids[0].clone());
+        let trusted_kubernetes_connector = trusted_kubernetes_connector_id.is_some();
         let (evidence_verifier_bindings, evidence_verifier_blockers) =
             resolve_evidence_verifier_bindings(
                 &evidence_contract,
@@ -1982,6 +2049,8 @@ impl TaskExecutor for AgentTaskExecutor {
                 &envelope.connector_ids,
                 &resolved.governance.rules.facts,
                 default_repository_root.as_deref(),
+                deployment_target_preflight.target.as_ref(),
+                trusted_kubernetes_connector,
             );
         examination.evidence_verifier_bindings = evidence_verifier_bindings;
         let bound_evidence_verifiers = examination.evidence_verifier_bindings.clone();
@@ -2084,6 +2153,9 @@ impl TaskExecutor for AgentTaskExecutor {
                     "status": record.status,
                     "matched_labels": record.matched_labels,
                     "required_states": record.required_states,
+                    "resource_kind": record.resource_kind,
+                    "resource_name": record.resource_name,
+                    "namespace": record.namespace,
                     "source": record.source,
                     "source_line": record.source_line,
                     "reason": record.reason,
@@ -2273,10 +2345,12 @@ impl TaskExecutor for AgentTaskExecutor {
                 .map(|target| target.branch.clone());
         }
         resolved.config.task_tool_authority = task_tool_authority;
-        let expected_ocp_command = crate::infrastructure::ocp::ocp_worker_command().ok();
+        let mut evidence_ocp_environment = None;
         for server in &mut resolved.config.mcp_servers {
             server.name = format!("spacesly-{}", server.secret_id);
-            if expected_ocp_command.as_ref() == Some(&server.command) {
+            if expected_ocp_command.as_ref() == Some(&server.command)
+                && trusted_kubernetes_connector_id.as_deref() == Some(server.secret_id.as_str())
+            {
                 if let Some(target) = deployment_target_preflight.target.as_ref() {
                     server.environment.insert(
                         crate::infrastructure::ocp::ENV_DEFAULT_NAMESPACE.to_string(),
@@ -2287,6 +2361,7 @@ impl TaskExecutor for AgentTaskExecutor {
                         target.namespace.clone(),
                     );
                 }
+                evidence_ocp_environment = Some(server.environment.clone());
             }
             server.proxy_authority = Some(context.external_authority(
                 &server.secret_id,
@@ -2546,17 +2621,19 @@ impl TaskExecutor for AgentTaskExecutor {
                     }),
                 )?;
             }
-            if !bound_evidence_verifiers.is_empty() {
+            let git_verifiers = bound_evidence_verifiers
+                .iter()
+                .filter(|binding| binding.provider == "git")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !git_verifiers.is_empty() {
                 let repository_root = evidence_repository_root.as_deref().ok_or_else(|| {
                     TaskExecutionError::blocked(
                         "Evidence verifier lost its resolved repository authority.",
                     )
                 })?;
-                let (evidence, failures) = verify_git_evidence_states(
-                    &bound_evidence_verifiers,
-                    repository_root,
-                    &evidence_contract,
-                );
+                let (evidence, failures) =
+                    verify_git_evidence_states(&git_verifiers, repository_root, &evidence_contract);
                 context.emit_event(
                     TaskSessionEventKind::Runtime,
                     json!({
@@ -2573,6 +2650,76 @@ impl TaskExecutor for AgentTaskExecutor {
                         "Git evidence verification blocked completion; unsatisfied states: {}.",
                         failures.join(", ")
                     )));
+                }
+            }
+            for binding in bound_evidence_verifiers
+                .iter()
+                .filter(|binding| binding.provider == "kubernetes")
+            {
+                let environment = evidence_ocp_environment.as_ref().ok_or_else(|| {
+                    TaskExecutionError::blocked(
+                        "Kubernetes evidence verifier lost its trusted connector configuration.",
+                    )
+                })?;
+                let namespace = binding.namespace.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Kubernetes evidence namespace is missing.")
+                })?;
+                let name = binding.resource_name.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Kubernetes evidence resource is missing.")
+                })?;
+                let result = crate::infrastructure::ocp::verify_deployment_available(
+                    environment,
+                    namespace,
+                    name,
+                );
+                let (status, evidence, failure) = match result {
+                    Ok(evidence) if evidence.available => (
+                        "satisfied",
+                        json!({
+                            "state": "deployment_available",
+                            "status": "satisfied",
+                            "desired_replicas": evidence.desired_replicas,
+                            "updated_replicas": evidence.updated_replicas,
+                            "ready_replicas": evidence.ready_replicas,
+                            "available_replicas": evidence.available_replicas,
+                            "generation_observed": evidence.generation_observed,
+                        }),
+                        None,
+                    ),
+                    Ok(evidence) => (
+                        "blocked",
+                        json!({
+                            "state": "deployment_available",
+                            "status": "unsatisfied",
+                            "desired_replicas": evidence.desired_replicas,
+                            "updated_replicas": evidence.updated_replicas,
+                            "ready_replicas": evidence.ready_replicas,
+                            "available_replicas": evidence.available_replicas,
+                            "generation_observed": evidence.generation_observed,
+                        }),
+                        Some("deployment_available"),
+                    ),
+                    Err(_) => (
+                        "blocked",
+                        json!({"state": "deployment_available", "status": "unavailable"}),
+                        Some("deployment_available"),
+                    ),
+                };
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "evidence_verifier_result",
+                        "schema_version": 1,
+                        "provider": "kubernetes",
+                        "status": status,
+                        "resource_kind": "deployment",
+                        "evidence": [evidence],
+                    }),
+                )?;
+                if failure.is_some() {
+                    return Err(TaskExecutionError::blocked(
+                        "Kubernetes Deployment availability verification blocked completion.",
+                    ));
                 }
             }
         }
@@ -4977,6 +5124,9 @@ mod tests {
             status: "ready".to_string(),
             matched_labels: Vec::new(),
             required_states: states.iter().map(|state| state.to_string()).collect(),
+            resource_kind: None,
+            resource_name: None,
+            namespace: None,
             source: "global.agent_rules".to_string(),
             source_line: 40,
             reason: "bound".to_string(),
@@ -5105,6 +5255,8 @@ mod tests {
             &[],
             &facts,
             Some(directory.path()),
+            None,
+            false,
         );
         assert!(blockers.is_empty());
         assert_eq!(records.len(), 1);
@@ -5116,6 +5268,8 @@ mod tests {
             &[],
             &facts,
             Some(directory.path()),
+            None,
+            false,
         );
         assert_eq!(records[0].status, "missing_repository");
         assert_eq!(blockers.len(), 1);
@@ -5126,8 +5280,70 @@ mod tests {
             &["corporate-bamboo".to_string()],
             &facts,
             None,
+            None,
+            false,
         );
         assert_eq!(records[0].status, "unsupported_provider");
+        assert_eq!(blockers.len(), 1);
+    }
+
+    #[test]
+    fn kubernetes_evidence_verifier_binds_exact_workload_and_resolved_namespace() {
+        let facts = RuleFactsRecord {
+            connectors: vec![ConnectorRuleFact {
+                id: "ocp-dev".to_string(),
+                connector_type: "ocp".to_string(),
+                ..Default::default()
+            }],
+            evidence_verifiers: vec![crate::domain::governance::EvidenceVerifierRuleFact {
+                id: "deployment-health".to_string(),
+                provider: "kubernetes".to_string(),
+                applies_to_labels: Vec::new(),
+                required_states: vec!["deployment_available".to_string()],
+                source: "global.agent_rules".to_string(),
+                source_line: 60,
+            }],
+            ..Default::default()
+        };
+        let target =
+            deployment_target_fact("PRESTAGE", "prerelease", "prerelease", "qcash-prerelease");
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"deployment": {"workload": "payroll-api"}}),
+            &["external_tools:ocp-dev".to_string()],
+            &["ocp-dev".to_string()],
+            &facts,
+            None,
+            Some(&target),
+            true,
+        );
+        assert!(blockers.is_empty());
+        assert_eq!(records[0].status, "ready");
+        assert_eq!(records[0].resource_kind.as_deref(), Some("deployment"));
+        assert_eq!(records[0].resource_name.as_deref(), Some("payroll-api"));
+        assert_eq!(records[0].namespace.as_deref(), Some("qcash-prerelease"));
+
+        let (missing, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"deployment": {}}),
+            &["external_tools:ocp-dev".to_string()],
+            &["ocp-dev".to_string()],
+            &facts,
+            None,
+            Some(&target),
+            true,
+        );
+        assert_eq!(missing[0].status, "missing_resource");
+        assert_eq!(blockers.len(), 1);
+
+        let (unsupported, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"deployment": {"workload": "payroll-api"}}),
+            &["external_tools:ocp-dev".to_string()],
+            &["ocp-dev".to_string()],
+            &facts,
+            None,
+            Some(&target),
+            false,
+        );
+        assert_eq!(unsupported[0].status, "unsupported_provider");
         assert_eq!(blockers.len(), 1);
     }
 

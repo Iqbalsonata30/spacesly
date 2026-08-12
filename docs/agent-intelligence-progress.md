@@ -10,7 +10,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
-- Phase 11 is in progress with the first independent Git terminal-state verifier.
+- Phase 11 is in progress with independent Git terminal-state and Kubernetes Deployment-availability verifiers.
 
 ## Phase 11 In Progress
 
@@ -38,13 +38,41 @@ Implemented Git evidence-verifier vertical slice:
 Known limitation of this slice:
 
 - `new_commit` proves that repository `HEAD` changed from the immutable task baseline, but does not yet attribute the commit contents to a specific semantic objective.
-- Bamboo build status, Kubernetes rollout health, and exact Jira issue/comment state still require provider-specific response adapters.
+- Bamboo build status and exact Jira issue/comment state still require provider-specific response adapters.
+
+Implemented Kubernetes Deployment availability vertical slice:
+
+```markdown
+## Evidence Verifier: deployment-health
+
+- Provider: kubernetes
+- Required states:
+  - deployment_available
+```
+
+```json
+{
+  "deployment": {
+    "target": "prerelease",
+    "workload": "payroll-api"
+  }
+}
+```
+
+- The immutable contract identifies one canonical Deployment workload, while deployment-target Rules resolve and bind its namespace.
+- The verifier reuses the trusted embedded OCP connector configuration after task authority is applied; it does not consume model-controlled MCP output.
+- Namespace equality is checked before credential/configuration loading or API access, and unsafe resource identities are rejected before I/O.
+- Availability requires `status.observedGeneration >= metadata.generation` and updated, ready, and available replicas all to equal desired replicas.
+- Durable evidence contains only resource kind, replica counters, generation-observed status, and satisfied/unsatisfied/unavailable state.
+- Missing target/workload authority, unavailable reads, stale generations, and incomplete replicas fail closed.
+- This increment takes one authoritative state snapshot. A progressing rollout blocks the current completion; bounded polling and rollout deadlines remain future work.
 
 Phase 11 regression evidence:
 
 - Focused Rules parser, label binding, missing-baseline, and unsupported-provider tests: 2 passed.
 - Focused clean-worktree/new-commit state-transition and local-upstream containment tests: 2 passed.
-- Full Rust suite: 449 passed, 3 ignored, 0 failed in serial mode.
+- Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
+- Full Rust suite: 453 passed, 3 ignored, 0 failed in serial mode.
 - `cargo check` and formatting: passed.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 

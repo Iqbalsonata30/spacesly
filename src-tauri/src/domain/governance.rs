@@ -1070,6 +1070,7 @@ fn normalized_contract_text(contract: &Value) -> String {
     collect_string(contract.pointer("/ticket/title"), &mut values);
     collect_array(contract.pointer("/ticket/labels"), &mut values);
     collect_string(contract.pointer("/deployment/target"), &mut values);
+    collect_string(contract.pointer("/deployment/workload"), &mut values);
     if let Some(workflow) = contract.get("workflow").and_then(Value::as_array) {
         for step in workflow {
             collect_string(step.get("title"), &mut values);
@@ -1503,6 +1504,24 @@ mod tests {
             vec!["clean_worktree", "new_commit", "pushed_upstream"]
         );
         assert_eq!(verifier.source_line, 2);
+    }
+
+    #[test]
+    fn rule_compiler_extracts_kubernetes_deployment_evidence_verifier() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: deployment-health
+- Provider: kubernetes
+- Required states:
+  - deployment_available
+"#,
+        );
+        assert_eq!(facts.evidence_verifiers.len(), 1);
+        assert_eq!(facts.evidence_verifiers[0].provider, "kubernetes");
+        assert_eq!(
+            facts.evidence_verifiers[0].required_states,
+            vec!["deployment_available"]
+        );
     }
 
     #[test]

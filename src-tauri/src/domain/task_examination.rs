@@ -162,6 +162,12 @@ pub struct EvidenceVerifierBindingRecord {
     pub status: String,
     pub matched_labels: Vec<String>,
     pub required_states: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub source: String,
     pub source_line: u32,
     pub reason: String,
@@ -479,7 +485,11 @@ impl TaskExaminationRecord {
                 || !canonical_inventory_name(&record.provider, false)
                 || !matches!(
                     record.status.as_str(),
-                    "ready" | "invalid_rule" | "unsupported_provider" | "missing_repository"
+                    "ready"
+                        | "invalid_rule"
+                        | "unsupported_provider"
+                        | "missing_repository"
+                        | "missing_resource"
                 )
                 || record.matched_labels.len() > MAX_EXAMINATION_ITEMS
                 || record.required_states.is_empty()
@@ -488,6 +498,23 @@ impl TaskExaminationRecord {
                     .required_states
                     .iter()
                     .any(|state| !canonical_inventory_name(state, false))
+                || record
+                    .resource_kind
+                    .as_ref()
+                    .is_some_and(|value| !canonical_inventory_name(value, false))
+                || record
+                    .resource_name
+                    .as_ref()
+                    .is_some_and(|value| !canonical_inventory_name(value, false))
+                || record
+                    .namespace
+                    .as_ref()
+                    .is_some_and(|value| !canonical_inventory_name(value, false))
+                || (record.provider == "kubernetes"
+                    && record.status == "ready"
+                    && (record.resource_kind.as_deref() != Some("deployment")
+                        || record.resource_name.is_none()
+                        || record.namespace.is_none()))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()
@@ -954,6 +981,11 @@ fn resource_references(contract: &Value) -> Vec<TaskResourceReference> {
             "deployment_target",
             "deployment.target",
             &["deployment", "target"][..],
+        ),
+        (
+            "deployment_workload",
+            "deployment.workload",
+            &["deployment", "workload"][..],
         ),
     ] {
         if let Some(value) = contract_path(contract, path)

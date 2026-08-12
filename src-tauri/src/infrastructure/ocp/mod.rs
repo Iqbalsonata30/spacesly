@@ -350,6 +350,125 @@ pub struct OcpConnectorEnv {
     pub bound_namespace: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentAvailabilityEvidence {
+    pub desired_replicas: u64,
+    pub updated_replicas: u64,
+    pub ready_replicas: u64,
+    pub available_replicas: u64,
+    pub generation_observed: bool,
+    pub available: bool,
+}
+
+/// Independently reads one task-bound Deployment and returns only rollout-health counters.
+pub fn verify_deployment_available(
+    environment: &HashMap<String, String>,
+    namespace: &str,
+    name: &str,
+) -> Result<DeploymentAvailabilityEvidence, String> {
+    if !safe_kubernetes_namespace(namespace) || !safe_kubernetes_resource_name(name) {
+        return Err(
+            "Kubernetes evidence verifier received an invalid resource identity.".to_string(),
+        );
+    }
+    if environment
+        .get(TASK_BOUND_NAMESPACE_ENV)
+        .map(String::as_str)
+        != Some(namespace)
+    {
+        return Err("Kubernetes evidence verifier namespace is not task-bound.".to_string());
+    }
+    let mode = environment
+        .get(ENV_MODE)
+        .and_then(|value| OcpAuthMode::parse(value))
+        .ok_or_else(|| "Kubernetes evidence verifier has no valid connector mode.".to_string())?;
+    let env = OcpConnectorEnv {
+        mode,
+        kubeconfig: environment.get(ENV_KUBECONFIG).cloned(),
+        context: environment.get(ENV_CONTEXT).cloned(),
+        server: environment.get(ENV_SERVER).cloned(),
+        default_namespace: Some(namespace.to_string()),
+        credentials_file: environment.get(ENV_CREDENTIALS_FILE).map(PathBuf::from),
+        connector_dir: environment.get(ENV_CONNECTOR_DIR).map(PathBuf::from),
+        approved_operation: None,
+        approved_arguments_digest: None,
+        bound_namespace: Some(namespace.to_string()),
+    };
+    let cluster = resolve_cluster(&env).map_err(|error| error.to_string())?;
+    let client =
+        OcpClient::build(&cluster, OcpTimeouts::default()).map_err(|error| error.to_string())?;
+    let deployment = client
+        .get_namespaced("apps", "v1", "deployments", name, Some(namespace))
+        .map_err(|error| error.to_string())?;
+    Ok(deployment_availability_evidence(&deployment))
+}
+
+fn deployment_availability_evidence(deployment: &Value) -> DeploymentAvailabilityEvidence {
+    let desired = deployment
+        .pointer("/spec/replicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let updated = deployment
+        .pointer("/status/updatedReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ready = deployment
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let available = deployment
+        .pointer("/status/availableReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let generation_observed = observed >= generation;
+    DeploymentAvailabilityEvidence {
+        desired_replicas: desired,
+        updated_replicas: updated,
+        ready_replicas: ready,
+        available_replicas: available,
+        generation_observed,
+        available: generation_observed
+            && updated == desired
+            && ready == desired
+            && available == desired,
+    }
+}
+
+fn safe_kubernetes_namespace(value: &str) -> bool {
+    safe_kubernetes_label(value, 63, false)
+}
+
+fn safe_kubernetes_resource_name(value: &str) -> bool {
+    safe_kubernetes_label(value, 253, true)
+}
+
+fn safe_kubernetes_label(value: &str, max_len: usize, allow_dot: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'-'
+                || (allow_dot && byte == b'.')
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 impl OcpConnectorEnv {
     pub fn from_env() -> Result<Self, String> {
         let mode = required_env(ENV_MODE)?;
@@ -1151,6 +1270,76 @@ fn set_private_file_permissions(_path: &Path) -> OcpResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_availability_requires_observed_generation_and_all_replicas() {
+        let healthy = deployment_availability_evidence(&json!({
+            "metadata": {"generation": 7},
+            "spec": {"replicas": 3},
+            "status": {
+                "observedGeneration": 7,
+                "updatedReplicas": 3,
+                "readyReplicas": 3,
+                "availableReplicas": 3
+            }
+        }));
+        assert!(healthy.available);
+        assert!(healthy.generation_observed);
+
+        let stale = deployment_availability_evidence(&json!({
+            "metadata": {"generation": 8},
+            "spec": {"replicas": 3},
+            "status": {
+                "observedGeneration": 7,
+                "updatedReplicas": 3,
+                "readyReplicas": 3,
+                "availableReplicas": 3
+            }
+        }));
+        assert!(!stale.available);
+        assert!(!stale.generation_observed);
+
+        let progressing = deployment_availability_evidence(&json!({
+            "metadata": {"generation": 8},
+            "spec": {"replicas": 3},
+            "status": {
+                "observedGeneration": 8,
+                "updatedReplicas": 3,
+                "readyReplicas": 2,
+                "availableReplicas": 2
+            }
+        }));
+        assert!(!progressing.available);
+        assert_eq!(progressing.ready_replicas, 2);
+    }
+
+    #[test]
+    fn deployment_availability_verifier_requires_exact_task_namespace_before_io() {
+        let environment = HashMap::from([
+            (ENV_MODE.to_string(), "kubeconfig".to_string()),
+            (ENV_KUBECONFIG.to_string(), "/does/not/exist".to_string()),
+            (TASK_BOUND_NAMESPACE_ENV.to_string(), "prestage".to_string()),
+        ]);
+        let error = verify_deployment_available(&environment, "production", "api")
+            .expect_err("namespace mismatch blocks before kubeconfig access");
+        assert!(error.contains("namespace is not task-bound"));
+
+        let invalid = verify_deployment_available(&environment, "prestage", "../api")
+            .expect_err("unsafe resource identity blocks before kubeconfig access");
+        assert!(invalid.contains("invalid resource identity"));
+
+        let invalid_namespace = HashMap::from([
+            (ENV_MODE.to_string(), "kubeconfig".to_string()),
+            (ENV_KUBECONFIG.to_string(), "/does/not/exist".to_string()),
+            (
+                TASK_BOUND_NAMESPACE_ENV.to_string(),
+                "pre.stage".to_string(),
+            ),
+        ]);
+        let invalid = verify_deployment_available(&invalid_namespace, "pre.stage", "api")
+            .expect_err("invalid namespace blocks before kubeconfig access");
+        assert!(invalid.contains("invalid resource identity"));
+    }
     use crate::infrastructure::ocp::tools::OcpTool;
 
     #[test]

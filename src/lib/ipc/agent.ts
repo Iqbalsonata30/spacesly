@@ -88,7 +88,9 @@ export interface ExecutionContract {
   };
   /** Optional deterministic selector resolved only through the user's deployment Rules table. */
   deployment?: {
-    target: string;
+    target?: string;
+    /** Kubernetes Deployment name used by deterministic rollout-health evidence policies. */
+    workload?: string;
   };
   capability_plan: {
     schema_version: 1;

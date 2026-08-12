@@ -309,7 +309,14 @@ Implemented Git evidence-verifier increment:
 - Spacesly evaluates those states directly in the resolved trusted repository after the worker returns but before accepting completion.
 - `new_commit` compares current `HEAD` with the immutable contract `repository.head_commit`; `pushed_upstream` requires an upstream and proves that upstream contains `HEAD`.
 - Results persist as secret-free state/status evidence. Unsatisfied or unavailable required states block completion independently of the model summary.
-- Unsupported providers fail closed when an applicable rule is requested; Bamboo, Kubernetes, and Jira semantic adapters remain planned.
+- Unsupported providers fail closed when an applicable rule is requested; Bamboo and Jira semantic adapters remain planned.
+
+Implemented Kubernetes Deployment availability increment:
+
+- The immutable contract declares `deployment.workload`, while the existing deployment-target Rules bind its namespace.
+- Spacesly independently reads that exact Deployment through the trusted embedded OCP connector configuration rather than trusting model-controlled MCP output.
+- Availability requires the controller to have observed the current generation and updated, ready, and available replicas all to equal desired replicas.
+- Namespace mismatch and unsafe resource identities fail before credentials are loaded or cluster I/O begins.
 
 Benefits:
 
