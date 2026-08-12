@@ -329,6 +329,14 @@ Implemented Bamboo exact build-result increment:
 - Successful state for a different build, prose-only claims, failed states, and unknown response shapes block completion.
 - Optional Rules-controlled polling follows an in-progress build with bounded intervals, a bounded overall deadline, assignment-fence checks between reads, and per-request timeouts capped by the remaining deadline. Connector errors are not blindly retried.
 
+Implemented Jira exact issue-status increment:
+
+- User Rules select one Jira connector, one semantic read operation, the `expected_status` terminal predicate, and a bounded `Expected status` value.
+- The immutable task supplies `ticket.provider=jira` and one canonical Jira issue key; Spacesly never infers issue authority from task prose.
+- Live MCP discovery must resolve the Rules operation to exactly one read-only tool with exactly one supported issue-key argument.
+- After execution, Spacesly independently reads that exact issue and strictly accepts only structured JSON containing the same key and one unambiguous status equal to the Rules value.
+- A different issue key, multiple statuses, status mismatch, prose-only output, unknown response shape, mutation-classified tool, or connector failure blocks completion without retaining raw output or diagnostics.
+
 Benefits:
 
 - Evidence becomes independently checkable rather than descriptive text.
@@ -341,7 +349,7 @@ Trade-offs:
 
 Exit criteria:
 
-- High-risk objective types have an authoritative verifier.
+- High-risk objective types have an authoritative verifier; exact Jira comment-state verification remains open.
 - Verification failures retain the mutation receipt and block safely.
 
 ### Phase 12 — Evaluation and Regression Harness

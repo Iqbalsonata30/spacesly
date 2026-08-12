@@ -8,6 +8,7 @@ pub mod files;
 pub mod formatting;
 pub mod git;
 pub mod global_environment;
+pub mod jira;
 pub mod jira_rest;
 pub mod lsp;
 pub mod mcp;

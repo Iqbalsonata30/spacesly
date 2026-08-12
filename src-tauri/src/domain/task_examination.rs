@@ -173,6 +173,8 @@ pub struct EvidenceVerifierBindingRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval_seconds: Option<u64>,
@@ -530,6 +532,13 @@ impl TaskExaminationRecord {
                     .resource_name
                     .as_ref()
                     .is_some_and(|value| !canonical_inventory_name(value, false))
+                || record.expected_status.as_ref().is_some_and(|value| {
+                    value.trim() != value
+                        || value.is_empty()
+                        || value.len() > 128
+                        || value.chars().any(char::is_control)
+                })
+                || (record.provider != "jira" && record.expected_status.is_some())
                 || record
                     .namespace
                     .as_ref()
@@ -558,6 +567,18 @@ impl TaskExaminationRecord {
                         || record.read_tool.is_none()
                         || record.read_argument.is_none()
                         || record.resource_kind.as_deref() != Some("build")))
+                || (record.provider == "jira"
+                    && record.status == "ready"
+                    && (record.connector_id.is_none()
+                        || record.read_tool.is_none()
+                        || record.read_argument.is_none()
+                        || record.resource_kind.as_deref() != Some("issue")
+                        || record.resource_name.as_deref().is_none_or(|value| {
+                            !crate::infrastructure::jira::canonical_jira_issue_key(value)
+                        })
+                        || record.expected_status.as_deref().is_none_or(|value| {
+                            !crate::infrastructure::jira::valid_jira_status(value)
+                        })))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()

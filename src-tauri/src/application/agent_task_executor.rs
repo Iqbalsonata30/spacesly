@@ -29,6 +29,10 @@ use crate::infrastructure::bamboo::{
     BambooEvidenceError,
 };
 use crate::infrastructure::git::repository_root_at;
+use crate::infrastructure::jira::{
+    canonical_jira_issue_key, parse_jira_issue_status_evidence, valid_jira_status,
+    JiraEvidenceError,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -369,6 +373,7 @@ fn resolve_evidence_verifier_bindings(
             }),
             "kubernetes" => verifier.required_states == ["deployment_available"],
             "bamboo" => verifier.required_states == ["successful_build"],
+            "jira" => verifier.required_states == ["expected_status"],
             _ => false,
         };
         let workload = contract
@@ -386,22 +391,33 @@ fn resolve_evidence_verifier_bindings(
             .and_then(Value::as_str)
             .map(str::trim)
             .is_some_and(|provider| provider.eq_ignore_ascii_case("bamboo"));
-        let bamboo_connector_rule = verifier.connector_id.as_ref().and_then(|connector_id| {
+        let jira_issue_key = contract
+            .pointer("/ticket/key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_uppercase)
+            .filter(|value| canonical_jira_issue_key(value));
+        let jira_ticket_provider = contract
+            .pointer("/ticket/provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("jira"));
+        let external_connector_rule = verifier.connector_id.as_ref().and_then(|connector_id| {
             rule_facts.connectors.iter().find(|rule| {
-                rule.id == *connector_id && rule.connector_type.eq_ignore_ascii_case("bamboo")
+                rule.id == *connector_id
+                    && rule.connector_type.eq_ignore_ascii_case(&verifier.provider)
             })
         });
-        let bamboo_capability = verifier.connector_id.as_ref().and_then(|connector_id| {
+        let external_capability = verifier.connector_id.as_ref().and_then(|connector_id| {
             capabilities.iter().find(|capability| {
                 capability.connector_id == *connector_id
                     && capability.status == ConnectorDiscoveryStatus::Available
             })
         });
-        let bamboo_read_tool = match (
+        let external_read_tool = match (
             verifier.read_operation.as_deref(),
             verifier.connector_id.as_deref(),
-            bamboo_connector_rule,
-            bamboo_capability,
+            external_connector_rule,
+            external_capability,
         ) {
             (Some(operation), Some(connector_id), Some(rule), Some(capability)) => {
                 matching_connector_tool(
@@ -420,8 +436,8 @@ fn resolve_evidence_verifier_bindings(
             }
             _ => None,
         };
-        let bamboo_read_argument = bamboo_read_tool.as_ref().and_then(|tool| {
-            let capability = bamboo_capability?;
+        let external_read_argument = external_read_tool.as_ref().and_then(|tool| {
+            let capability = external_capability?;
             let tool = capability
                 .tools
                 .iter()
@@ -429,15 +445,17 @@ fn resolve_evidence_verifier_bindings(
             let candidates = tool
                 .argument_names
                 .iter()
-                .filter(|argument| {
-                    matches!(
+                .filter(|argument| match verifier.provider.as_str() {
+                    "bamboo" => matches!(
                         argument.as_str(),
                         "result_key"
                             | "build_result_key"
                             | "buildResultKey"
                             | "build_key"
                             | "buildKey"
-                    )
+                    ),
+                    "jira" => matches!(argument.as_str(), "issue_key" | "issueKey" | "key"),
+                    _ => false,
                 })
                 .collect::<Vec<_>>();
             (candidates.len() == 1).then(|| candidates[0].clone())
@@ -471,14 +489,22 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Evidence polling requires Kubernetes or Bamboo plus both bounded interval and timeout seconds.",
             )
-        } else if verifier.provider != "bamboo"
+        } else if verifier.provider != "jira" && verifier.expected_status.is_some() {
+            (
+                "invalid_rule",
+                "Expected status is supported only by the Jira evidence adapter.",
+            )
+        } else if !matches!(verifier.provider.as_str(), "bamboo" | "jira")
             && (verifier.connector_id.is_some() || verifier.read_operation.is_some())
         {
             (
                 "invalid_rule",
-                "Connector and Read operation fields are supported only by the Bamboo evidence adapter.",
+                "Connector and Read operation fields require a supported external evidence adapter.",
             )
-        } else if !matches!(verifier.provider.as_str(), "git" | "kubernetes" | "bamboo") {
+        } else if !matches!(
+            verifier.provider.as_str(),
+            "git" | "kubernetes" | "bamboo" | "jira"
+        ) {
             (
                 "unsupported_provider",
                 "This evidence verifier provider has no deterministic adapter yet.",
@@ -488,7 +514,7 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Evidence Verifier required states are not supported by this provider adapter.",
             )
-        } else if verifier.provider == "bamboo"
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
             && (verifier
                 .connector_id
                 .as_deref()
@@ -500,21 +526,21 @@ fn resolve_evidence_verifier_bindings(
         {
             (
                 "invalid_rule",
-                "Bamboo evidence verification requires canonical Connector and Read operation fields.",
+                "External evidence verification requires canonical Connector and Read operation fields.",
             )
-        } else if verifier.provider == "bamboo"
-            && (bamboo_connector_rule.is_none() || bamboo_capability.is_none())
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
+            && (external_connector_rule.is_none() || external_capability.is_none())
         {
             (
                 "missing_connector",
-                "Bamboo evidence verification requires one selected, available Bamboo Connector Rule.",
+                "External evidence verification requires one selected, available matching Connector Rule.",
             )
-        } else if verifier.provider == "bamboo"
-            && (bamboo_read_tool.is_none() || bamboo_read_argument.is_none())
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
+            && (external_read_tool.is_none() || external_read_argument.is_none())
         {
             (
                 "missing_operation",
-                "The Bamboo read operation is absent, ambiguous, or not classified read-only.",
+                "The external read operation is absent, ambiguous, or not classified read-only.",
             )
         } else if verifier.provider == "kubernetes" && !trusted_kubernetes_connector {
             (
@@ -547,6 +573,22 @@ fn resolve_evidence_verifier_bindings(
                 "missing_resource",
                 "Bamboo successful-build verification requires build.provider=bamboo authority.",
             )
+        } else if verifier.provider == "jira" && (!jira_ticket_provider || jira_issue_key.is_none())
+        {
+            (
+                "missing_resource",
+                "Jira status verification requires an exact immutable Jira ticket key.",
+            )
+        } else if verifier.provider == "jira"
+            && verifier
+                .expected_status
+                .as_deref()
+                .is_none_or(|status| !valid_jira_status(status))
+        {
+            (
+                "invalid_rule",
+                "Jira expected-status verification requires a bounded Expected status value.",
+            )
         } else {
             let reason = if verifier.provider == "kubernetes" {
                 "The Deployment verifier is bound to the trusted connector and resolved resource identity."
@@ -556,6 +598,8 @@ fn resolve_evidence_verifier_bindings(
                 } else {
                     "The Bamboo verifier is bound to one live read tool and requires a trusted trigger receipt before verification."
                 }
+            } else if verifier.provider == "jira" {
+                "The Jira verifier is bound to one live read tool, exact immutable issue key, and Rules-defined expected status."
             } else {
                 "The Git terminal-state verifier is bound to the resolved trusted repository."
             };
@@ -571,25 +615,30 @@ fn resolve_evidence_verifier_bindings(
             status: status.to_string(),
             matched_labels,
             required_states: verifier.required_states.clone(),
-            connector_id: (verifier.provider == "bamboo")
+            connector_id: matches!(verifier.provider.as_str(), "bamboo" | "jira")
                 .then(|| verifier.connector_id.clone())
                 .flatten(),
-            read_tool: (verifier.provider == "bamboo")
-                .then(|| bamboo_read_tool.clone())
+            read_tool: matches!(verifier.provider.as_str(), "bamboo" | "jira")
+                .then(|| external_read_tool.clone())
                 .flatten(),
-            read_argument: (verifier.provider == "bamboo")
-                .then(|| bamboo_read_argument.clone())
+            read_argument: matches!(verifier.provider.as_str(), "bamboo" | "jira")
+                .then(|| external_read_argument.clone())
                 .flatten(),
             resource_kind: match verifier.provider.as_str() {
                 "kubernetes" => Some("deployment".to_string()),
                 "bamboo" => Some("build".to_string()),
+                "jira" => Some("issue".to_string()),
                 _ => None,
             },
             resource_name: match verifier.provider.as_str() {
                 "kubernetes" => workload.map(str::to_string),
                 "bamboo" => build_result_key.map(|value| value.to_ascii_uppercase()),
+                "jira" => jira_issue_key,
                 _ => None,
             },
+            expected_status: (verifier.provider == "jira")
+                .then(|| verifier.expected_status.clone())
+                .flatten(),
             namespace: (verifier.provider == "kubernetes")
                 .then(|| deployment_target.map(|target| target.namespace.clone()))
                 .flatten(),
@@ -934,6 +983,51 @@ where
             });
         }
         wait(interval.min(deadline.saturating_sub(after_read)))?;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JiraIssueStatusVerification {
+    state: &'static str,
+    observed_status: Option<String>,
+    satisfied: bool,
+}
+
+fn verify_jira_issue_status(
+    response: Result<Value, String>,
+    issue_key: &str,
+    expected_status: &str,
+) -> JiraIssueStatusVerification {
+    match response {
+        Ok(response) => match parse_jira_issue_status_evidence(&response, issue_key) {
+            Ok(evidence) if evidence.status.eq_ignore_ascii_case(expected_status) => {
+                JiraIssueStatusVerification {
+                    state: "satisfied",
+                    observed_status: Some(evidence.status),
+                    satisfied: true,
+                }
+            }
+            Ok(evidence) => JiraIssueStatusVerification {
+                state: "status_mismatch",
+                observed_status: Some(evidence.status),
+                satisfied: false,
+            },
+            Err(JiraEvidenceError::Conflict) => JiraIssueStatusVerification {
+                state: "conflict",
+                observed_status: None,
+                satisfied: false,
+            },
+            Err(JiraEvidenceError::Unavailable) => JiraIssueStatusVerification {
+                state: "unavailable",
+                observed_status: None,
+                satisfied: false,
+            },
+        },
+        Err(_) => JiraIssueStatusVerification {
+            state: "unavailable",
+            observed_status: None,
+            satisfied: false,
+        },
     }
 }
 
@@ -2794,9 +2888,11 @@ impl TaskExecutor for AgentTaskExecutor {
         }
         resolved.config.task_tool_authority = task_tool_authority;
         let mut evidence_ocp_environment = None;
-        let bamboo_evidence_connector_ids = bound_evidence_verifiers
+        let external_evidence_connector_ids = bound_evidence_verifiers
             .iter()
-            .filter(|binding| binding.provider == "bamboo" && binding.status == "ready")
+            .filter(|binding| {
+                matches!(binding.provider.as_str(), "bamboo" | "jira") && binding.status == "ready"
+            })
             .filter_map(|binding| binding.connector_id.clone())
             .collect::<HashSet<_>>();
         let mut evidence_mcp_connectors = HashMap::new();
@@ -2817,7 +2913,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 }
                 evidence_ocp_environment = Some(server.environment.clone());
             }
-            if bamboo_evidence_connector_ids.contains(&server.secret_id) {
+            if external_evidence_connector_ids.contains(&server.secret_id) {
                 evidence_mcp_connectors.insert(
                     server.secret_id.clone(),
                     (server.command.clone(), server.environment.clone()),
@@ -3290,6 +3386,71 @@ impl TaskExecutor for AgentTaskExecutor {
                 if !satisfied {
                     return Err(TaskExecutionError::blocked(
                         "Bamboo successful-build verification blocked completion.",
+                    ));
+                }
+            }
+            for binding in bound_evidence_verifiers
+                .iter()
+                .filter(|binding| binding.provider == "jira")
+            {
+                let connector_id = binding.connector_id.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Jira evidence connector is missing.")
+                })?;
+                let tool = binding.read_tool.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Jira evidence read tool is missing.")
+                })?;
+                let argument = binding.read_argument.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Jira evidence read argument is missing.")
+                })?;
+                let issue_key = binding.resource_name.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Jira evidence issue identity is missing.")
+                })?;
+                let expected_status = binding.expected_status.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Jira expected status is missing.")
+                })?;
+                context.authorize_capability(&format!("external_tools:{connector_id}"))?;
+                let (command, environment) =
+                    evidence_mcp_connectors.get(connector_id).ok_or_else(|| {
+                        TaskExecutionError::blocked(
+                            "Jira evidence verifier lost its trusted connector configuration.",
+                        )
+                    })?;
+                context.ensure_current()?;
+                let arguments = Value::Object(serde_json::Map::from_iter([(
+                    argument.to_string(),
+                    json!(issue_key),
+                )]));
+                let response = crate::infrastructure::mcp::call_mcp_read_tool(
+                    connector_id,
+                    command,
+                    environment,
+                    tool,
+                    arguments,
+                    Duration::from_secs(45),
+                );
+                context.ensure_current()?;
+                let verification = verify_jira_issue_status(response, issue_key, expected_status);
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "evidence_verifier_result",
+                        "schema_version": 1,
+                        "provider": "jira",
+                        "status": if verification.satisfied { "satisfied" } else { "blocked" },
+                        "connector_id": connector_id,
+                        "resource_kind": "issue",
+                        "resource_name": issue_key,
+                        "evidence": [{
+                            "state": "expected_status",
+                            "status": verification.state,
+                            "expected_status": expected_status,
+                            "observed_status": verification.observed_status,
+                        }],
+                    }),
+                )?;
+                if !verification.satisfied {
+                    return Err(TaskExecutionError::blocked(
+                        "Jira issue-status verification blocked completion.",
                     ));
                 }
             }
@@ -5734,6 +5895,7 @@ mod tests {
             read_argument: None,
             resource_kind: None,
             resource_name: None,
+            expected_status: None,
             namespace: None,
             poll_interval_seconds: None,
             timeout_seconds: None,
@@ -6093,6 +6255,50 @@ mod tests {
     }
 
     #[test]
+    fn jira_issue_status_verification_satisfies_only_exact_expected_state() {
+        let satisfied = verify_jira_issue_status(
+            Ok(json!({
+                "key": "OPS-42",
+                "fields": {"status": {"name": "In Progress"}}
+            })),
+            "OPS-42",
+            "in progress",
+        );
+        assert_eq!(satisfied.state, "satisfied");
+        assert_eq!(satisfied.observed_status.as_deref(), Some("In Progress"));
+        assert!(satisfied.satisfied);
+
+        let mismatch = verify_jira_issue_status(
+            Ok(json!({"key": "OPS-42", "status": "To Do"})),
+            "OPS-42",
+            "In Progress",
+        );
+        assert_eq!(mismatch.state, "status_mismatch");
+        assert_eq!(mismatch.observed_status.as_deref(), Some("To Do"));
+        assert!(!mismatch.satisfied);
+
+        let conflict = verify_jira_issue_status(
+            Ok(json!({"key": "OPS-43", "status": "In Progress"})),
+            "OPS-42",
+            "In Progress",
+        );
+        assert_eq!(conflict.state, "conflict");
+        assert!(!conflict.satisfied);
+    }
+
+    #[test]
+    fn jira_issue_status_verification_redacts_connector_failure() {
+        let verification = verify_jira_issue_status(
+            Err("transport failed with password=must-not-retain".to_string()),
+            "OPS-42",
+            "Done",
+        );
+        assert_eq!(verification.state, "unavailable");
+        assert_eq!(verification.observed_status, None);
+        assert!(!format!("{verification:?}").contains("must-not-retain"));
+    }
+
+    #[test]
     fn git_evidence_verifier_observes_clean_new_commit_and_upstream_state() {
         let directory = tempdir().expect("workspace");
         let repository = directory.path().join("repository");
@@ -6329,6 +6535,94 @@ mod tests {
         assert_eq!(records[0].status, "invalid_rule");
         assert_eq!(records[0].poll_interval_seconds, None);
         assert_eq!(records[0].timeout_seconds, None);
+        assert_eq!(blockers.len(), 1);
+    }
+
+    #[test]
+    fn jira_evidence_verifier_binds_exact_issue_status_read() {
+        let jira_rule = crate::domain::governance::EvidenceVerifierRuleFact {
+            id: "jira-in-progress".to_string(),
+            provider: "jira".to_string(),
+            connector_id: Some("corporate-jira".to_string()),
+            read_operation: Some("get_issue".to_string()),
+            expected_status: Some("In Progress".to_string()),
+            required_states: vec!["expected_status".to_string()],
+            source: "global.agent_rules".to_string(),
+            source_line: 60,
+            ..Default::default()
+        };
+        let facts = RuleFactsRecord {
+            connectors: vec![ConnectorRuleFact {
+                id: "corporate-jira".to_string(),
+                connector_type: "jira".to_string(),
+                ..Default::default()
+            }],
+            evidence_verifiers: vec![jira_rule.clone()],
+            ..Default::default()
+        };
+        let capability = crate::domain::task_examination::ConnectorCapabilitySnapshot {
+            connector_id: "corporate-jira".to_string(),
+            status: ConnectorDiscoveryStatus::Available,
+            tools: vec![crate::domain::task_examination::DiscoveredToolCapability {
+                name: "jira_get_issue".to_string(),
+                risk: "read".to_string(),
+                argument_names: vec!["issue_key".to_string()],
+            }],
+            error: None,
+            warnings: Vec::new(),
+        };
+        let contract = json!({
+            "ticket": {"provider": "jira", "key": "OPS-42", "labels": []}
+        });
+        let (records, blockers) = resolve_evidence_verifier_bindings(
+            &contract,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-jira".to_string()],
+                connector_ids: &["corporate-jira".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: std::slice::from_ref(&capability),
+            },
+        );
+        assert!(blockers.is_empty());
+        assert_eq!(records[0].status, "ready");
+        assert_eq!(records[0].read_tool.as_deref(), Some("jira_get_issue"));
+        assert_eq!(records[0].read_argument.as_deref(), Some("issue_key"));
+        assert_eq!(records[0].resource_name.as_deref(), Some("OPS-42"));
+        assert_eq!(records[0].expected_status.as_deref(), Some("In Progress"));
+
+        let (missing, blockers) = resolve_evidence_verifier_bindings(
+            &json!({"ticket": {"provider": "local", "key": null, "labels": []}}),
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-jira".to_string()],
+                connector_ids: &["corporate-jira".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: std::slice::from_ref(&capability),
+            },
+        );
+        assert_eq!(missing[0].status, "missing_resource");
+        assert_eq!(blockers.len(), 1);
+
+        let mut invalid = facts;
+        invalid.evidence_verifiers[0].expected_status = Some("\nsecret".to_string());
+        let (invalid_records, blockers) = resolve_evidence_verifier_bindings(
+            &contract,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-jira".to_string()],
+                connector_ids: &["corporate-jira".to_string()],
+                rule_facts: &invalid,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[capability],
+            },
+        );
+        assert_eq!(invalid_records[0].status, "invalid_rule");
         assert_eq!(blockers.len(), 1);
     }
 
