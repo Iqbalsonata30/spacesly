@@ -538,9 +538,9 @@ impl TaskExaminationRecord {
                     && record.status == "ready"
                     && (record.resource_kind.as_deref() != Some("deployment")
                         || record.resource_name.is_none()
-                        || record.namespace.is_none()
-                        || record.poll_interval_seconds.is_some()
-                            != record.timeout_seconds.is_some()
+                        || record.namespace.is_none()))
+                || (record.status == "ready"
+                    && (record.poll_interval_seconds.is_some() != record.timeout_seconds.is_some()
                         || record
                             .poll_interval_seconds
                             .is_some_and(|value| !(1..=30).contains(&value))
@@ -550,15 +550,14 @@ impl TaskExaminationRecord {
                                     .poll_interval_seconds
                                     .is_some_and(|interval| interval > value)
                         })))
-                || (record.provider != "kubernetes"
+                || (!matches!(record.provider.as_str(), "kubernetes" | "bamboo")
                     && (record.poll_interval_seconds.is_some() || record.timeout_seconds.is_some()))
                 || (record.provider == "bamboo"
                     && record.status == "ready"
                     && (record.connector_id.is_none()
                         || record.read_tool.is_none()
                         || record.read_argument.is_none()
-                        || record.resource_kind.as_deref() != Some("build")
-                        || record.resource_name.is_none()))
+                        || record.resource_kind.as_deref() != Some("build")))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()

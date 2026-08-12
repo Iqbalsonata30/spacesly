@@ -1076,6 +1076,7 @@ pub fn call_mcp_read_tool(
     environment: &HashMap<String, String>,
     tool_name: &str,
     arguments: Value,
+    request_timeout: Duration,
 ) -> Result<Value, String> {
     if !canonical_capability_name(connector_id)
         || !canonical_capability_name(tool_name)
@@ -1095,7 +1096,13 @@ pub fn call_mcp_read_tool(
         scope_id: Some(format!("agent-evidence:{connector_id}")),
         secret_id: Some(connector_id.to_string()),
     };
-    let result = with_mcp_client(&server, |client| client.call_tool(tool_name, arguments));
+    let request_timeout = request_timeout
+        .min(Duration::from_secs(45))
+        .max(Duration::from_millis(1));
+    let deadline = Instant::now() + request_timeout;
+    let result = with_mcp_client_until(&server, Some(deadline), |client| {
+        client.call_tool_with_timeout(tool_name, arguments, remaining_mcp_timeout(deadline))
+    });
     let _ = close_mcp_session(server);
     result
 }
@@ -1378,9 +1385,13 @@ impl StdioMcpClient {
     }
 
     fn initialize(&self) -> Result<(), String> {
+        self.initialize_with_timeout(Duration::from_secs(45))
+    }
+
+    fn initialize_with_timeout(&self, timeout: Duration) -> Result<(), String> {
         let metric =
             crate::infrastructure::performance::span("mcp_transport_initialization_ms", "mcp");
-        self.request(
+        self.request_with_timeout(
             "initialize",
             json!({
                 "protocolVersion": "2024-11-05",
@@ -1390,6 +1401,7 @@ impl StdioMcpClient {
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            timeout,
         )?;
         self.notify("notifications/initialized", json!({}))?;
         metric.finish();
@@ -1397,19 +1409,32 @@ impl StdioMcpClient {
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        ToolBroker::validate_mcp_call(name, &self.tools()?, &arguments)?;
-        self.request(
+        self.call_tool_with_timeout(name, arguments, Duration::from_secs(45))
+    }
+
+    fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        ToolBroker::validate_mcp_call(name, &self.tools_with_timeout(timeout)?, &arguments)?;
+        self.request_with_timeout(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments
             }),
+            timeout,
         )
     }
 
-    fn list_tool_metadata(&self) -> Result<Vec<McpToolMetadata>, String> {
+    fn list_tool_metadata_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<McpToolMetadata>, String> {
         let discovery = crate::infrastructure::performance::span("mcp_schema_discovery_ms", "mcp");
-        let result = self.request("tools/list", json!({}))?;
+        let result = self.request_with_timeout("tools/list", json!({}), timeout)?;
         if crate::infrastructure::performance::mode()
             == crate::infrastructure::performance::PerformanceMode::Profiling
         {
@@ -1455,6 +1480,10 @@ impl StdioMcpClient {
     }
 
     fn tools(&self) -> Result<Vec<String>, String> {
+        self.tools_with_timeout(Duration::from_secs(45))
+    }
+
+    fn tools_with_timeout(&self, timeout: Duration) -> Result<Vec<String>, String> {
         if let Some(metadata) = self
             .tool_metadata
             .lock()
@@ -1465,7 +1494,7 @@ impl StdioMcpClient {
             return Ok(metadata.into_iter().map(|tool| tool.name).collect());
         }
         crate::infrastructure::performance::increment("mcp_schema_cache_misses_total", "mcp", 1);
-        let metadata = self.list_tool_metadata()?;
+        let metadata = self.list_tool_metadata_with_timeout(timeout)?;
         let tools: Vec<String> = metadata.iter().map(|tool| tool.name.clone()).collect();
         *self
             .tool_metadata
@@ -1503,7 +1532,12 @@ impl StdioMcpClient {
         )
     }
 
-    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let message = json!({
             "jsonrpc": "2.0",
@@ -1522,7 +1556,7 @@ impl StdioMcpClient {
             return Err(error);
         }
 
-        let response = receiver.recv_timeout(Duration::from_secs(45)).map_err(|error| {
+        let response = receiver.recv_timeout(timeout).map_err(|error| {
             let _ = self.pending.lock().map(|mut pending| pending.remove(&id));
             let stderr = self
                 .stderr
@@ -1537,9 +1571,9 @@ impl StdioMcpClient {
             if let Some(reader_error) = reader_error {
                 reader_error
             } else if stderr.is_empty() {
-                format!("Timed out waiting for MCP response after 45s. The MCP server started but did not answer this request. Verify the selected tool arguments. Internal timeout: {error}")
+                format!("Timed out waiting for MCP response after {}s. The MCP server started but did not answer this request. Verify the selected tool arguments. Internal timeout: {error}", timeout.as_secs())
             } else {
-                format!("Timed out waiting for MCP response after 45s. MCP stderr: {stderr}")
+                format!("Timed out waiting for MCP response after {}s. MCP stderr: {stderr}", timeout.as_secs())
             }
         })?;
 
@@ -1650,6 +1684,17 @@ fn with_mcp_client<T, F>(server: &McpServerConfig, operation: F) -> Result<T, St
 where
     F: FnOnce(&StdioMcpClient) -> Result<T, String>,
 {
+    with_mcp_client_until(server, None, operation)
+}
+
+fn with_mcp_client_until<T, F>(
+    server: &McpServerConfig,
+    deadline: Option<Instant>,
+    operation: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&StdioMcpClient) -> Result<T, String>,
+{
     let key = mcp_server_key(server);
     let manager = mcp_session_manager();
     let now = Instant::now();
@@ -1705,8 +1750,13 @@ where
                 existing
             } else {
                 let client = StdioMcpClient::start(server)?;
-                client.initialize()?;
-                client.tools()?;
+                if let Some(deadline) = deadline {
+                    client.initialize_with_timeout(remaining_mcp_timeout(deadline))?;
+                    client.tools_with_timeout(remaining_mcp_timeout(deadline))?;
+                } else {
+                    client.initialize()?;
+                    client.tools()?;
+                }
                 let candidate = Arc::new(client);
                 let evicted = {
                     let mut sessions =
@@ -1753,6 +1803,12 @@ where
         }
     }
     result
+}
+
+fn remaining_mcp_timeout(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1))
 }
 
 fn mcp_error_invalidates_session(error: &str) -> bool {
@@ -2691,12 +2747,40 @@ done
             &HashMap::new(),
             "bamboo_get_build",
             json!({"result_key": "PAYROLL-DEPLOY-42"}),
+            Duration::from_secs(5),
         )
         .expect("read-only evidence call succeeds");
         assert_eq!(
             result.pointer("/content/0/type").and_then(Value::as_str),
             Some("text")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_evidence_timeout_bounds_cold_initialization() {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) sleep 2 ;;
+  esac
+done
+"#;
+        let connector_id = format!("slow-evidence-{}", request_seed());
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let started = Instant::now();
+        let error = call_mcp_read_tool(
+            &connector_id,
+            &command,
+            &HashMap::new(),
+            "bamboo_get_build",
+            json!({"result_key": "PAYROLL-DEPLOY-42"}),
+            Duration::from_millis(100),
+        )
+        .expect_err("cold initialization must respect the evidence deadline");
+
+        assert!(error.contains("Timed out waiting for MCP response"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -2707,6 +2791,7 @@ done
             &HashMap::new(),
             "bamboo_trigger_build",
             json!({"plan_key": "PAYROLL-DEPLOY"}),
+            Duration::from_secs(5),
         )
         .expect_err("mutation tool must be rejected before connector spawn");
         assert!(error.contains("not read-only"));

@@ -858,6 +858,14 @@ pub struct AgentTaskObjectiveResult {
     pub blocked_reason: Option<String>,
 }
 
+/// Secret-free identity of an external resource created by a successful tool call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalResourceReference {
+    pub provider: String,
+    pub resource_kind: String,
+    pub resource_id: String,
+}
+
 /// Secret-free identity of a successful tool call supporting an objective checkpoint.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTaskObjectiveToolReceipt {
@@ -867,6 +875,8 @@ pub struct AgentTaskObjectiveToolReceipt {
     pub arguments_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_operation_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_resource: Option<ExternalResourceReference>,
 }
 
 /// Durable evidence that one semantic objective completed in an earlier assignment attempt.

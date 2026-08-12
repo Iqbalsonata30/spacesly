@@ -95,7 +95,7 @@ export interface ExecutionContract {
   /** Optional exact external build identity used by deterministic build evidence policies. */
   build?: {
     provider: "bamboo";
-    result_key: string;
+    result_key?: string;
   };
   capability_plan: {
     schema_version: 1;

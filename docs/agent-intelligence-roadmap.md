@@ -322,10 +322,12 @@ Implemented Kubernetes Deployment availability increment:
 Implemented Bamboo exact build-result increment:
 
 - User Rules select the Bamboo connector and semantic read operation; live MCP discovery must resolve it to exactly one read-only tool with one supported result-key argument.
-- The immutable contract supplies `build.provider=bamboo` and the exact `build.result_key`.
+- The immutable contract supplies `build.provider=bamboo`; `build.result_key` is optional when the worker triggers a build during the task.
+- A successful canonical or MCP-namespaced `bamboo_trigger_build` call must return one exact result identity in structured connector output. Spacesly captures that identity in a secret-free tool receipt and rejects prose-only or identity-free successful responses.
+- On continuation, the verifier resolves the identity from current and retained objective-checkpoint receipts. A conflicting contract key or multiple captured keys blocks instead of guessing.
 - Spacesly independently calls the connector after execution and strictly normalizes structured build identity/state without retaining raw output or connector errors.
-- Successful state for a different build, prose-only claims, failed/progressing states, and unknown response shapes block completion.
-- Newly triggered builds still require a trusted mutation-result identity capture before this verifier can follow their dynamic result key.
+- Successful state for a different build, prose-only claims, failed states, and unknown response shapes block completion.
+- Optional Rules-controlled polling follows an in-progress build with bounded intervals, a bounded overall deadline, assignment-fence checks between reads, and per-request timeouts capped by the remaining deadline. Connector errors are not blindly retried.
 
 Benefits:
 
@@ -335,7 +337,7 @@ Benefits:
 Trade-offs:
 
 - Verification may add connector calls and latency.
-- Rollout polling occupies the task worker until success, cancellation, connector failure, or the Rules deadline; asynchronous verification remains future work.
+- Kubernetes and Bamboo polling occupy the task worker until success, cancellation, connector failure, or the Rules deadline; asynchronous verification remains future work.
 
 Exit criteria:
 

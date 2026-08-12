@@ -1285,6 +1285,7 @@ fn emit_worker_stream_event(
             arguments_observed: _,
             display_context,
             resource_operation_key: _,
+            external_resource: _,
         } => {
             let operation_id = operation_id(
                 run_id,
@@ -3076,6 +3077,7 @@ mod tests {
                 target: None,
             },
             resource_operation_key: None,
+            external_resource: None,
         })
         .expect("failed tool must stop worker");
 

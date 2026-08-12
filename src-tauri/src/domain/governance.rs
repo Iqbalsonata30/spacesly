@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const GOVERNANCE_RESOLUTION_VERSION: u32 = 1;
 pub const RULES_NORMALIZATION_VERSION: &str = "agent-rules-lines-v1";
-pub const RULE_FACTS_SCHEMA_VERSION: u32 = 4;
-pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v4";
+pub const RULE_FACTS_SCHEMA_VERSION: u32 = 5;
+pub const RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v5";
+const RECENT_RULE_FACTS_SCHEMA_VERSION: u32 = 4;
+const RECENT_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v4";
 const PRIOR_RULE_FACTS_SCHEMA_VERSION: u32 = 3;
 const PRIOR_RULE_FACTS_COMPILER_VERSION: &str = "agent-rule-facts-v3";
 const PREVIOUS_RULE_FACTS_SCHEMA_VERSION: u32 = 2;
@@ -220,6 +222,8 @@ impl GovernanceResolutionRecord {
                 let supported_compiler = (self.rules.facts.schema_version
                     == RULE_FACTS_SCHEMA_VERSION
                     && self.rules.facts.compiler_version == RULE_FACTS_COMPILER_VERSION)
+                    || (self.rules.facts.schema_version == RECENT_RULE_FACTS_SCHEMA_VERSION
+                        && self.rules.facts.compiler_version == RECENT_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == PRIOR_RULE_FACTS_SCHEMA_VERSION
                         && self.rules.facts.compiler_version == PRIOR_RULE_FACTS_COMPILER_VERSION)
                     || (self.rules.facts.schema_version == PREVIOUS_RULE_FACTS_SCHEMA_VERSION
@@ -1597,6 +1601,8 @@ mod tests {
 - Connector: corporate-bamboo
 - Read operation: get_build
 - Required states: successful_build
+- Poll interval seconds: 5
+- Timeout seconds: 120
 "#,
         );
         let verifier = &facts.evidence_verifiers[0];
@@ -1604,6 +1610,8 @@ mod tests {
         assert_eq!(verifier.connector_id.as_deref(), Some("corporate-bamboo"));
         assert_eq!(verifier.read_operation.as_deref(), Some("get_build"));
         assert_eq!(verifier.required_states, vec!["successful_build"]);
+        assert_eq!(verifier.poll_interval_seconds, Some(5));
+        assert_eq!(verifier.timeout_seconds, Some(120));
     }
 
     #[test]
@@ -1635,9 +1643,15 @@ mod tests {
     }
 
     #[test]
-    fn retained_prior_rule_facts_remain_valid_after_v4_compiler_upgrade() {
+    fn retained_prior_rule_facts_remain_valid_after_v5_compiler_upgrade() {
         let mut resolution = resolve_governance(5, &profile(Vec::new()), &contract("Inspect"))
             .expect("governance resolves");
+        resolution.rules.facts.schema_version = RECENT_RULE_FACTS_SCHEMA_VERSION;
+        resolution.rules.facts.compiler_version = RECENT_RULE_FACTS_COMPILER_VERSION.to_string();
+        resolution
+            .validate_for(5)
+            .expect("retained v4 rule facts remain compatible");
+
         resolution.rules.facts.schema_version = PRIOR_RULE_FACTS_SCHEMA_VERSION;
         resolution.rules.facts.compiler_version = PRIOR_RULE_FACTS_COMPILER_VERSION.to_string();
         resolution

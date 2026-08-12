@@ -1,6 +1,7 @@
 pub mod ai_event;
 pub mod ai_run;
 pub mod ai_worker;
+pub mod bamboo;
 pub mod execution_store;
 pub mod file_watcher;
 pub mod files;

@@ -1718,6 +1718,22 @@ impl SchedulerStore {
                             receipt.tool_name.as_str(),
                             "ocp_restart_deployment" | "ocp_scale_deployment"
                         ))
+                    || receipt.external_resource.as_ref().is_some_and(|resource| {
+                        resource.provider != "bamboo"
+                            || resource.resource_kind != "build"
+                            || !crate::infrastructure::bamboo::canonical_bamboo_result_key(
+                                &resource.resource_id,
+                            )
+                    })
+                    || (crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
+                        &receipt.tool_name,
+                    ) && receipt.external_resource.is_none())
+                    || (receipt.external_resource.is_some()
+                        && !crate::infrastructure::bamboo::trusted_bamboo_trigger_tool(
+                            &receipt.tool_name,
+                        ))
+                    || (receipt.external_resource.is_some()
+                        && receipt.resource_operation_key.is_some())
             })
         {
             return Err("Objective checkpoint payload is invalid.".to_string());
@@ -7086,6 +7102,7 @@ mod tests {
             risk: "mutation".to_string(),
             arguments_digest: "a".repeat(64),
             resource_operation_key: Some(operation_key.to_string()),
+            external_resource: None,
         }
     }
 
@@ -7099,7 +7116,87 @@ mod tests {
             risk: "mutation".to_string(),
             arguments_digest: "b".repeat(64),
             resource_operation_key: Some(operation_key.to_string()),
+            external_resource: None,
         }
+    }
+
+    fn bamboo_trigger_receipt(result_key: &str) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: "bamboo-call-1".to_string(),
+            tool_name: "corporate_bamboo_trigger_build".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "c".repeat(64),
+            resource_operation_key: None,
+            external_resource: Some(crate::domain::task_session::ExternalResourceReference {
+                provider: "bamboo".to_string(),
+                resource_kind: "build".to_string(),
+                resource_id: result_key.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn bamboo_trigger_identity_persists_and_replays_with_checkpoint() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let receipt = bamboo_trigger_receipt("PAYROLL-DEPLOY-42");
+        let evidence = vec!["Bamboo result PAYROLL-DEPLOY-42 succeeded".to_string()];
+
+        let first = store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-build",
+                &evidence,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("Bamboo checkpoint recorded");
+        assert_eq!(first.payload["new_checkpoint"], true);
+        let retained = store
+            .objective_checkpoints(session_id)
+            .expect("checkpoints read");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].tool_receipts, vec![receipt.clone()]);
+
+        let replay = store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-build",
+                &evidence,
+                &[receipt],
+            )
+            .expect("exact replay accepted");
+        assert_eq!(replay.payload["new_checkpoint"], false);
+    }
+
+    #[test]
+    fn bamboo_checkpoint_rejects_missing_or_malformed_trigger_identity() {
+        let directory = tempdir().expect("temp directory");
+        let (store, _session_id, authority) =
+            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let evidence = vec!["Build observed".to_string()];
+        let mut missing = bamboo_trigger_receipt("PAYROLL-DEPLOY-42");
+        missing.external_resource = None;
+        assert!(store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-missing",
+                &evidence,
+                &[missing],
+            )
+            .expect_err("missing identity rejected")
+            .contains("payload is invalid"));
+
+        let malformed = bamboo_trigger_receipt("not a result key");
+        assert!(store
+            .record_objective_checkpoint(
+                assignment_fence(&authority),
+                "objective-malformed",
+                &evidence,
+                &[malformed],
+            )
+            .expect_err("malformed identity rejected")
+            .contains("payload is invalid"));
     }
 
     fn succeeded_scale_mutation(

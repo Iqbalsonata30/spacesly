@@ -518,6 +518,11 @@ export type TaskExecutionManifest = {
         risk: string;
         arguments_digest: string;
         resource_operation_key?: string;
+        external_resource?: {
+          provider: string;
+          resource_kind: string;
+          resource_id: string;
+        };
       }>;
       source_attempt_id: number;
       recorded_at: number;

@@ -24,6 +24,10 @@ use crate::infrastructure::ai_worker::{
     execute_ai_worker_task, AiWorkerCompletionStatus, AiWorkerConfig, AiWorkerEventCallback,
     AiWorkerMcpServer, AiWorkerStreamEvent, AiWorkerTask, AiWorkerTaskResult,
 };
+use crate::infrastructure::bamboo::{
+    canonical_bamboo_result_key, parse_bamboo_build_evidence, BambooBuildStatus,
+    BambooEvidenceError,
+};
 use crate::infrastructure::git::repository_root_at;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -448,7 +452,8 @@ fn resolve_evidence_verifier_bindings(
                         (interval..=MAX_EVIDENCE_TIMEOUT_SECONDS).contains(&timeout)
                     })
             })
-            && (verifier.provider == "kubernetes" || !polling_configured);
+            && (matches!(verifier.provider.as_str(), "kubernetes" | "bamboo")
+                || !polling_configured);
         let (status, reason) = if !canonical_connector_token(&verifier.id)
             || !canonical_connector_token(&verifier.provider)
             || verifier.required_states.is_empty()
@@ -464,7 +469,7 @@ fn resolve_evidence_verifier_bindings(
         } else if !valid_polling {
             (
                 "invalid_rule",
-                "Evidence polling requires Kubernetes plus both bounded interval and timeout seconds.",
+                "Evidence polling requires Kubernetes or Bamboo plus both bounded interval and timeout seconds.",
             )
         } else if verifier.provider != "bamboo"
             && (verifier.connector_id.is_some() || verifier.read_operation.is_some())
@@ -537,18 +542,20 @@ fn resolve_evidence_verifier_bindings(
             && (deployment_target.is_none() || workload.is_none())
         {
             ("missing_resource", "Kubernetes deployment availability requires a resolved deployment target and canonical deployment.workload.")
-        } else if verifier.provider == "bamboo"
-            && (!bamboo_build_provider || build_result_key.is_none())
-        {
+        } else if verifier.provider == "bamboo" && !bamboo_build_provider {
             (
                 "missing_resource",
-                "Bamboo successful-build verification requires canonical build.result_key authority.",
+                "Bamboo successful-build verification requires build.provider=bamboo authority.",
             )
         } else {
             let reason = if verifier.provider == "kubernetes" {
                 "The Deployment verifier is bound to the trusted connector and resolved resource identity."
             } else if verifier.provider == "bamboo" {
-                "The Bamboo verifier is bound to one live read tool and exact immutable build identity."
+                if build_result_key.is_some() {
+                    "The Bamboo verifier is bound to one live read tool and exact immutable build identity."
+                } else {
+                    "The Bamboo verifier is bound to one live read tool and requires a trusted trigger receipt before verification."
+                }
             } else {
                 "The Git terminal-state verifier is bound to the resolved trusted repository."
             };
@@ -586,10 +593,10 @@ fn resolve_evidence_verifier_bindings(
             namespace: (verifier.provider == "kubernetes")
                 .then(|| deployment_target.map(|target| target.namespace.clone()))
                 .flatten(),
-            poll_interval_seconds: (verifier.provider == "kubernetes")
+            poll_interval_seconds: matches!(verifier.provider.as_str(), "kubernetes" | "bamboo")
                 .then_some(verifier.poll_interval_seconds)
                 .flatten(),
-            timeout_seconds: (verifier.provider == "kubernetes")
+            timeout_seconds: matches!(verifier.provider.as_str(), "kubernetes" | "bamboo")
                 .then_some(verifier.timeout_seconds)
                 .flatten(),
             source: verifier.source.clone(),
@@ -779,105 +786,154 @@ fn deployment_availability_evidence_json(result: &DeploymentAvailabilityPollResu
     value
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedBambooBuildIdentity {
+    result_key: String,
+    source: &'static str,
+}
+
+fn resolve_bamboo_build_identity(
+    contract_result_key: Option<&str>,
+    current_receipts: &[AgentTaskObjectiveToolReceipt],
+    checkpoints: &[crate::domain::task_session::AgentTaskObjectiveCheckpoint],
+) -> Result<ResolvedBambooBuildIdentity, &'static str> {
+    let captured = current_receipts
+        .iter()
+        .chain(
+            checkpoints
+                .iter()
+                .flat_map(|checkpoint| checkpoint.tool_receipts.iter()),
+        )
+        .filter_map(|receipt| receipt.external_resource.as_ref())
+        .filter(|resource| resource.provider == "bamboo" && resource.resource_kind == "build")
+        .filter(|resource| canonical_bamboo_result_key(&resource.resource_id))
+        .map(|resource| resource.resource_id.to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+    if captured.len() > 1 {
+        return Err("conflicting_trigger_receipts");
+    }
+    let captured = captured.into_iter().next();
+    let contracted = contract_result_key.map(str::to_ascii_uppercase);
+    match (contracted, captured) {
+        (Some(contracted), Some(captured)) if contracted != captured => {
+            Err("contract_trigger_conflict")
+        }
+        (Some(result_key), Some(_)) => Ok(ResolvedBambooBuildIdentity {
+            result_key,
+            source: "contract_and_trigger_receipt",
+        }),
+        (Some(result_key), None) => Ok(ResolvedBambooBuildIdentity {
+            result_key,
+            source: "contract",
+        }),
+        (None, Some(result_key)) => Ok(ResolvedBambooBuildIdentity {
+            result_key,
+            source: "trigger_receipt",
+        }),
+        (None, None) => Err("missing_build_identity"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BambooBuildStatus {
+enum BambooBuildPollStatus {
     Successful,
     Failed,
     InProgress,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BambooBuildEvidence {
-    result_key: String,
-    status: BambooBuildStatus,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BambooEvidenceError {
+    TimedOut,
     Conflict,
     Unavailable,
 }
 
-fn parse_bamboo_build_evidence(
-    response: &Value,
-    expected_result_key: &str,
-) -> Result<BambooBuildEvidence, BambooEvidenceError> {
-    let expected = expected_result_key.to_ascii_uppercase();
-    let mut roots = vec![response.clone()];
-    if let Some(structured) = response.get("structuredContent") {
-        roots.push(structured.clone());
-    }
-    if let Some(content) = response.get("content").and_then(Value::as_array) {
-        roots.extend(content.iter().filter_map(|item| {
-            item.get("text")
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        }));
-    }
-
-    let mut conflicting_identity = false;
-    let mut visited = 0_usize;
-    for root in &roots {
-        let mut stack = vec![(root, 0_usize)];
-        while let Some((value, depth)) = stack.pop() {
-            visited = visited.saturating_add(1);
-            if visited > 128 || depth > 6 {
-                continue;
-            }
-            if let Some(object) = value.as_object() {
-                let identity = [
-                    "buildResultKey",
-                    "build_result_key",
-                    "resultKey",
-                    "result_key",
-                    "buildKey",
-                    "build_key",
-                    "key",
-                ]
-                .iter()
-                .find_map(|key| object.get(*key).and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| canonical_bamboo_result_key(value));
-                let state = ["buildState", "build_state", "state", "status"]
-                    .iter()
-                    .find_map(|key| object.get(*key).and_then(Value::as_str))
-                    .and_then(normalize_bamboo_build_status);
-                if let Some(identity) = identity {
-                    if identity.to_ascii_uppercase() == expected {
-                        return state
-                            .map(|status| BambooBuildEvidence {
-                                result_key: expected,
-                                status,
-                            })
-                            .ok_or(BambooEvidenceError::Unavailable);
-                    }
-                    conflicting_identity = true;
-                }
-                stack.extend(object.values().map(|value| (value, depth + 1)));
-            } else if let Some(values) = value.as_array() {
-                stack.extend(values.iter().map(|value| (value, depth + 1)));
-            }
-        }
-    }
-    Err(if conflicting_identity {
-        BambooEvidenceError::Conflict
-    } else {
-        BambooEvidenceError::Unavailable
-    })
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BambooBuildPollResult {
+    status: BambooBuildPollStatus,
+    attempts: u32,
 }
 
-fn normalize_bamboo_build_status(value: &str) -> Option<BambooBuildStatus> {
-    let normalized = value
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-', '_'], "");
-    match normalized.as_str() {
-        "successful" | "success" | "passed" => Some(BambooBuildStatus::Successful),
-        "failed" | "failure" | "error" | "cancelled" | "canceled" => {
-            Some(BambooBuildStatus::Failed)
+fn poll_bamboo_build<Read, Ensure, Wait, Elapsed, ControlError>(
+    result_key: &str,
+    interval: Option<Duration>,
+    timeout: Option<Duration>,
+    mut read: Read,
+    mut ensure_current: Ensure,
+    mut wait: Wait,
+    mut elapsed: Elapsed,
+) -> Result<BambooBuildPollResult, ControlError>
+where
+    Read: FnMut(Duration) -> Result<Value, String>,
+    Ensure: FnMut() -> Result<(), ControlError>,
+    Wait: FnMut(Duration) -> Result<(), ControlError>,
+    Elapsed: FnMut() -> Duration,
+{
+    let polling = interval.zip(timeout);
+    let mut attempts = 0_u32;
+    loop {
+        ensure_current()?;
+        let before_read = elapsed();
+        if attempts > 0 && polling.is_some_and(|(_, deadline)| before_read >= deadline) {
+            return Ok(BambooBuildPollResult {
+                status: BambooBuildPollStatus::TimedOut,
+                attempts,
+            });
         }
-        "inprogress" | "building" | "queued" | "pending" => Some(BambooBuildStatus::InProgress),
-        _ => None,
+        let request_budget = polling
+            .map(|(_, deadline)| deadline.saturating_sub(before_read))
+            .unwrap_or(Duration::from_secs(45))
+            .max(Duration::from_millis(1));
+        attempts = attempts.saturating_add(1);
+        let response = match read(request_budget) {
+            Ok(response) => response,
+            Err(_) => {
+                return Ok(BambooBuildPollResult {
+                    status: BambooBuildPollStatus::Unavailable,
+                    attempts,
+                });
+            }
+        };
+        let evidence = match parse_bamboo_build_evidence(&response, result_key) {
+            Ok(evidence) => evidence,
+            Err(BambooEvidenceError::Conflict) => {
+                return Ok(BambooBuildPollResult {
+                    status: BambooBuildPollStatus::Conflict,
+                    attempts,
+                });
+            }
+            Err(BambooEvidenceError::Unavailable) => {
+                return Ok(BambooBuildPollResult {
+                    status: BambooBuildPollStatus::Unavailable,
+                    attempts,
+                });
+            }
+        };
+        match evidence.status {
+            BambooBuildStatus::Successful => {
+                return Ok(BambooBuildPollResult {
+                    status: BambooBuildPollStatus::Successful,
+                    attempts,
+                });
+            }
+            BambooBuildStatus::Failed => {
+                return Ok(BambooBuildPollResult {
+                    status: BambooBuildPollStatus::Failed,
+                    attempts,
+                });
+            }
+            BambooBuildStatus::InProgress => {}
+        }
+        let Some((interval, deadline)) = polling else {
+            return Ok(BambooBuildPollResult {
+                status: BambooBuildPollStatus::InProgress,
+                attempts,
+            });
+        };
+        let after_read = elapsed();
+        if after_read >= deadline {
+            return Ok(BambooBuildPollResult {
+                status: BambooBuildPollStatus::TimedOut,
+                attempts,
+            });
+        }
+        wait(interval.min(deadline.saturating_sub(after_read)))?;
     }
 }
 
@@ -1233,23 +1289,6 @@ fn canonical_connector_operation(value: &str) -> bool {
             && value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
             }))
-}
-
-fn canonical_bamboo_result_key(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.contains('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 fn normalized_connector_base_url(value: &str) -> Option<String> {
@@ -1915,6 +1954,7 @@ fn runtime_callback(
                         },
                         arguments_digest: arguments_digest.clone(),
                         resource_operation_key: None,
+                        external_resource: None,
                     },
                 );
         }
@@ -1927,6 +1967,7 @@ fn runtime_callback(
             arguments_digest,
             arguments_observed,
             resource_operation_key,
+            external_resource,
             ..
         } = &event
         {
@@ -1953,9 +1994,11 @@ fn runtime_callback(
                         },
                         arguments_digest: arguments_digest.clone(),
                         resource_operation_key: None,
+                        external_resource: None,
                     },
                 };
                 receipt.resource_operation_key = resource_operation_key.clone();
+                receipt.external_resource = external_resource.clone();
                 observation.successful_tool_calls =
                     observation.successful_tool_calls.saturating_add(1);
                 if !matches!(risk.trim().to_ascii_lowercase().as_str(), "read" | "low") {
@@ -3144,9 +3187,38 @@ impl TaskExecutor for AgentTaskExecutor {
                 let argument = binding.read_argument.as_deref().ok_or_else(|| {
                     TaskExecutionError::blocked("Bamboo evidence read argument is missing.")
                 })?;
-                let result_key = binding.resource_name.as_deref().ok_or_else(|| {
-                    TaskExecutionError::blocked("Bamboo evidence build identity is missing.")
-                })?;
+                let current_receipts = successful_receipts
+                    .lock()
+                    .map_err(|error| TaskExecutionError::new(error.to_string()))?
+                    .clone();
+                let identity = match resolve_bamboo_build_identity(
+                    binding.resource_name.as_deref(),
+                    &current_receipts,
+                    &objective_checkpoints,
+                ) {
+                    Ok(identity) => identity,
+                    Err(reason) => {
+                        context.emit_event(
+                            TaskSessionEventKind::Runtime,
+                            json!({
+                                "type": "evidence_verifier_result",
+                                "schema_version": 1,
+                                "provider": "bamboo",
+                                "status": "blocked",
+                                "connector_id": connector_id,
+                                "resource_kind": "build",
+                                "evidence": [{
+                                    "state": "successful_build",
+                                    "status": reason,
+                                }],
+                            }),
+                        )?;
+                        return Err(TaskExecutionError::blocked(
+                            "Bamboo build identity resolution blocked completion.",
+                        ));
+                    }
+                };
+                let result_key = identity.result_key.as_str();
                 context.authorize_capability(&format!("external_tools:{connector_id}"))?;
                 let (command, environment) =
                     evidence_mcp_connectors.get(connector_id).ok_or_else(|| {
@@ -3154,38 +3226,46 @@ impl TaskExecutor for AgentTaskExecutor {
                             "Bamboo evidence verifier lost its trusted connector configuration.",
                         )
                     })?;
-                context.ensure_current()?;
-                let arguments = Value::Object(serde_json::Map::from_iter([(
-                    argument.to_string(),
-                    json!(result_key),
-                )]));
-                let response = crate::infrastructure::mcp::call_mcp_read_tool(
-                    connector_id,
-                    command,
-                    environment,
-                    tool,
-                    arguments,
-                );
-                context.ensure_current()?;
-                let (state, satisfied) = match response
-                    .as_ref()
-                    .map_err(|_| BambooEvidenceError::Unavailable)
-                    .and_then(|response| parse_bamboo_build_evidence(response, result_key))
-                {
-                    Ok(BambooBuildEvidence {
-                        status: BambooBuildStatus::Successful,
-                        ..
-                    }) => ("successful", true),
-                    Ok(BambooBuildEvidence {
-                        status: BambooBuildStatus::Failed,
-                        ..
-                    }) => ("failed", false),
-                    Ok(BambooBuildEvidence {
-                        status: BambooBuildStatus::InProgress,
-                        ..
-                    }) => ("in_progress", false),
-                    Err(BambooEvidenceError::Conflict) => ("conflict", false),
-                    Err(BambooEvidenceError::Unavailable) => ("unavailable", false),
+                let interval = binding.poll_interval_seconds.map(Duration::from_secs);
+                let timeout = binding.timeout_seconds.map(Duration::from_secs);
+                let poll_started = Instant::now();
+                let poll = poll_bamboo_build(
+                    result_key,
+                    interval,
+                    timeout,
+                    |request_timeout| {
+                        let arguments = Value::Object(serde_json::Map::from_iter([(
+                            argument.to_string(),
+                            json!(result_key),
+                        )]));
+                        crate::infrastructure::mcp::call_mcp_read_tool(
+                            connector_id,
+                            command,
+                            environment,
+                            tool,
+                            arguments,
+                            request_timeout,
+                        )
+                    },
+                    || context.ensure_current(),
+                    |duration| {
+                        let wait_started = Instant::now();
+                        while wait_started.elapsed() < duration {
+                            context.ensure_current()?;
+                            let remaining = duration.saturating_sub(wait_started.elapsed());
+                            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                        }
+                        context.ensure_current()
+                    },
+                    || poll_started.elapsed(),
+                )?;
+                let (state, satisfied) = match poll.status {
+                    BambooBuildPollStatus::Successful => ("successful", true),
+                    BambooBuildPollStatus::Failed => ("failed", false),
+                    BambooBuildPollStatus::InProgress => ("in_progress", false),
+                    BambooBuildPollStatus::TimedOut => ("timed_out", false),
+                    BambooBuildPollStatus::Conflict => ("conflict", false),
+                    BambooBuildPollStatus::Unavailable => ("unavailable", false),
                 };
                 context.emit_event(
                     TaskSessionEventKind::Runtime,
@@ -3197,9 +3277,13 @@ impl TaskExecutor for AgentTaskExecutor {
                         "connector_id": connector_id,
                         "resource_kind": "build",
                         "resource_name": result_key,
+                        "identity_source": identity.source,
+                        "poll_interval_seconds": binding.poll_interval_seconds,
+                        "timeout_seconds": binding.timeout_seconds,
                         "evidence": [{
                             "state": "successful_build",
                             "status": state,
+                            "attempts": poll.attempts,
                         }],
                     }),
                 )?;
@@ -3414,6 +3498,7 @@ pub(crate) fn emit_runtime_event(
             arguments_observed: _,
             display_context,
             resource_operation_key,
+            external_resource,
         } => {
             let failure = (!success).then(|| {
                 format!(
@@ -3435,6 +3520,7 @@ pub(crate) fn emit_runtime_event(
                     "arguments_digest": arguments_digest,
                     "display_context": display_context,
                     "resource_operation_key": resource_operation_key,
+                    "external_resource": external_resource,
                 }),
                 failure,
             )
@@ -3463,7 +3549,10 @@ mod tests {
     use super::*;
     use crate::application::execution_engine::ExecutionEngine;
     use crate::domain::execution::{ExecutionRun, StepRun};
-    use crate::domain::task_session::{TaskSessionEnvelope, TaskSessionState, TaskToolState};
+    use crate::domain::task_session::{
+        AgentTaskObjectiveCheckpoint, ExternalResourceReference, TaskSessionEnvelope,
+        TaskSessionState, TaskToolState,
+    };
     use crate::infrastructure::ai_worker::AiWorkerMcpServer;
     use crate::infrastructure::ai_worker::AiWorkerObjectiveResult;
     use crate::infrastructure::tool_broker::{argument_digest, ToolDisplayContext};
@@ -3472,6 +3561,25 @@ mod tests {
     use std::sync::{Barrier, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    fn bamboo_external_resource(result_key: &str) -> ExternalResourceReference {
+        ExternalResourceReference {
+            provider: "bamboo".to_string(),
+            resource_kind: "build".to_string(),
+            resource_id: result_key.to_string(),
+        }
+    }
+
+    fn bamboo_trigger_receipt(result_key: &str) -> AgentTaskObjectiveToolReceipt {
+        AgentTaskObjectiveToolReceipt {
+            tool_call_id: "bamboo-call".to_string(),
+            tool_name: "bamboo_trigger_build".to_string(),
+            risk: "mutation".to_string(),
+            arguments_digest: "d".repeat(64),
+            resource_operation_key: None,
+            external_resource: Some(bamboo_external_resource(result_key)),
+        }
+    }
 
     struct FakeResolver {
         attempts: Arc<Mutex<Vec<String>>>,
@@ -3682,6 +3790,7 @@ mod tests {
                     target: None,
                 },
                 resource_operation_key: None,
+                external_resource: None,
             })?;
             unreachable!("failed tool callback must terminate execution")
         }
@@ -3720,6 +3829,7 @@ mod tests {
                     target: Some("QCASH-BUILD".to_string()),
                 },
                 resource_operation_key: None,
+                external_resource: Some(bamboo_external_resource("QCASH-BUILD-842")),
             })?;
             unreachable!("mismatched completion callback must terminate execution")
         }
@@ -3757,6 +3867,7 @@ mod tests {
                         target: None,
                     },
                     resource_operation_key: None,
+                    external_resource: None,
                 })?;
                 unreachable!("failed tool callback must terminate the first execution")
             }
@@ -3795,6 +3906,7 @@ mod tests {
                     target: None,
                 },
                 resource_operation_key: None,
+                external_resource: Some(bamboo_external_resource("QCASH-BUILD-842")),
             })?;
             on_event(AiWorkerStreamEvent::ToolCompleted {
                 tool_call_id: "call-follow-up".to_string(),
@@ -3810,6 +3922,7 @@ mod tests {
                     target: None,
                 },
                 resource_operation_key: None,
+                external_resource: None,
             })?;
             unreachable!("failed follow-up callback must terminate execution")
         }
@@ -3849,6 +3962,7 @@ mod tests {
                         target: None,
                     },
                     resource_operation_key: None,
+                    external_resource: None,
                 })?;
                 unreachable!("missing tool callback must terminate the first execution")
             }
@@ -3992,6 +4106,7 @@ mod tests {
                     target: Some("QCASH-BUILD".to_string()),
                 },
                 resource_operation_key: None,
+                external_resource: Some(bamboo_external_resource("QCASH-BUILD-842")),
             })?;
             on_event(AiWorkerStreamEvent::ObjectiveCheckpoint {
                 objective_id: "objective-1".to_string(),
@@ -4076,6 +4191,7 @@ mod tests {
                         target: Some("deployment/clbo".to_string()),
                     },
                     resource_operation_key: None,
+                    external_resource: None,
                 })?;
                 return Err(approval_error.to_string());
             }
@@ -4244,6 +4360,7 @@ mod tests {
                     target: Some(authority.session_id.0.to_string()),
                 },
                 resource_operation_key: None,
+                external_resource: None,
             })?;
             on_event(AiWorkerStreamEvent::TextDelta(format!(
                 "session:{}",
@@ -5600,6 +5717,7 @@ mod tests {
             risk: "read".to_string(),
             arguments_digest: "digest".to_string(),
             resource_operation_key: None,
+            external_resource: None,
         }
     }
 
@@ -5821,6 +5939,160 @@ mod tests {
     }
 
     #[test]
+    fn bamboo_identity_resolves_from_current_or_retained_receipt_and_detects_conflicts() {
+        let current = bamboo_trigger_receipt("PAYROLL-DEPLOY-42");
+        let resolved = resolve_bamboo_build_identity(None, std::slice::from_ref(&current), &[])
+            .expect("current receipt resolves");
+        assert_eq!(resolved.result_key, "PAYROLL-DEPLOY-42");
+        assert_eq!(resolved.source, "trigger_receipt");
+
+        let checkpoint = AgentTaskObjectiveCheckpoint {
+            objective_id: "objective-build".to_string(),
+            evidence: vec!["build observed".to_string()],
+            tool_receipts: vec![current],
+            source_attempt_id: 1,
+            recorded_at: 1,
+        };
+        let retained = resolve_bamboo_build_identity(None, &[], &[checkpoint])
+            .expect("retained receipt resolves");
+        assert_eq!(retained.result_key, "PAYROLL-DEPLOY-42");
+
+        assert_eq!(
+            resolve_bamboo_build_identity(
+                Some("PAYROLL-DEPLOY-43"),
+                &[bamboo_trigger_receipt("PAYROLL-DEPLOY-42")],
+                &[],
+            ),
+            Err("contract_trigger_conflict")
+        );
+        assert_eq!(
+            resolve_bamboo_build_identity(
+                None,
+                &[
+                    bamboo_trigger_receipt("PAYROLL-DEPLOY-42"),
+                    bamboo_trigger_receipt("PAYROLL-DEPLOY-43"),
+                ],
+                &[],
+            ),
+            Err("conflicting_trigger_receipts")
+        );
+        assert_eq!(
+            resolve_bamboo_build_identity(None, &[], &[]),
+            Err("missing_build_identity")
+        );
+    }
+
+    #[test]
+    fn bamboo_polling_retries_progress_then_succeeds_with_bounded_requests() {
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let attempts = AtomicUsize::new(0);
+        let budgets = Arc::new(Mutex::new(Vec::new()));
+        let result = poll_bamboo_build(
+            "PAYROLL-DEPLOY-42",
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(20)),
+            {
+                let budgets = budgets.clone();
+                move |budget| {
+                    budgets.lock().expect("budgets lock").push(budget);
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({
+                        "buildResultKey": "PAYROLL-DEPLOY-42",
+                        "buildState": if attempt == 0 { "InProgress" } else { "Successful" }
+                    }))
+                }
+            },
+            || Ok::<(), &'static str>(()),
+            {
+                let elapsed = elapsed.clone();
+                move |duration| {
+                    *elapsed.lock().expect("elapsed lock") += duration;
+                    Ok::<(), &'static str>(())
+                }
+            },
+            {
+                let elapsed = elapsed.clone();
+                move || *elapsed.lock().expect("elapsed lock")
+            },
+        )
+        .expect("poll succeeds");
+        assert_eq!(result.status, BambooBuildPollStatus::Successful);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(
+            *budgets.lock().expect("budgets lock"),
+            vec![Duration::from_secs(20), Duration::from_secs(15)]
+        );
+    }
+
+    #[test]
+    fn bamboo_polling_times_out_and_does_not_retry_connector_errors() {
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let timed_out = poll_bamboo_build(
+            "PAYROLL-DEPLOY-42",
+            Some(Duration::from_secs(4)),
+            Some(Duration::from_secs(10)),
+            |_| {
+                Ok(json!({
+                    "buildResultKey": "PAYROLL-DEPLOY-42",
+                    "buildState": "InProgress"
+                }))
+            },
+            || Ok::<(), &'static str>(()),
+            {
+                let elapsed = elapsed.clone();
+                move |duration| {
+                    *elapsed.lock().expect("elapsed lock") += duration;
+                    Ok::<(), &'static str>(())
+                }
+            },
+            {
+                let elapsed = elapsed.clone();
+                move || *elapsed.lock().expect("elapsed lock")
+            },
+        )
+        .expect("timeout is an evidence status");
+        assert_eq!(timed_out.status, BambooBuildPollStatus::TimedOut);
+        assert_eq!(timed_out.attempts, 3);
+
+        let attempts = AtomicUsize::new(0);
+        let unavailable = poll_bamboo_build(
+            "PAYROLL-DEPLOY-42",
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(15)),
+            |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err("redacted connector failure".to_string())
+            },
+            || Ok::<(), &'static str>(()),
+            |_| Ok::<(), &'static str>(()),
+            || Duration::ZERO,
+        )
+        .expect("connector error is an evidence status");
+        assert_eq!(unavailable.status, BambooBuildPollStatus::Unavailable);
+        assert_eq!(unavailable.attempts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bamboo_polling_propagates_cancellation_during_wait() {
+        let result = poll_bamboo_build(
+            "PAYROLL-DEPLOY-42",
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(15)),
+            |_| {
+                Ok(json!({
+                    "buildResultKey": "PAYROLL-DEPLOY-42",
+                    "buildState": "InProgress"
+                }))
+            },
+            || Ok::<(), &'static str>(()),
+            |_| Err("cancelled"),
+            || Duration::ZERO,
+        );
+        assert_eq!(result, Err("cancelled"));
+    }
+
+    #[test]
     fn git_evidence_verifier_observes_clean_new_commit_and_upstream_state() {
         let directory = tempdir().expect("workspace");
         let repository = directory.path().join("repository");
@@ -5904,6 +6176,8 @@ mod tests {
             read_operation: Some("get_build".to_string()),
             applies_to_labels: Vec::new(),
             required_states: vec!["successful_build".to_string()],
+            poll_interval_seconds: Some(5),
+            timeout_seconds: Some(120),
             source: "global.agent_rules".to_string(),
             source_line: 50,
             ..Default::default()
@@ -5981,10 +6255,43 @@ mod tests {
         assert_eq!(records[0].connector_id.as_deref(), Some("corporate-bamboo"));
         assert_eq!(records[0].read_tool.as_deref(), Some("bamboo_get_build"));
         assert_eq!(records[0].read_argument.as_deref(), Some("result_key"));
+        assert_eq!(records[0].poll_interval_seconds, Some(5));
+        assert_eq!(records[0].timeout_seconds, Some(120));
         assert_eq!(
             records[0].resource_name.as_deref(),
             Some("PAYROLL-DEPLOY-42")
         );
+
+        let (dynamic_records, dynamic_blockers) = resolve_evidence_verifier_bindings(
+            &json!({"build": {"provider": "bamboo"}}),
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-bamboo".to_string()],
+                connector_ids: &["corporate-bamboo".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[
+                    crate::domain::task_examination::ConnectorCapabilitySnapshot {
+                        connector_id: "corporate-bamboo".to_string(),
+                        status: ConnectorDiscoveryStatus::Available,
+                        tools: vec![crate::domain::task_examination::DiscoveredToolCapability {
+                            name: "bamboo_get_build".to_string(),
+                            risk: "read".to_string(),
+                            argument_names: vec!["result_key".to_string()],
+                        }],
+                        error: None,
+                        warnings: Vec::new(),
+                    },
+                ],
+            },
+        );
+        assert!(dynamic_blockers.is_empty());
+        assert_eq!(dynamic_records[0].status, "ready");
+        assert_eq!(dynamic_records[0].resource_name, None);
+        assert!(dynamic_records[0]
+            .reason
+            .contains("trusted trigger receipt"));
 
         let (records, blockers) = resolve_evidence_verifier_bindings(
             &json!({"build": {"provider": "bamboo", "result_key": "PAYROLL-DEPLOY-42"}}),

@@ -11,6 +11,7 @@ use super::task_tools::TASK_TOOLS_AUTHORITY_ENV;
 use super::tool_broker::{argument_digest, tool_display_context, ToolBroker, ToolDisplayContext};
 use crate::domain::governance::AgentSkillDefinition;
 use crate::domain::resource_idempotency::{ResourceExecutionStatus, ResourceMutationEvidence};
+use crate::domain::task_session::ExternalResourceReference;
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
@@ -466,6 +467,7 @@ pub enum AiWorkerStreamEvent {
         arguments_observed: bool,
         display_context: ToolDisplayContext,
         resource_operation_key: Option<String>,
+        external_resource: Option<ExternalResourceReference>,
     },
     UsageUpdated {
         input_tokens: u64,
@@ -3317,6 +3319,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             Some(format!("{marker}: {output}"))
         });
     let resource_operation_key = successful_resource_operation_key(&tool_name, tool_output);
+    let external_resource = successful_external_resource_reference(&tool_name, tool_output);
     match status {
         "completed" if blocked_tool_result.is_some() => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3328,6 +3331,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             arguments_observed,
             display_context,
             resource_operation_key: None,
+            external_resource: None,
         }),
         "completed" if !arguments_valid => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3342,6 +3346,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             arguments_observed,
             display_context,
             resource_operation_key: None,
+            external_resource: None,
         }),
         "completed"
             if trusted_resource_mutation_tool(&tool_name) && resource_operation_key.is_none() =>
@@ -3359,6 +3364,26 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
                 arguments_observed,
                 display_context,
                 resource_operation_key: None,
+                external_resource: None,
+            })
+        }
+        "completed"
+            if trusted_external_resource_tool(&tool_name) && external_resource.is_none() =>
+        {
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                tool_call_id,
+                tool_name,
+                success: false,
+                error: Some(
+                    "protocol[missing_external_resource]: trusted external mutation result did not contain a valid resource identity."
+                        .to_string(),
+                ),
+                risk,
+                arguments_digest,
+                arguments_observed,
+                display_context,
+                resource_operation_key: None,
+                external_resource: None,
             })
         }
         "completed" => Some(AiWorkerStreamEvent::ToolCompleted {
@@ -3371,6 +3396,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             arguments_observed,
             display_context,
             resource_operation_key,
+            external_resource,
         }),
         "error" | "failed" => Some(AiWorkerStreamEvent::ToolCompleted {
             tool_call_id,
@@ -3382,6 +3408,7 @@ fn parse_opencode_stream_event(line: &str) -> Option<AiWorkerStreamEvent> {
             arguments_observed,
             display_context,
             resource_operation_key: None,
+            external_resource: None,
         }),
         _ => Some(AiWorkerStreamEvent::ToolStarted {
             tool_call_id,
@@ -3416,6 +3443,29 @@ fn successful_resource_operation_key(tool_name: &str, output: Option<&Value>) ->
 
 fn trusted_resource_mutation_tool(tool_name: &str) -> bool {
     matches!(tool_name, "ocp_restart_deployment" | "ocp_scale_deployment")
+}
+
+fn successful_external_resource_reference(
+    tool_name: &str,
+    output: Option<&Value>,
+) -> Option<ExternalResourceReference> {
+    if !trusted_external_resource_tool(tool_name) {
+        return None;
+    }
+    let payload = match output? {
+        Value::String(value) => serde_json::from_str::<Value>(value).ok()?,
+        value => value.clone(),
+    };
+    let resource_id = super::bamboo::extract_triggered_build_result_key(&payload)?;
+    Some(ExternalResourceReference {
+        provider: "bamboo".to_string(),
+        resource_kind: "build".to_string(),
+        resource_id,
+    })
+}
+
+fn trusted_external_resource_tool(tool_name: &str) -> bool {
+    super::bamboo::trusted_bamboo_trigger_tool(tool_name)
 }
 
 fn objective_checkpoint_from_text(text: &str) -> Option<AiWorkerStreamEvent> {
@@ -4519,6 +4569,7 @@ mod tests {
                 arguments_observed: false,
                 display_context: tool_display_context("shell", &serde_json::json!({})),
                 resource_operation_key: None,
+                external_resource: None,
             })
         );
 
@@ -4568,6 +4619,7 @@ mod tests {
                 arguments_observed: false,
                 display_context: tool_display_context("jira_search", &serde_json::json!({})),
                 resource_operation_key: None,
+                external_resource: None,
             })
         );
     }
@@ -4717,6 +4769,69 @@ mod tests {
                 ..
             }) if error.contains("malformed_tool_arguments")
         ));
+    }
+
+    #[test]
+    fn captures_only_structured_bamboo_trigger_identity() {
+        let captured = parse_opencode_stream_event(
+            &serde_json::json!({
+                "part": {
+                    "type": "tool",
+                    "callID": "trigger-call",
+                    "tool": "corporate_bamboo_trigger_build",
+                    "state": {
+                        "status": "completed",
+                        "output": serde_json::json!({
+                            "content": [{
+                                "type": "text",
+                                "text": "{\"planKey\":\"PAYROLL-DEPLOY\",\"buildNumber\":42}"
+                            }]
+                        }).to_string()
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            captured,
+            Some(AiWorkerStreamEvent::ToolCompleted {
+                success: true,
+                external_resource: Some(ExternalResourceReference {
+                    ref provider,
+                    ref resource_kind,
+                    ref resource_id,
+                }),
+                ..
+            }) if provider == "bamboo"
+                && resource_kind == "build"
+                && resource_id == "PAYROLL-DEPLOY-42"
+        ));
+
+        for output in [
+            serde_json::json!({"message": "PAYROLL-DEPLOY-42 started"}),
+            serde_json::json!({}),
+        ] {
+            let rejected = parse_opencode_stream_event(
+                &serde_json::json!({
+                    "part": {
+                        "type": "tool",
+                        "callID": "trigger-call",
+                        "tool": "bamboo_trigger_build",
+                        "state": {"status": "completed", "output": output.to_string()}
+                    }
+                })
+                .to_string(),
+            );
+            assert!(matches!(
+                rejected,
+                Some(AiWorkerStreamEvent::ToolCompleted {
+                    success: false,
+                    error: Some(ref error),
+                    external_resource: None,
+                    ..
+                }) if error.contains("missing_external_resource")
+            ));
+        }
     }
 
     #[test]

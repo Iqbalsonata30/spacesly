@@ -68,7 +68,7 @@ Implemented Kubernetes Deployment availability vertical slice:
 - Durable evidence contains only resource kind, replica counters, generation-observed status, and satisfied/unsatisfied/unavailable state.
 - Missing target/workload authority, unavailable reads, stale generations, and incomplete replicas fail closed.
 - Rules may optionally provide both a poll interval and rollout timeout. Values are bounded to 1–30 seconds and 1–600 seconds respectively, with the interval no greater than the timeout; invalid or partial policies block during preflight.
-- Rule facts compiler v4 persists typed polling plus Bamboo connector/read-operation bindings; retained v1–v3 task snapshots remain valid under their original immutable semantics.
+- Rule facts compiler v5 persists typed polling plus Bamboo connector/read-operation bindings; retained v1–v4 task snapshots remain valid under their original immutable semantics.
 - A progressing Deployment is reread until it becomes available or reaches the deadline. Connector/RBAC failures are not blindly retried, every wait rechecks assignment authority, and each API request is capped by the remaining deadline.
 - Omitting both polling fields preserves the one-snapshot verifier behavior.
 
@@ -82,22 +82,29 @@ Implemented Bamboo exact build-result vertical slice:
 - Read operation: get_build
 - Required states:
   - successful_build
+- Poll interval seconds: 5
+- Timeout seconds: 120
 ```
 
 ```json
 {
   "build": {
-    "provider": "bamboo",
-    "result_key": "PAYROLL-DEPLOY-42"
+    "provider": "bamboo"
   }
 }
 ```
 
 - The verifier binds one exact user-defined Bamboo connector, one live-discovered read-only MCP tool, and one supported result-key argument before execution.
-- After the worker returns, Spacesly performs a separate MCP read and accepts success only when structured JSON contains the exact immutable result key and a normalized successful terminal state.
-- Failed and progressing builds, mismatched identities, unknown/prose responses, mutation-classified tools, missing connector capability, and transport errors block completion.
-- Durable evidence contains only connector ID, exact build result key, and normalized state. Raw MCP output, connector diagnostics, credentials, and unrelated response fields are not retained.
-- This slice verifies builds whose exact result key is already present in the immutable contract. Trusted capture of a result key returned by a newly triggered build and Bamboo polling remain follow-up work.
+- `build.provider=bamboo` is required. An optional immutable `build.result_key` can pin a known build; otherwise Spacesly obtains the identity from a trusted trigger receipt.
+- Completed canonical and MCP-namespaced `bamboo_trigger_build` calls must contain one canonical result key, or a canonical plan key plus build number, in structured JSON. Prose-only output and successful responses without identity become failed tool events.
+- The secret-free `{provider, resource_kind, resource_id}` reference is carried through the runtime event, successful receipt, objective checkpoint, and exact checkpoint replay.
+- The verifier resolves the build from current or retained receipts. Multiple captured builds, or disagreement between a receipt and immutable contract key, block deterministically.
+- After the worker returns, Spacesly performs a separate MCP read and accepts success only when structured JSON contains the resolved result key and a normalized successful terminal state.
+- Optional Rules-controlled polling rereads only an in-progress build. Interval and timeout use the existing 1–30 and 1–600 second bounds, every wait rechecks assignment authority, and every MCP request is capped by the remaining deadline.
+- Failed builds, timeouts, mismatched identities, unknown/prose responses, mutation-classified read tools, missing connector capability, and transport errors block completion. Connector errors are not blindly retried.
+- Durable evidence contains only connector ID, exact build result key, identity source, attempt count, and normalized state. Raw MCP output, connector diagnostics, credentials, and unrelated response fields are not retained.
+- Rule facts compiler v5 persists Bamboo polling; retained v1–v4 task snapshots remain valid under their original immutable semantics.
+- Known limitation: trigger recognition currently covers the canonical `bamboo_trigger_build` adapter name and MCP namespace prefixes. The event is durable immediately, but its identity becomes authoritative continuation input only when an objective checkpoint is committed; this increment does not yet provide pre-trigger lookup or an uncertain-mutation fence if execution is interrupted before that checkpoint.
 
 Phase 11 regression evidence:
 
@@ -105,8 +112,8 @@ Phase 11 regression evidence:
 - Focused clean-worktree/new-commit state-transition and local-upstream containment tests: 2 passed.
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
-- Focused Bamboo Rules/binding, strict response parsing, MCP read-only boundary, and redaction tests: 7 passed.
-- Full Rust suite: 465 passed, 3 ignored, 0 failed in serial mode.
+- Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
+- Full Rust suite: 476 passed, 3 ignored, 0 failed in serial mode.
 - `cargo check` and formatting: passed.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.
 
@@ -325,6 +332,7 @@ Regression evidence recorded so far:
 4. Objective evidence is structurally required, but not every connector has an independent state verifier.
 5. Dynamic tasks lack a release-grade evaluation corpus and safety scorecard.
 6. Resource mutation objective/receipt binding is limited to the supported Deployment scale/restart slices; broader connector coverage remains incomplete.
+7. Bamboo trigger-result identities become authoritative continuation input only after an objective checkpoint; interruption before checkpointing still lacks provider-level uncertain-mutation reconciliation.
 
 ## Phase 9 Follow-On Coverage
 
