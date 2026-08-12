@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::governance::compile_rule_facts;
 use crate::domain::task_recovery::{
     decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction, RuntimeRecoveryContext,
 };
@@ -71,6 +72,10 @@ pub enum AgentEvaluationScenario {
         response: String,
         expected: PlanningProposalExpectation,
     },
+    RulesCompilation {
+        rules: String,
+        expected: RulesCompilationExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -112,6 +117,27 @@ pub struct PlanningProposalObservation {
     pub objective_ids: Vec<String>,
     pub operation_hints: Vec<String>,
     pub resource_hints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RulesCompilationExpectation {
+    pub repository_ids: Vec<String>,
+    pub repositories_missing_local_path: usize,
+    pub protected_branches: Vec<String>,
+    pub approval_policy_count: usize,
+    pub deployment_targets: Vec<RulesDeploymentTargetExpectation>,
+    pub connector_ids: Vec<String>,
+    pub verification_policy_ids: Vec<String>,
+    pub evidence_verifier_ids: Vec<String>,
+    pub warning_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct RulesDeploymentTargetExpectation {
+    pub label: String,
+    pub target: String,
+    pub branch: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,6 +320,71 @@ fn evaluate_fixture(
             }
             mismatches
         }
+        AgentEvaluationScenario::RulesCompilation { rules, expected } => {
+            let facts = compile_rule_facts(rules);
+            let mut repository_ids = facts
+                .repositories
+                .iter()
+                .map(|repository| repository.id.clone())
+                .collect::<Vec<_>>();
+            let mut protected_branches = facts
+                .protected_branches
+                .iter()
+                .flat_map(|policy| policy.branches.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut deployment_targets = facts
+                .deployment_targets
+                .iter()
+                .map(|target| RulesDeploymentTargetExpectation {
+                    label: target.label.clone(),
+                    target: target.target.clone(),
+                    branch: target.branch.clone(),
+                    namespace: target.namespace.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut connector_ids = facts
+                .connectors
+                .iter()
+                .map(|connector| connector.id.clone())
+                .collect::<Vec<_>>();
+            let mut verification_policy_ids = facts
+                .verification_policies
+                .iter()
+                .map(|policy| policy.id.clone())
+                .collect::<Vec<_>>();
+            let mut evidence_verifier_ids = facts
+                .evidence_verifiers
+                .iter()
+                .map(|verifier| verifier.id.clone())
+                .collect::<Vec<_>>();
+            repository_ids.sort();
+            protected_branches.sort();
+            protected_branches.dedup();
+            deployment_targets.sort();
+            connector_ids.sort();
+            verification_policy_ids.sort();
+            evidence_verifier_ids.sort();
+            let observed = RulesCompilationExpectation {
+                repository_ids,
+                repositories_missing_local_path: facts
+                    .repositories
+                    .iter()
+                    .filter(|repository| repository.local_path.is_none())
+                    .count(),
+                protected_branches,
+                approval_policy_count: facts
+                    .protected_branches
+                    .iter()
+                    .filter(|policy| policy.approval_required)
+                    .count(),
+                deployment_targets,
+                connector_ids,
+                verification_policy_ids,
+                evidence_verifier_ids,
+                warning_count: facts.warnings.len(),
+            };
+            rules_compilation_mismatches(&observed, expected)
+        }
     }
 }
 
@@ -376,9 +467,85 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent planning-proposal fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::RulesCompilation { rules, expected } => {
+                let identifiers = expected
+                    .repository_ids
+                    .iter()
+                    .chain(expected.protected_branches.iter())
+                    .chain(expected.connector_ids.iter())
+                    .chain(expected.verification_policy_ids.iter())
+                    .chain(expected.evidence_verifier_ids.iter());
+                if rules.trim().is_empty()
+                    || rules.len() > 32 * 1024
+                    || rules.contains('\0')
+                    || identifiers
+                        .into_iter()
+                        .any(|value| !valid_identifier(value))
+                    || expected.repository_ids.len() > 64
+                    || expected.protected_branches.len() > 64
+                    || expected.connector_ids.len() > 64
+                    || expected.verification_policy_ids.len() > 64
+                    || expected.evidence_verifier_ids.len() > 64
+                    || expected.repositories_missing_local_path > 64
+                    || expected.approval_policy_count > 64
+                    || expected.warning_count > 64
+                    || expected.deployment_targets.len() > 64
+                    || expected.deployment_targets.iter().any(|target| {
+                        [
+                            &target.label,
+                            &target.target,
+                            &target.branch,
+                            &target.namespace,
+                        ]
+                        .into_iter()
+                        .any(|value| {
+                            value.trim().is_empty()
+                                || value.len() > 128
+                                || value.chars().any(char::is_control)
+                        })
+                    })
+                {
+                    return Err("Agent Rules-compilation fixture is invalid.".to_string());
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn rules_compilation_mismatches(
+    observed: &RulesCompilationExpectation,
+    expected: &RulesCompilationExpectation,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if observed.repository_ids != expected.repository_ids {
+        mismatches.push("repository_ids".to_string());
+    }
+    if observed.repositories_missing_local_path != expected.repositories_missing_local_path {
+        mismatches.push("repositories_missing_local_path".to_string());
+    }
+    if observed.protected_branches != expected.protected_branches {
+        mismatches.push("protected_branches".to_string());
+    }
+    if observed.approval_policy_count != expected.approval_policy_count {
+        mismatches.push("approval_policy_count".to_string());
+    }
+    if observed.deployment_targets != expected.deployment_targets {
+        mismatches.push("deployment_targets".to_string());
+    }
+    if observed.connector_ids != expected.connector_ids {
+        mismatches.push("connector_ids".to_string());
+    }
+    if observed.verification_policy_ids != expected.verification_policy_ids {
+        mismatches.push("verification_policy_ids".to_string());
+    }
+    if observed.evidence_verifier_ids != expected.evidence_verifier_ids {
+        mismatches.push("evidence_verifier_ids".to_string());
+    }
+    if observed.warning_count != expected.warning_count {
+        mismatches.push("warning_count".to_string());
+    }
+    mismatches
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -527,12 +694,16 @@ mod tests {
         let report =
             evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
                 .expect("corpus evaluates");
-        assert_eq!(report.total, 18);
-        assert_eq!(report.passed, 18);
+        assert_eq!(report.total, 21);
+        assert_eq!(report.passed, 21);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
+        assert_eq!(
+            report.categories[&AgentEvaluationCategory::SafeExecution].passed,
+            9
+        );
         assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::Planning].pass_rate_basis_points,
@@ -614,6 +785,36 @@ mod tests {
     }
 
     #[test]
+    fn rules_failure_report_never_echoes_the_rules_snapshot() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::RulesCompilation { .. }
+                )
+            })
+            .expect("Rules fixture exists");
+        let AgentEvaluationScenario::RulesCompilation { rules, expected } = &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is a Rules compilation");
+        };
+        rules.push_str("\nOperator token=rules-private-value");
+        expected.warning_count = 1;
+
+        let report =
+            evaluate_agent_corpus(&corpus, fixture_model_validator, fixture_planning_validator)
+                .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].mismatches, ["warning_count"]);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("rules-private-value"));
+        assert!(!encoded.contains("token="));
+    }
+
+    #[test]
     fn malformed_or_duplicate_fixtures_fail_closed() {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         corpus.fixtures[1].fixture_id = corpus.fixtures[0].fixture_id.clone();
@@ -625,5 +826,23 @@ mod tests {
         .expect_err("duplicate fixture rejected")
         .contains("unique"));
         assert!(parse_agent_evaluation_corpus(r#"{"schema_version":2}"#).is_err());
+
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let rules = corpus
+            .fixtures
+            .iter_mut()
+            .find_map(|fixture| match &mut fixture.scenario {
+                AgentEvaluationScenario::RulesCompilation { rules, .. } => Some(rules),
+                _ => None,
+            })
+            .expect("Rules fixture exists");
+        rules.push('\0');
+        assert!(evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+        )
+        .expect_err("NUL in Rules fixture rejected")
+        .contains("Rules-compilation"));
     }
 }

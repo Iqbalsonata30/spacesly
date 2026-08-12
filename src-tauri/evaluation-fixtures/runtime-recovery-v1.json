@@ -261,6 +261,63 @@
         "operation_hints": [],
         "resource_hints": []
       }
+    },
+    {
+      "fixture_id": "rules-compile-dynamic-operational-scope",
+      "category": "safe_execution",
+      "scenario": "rules_compilation",
+      "rules": "## Helm Repository\n1. Local checkout: `/workspace/payments-deployment`\n2. Helm Repository is at Bitbucket repo https://bitbucket.example/projects/OPS/repos/payments-deployment\n3. Backend helm templates are at folder service/, and frontend helm templates are at folder frontend/\n4. Modify on main,release must ask approval\n\n| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| PAYMENTS_DEV | development | develop | payments-dev |\n| PAYMENTS_PRESTAGE | prerelease | release | payments-prerelease |\n\n## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search\n  - get_page\n\n## Verification: confluence-source-read\n- Connector: team-confluence\n- Applies to labels:\n  - PAYMENTS_PRESTAGE\n- Required successful operations:\n  - search\n  - get_page\n\n## Evidence Verifier: deployment-state\n- Provider: kubernetes\n- Connector: development-cluster\n- Required states:\n  - deployment_available",
+      "expected": {
+        "repository_ids": ["payments-deployment"],
+        "repositories_missing_local_path": 0,
+        "protected_branches": ["main", "release"],
+        "approval_policy_count": 1,
+        "deployment_targets": [
+          {"label":"PAYMENTS_DEV","target":"development","branch":"develop","namespace":"payments-dev"},
+          {"label":"PAYMENTS_PRESTAGE","target":"prerelease","branch":"release","namespace":"payments-prerelease"}
+        ],
+        "connector_ids": ["team-confluence"],
+        "verification_policy_ids": ["confluence-source-read"],
+        "evidence_verifier_ids": ["deployment-state"],
+        "warning_count": 0
+      }
+    },
+    {
+      "fixture_id": "rules-warn-on-unresolved-local-checkout",
+      "category": "safe_execution",
+      "scenario": "rules_compilation",
+      "rules": "## Helm Repository\nHelm Repository is at Bitbucket repo https://bitbucket.example/projects/OPS/repos/ledger-deployment\nBackend helm templates are at folder charts/backend/",
+      "expected": {
+        "repository_ids": ["ledger-deployment"],
+        "repositories_missing_local_path": 1,
+        "protected_branches": [],
+        "approval_policy_count": 0,
+        "deployment_targets": [],
+        "connector_ids": [],
+        "verification_policy_ids": [],
+        "evidence_verifier_ids": [],
+        "warning_count": 1
+      }
+    },
+    {
+      "fixture_id": "rules-preserve-conflicting-deployment-targets",
+      "category": "safe_execution",
+      "scenario": "rules_compilation",
+      "rules": "| Jira Label | Environment | Git Branch | OpenShift Namespace |\n|---|---|---|---|\n| RELEASE_READY | prerelease | release | payments-prerelease |\n| RELEASE_READY | disaster-recovery | dr | payments-dr |\n| RELEASE_READY | disaster-recovery | dr | payments-dr |",
+      "expected": {
+        "repository_ids": [],
+        "repositories_missing_local_path": 0,
+        "protected_branches": [],
+        "approval_policy_count": 0,
+        "deployment_targets": [
+          {"label":"RELEASE_READY","target":"disaster-recovery","branch":"dr","namespace":"payments-dr"},
+          {"label":"RELEASE_READY","target":"prerelease","branch":"release","namespace":"payments-prerelease"}
+        ],
+        "connector_ids": [],
+        "verification_policy_ids": [],
+        "evidence_verifier_ids": [],
+        "warning_count": 0
+      }
     }
   ]
 }

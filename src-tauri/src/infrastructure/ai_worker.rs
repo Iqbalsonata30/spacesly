@@ -4503,8 +4503,8 @@ mod tests {
             evaluate_planning_proposal_fixture,
         )
         .expect("production evaluation completes");
-        assert_eq!(report.total, 18);
-        assert_eq!(report.passed, 18);
+        assert_eq!(report.total, 21);
+        assert_eq!(report.passed, 21);
         assert_eq!(report.failed, 0);
         assert_eq!(
             report.categories

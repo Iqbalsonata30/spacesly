@@ -385,12 +385,13 @@ Implemented recovery-policy corpus increment:
 - Failure reports retain fixture IDs and mismatched output field names only. Fixture error text, connector diagnostics, credentials, and task content are not copied into the report.
 - Model-result fixtures execute the production structured-response and objective-coverage validator. They cover valid evidence, malformed non-JSON completion claims, omitted and duplicate objectives, evidence-free completed objectives, and sensitive completion claims without operator approval.
 - Planning-proposal fixtures execute the production semantic-plan parser. They cover bounded multi-objective decomposition, stable objective IDs, normalized non-authoritative hints, mutation classification, malformed output, empty plans, and missing success-evidence contracts.
+- Rules-compilation fixtures execute the production domain compiler using generic repositories and environments. They cover dynamic repository identity, unresolved local checkouts, protected-branch approval policy, deployment targets, connector/verifier identities, and preserved conflicting rows.
 
 Current limitations:
 
 - All four score categories now have initial deterministic coverage, but none is yet a release-grade corpus.
 - Planning currently scores production proposal parsing and normalization, not the semantic quality of a live model's task decomposition.
-- Connector simulation, malformed Rules, workspace escape, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
+- Live Rules-bound preflight, connector simulation, workspace escape, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
 
 Benefits:
 
