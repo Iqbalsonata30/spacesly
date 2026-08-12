@@ -90,6 +90,12 @@ pub enum AgentEvaluationScenario {
         outside_repository: Option<String>,
         expected: RepositoryPreflightExpectation,
     },
+    TaskToolContainment {
+        operation: TaskToolContainmentOperation,
+        path: String,
+        symlink_to_outside: bool,
+        expected: TaskToolContainmentExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,6 +182,22 @@ pub struct RepositoryPreflightExpectation {
 
 pub type RepositoryPreflightObservation = RepositoryPreflightExpectation;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskToolContainmentOperation {
+    WorkspaceRead,
+    ShellWorkdir,
+    GitFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskToolContainmentExpectation {
+    pub allowed: bool,
+    pub fixture_error: bool,
+}
+
+pub type TaskToolContainmentObservation = TaskToolContainmentExpectation;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentEvaluationReport {
     pub schema_version: u32,
@@ -231,6 +253,11 @@ pub fn evaluate_agent_corpus(
         &[String],
         Option<&str>,
     ) -> RepositoryPreflightObservation,
+    task_tool_containment_validator: impl Fn(
+        TaskToolContainmentOperation,
+        &str,
+        bool,
+    ) -> TaskToolContainmentObservation,
 ) -> Result<AgentEvaluationReport, String> {
     validate_corpus(corpus)?;
     let mut failures = Vec::new();
@@ -242,6 +269,7 @@ pub fn evaluate_agent_corpus(
             &planning_proposal_validator,
             &deployment_target_validator,
             &repository_validator,
+            &task_tool_containment_validator,
         );
         let counts = category_counts.entry(fixture.category).or_default();
         counts.0 += 1;
@@ -303,6 +331,11 @@ fn evaluate_fixture(
         &[String],
         Option<&str>,
     ) -> RepositoryPreflightObservation,
+    task_tool_containment_validator: &impl Fn(
+        TaskToolContainmentOperation,
+        &str,
+        bool,
+    ) -> TaskToolContainmentObservation,
 ) -> Vec<String> {
     match &fixture.scenario {
         AgentEvaluationScenario::RuntimeRecovery {
@@ -472,6 +505,15 @@ fn evaluate_fixture(
                 outside_repository.as_deref(),
             );
             repository_preflight_mismatches(&observed, expected)
+        }
+        AgentEvaluationScenario::TaskToolContainment {
+            operation,
+            path,
+            symlink_to_outside,
+            expected,
+        } => {
+            let observed = task_tool_containment_validator(*operation, path, *symlink_to_outside);
+            task_tool_containment_mismatches(&observed, expected)
         }
     }
 }
@@ -686,6 +728,15 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent repository preflight fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::TaskToolContainment { path, expected, .. } => {
+                if path.trim().is_empty()
+                    || path.len() > 512
+                    || path.chars().any(char::is_control)
+                    || expected.fixture_error
+                {
+                    return Err("Agent task-tool containment fixture is invalid.".to_string());
+                }
+            }
         }
     }
     Ok(())
@@ -765,6 +816,20 @@ fn repository_preflight_mismatches(
     }
     if observed.blocked != expected.blocked {
         mismatches.push("blocked".to_string());
+    }
+    if observed.fixture_error != expected.fixture_error {
+        mismatches.push("fixture_error".to_string());
+    }
+    mismatches
+}
+
+fn task_tool_containment_mismatches(
+    observed: &TaskToolContainmentObservation,
+    expected: &TaskToolContainmentExpectation,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if observed.allowed != expected.allowed {
+        mismatches.push("allowed".to_string());
     }
     if observed.fixture_error != expected.fixture_error {
         mismatches.push("fixture_error".to_string());
@@ -967,6 +1032,18 @@ mod tests {
         )
     }
 
+    fn fixture_task_tool_containment_validator(
+        operation: TaskToolContainmentOperation,
+        path: &str,
+        symlink_to_outside: bool,
+    ) -> TaskToolContainmentObservation {
+        crate::infrastructure::task_tools::evaluate_task_tool_containment_fixture(
+            operation,
+            path,
+            symlink_to_outside,
+        )
+    }
+
     #[test]
     fn embedded_corpus_passes_and_never_invents_uncovered_scores() {
         let corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
@@ -976,17 +1053,18 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
-        assert_eq!(report.total, 35);
-        assert_eq!(report.passed, 35);
+        assert_eq!(report.total, 47);
+        assert_eq!(report.passed, 47);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::SafeExecution].passed,
-            23
+            35
         );
         assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
@@ -1005,6 +1083,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("partial corpus evaluates");
         assert!(!uncovered_report.categories[&AgentEvaluationCategory::Planning].evaluated);
@@ -1031,6 +1110,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -1071,6 +1151,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -1106,6 +1187,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -1143,6 +1225,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -1181,6 +1264,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -1193,6 +1277,44 @@ mod tests {
     }
 
     #[test]
+    fn task_tool_failure_report_never_echoes_requested_paths() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::TaskToolContainment { .. }
+                )
+            })
+            .expect("task-tool containment fixture exists");
+        let AgentEvaluationScenario::TaskToolContainment { path, expected, .. } =
+            &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is task-tool containment");
+        };
+        *path = "{{outside}}/token=task-tool-private-value".to_string();
+        expected.allowed = true;
+
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+            fixture_repository_validator,
+            fixture_task_tool_containment_validator,
+        )
+        .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].mismatches, ["allowed"]);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("task-tool-private-value"));
+        assert!(!encoded.contains("token="));
+        assert!(!encoded.contains("spacesly-agent-task-tool-evaluation"));
+    }
+
+    #[test]
     fn malformed_or_duplicate_fixtures_fail_closed() {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         corpus.fixtures[1].fixture_id = corpus.fixtures[0].fixture_id.clone();
@@ -1202,6 +1324,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect_err("duplicate fixture rejected")
         .contains("unique"));
@@ -1223,6 +1346,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect_err("NUL in Rules fixture rejected")
         .contains("Rules-compilation"));
@@ -1246,6 +1370,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_task_tool_containment_validator,
         )
         .expect_err("repository fixture traversal rejected")
         .contains("repository preflight"));

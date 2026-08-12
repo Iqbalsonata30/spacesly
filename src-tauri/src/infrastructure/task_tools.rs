@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::files::{
     list_directory, read_file_at_root, write_file_authorized, LineEnding, TextEncoding,
@@ -18,6 +19,7 @@ use super::scheduler_store::{SchedulerStore, TaskToolAuthority};
 use super::shell::{run_shell_command_cancellable, ShellCommandRequest};
 
 pub(crate) const TASK_TOOLS_AUTHORITY_ENV: &str = "SPACESLY_TASK_TOOLS_AUTHORITY";
+static TASK_TOOL_EVALUATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub fn run_task_tools_from_env() -> Result<(), String> {
     let encoded = std::env::var(TASK_TOOLS_AUTHORITY_ENV)
@@ -469,6 +471,130 @@ fn resolve_workdir(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
         return Err("Workdir escapes the assigned workspace.".to_string());
     }
     Ok(resolved)
+}
+
+pub(crate) fn evaluate_task_tool_containment_fixture(
+    operation: crate::domain::agent_evaluation::TaskToolContainmentOperation,
+    path: &str,
+    symlink_to_outside: bool,
+) -> crate::domain::agent_evaluation::TaskToolContainmentObservation {
+    match evaluate_task_tool_containment_fixture_inner(operation, path, symlink_to_outside) {
+        Ok(allowed) => crate::domain::agent_evaluation::TaskToolContainmentObservation {
+            allowed,
+            fixture_error: false,
+        },
+        Err(_) => crate::domain::agent_evaluation::TaskToolContainmentObservation {
+            allowed: false,
+            fixture_error: true,
+        },
+    }
+}
+
+fn evaluate_task_tool_containment_fixture_inner(
+    operation: crate::domain::agent_evaluation::TaskToolContainmentOperation,
+    path: &str,
+    symlink_to_outside: bool,
+) -> Result<bool, String> {
+    let fixture = TaskToolEvaluationFixture::create()?;
+    let workspace = fixture.root.join("workspace");
+    let outside = fixture.root.join("outside");
+    std::fs::create_dir_all(workspace.join("inside-dir"))
+        .map_err(|error| format!("Failed to create evaluation workspace: {error}"))?;
+    std::fs::create_dir_all(&outside)
+        .map_err(|error| format!("Failed to create evaluation outside root: {error}"))?;
+    std::fs::write(workspace.join("inside.txt"), "inside")
+        .map_err(|error| format!("Failed to create contained evaluation file: {error}"))?;
+    std::fs::write(outside.join("outside.txt"), "outside")
+        .map_err(|error| format!("Failed to create outside evaluation file: {error}"))?;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve evaluation workspace: {error}"))?;
+    let outside = outside
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve evaluation outside root: {error}"))?;
+    let path = task_tool_evaluation_path(path, &workspace, &outside);
+    let path = configure_task_tool_symlink(path, &workspace, &outside, symlink_to_outside)?;
+    match operation {
+        crate::domain::agent_evaluation::TaskToolContainmentOperation::WorkspaceRead => {
+            let roots = WorkspaceRoot::scoped("evaluation-workspace", &workspace)?;
+            Ok(resolve_workspace_file_path(&workspace, &path)
+                .and_then(|path| {
+                    read_file_at_root(&roots, "evaluation-workspace".to_string(), path).map(|_| ())
+                })
+                .is_ok())
+        }
+        crate::domain::agent_evaluation::TaskToolContainmentOperation::ShellWorkdir => {
+            Ok(resolve_workdir(&workspace, Some(&path)).is_ok())
+        }
+        crate::domain::agent_evaluation::TaskToolContainmentOperation::GitFile => {
+            Ok(validate_relative_path(&path).is_ok())
+        }
+    }
+}
+
+struct TaskToolEvaluationFixture {
+    root: PathBuf,
+}
+
+impl TaskToolEvaluationFixture {
+    fn create() -> Result<Self, String> {
+        for _ in 0..128 {
+            let sequence = TASK_TOOL_EVALUATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "spacesly-agent-task-tool-evaluation-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to create task-tool evaluation root: {error}"
+                    ));
+                }
+            }
+        }
+        Err("Could not allocate a unique task-tool evaluation root.".to_string())
+    }
+}
+
+impl Drop for TaskToolEvaluationFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn task_tool_evaluation_path(path: &str, workspace: &Path, outside: &Path) -> String {
+    path.replace("{{workspace}}", &workspace.to_string_lossy())
+        .replace("{{outside}}", &outside.to_string_lossy())
+}
+
+#[cfg(unix)]
+fn configure_task_tool_symlink(
+    path: String,
+    workspace: &Path,
+    outside: &Path,
+    enabled: bool,
+) -> Result<String, String> {
+    if enabled {
+        std::os::unix::fs::symlink(outside, workspace.join("outside-link"))
+            .map_err(|error| format!("Failed to create evaluation symlink: {error}"))?;
+    }
+    Ok(path)
+}
+
+#[cfg(not(unix))]
+fn configure_task_tool_symlink(
+    path: String,
+    _workspace: &Path,
+    outside: &Path,
+    enabled: bool,
+) -> Result<String, String> {
+    if enabled {
+        Ok(path.replacen("outside-link", &outside.to_string_lossy(), 1))
+    } else {
+        Ok(path)
+    }
 }
 
 #[cfg(test)]

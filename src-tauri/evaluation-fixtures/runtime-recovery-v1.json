@@ -542,6 +542,114 @@
         "blocked": true,
         "fixture_error": false
       }
+    },
+    {
+      "fixture_id": "task-tool-read-allows-contained-relative-file",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "workspace_read",
+      "path": "inside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": true, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-read-allows-contained-absolute-file",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "workspace_read",
+      "path": "{{workspace}}/inside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": true, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-read-blocks-parent-traversal",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "workspace_read",
+      "path": "../outside/outside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-read-blocks-absolute-escape",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "workspace_read",
+      "path": "{{outside}}/outside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-read-blocks-symlink-escape",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "workspace_read",
+      "path": "outside-link/outside.txt",
+      "symlink_to_outside": true,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-shell-allows-contained-workdir",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "shell_workdir",
+      "path": "inside-dir",
+      "symlink_to_outside": false,
+      "expected": {"allowed": true, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-shell-blocks-parent-traversal",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "shell_workdir",
+      "path": "../outside",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-shell-blocks-absolute-escape",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "shell_workdir",
+      "path": "{{outside}}",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-shell-blocks-symlink-escape",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "shell_workdir",
+      "path": "outside-link",
+      "symlink_to_outside": true,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-git-allows-contained-file",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "git_file",
+      "path": "src/main.rs",
+      "symlink_to_outside": false,
+      "expected": {"allowed": true, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-git-blocks-parent-traversal",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "git_file",
+      "path": "../outside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
+    },
+    {
+      "fixture_id": "task-tool-git-blocks-absolute-file",
+      "category": "safe_execution",
+      "scenario": "task_tool_containment",
+      "operation": "git_file",
+      "path": "{{outside}}/outside.txt",
+      "symlink_to_outside": false,
+      "expected": {"allowed": false, "fixture_error": false}
     }
   ]
 }

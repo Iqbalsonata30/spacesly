@@ -388,12 +388,13 @@ Implemented recovery-policy corpus increment:
 - Rules-compilation fixtures execute the production domain compiler using generic repositories and environments. They cover dynamic repository identity, unresolved local checkouts, protected-branch approval policy, deployment targets, connector/verifier identities, and preserved conflicting rows.
 - Deployment-target fixtures execute the production Rules-bound preflight resolver. They cover ticket labels, explicit targets, agreeing combined selectors, conflicts, unresolved targets, ambiguous labels, invalid branch/namespace Rules, and secret-free diagnostics.
 - Repository fixtures create isolated Git layouts and execute the production Rules-bound repository resolver. They cover exact contained checkouts, bounded discovery, ambiguity, missing checkouts, contract/Rules conflicts, outside-workspace paths, multiple unselected Rules, cleanup, and secret-free normalized reports.
+- Task-tool fixtures execute production workspace-read, shell-workdir, and Git-file path resolution in isolated layouts. They cover contained paths, parent traversal, absolute escapes, Unix symlink escapes, portable non-Unix outside-path equivalents, cleanup, and path-free reports.
 
 Current limitations:
 
 - All four score categories now have initial deterministic coverage, but none is yet a release-grade corpus.
 - Planning currently scores production proposal parsing and normalization, not the semantic quality of a live model's task decomposition.
-- Live connector Rules-bound preflight, task-tool traversal/symlink containment, connector simulation, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
+- Live connector Rules-bound preflight, connector simulation, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
 
 Benefits:
 
