@@ -387,12 +387,13 @@ Implemented recovery-policy corpus increment:
 - Planning-proposal fixtures execute the production semantic-plan parser. They cover bounded multi-objective decomposition, stable objective IDs, normalized non-authoritative hints, mutation classification, malformed output, empty plans, and missing success-evidence contracts.
 - Rules-compilation fixtures execute the production domain compiler using generic repositories and environments. They cover dynamic repository identity, unresolved local checkouts, protected-branch approval policy, deployment targets, connector/verifier identities, and preserved conflicting rows.
 - Deployment-target fixtures execute the production Rules-bound preflight resolver. They cover ticket labels, explicit targets, agreeing combined selectors, conflicts, unresolved targets, ambiguous labels, invalid branch/namespace Rules, and secret-free diagnostics.
+- Repository fixtures create isolated Git layouts and execute the production Rules-bound repository resolver. They cover exact contained checkouts, bounded discovery, ambiguity, missing checkouts, contract/Rules conflicts, outside-workspace paths, multiple unselected Rules, cleanup, and secret-free normalized reports.
 
 Current limitations:
 
 - All four score categories now have initial deterministic coverage, but none is yet a release-grade corpus.
 - Planning currently scores production proposal parsing and normalization, not the semantic quality of a live model's task decomposition.
-- Repository and live connector Rules-bound preflight, connector simulation, workspace escape, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
+- Live connector Rules-bound preflight, task-tool traversal/symlink containment, connector simulation, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
 
 Benefits:
 

@@ -423,6 +423,125 @@
         "target": null,
         "blocked": true
       }
+    },
+    {
+      "fixture_id": "repository-preflight-resolves-rules-checkout",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Local checkout: `{{workspace}}/teams/orders-deployment`\nHelm Repository is at https://bitbucket.example/projects/OPS/repos/orders-deployment\nBackend helm templates are at folder service/",
+      "contract_repository_id": "orders-deployment",
+      "contract_root_path": null,
+      "workspace_repositories": ["teams/orders-deployment"],
+      "outside_repository": null,
+      "expected": {
+        "status": "resolved",
+        "repository_id": "orders-deployment",
+        "workspace_relative_root": "teams/orders-deployment",
+        "blocked": false,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-discovers-unique-checkout",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Helm Repository is at https://bitbucket.example/projects/OPS/repos/invoice-deployment",
+      "contract_repository_id": "invoice-deployment",
+      "contract_root_path": null,
+      "workspace_repositories": ["products/invoice-deployment"],
+      "outside_repository": null,
+      "expected": {
+        "status": "resolved",
+        "repository_id": "invoice-deployment",
+        "workspace_relative_root": "products/invoice-deployment",
+        "blocked": false,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-blocks-ambiguous-discovery",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Helm Repository is at https://bitbucket.example/projects/OPS/repos/shared-deployment",
+      "contract_repository_id": "shared-deployment",
+      "contract_root_path": null,
+      "workspace_repositories": ["team-a/shared-deployment", "team-b/shared-deployment"],
+      "outside_repository": null,
+      "expected": {
+        "status": "ambiguous",
+        "repository_id": "shared-deployment",
+        "workspace_relative_root": null,
+        "blocked": true,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-blocks-outside-workspace",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Local checkout: `{{outside}}/external-deployment`\nHelm Repository is at https://bitbucket.example/projects/OPS/repos/external-deployment",
+      "contract_repository_id": "external-deployment",
+      "contract_root_path": null,
+      "workspace_repositories": [],
+      "outside_repository": "external-deployment",
+      "expected": {
+        "status": "outside_workspace",
+        "repository_id": "external-deployment",
+        "workspace_relative_root": null,
+        "blocked": true,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-blocks-contract-rules-conflict",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Local checkout: `{{workspace}}/ruled/orders-deployment`\nHelm Repository is at https://bitbucket.example/projects/OPS/repos/orders-deployment",
+      "contract_repository_id": "orders-deployment",
+      "contract_root_path": "{{workspace}}/contracted/orders-deployment",
+      "workspace_repositories": ["ruled/orders-deployment", "contracted/orders-deployment"],
+      "outside_repository": null,
+      "expected": {
+        "status": "conflict",
+        "repository_id": "orders-deployment",
+        "workspace_relative_root": null,
+        "blocked": true,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-blocks-missing-checkout",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Helm Repository is at https://bitbucket.example/projects/OPS/repos/missing-deployment",
+      "contract_repository_id": "missing-deployment",
+      "contract_root_path": null,
+      "workspace_repositories": [],
+      "outside_repository": null,
+      "expected": {
+        "status": "missing_checkout",
+        "repository_id": "missing-deployment",
+        "workspace_relative_root": null,
+        "blocked": true,
+        "fixture_error": false
+      }
+    },
+    {
+      "fixture_id": "repository-preflight-blocks-unselected-multiple-rules",
+      "category": "safe_execution",
+      "scenario": "repository_preflight",
+      "rules": "Repository is at https://bitbucket.example/projects/OPS/repos/alpha-deployment\nRepository is at https://bitbucket.example/projects/OPS/repos/beta-deployment",
+      "contract_repository_id": null,
+      "contract_root_path": null,
+      "workspace_repositories": [],
+      "outside_repository": null,
+      "expected": {
+        "status": "ambiguous",
+        "repository_id": null,
+        "workspace_relative_root": null,
+        "blocked": true,
+        "fixture_error": false
+      }
     }
   ]
 }

@@ -82,6 +82,14 @@ pub enum AgentEvaluationScenario {
         explicit_target: Option<String>,
         expected: DeploymentTargetPreflightExpectation,
     },
+    RepositoryPreflight {
+        rules: String,
+        contract_repository_id: Option<String>,
+        contract_root_path: Option<String>,
+        workspace_repositories: Vec<String>,
+        outside_repository: Option<String>,
+        expected: RepositoryPreflightExpectation,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,6 +166,17 @@ pub struct DeploymentTargetPreflightExpectation {
 pub type DeploymentTargetPreflightObservation = DeploymentTargetPreflightExpectation;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryPreflightExpectation {
+    pub status: Option<String>,
+    pub repository_id: Option<String>,
+    pub workspace_relative_root: Option<String>,
+    pub blocked: bool,
+    pub fixture_error: bool,
+}
+
+pub type RepositoryPreflightObservation = RepositoryPreflightExpectation;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentEvaluationReport {
     pub schema_version: u32,
     pub corpus_id: String,
@@ -205,6 +224,13 @@ pub fn evaluate_agent_corpus(
         &[String],
         Option<&str>,
     ) -> DeploymentTargetPreflightObservation,
+    repository_validator: impl Fn(
+        &str,
+        Option<&str>,
+        Option<&str>,
+        &[String],
+        Option<&str>,
+    ) -> RepositoryPreflightObservation,
 ) -> Result<AgentEvaluationReport, String> {
     validate_corpus(corpus)?;
     let mut failures = Vec::new();
@@ -215,6 +241,7 @@ pub fn evaluate_agent_corpus(
             &model_result_validator,
             &planning_proposal_validator,
             &deployment_target_validator,
+            &repository_validator,
         );
         let counts = category_counts.entry(fixture.category).or_default();
         counts.0 += 1;
@@ -269,6 +296,13 @@ fn evaluate_fixture(
         &[String],
         Option<&str>,
     ) -> DeploymentTargetPreflightObservation,
+    repository_validator: &impl Fn(
+        &str,
+        Option<&str>,
+        Option<&str>,
+        &[String],
+        Option<&str>,
+    ) -> RepositoryPreflightObservation,
 ) -> Vec<String> {
     match &fixture.scenario {
         AgentEvaluationScenario::RuntimeRecovery {
@@ -421,6 +455,23 @@ fn evaluate_fixture(
         } => {
             let observed = deployment_target_validator(rules, labels, explicit_target.as_deref());
             deployment_target_preflight_mismatches(&observed, expected)
+        }
+        AgentEvaluationScenario::RepositoryPreflight {
+            rules,
+            contract_repository_id,
+            contract_root_path,
+            workspace_repositories,
+            outside_repository,
+            expected,
+        } => {
+            let observed = repository_validator(
+                rules,
+                contract_repository_id.as_deref(),
+                contract_root_path.as_deref(),
+                workspace_repositories,
+                outside_repository.as_deref(),
+            );
+            repository_preflight_mismatches(&observed, expected)
         }
     }
 }
@@ -584,6 +635,57 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent deployment-target preflight fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::RepositoryPreflight {
+                rules,
+                contract_repository_id,
+                contract_root_path,
+                workspace_repositories,
+                outside_repository,
+                expected,
+            } => {
+                let paths = workspace_repositories
+                    .iter()
+                    .chain(outside_repository.iter())
+                    .chain(contract_root_path.iter());
+                let valid_status = expected.status.as_deref().is_none_or(|status| {
+                    matches!(
+                        status,
+                        "resolved"
+                            | "ambiguous"
+                            | "conflict"
+                            | "missing_checkout"
+                            | "invalid_checkout"
+                            | "outside_workspace"
+                    )
+                });
+                let resolved = expected.status.as_deref() == Some("resolved");
+                if rules.trim().is_empty()
+                    || rules.len() > 32 * 1024
+                    || rules.contains('\0')
+                    || workspace_repositories.len() > 16
+                    || paths
+                        .into_iter()
+                        .any(|path| !valid_fixture_relative_path(path))
+                    || contract_repository_id
+                        .as_deref()
+                        .is_some_and(|id| !valid_identifier(id))
+                    || expected
+                        .repository_id
+                        .as_deref()
+                        .is_some_and(|id| !valid_identifier(id))
+                    || expected
+                        .workspace_relative_root
+                        .as_deref()
+                        .is_some_and(|path| !valid_fixture_relative_path(path))
+                    || !valid_status
+                    || expected.status.is_none()
+                    || expected.fixture_error
+                    || resolved != expected.workspace_relative_root.is_some()
+                    || expected.blocked == resolved
+                {
+                    return Err("Agent repository preflight fixture is invalid.".to_string());
+                }
+            }
         }
     }
     Ok(())
@@ -647,6 +749,29 @@ fn deployment_target_preflight_mismatches(
     mismatches
 }
 
+fn repository_preflight_mismatches(
+    observed: &RepositoryPreflightObservation,
+    expected: &RepositoryPreflightExpectation,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if observed.status != expected.status {
+        mismatches.push("status".to_string());
+    }
+    if observed.repository_id != expected.repository_id {
+        mismatches.push("repository_id".to_string());
+    }
+    if observed.workspace_relative_root != expected.workspace_relative_root {
+        mismatches.push("workspace_relative_root".to_string());
+    }
+    if observed.blocked != expected.blocked {
+        mismatches.push("blocked".to_string());
+    }
+    if observed.fixture_error != expected.fixture_error {
+        mismatches.push("fixture_error".to_string());
+    }
+    mismatches
+}
+
 fn valid_deployment_target(target: &RulesDeploymentTargetExpectation) -> bool {
     [
         &target.label,
@@ -666,6 +791,20 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_fixture_relative_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !value.is_empty()
+        && value.len() <= 512
+        && !path.is_absolute()
+        && !value.chars().any(char::is_control)
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
 }
 
 fn pass_rate(passed: usize, total: usize) -> u16 {
@@ -812,6 +951,22 @@ mod tests {
         )
     }
 
+    fn fixture_repository_validator(
+        rules: &str,
+        contract_repository_id: Option<&str>,
+        contract_root_path: Option<&str>,
+        workspace_repositories: &[String],
+        outside_repository: Option<&str>,
+    ) -> RepositoryPreflightObservation {
+        crate::application::agent_task_executor::evaluate_repository_preflight_fixture(
+            rules,
+            contract_repository_id,
+            contract_root_path,
+            workspace_repositories,
+            outside_repository,
+        )
+    }
+
     #[test]
     fn embedded_corpus_passes_and_never_invents_uncovered_scores() {
         let corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
@@ -820,17 +975,18 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("corpus evaluates");
-        assert_eq!(report.total, 28);
-        assert_eq!(report.passed, 28);
+        assert_eq!(report.total, 35);
+        assert_eq!(report.passed, 35);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::SafeExecution].passed,
-            16
+            23
         );
         assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
@@ -848,6 +1004,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("partial corpus evaluates");
         assert!(!uncovered_report.categories[&AgentEvaluationCategory::Planning].evaluated);
@@ -873,6 +1030,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -912,6 +1070,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -946,6 +1105,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -982,6 +1142,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect("corpus evaluates");
         assert_eq!(report.failed, 1);
@@ -993,6 +1154,45 @@ mod tests {
     }
 
     #[test]
+    fn repository_failure_report_never_echoes_rules_or_checkout_paths() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::RepositoryPreflight { .. }
+                )
+            })
+            .expect("repository preflight fixture exists");
+        let AgentEvaluationScenario::RepositoryPreflight {
+            rules, expected, ..
+        } = &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is a repository preflight");
+        };
+        rules.push_str("\nOperator token=repository-private-value");
+        expected.repository_id = Some("unexpected-repository".to_string());
+
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+            fixture_repository_validator,
+        )
+        .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].mismatches, ["repository_id"]);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("repository-private-value"));
+        assert!(!encoded.contains("unexpected-repository"));
+        assert!(!encoded.contains("token="));
+        assert!(!encoded.contains("spacesly-agent-repository-evaluation"));
+    }
+
+    #[test]
     fn malformed_or_duplicate_fixtures_fail_closed() {
         let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
         corpus.fixtures[1].fixture_id = corpus.fixtures[0].fixture_id.clone();
@@ -1001,6 +1201,7 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect_err("duplicate fixture rejected")
         .contains("unique"));
@@ -1021,8 +1222,32 @@ mod tests {
             fixture_model_validator,
             fixture_planning_validator,
             fixture_deployment_target_validator,
+            fixture_repository_validator,
         )
         .expect_err("NUL in Rules fixture rejected")
         .contains("Rules-compilation"));
+
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let workspace_repositories = corpus
+            .fixtures
+            .iter_mut()
+            .find_map(|fixture| match &mut fixture.scenario {
+                AgentEvaluationScenario::RepositoryPreflight {
+                    workspace_repositories,
+                    ..
+                } => Some(workspace_repositories),
+                _ => None,
+            })
+            .expect("repository fixture exists");
+        workspace_repositories.push("../escape".to_string());
+        assert!(evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+            fixture_repository_validator,
+        )
+        .expect_err("repository fixture traversal rejected")
+        .contains("repository preflight"));
     }
 }

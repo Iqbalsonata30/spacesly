@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ const MAX_REPOSITORY_DISCOVERY_DEPTH: usize = 4;
 const MAX_REPOSITORY_DISCOVERY_DIRECTORIES: usize = 4_096;
 const MAX_EVIDENCE_POLL_INTERVAL_SECONDS: u64 = 30;
 const MAX_EVIDENCE_TIMEOUT_SECONDS: u64 = 600;
+static REPOSITORY_EVALUATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct RepositoryPreflight {
     record: Option<RepositoryResolutionRecord>,
@@ -1906,6 +1907,150 @@ fn resolve_repository_preflight(
         repository_root: Some(canonical),
         blocker: None,
     }
+}
+
+pub(crate) fn evaluate_repository_preflight_fixture(
+    rules: &str,
+    contract_repository_id: Option<&str>,
+    contract_root_path: Option<&str>,
+    workspace_repositories: &[String],
+    outside_repository: Option<&str>,
+) -> crate::domain::agent_evaluation::RepositoryPreflightObservation {
+    match evaluate_repository_preflight_fixture_inner(
+        rules,
+        contract_repository_id,
+        contract_root_path,
+        workspace_repositories,
+        outside_repository,
+    ) {
+        Ok(observation) => observation,
+        Err(_) => crate::domain::agent_evaluation::RepositoryPreflightObservation {
+            status: None,
+            repository_id: None,
+            workspace_relative_root: None,
+            blocked: true,
+            fixture_error: true,
+        },
+    }
+}
+
+fn evaluate_repository_preflight_fixture_inner(
+    rules: &str,
+    contract_repository_id: Option<&str>,
+    contract_root_path: Option<&str>,
+    workspace_repositories: &[String],
+    outside_repository: Option<&str>,
+) -> Result<crate::domain::agent_evaluation::RepositoryPreflightObservation, String> {
+    let fixture = RepositoryEvaluationFixture::create()?;
+    let workspace = fixture.root.join("workspace");
+    let outside = fixture.root.join("outside");
+    std::fs::create_dir_all(&workspace)
+        .map_err(|error| format!("Failed to create evaluation workspace: {error}"))?;
+    std::fs::create_dir_all(&outside)
+        .map_err(|error| format!("Failed to create evaluation outside root: {error}"))?;
+    for path in workspace_repositories {
+        initialize_evaluation_repository(&workspace.join(path))?;
+    }
+    if let Some(path) = outside_repository {
+        initialize_evaluation_repository(&outside.join(path))?;
+    }
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve evaluation workspace: {error}"))?;
+    let outside = outside
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve evaluation outside root: {error}"))?;
+    let rules = replace_repository_fixture_roots(rules, &workspace, &outside);
+    let mut contract = json!({});
+    if let Some(repository_id) = contract_repository_id {
+        contract["repository"] = json!({ "id": repository_id });
+    }
+    if let Some(root_path) = contract_root_path {
+        let root_path = replace_repository_fixture_roots(root_path, &workspace, &outside);
+        if contract.get("repository").is_none() {
+            contract["repository"] = json!({});
+        }
+        contract["repository"]["root_path"] = json!(root_path);
+    }
+    let facts = compile_rule_facts(&rules);
+    let preflight = resolve_repository_preflight(&contract, &facts, &workspace);
+    let record = preflight.record.as_ref();
+    let workspace_relative_root = preflight
+        .repository_root
+        .as_deref()
+        .and_then(|root| root.strip_prefix(&workspace).ok())
+        .map(normalized_fixture_path);
+    Ok(
+        crate::domain::agent_evaluation::RepositoryPreflightObservation {
+            status: record.map(|record| record.status.clone()),
+            repository_id: record.and_then(|record| record.repository_id.clone()),
+            workspace_relative_root,
+            blocked: preflight.blocker.is_some(),
+            fixture_error: false,
+        },
+    )
+}
+
+struct RepositoryEvaluationFixture {
+    root: PathBuf,
+}
+
+impl RepositoryEvaluationFixture {
+    fn create() -> Result<Self, String> {
+        for _ in 0..128 {
+            let sequence = REPOSITORY_EVALUATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "spacesly-agent-repository-evaluation-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to create repository evaluation root: {error}"
+                    ));
+                }
+            }
+        }
+        Err("Could not allocate a unique repository evaluation root.".to_string())
+    }
+}
+
+impl Drop for RepositoryEvaluationFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn initialize_evaluation_repository(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("Failed to create evaluation repository: {error}"))?;
+    let status = std::process::Command::new(crate::infrastructure::git::git_executable()?)
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .status()
+        .map_err(|error| format!("Failed to initialize evaluation repository: {error}"))?;
+    if !status.success() {
+        return Err("Git could not initialize the evaluation repository.".to_string());
+    }
+    Ok(())
+}
+
+fn replace_repository_fixture_roots(value: &str, workspace: &Path, outside: &Path) -> String {
+    value
+        .replace("{{workspace}}", &workspace.to_string_lossy())
+        .replace("{{outside}}", &outside.to_string_lossy())
+}
+
+fn normalized_fixture_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn repository_preflight_failure(
