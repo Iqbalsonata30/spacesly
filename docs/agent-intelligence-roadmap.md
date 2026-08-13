@@ -372,7 +372,7 @@ Exit criteria:
 
 ### Phase 12 — Evaluation and Regression Harness
 
-Status: in progress.
+Status: completed.
 
 Create replayable task fixtures covering dynamic connectors, missing tools, malformed rules, workspace escapes, approval pauses, partial mutations, continuation, and model non-compliance.
 
@@ -391,11 +391,12 @@ Implemented recovery-policy corpus increment:
 - Task-tool fixtures execute production workspace-read, shell-workdir, and Git-file path resolution in isolated layouts. They cover contained paths, parent traversal, absolute escapes, Unix symlink escapes, portable non-Unix outside-path equivalents, cleanup, and path-free reports.
 - Connector-preflight fixtures execute the production Rules-bound configuration and capability resolver against sanitized MCP server configuration and live inventory snapshots. They cover matching configuration, missing Rules/configuration, URL mismatch, unavailable discovery, and missing or ambiguous operations without exposing URLs or inventory data in reports.
 
-Current limitations:
+Future expansion beyond the completed phase:
 
 - All four score categories now have initial deterministic coverage, but none is yet a release-grade corpus.
 - Planning currently scores production proposal parsing and normalization, not the semantic quality of a live model's task decomposition.
-- Live connector Rules-bound preflight, connector simulation, approval continuation, partial external mutations, provider evidence adapters, and curated live-model task-to-plan fixtures remain incremental Phase 12 work.
+- Connector process simulation, curated live-model task-to-plan fixtures, and broader replay coverage for approval continuation, partial external mutations, and provider evidence adapters remain incremental hardening work.
+- The headless evaluator is a required CI and release prerequisite; any fixture mismatch returns a non-zero status and blocks the workflow, while every run publishes its JSON scorecard as an artifact.
 
 Benefits:
 

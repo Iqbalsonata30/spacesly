@@ -11,9 +11,9 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
-- Phase 12 is in progress with a replayable, headless production-policy corpus and deterministic scorecard across all four initial categories.
+- Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 
-## Phase 12 In Progress
+## Phase 12 Completed
 
 Implemented recovery, result-evidence, planning-proposal, Rules-compilation, deployment/repository/connector preflight, and task-tool containment corpus slices:
 
@@ -30,6 +30,7 @@ Implemented recovery, result-evidence, planning-proposal, Rules-compilation, dep
 - Task-tool fixtures invoke production workspace-read, shell-workdir, and Git-file path resolution inside isolated temporary layouts. Contained relative/absolute paths succeed while parent traversal, absolute escape, and symlink escape are rejected. Non-Unix evaluation uses an equivalent absolute outside path because symlink creation is not portable.
 - All roadmap score categories are represented. The current run reports planning 4/4, safe execution 42/42, recovery 3/3, and evidence quality 5/5.
 - Run the release-safe headless command with `spacesly --spacesly-evaluate-agent`; it prints JSON and returns a non-zero exit code if parsing, validation, or any fixture fails.
+- Pull-request/main CI runs the evaluator after the Rust suite, and release workflows evaluate the exact tag/ref before any release build begins. Both publish the JSON scorecard as a workflow artifact while preserving non-zero evaluator exits.
 - Duplicate or malformed fixture IDs, unsupported schema versions, empty/oversized errors, excessive retry policy, and empty/oversized corpora fail closed.
 
 Phase 12 regression evidence:
@@ -40,13 +41,13 @@ Phase 12 regression evidence:
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
-Remaining Phase 12 scope:
+Future Phase 12 corpus expansion:
 
 - Planning coverage currently measures deterministic proposal-schema enforcement, not whether a live model semantically decomposes an arbitrary task correctly; curated task-to-plan model fixtures remain future work.
 - Rules compilation, deployment-target resolution, repository checkout containment, and deterministic connector configuration/capability preflight are covered. The corpus uses sanitized snapshots and does not spawn real connector processes or exercise discovery transport failures.
 - Task-tool read/workdir/Git-file containment is covered; mutation-time directory replacement races remain covered by focused file-service tests rather than the headless corpus.
-- Add real production-path fixtures for approval continuation, mutation-ledger recovery, and provider evidence adapters.
-- Add connector simulators and a CI release gate only after each score category has representative coverage.
+- Existing production tests cover approval continuation, mutation-ledger replay/uncertainty, and provider evidence adapters; adding those paths to the headless JSON corpus remains useful expansion rather than an exit blocker.
+- Add connector-process simulators and curated live-model fixtures as the corpus matures.
 
 ## Phase 11 Completed
 

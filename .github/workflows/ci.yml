@@ -105,6 +105,19 @@ jobs:
           workspaces: src-tauri
       - run: cargo test
         working-directory: src-tauri
+      - name: Enforce agent safety evaluation gate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -- --spacesly-evaluate-agent | tee agent-evaluation-report.json
+        working-directory: src-tauri
+      - name: Publish agent evaluation scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-evaluation-scorecard
+          path: src-tauri/agent-evaluation-report.json
+          if-no-files-found: ignore
 
   audit-rust:
     runs-on: ubuntu-latest
