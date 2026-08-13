@@ -37,6 +37,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RECOVERY_REQUIRES_RETRY_FRESH: &str =
     "[recovery_requires_retry_fresh] Spacesly cannot safely resume this Agent task because no durable OpenCode session identity was recorded. Use Retry Fresh explicitly.";
+pub(crate) const RECOVERY_REQUIRES_MUTATION_RECONCILIATION: &str =
+    "[recovery_requires_mutation_reconciliation] Spacesly stopped recovery because an external mutation has an uncertain outcome. Reconcile the retained mutation fence before continuing.";
 
 fn stable_manifest_identity_matches(
     first: &ExecutionManifestDraft,
@@ -4447,7 +4449,7 @@ fn recover_matching_attempts<P: rusqlite::Params>(
     for (attempt_id, session_id, fencing_token, label, payload, previous_state, opencode_id) in
         &attempts
     {
-        mark_attempt_resource_mutations_uncertain(
+        let uncertain_mutation_count = mark_attempt_resource_mutations_uncertain(
             transaction,
             from_i64(*attempt_id, "task attempt ID")?,
             now,
@@ -4460,7 +4462,11 @@ fn recover_matching_attempts<P: rusqlite::Params>(
             && opencode_id
                 .as_deref()
                 .is_none_or(|identity| identity.trim().is_empty());
-        let attempt_error = if missing_runtime_identity {
+        let mutation_reconciliation_required =
+            previous_state != "cancelling" && uncertain_mutation_count > 0;
+        let attempt_error = if mutation_reconciliation_required {
+            RECOVERY_REQUIRES_MUTATION_RECONCILIATION
+        } else if missing_runtime_identity {
             RECOVERY_REQUIRES_RETRY_FRESH
         } else {
             attempt_error
@@ -4479,6 +4485,12 @@ fn recover_matching_attempts<P: rusqlite::Params>(
         }
         let (next_state, recovery_reason, session_error) = if previous_state == "cancelling" {
             ("cancelled", event_reason, None)
+        } else if mutation_reconciliation_required {
+            (
+                "blocked",
+                "recovery_uncertain_mutation",
+                Some(RECOVERY_REQUIRES_MUTATION_RECONCILIATION),
+            )
         } else if missing_runtime_identity {
             (
                 "blocked",
@@ -4503,9 +4515,10 @@ fn recover_matching_attempts<P: rusqlite::Params>(
         if session_updated != 1 {
             return Err("Scheduler recovery lost ownership of an active session.".to_string());
         }
-        let recovery = match next_state {
-            "queued" if is_agent => Some("resume"),
-            "blocked" => Some("retry_fresh_required"),
+        let recovery = match (next_state, mutation_reconciliation_required) {
+            ("blocked", true) => Some("operator_reconciliation"),
+            ("queued", _) if is_agent => Some("resume"),
+            ("blocked", false) => Some("retry_fresh_required"),
             _ => None,
         };
         append_event_in_transaction(
@@ -4521,6 +4534,7 @@ fn recover_matching_attempts<P: rusqlite::Params>(
                     "recovery": recovery,
                     "action": recovery,
                     "error": session_error,
+                    "uncertain_mutation_count": uncertain_mutation_count,
                     "opencode_session_id": opencode_id
                 }),
                 progress: Some(TaskProgress {
@@ -7159,6 +7173,42 @@ mod tests {
         (store, session.id, authority)
     }
 
+    fn agent_external_mutation_assignment(
+        path: PathBuf,
+        worker_id: usize,
+    ) -> (SchedulerStore, TaskSessionId, ExternalAssignmentAuthority) {
+        let store = SchedulerStore::open_at(path).expect("persistent store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let request = owned_agent_request(
+            "long-running deployment",
+            "conversation-recovery",
+            "subject-recovery",
+        );
+        let session = store
+            .enqueue_with_grants(
+                &request,
+                &["external_tools:ocp".to_string()],
+                "test-approval",
+            )
+            .expect("Agent task enqueued");
+        let assignment = store
+            .claim_next(owner, worker_id, Duration::from_secs(30), 5)
+            .expect("Agent task claimed")
+            .expect("assignment exists");
+        store
+            .bind_opencode_session(assignment.fence, "opencode-long-running-recovery")
+            .expect("durable runtime identity bound");
+        let authority = store
+            .external_authority(
+                assignment.fence,
+                "external_tools:ocp",
+                "ocp",
+                &"a".repeat(64),
+            )
+            .expect("external authority");
+        (store, session.id, authority)
+    }
+
     fn assignment_fence(authority: &ExternalAssignmentAuthority) -> AssignmentFence {
         AssignmentFence {
             session_id: authority.session_id,
@@ -7763,10 +7813,10 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_resource_mutation_becomes_uncertain_during_recovery() {
+    fn unresolved_resource_mutation_blocks_recovery_before_reassignment() {
         let directory = tempdir().expect("temp directory");
         let (store, session_id, authority) =
-            external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+            agent_external_mutation_assignment(directory.path().join("scheduler.db"), 1);
         let identity = scale_identity(3);
         let mutation_id = match SchedulerStore::reserve_external_resource_mutation(
             &authority,
@@ -7801,28 +7851,101 @@ mod tests {
                 .len(),
             1
         );
+        let recovered = store
+            .get_session(session_id)
+            .expect("session read")
+            .expect("session exists");
+        assert_eq!(recovered.state, TaskSessionState::Blocked);
+        assert_eq!(
+            recovered.opencode_session_id.as_deref(),
+            Some("opencode-long-running-recovery")
+        );
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some(RECOVERY_REQUIRES_MUTATION_RECONCILIATION)
+        );
+        assert_eq!(
+            store
+                .capability_grants(session_id)
+                .expect("grants retained")
+                .iter()
+                .map(|grant| grant.capability.as_str())
+                .collect::<Vec<_>>(),
+            vec!["external_tools:ocp"]
+        );
+        let events = store.events_after(session_id, 0).expect("events read");
+        let recovery = events.last().expect("recovery event");
+        assert_eq!(recovery.payload["state"], "blocked");
+        assert_eq!(recovery.payload["reason"], "recovery_uncertain_mutation");
+        assert_eq!(recovery.payload["recovery"], "operator_reconciliation");
+        assert_eq!(recovery.payload["action"], "operator_reconciliation");
+        assert_eq!(recovery.payload["uncertain_mutation_count"], 1);
         let next_owner = store
             .register_owner()
             .expect("replacement owner registered");
-        let next = store
+        assert!(store
             .claim_next(next_owner, 2, Duration::from_secs(30), 5)
-            .expect("recovered task claimed")
-            .expect("recovered assignment");
-        let next_authority = store
-            .external_authority(next.fence, "external_tools:ocp", "ocp", &"a".repeat(64))
-            .expect("replacement authority");
-        assert!(matches!(
-            SchedulerStore::reserve_external_resource_mutation(
-                &next_authority,
-                "ocp_scale_deployment",
-                &identity
-            )
-            .expect("uncertain fence checked"),
-            ResourceMutationReservation::Blocked(ResourceMutationRecord {
-                state: ResourceMutationState::Uncertain,
-                ..
-            })
-        ));
+            .expect("reassignment checked")
+            .is_none());
+    }
+
+    #[test]
+    fn expired_lease_with_unresolved_mutation_blocks_before_reassignment() {
+        let directory = tempdir().expect("temp directory");
+        let (store, session_id, authority) =
+            agent_external_mutation_assignment(directory.path().join("scheduler.db"), 1);
+        let mutation_id = match SchedulerStore::reserve_external_resource_mutation(
+            &authority,
+            "ocp_scale_deployment",
+            &scale_identity(3),
+        )
+        .expect("mutation reserved")
+        {
+            ResourceMutationReservation::Reserved(record) => record.mutation_id,
+            ResourceMutationReservation::Blocked(_) => panic!("first mutation was blocked"),
+        };
+        {
+            let connection = store.connection.lock().expect("store locked");
+            connection
+                .execute(
+                    "UPDATE scheduler_task_attempts SET lease_expires_at = 1 WHERE attempt_id = ?1",
+                    params![authority.attempt_id],
+                )
+                .expect("attempt lease expired");
+            connection
+                .execute(
+                    "UPDATE scheduler_task_sessions SET lease_expires_at = 1 WHERE session_id = ?1",
+                    params![session_id.0],
+                )
+                .expect("session lease expired");
+        }
+
+        assert_eq!(store.recover_expired_at(2).expect("lease recovered"), 1);
+        let recovered = store
+            .get_session(session_id)
+            .expect("session read")
+            .expect("session exists");
+        assert_eq!(recovered.state, TaskSessionState::Blocked);
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some(RECOVERY_REQUIRES_MUTATION_RECONCILIATION)
+        );
+        let mutation = store
+            .resource_mutation(mutation_id)
+            .expect("mutation read")
+            .expect("mutation exists");
+        assert_eq!(mutation.state, ResourceMutationState::Uncertain);
+        assert_eq!(
+            mutation.failure_code.as_deref(),
+            Some("assignment_lease_expired")
+        );
+        let next_owner = store
+            .register_owner()
+            .expect("replacement owner registered");
+        assert!(store
+            .claim_next(next_owner, 2, Duration::from_secs(30), 5)
+            .expect("reassignment checked")
+            .is_none());
     }
 
     #[test]

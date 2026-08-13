@@ -609,6 +609,52 @@ assertEqual(
   true,
   "runtime recovery should explain the bounded retry",
 );
+const leaseRecoveryFenceProjection = projectAgentTaskSessionEvent(
+  {
+    id: 123,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 123,
+    kind: "lifecycle",
+    payload: {
+      state: "blocked",
+      reason: "recovery_uncertain_mutation",
+      recovery: "operator_reconciliation",
+      action: "operator_reconciliation",
+      uncertain_mutation_count: 1,
+    },
+    progress: { phase: "blocked", completed: 0, total: null },
+    created_at: 123,
+  },
+  "lease-recovery-123",
+  "04:30:10 AM",
+);
+assertEqual(
+  (leaseRecoveryFenceProjection.logs[0]?.message ?? "").includes(
+    "Recovery stopped before reassignment",
+  ),
+  true,
+  "lease recovery should explain why an uncertain mutation prevents reassignment",
+);
+assertEqual(
+  (leaseRecoveryFenceProjection.logs[0]?.message ?? "").includes(
+    "No replacement Worker was allowed",
+  ),
+  true,
+  "lease recovery should explain that replacement authority was not issued",
+);
+const leaseRecoveryActivities = timelineActivities(leaseRecoveryFenceProjection.logs);
+assertEqual(
+  leaseRecoveryActivities[0]?.title,
+  "Recovery Paused Safely",
+  "uncertain-mutation lease recovery should remain visible in the user-facing timeline",
+);
+assertEqual(
+  leaseRecoveryActivities[0]?.summary.includes("Recovery stopped before reassignment"),
+  true,
+  "uncertain-mutation lease recovery should preserve its safe user-facing reason",
+);
 const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
   {
     id: 124,

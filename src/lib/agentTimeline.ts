@@ -167,6 +167,9 @@ function presentationForLog(
   rawSummary: string,
 ): Pick<TimelineActivity, "key" | "title" | "summary" | "status" | "importance"> {
   const lifecycleState = lifecycleStateFrom(rawSummary);
+  if (log.label === "lifecycle" && /^Recovery stopped before reassignment/i.test(rawSummary)) {
+    return activity("recovery-fenced", "Recovery Paused Safely", rawSummary, "waiting");
+  }
   if (log.label === "lifecycle" && lifecycleState) return lifecyclePresentation(lifecycleState);
 
   if (log.label === "progress") {
@@ -309,7 +312,11 @@ function hiddenActivity(key: string): ReturnType<typeof activity> {
 }
 
 function lifecycleStateFrom(summary: string): string | null {
-  return summary.match(/entered\s+([a-z_]+)/i)?.[1]?.toLowerCase() ?? null;
+  return (
+    summary.match(/entered\s+([a-z_]+)/i)?.[1]?.toLowerCase() ??
+    summary.match(/Lifecycle state:\s*([a-z_]+)/i)?.[1]?.toLowerCase() ??
+    null
+  );
 }
 
 function lifecycleStateFromLog(log: AgentRunLog): string | null {

@@ -442,9 +442,18 @@ Exit criteria:
 
 ### Phase 14 — Long-Running and Multi-Agent Readiness
 
-Status: planned.
+Status: in progress.
 
 Harden lease recovery, connector session resumption, task decomposition, and authority isolation before allowing specialized agents to collaborate.
+
+Completed first increment: fail closed when lease or owner recovery discovers an unresolved external mutation.
+
+- Recovery transactionally interrupts the old assignment, revokes its effective authority through the existing fence, marks unresolved reservations uncertain, and blocks the same Task Session before a replacement Worker can claim it.
+- The immutable task request, grants, durable runtime identity, mutation evidence, and event history remain retained. Mutation-free interruption can still resume with a new assignment fence; missing runtime identity still requires Retry Fresh; cancellation remains terminal.
+- Backend-authoritative guidance selects the exact retained mutation fence. The rendered Activity timeline explains that recovery paused safely and that no replacement Worker resumed, while the operator must provide a reason before releasing the fence.
+- Browser-level coverage drives the interrupted-deployment reconciliation journey and verifies that fence release neither retries nor silently authorizes the task.
+
+This increment does not enable multi-agent execution. Connector process resumption, independent subtask contracts/grants/fences/budgets/evidence, and non-delegable specialized-agent authority remain Phase 14 work.
 
 Benefits:
 

@@ -13,6 +13,34 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
+- Phase 14 is in progress. The first vertical slice hardens lease/restart recovery so an in-flight external mutation becomes an operator-reconciliation block before any replacement Worker can resume the task.
+
+## Phase 14 In Progress
+
+Completed first vertical slice: uncertain-mutation recovery fencing.
+
+- Lease-expiry and scheduler-owner recovery remain one transaction: the old attempt is interrupted, its authority becomes stale, unresolved mutation reservations become `uncertain`, and the Task Session transition is committed with its durable event.
+- If recovery discovers any unresolved external mutation, the Task Session now becomes `blocked` before queue selection can issue replacement Worker authority. The retained event records only a safe recovery class and mutation count; it does not copy mutation arguments, provider responses, task content, runtime output, URLs, or credentials.
+- The existing immutable request, capability grants, durable OpenCode identity, mutation ledger, and prior attempt evidence remain attached to the same Task Session. Operator guidance resolves the latest canonical uncertain mutation and offers only exact fence review/release.
+- Recovery precedence is deterministic: cancellation stays terminal; otherwise an uncertain mutation requires operator reconciliation; otherwise a missing Agent runtime identity requires Retry Fresh; mutation-free recovery remains eligible to resume under a new assignment fence.
+- The Activity timeline presents this state as `Recovery Paused Safely`, explicitly states that the old authority was revoked and no replacement Worker resumed, and keeps the exact reconciliation action in the authoritative attention panel.
+
+Phase 14 first-increment regression evidence:
+
+- Focused scheduler recovery tests cover owner shutdown, lease expiry, preserved runtime identity and capability grants, retained mutation identity, blocked reassignment, stale-attempt rejection, mutation-free resume, and missing-runtime Retry Fresh behavior.
+- Frontend projection tests verify that operator reconciliation remains visible in the user-facing timeline instead of collapsing into a generic failure.
+- The rendered browser journey creates a representative interrupted deployment task, confirms that Continue and Retry Fresh are unavailable, opens the exact Jira mutation fence, supplies an operator reason, and verifies that releasing the fence does not retry the task.
+- Browser testing found and fixed a generic Activity presentation that hid the recovery cause and an incoherent fixture that displayed mutually exclusive approval and reconciliation states together.
+- Full Rust suite: 511 passed, 3 ignored, 0 failed; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator-guidance suite: 4 passed, 0 failed. The unchanged broader browser scenarios executed through test 9 before this environment dropped the reporter process; no full-suite pass is claimed for this increment.
+
+Remaining Phase 14 work:
+
+- Resume/recreate connector process sessions under bounded provider-neutral contracts.
+- Give decomposed subtasks independent contracts, grants, fences, budgets, and evidence before enabling multiple executing agents.
+- Prove that no planner or specialized agent can delegate authority it was not granted.
+- Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.
 
 ## Phase 13 Completed
 

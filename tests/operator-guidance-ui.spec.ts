@@ -142,7 +142,7 @@ async function installGuidance(page: Page, kind: GuidanceKind) {
 
 test("approval guidance performs the structured approval action", async ({ page }) => {
   await installGuidance(page, "approve");
-  await page.goto("/__operator-guidance");
+  await page.goto("/__operator-guidance?approval=1");
 
   const approvalRegion = page.getByRole("region", { name: "Action approval required" });
   await expect(approvalRegion.locator(".guidance-source")).toContainText(
@@ -174,6 +174,10 @@ test("uncertain mutation guidance opens the exact retained fence", async ({ page
   await installGuidance(page, "supersede_mutation");
   await page.goto("/__operator-guidance");
 
+  await expect(page.getByText(/Recovery stopped before reassignment/)).toBeVisible();
+  await expect(page.getByText(/No replacement Worker was allowed/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Continue/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Retry as a new task" })).toHaveCount(0);
   await page.getByRole("button", { name: "Review mutation fence" }).click();
   const recommended = page.locator(".mutation-record.recommended");
   await expect(recommended.getByText("#9 · jira add comment")).toBeVisible();

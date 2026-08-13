@@ -39,6 +39,27 @@ export function projectAgentTaskSessionEvent(
     taskSessionState = payload.state as TaskSessionState;
     tone = payload.state === "failed" || payload.state === "blocked" ? "error" : "info";
     summary = `Task Session entered ${payload.state}.`;
+    details.push(`- Lifecycle state: ${payload.state}`);
+    if (payload.recovery === "operator_reconciliation") {
+      const uncertainMutationCount =
+        typeof payload.uncertain_mutation_count === "number" &&
+        Number.isSafeInteger(payload.uncertain_mutation_count) &&
+        payload.uncertain_mutation_count > 0
+          ? payload.uncertain_mutation_count
+          : null;
+      summary = `Recovery stopped before reassignment because ${uncertainMutationCount === 1 ? "an external mutation has" : "external mutations have"} an uncertain outcome. No replacement Worker was allowed to resume.`;
+      details.push(
+        "- The prior assignment authority was revoked.",
+        "- No replacement Worker was allowed to resume this task.",
+        "- Review the retained mutation fence before continuing.",
+      );
+    } else if (payload.recovery === "resume") {
+      summary = "The interrupted task is eligible to resume under a new assignment fence.";
+      details.push(
+        "- The prior assignment authority was revoked.",
+        "- The durable runtime identity and task contract were retained.",
+      );
+    }
   } else if (event.kind === "tool") {
     const context =
       typeof payload.display_context === "object" && payload.display_context !== null
