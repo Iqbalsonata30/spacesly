@@ -268,9 +268,63 @@ pub struct SubtaskAuthorityStatus {
     pub completed_at: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum SubtaskEvidenceVerdict {
+    Verified,
+    Rejected,
+}
+
+impl SubtaskEvidenceVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct SubtaskEvidenceAttestation {
+    pub requirement_digest: String,
+    pub verifier_id: String,
+    pub verification_method: String,
+    pub verdict: SubtaskEvidenceVerdict,
+    pub evidence_digest: String,
+    pub observation_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskEvidenceStatus {
+    pub subtask_id: u64,
+    pub authority_id: u64,
+    pub requirement_digest: String,
+    pub verdict: String,
+    pub verifier_id: String,
+    pub verification_method: String,
+    pub evidence_digest: String,
+    pub observation_count: u32,
+    pub recorded_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskEvidenceAggregate {
+    pub total_subtasks: u32,
+    pub verified_subtasks: u32,
+    pub rejected_subtasks: u32,
+    pub pending_subtasks: u32,
+    pub completed_subtasks: u32,
+    pub ready_for_parent_completion: bool,
+}
+
 /// Unforgeable module-private capability required to activate dormant subtask authority.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubtaskDispatchPermit(());
+
+/// Module-private authority held by the future independent evidence verifier, never a Worker.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SubtaskEvidencePermit(());
 
 /// Identity required for a Worker to renew or finish one assignment attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -599,6 +653,24 @@ impl SchedulerStore {
                   );
                   CREATE INDEX IF NOT EXISTS idx_scheduler_subtask_authorities_active
                     ON scheduler_subtask_authorities(state, lease_expires_at);
+                  CREATE TABLE IF NOT EXISTS scheduler_subtask_evidence_attestations (
+                    subtask_id INTEGER PRIMARY KEY,
+                    authority_id INTEGER NOT NULL UNIQUE,
+                    contract_id TEXT NOT NULL,
+                    evidence_requirement_digest TEXT NOT NULL,
+                    verifier_id TEXT NOT NULL,
+                    verification_method TEXT NOT NULL,
+                    verdict TEXT NOT NULL CHECK (verdict IN ('verified', 'rejected')),
+                    evidence_digest TEXT NOT NULL,
+                    observation_count INTEGER NOT NULL CHECK (observation_count > 0),
+                    recorded_at INTEGER NOT NULL,
+                    FOREIGN KEY(subtask_id) REFERENCES scheduler_prepared_subtasks(subtask_id)
+                      ON DELETE CASCADE,
+                    FOREIGN KEY(authority_id) REFERENCES scheduler_subtask_authorities(authority_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_subtask_evidence_subtask
+                    ON scheduler_subtask_evidence_attestations(subtask_id, verdict);
                   CREATE TABLE IF NOT EXISTS scheduler_task_events (
                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    session_id INTEGER NOT NULL,
@@ -1558,6 +1630,11 @@ impl SchedulerStore {
     #[cfg(test)]
     fn test_subtask_dispatch_permit() -> SubtaskDispatchPermit {
         SubtaskDispatchPermit(())
+    }
+
+    #[cfg(test)]
+    fn test_subtask_evidence_permit() -> SubtaskEvidencePermit {
+        SubtaskEvidencePermit(())
     }
 
     pub(crate) fn register_owner(&self) -> Result<u64, String> {
@@ -3248,14 +3325,7 @@ impl SchedulerStore {
         if lease_millis == 0 || lease_millis > duration_millis(SUBTASK_AUTHORITY_MAX_LEASE)? {
             return Err("Subtask authority lease must be between 1 ms and 30 seconds.".to_string());
         }
-        validate_subtask_authority_shape(
-            authority,
-            authority
-                .capabilities
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default(),
-        )?;
+        validate_subtask_authority_descriptor_shape(authority)?;
         let store = Self::open_subtask_authority_store(authority)?;
         let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
@@ -3330,19 +3400,178 @@ impl SchedulerStore {
         Self::resolve_subtask_authority_at(authority, outcome, now_millis())
     }
 
+    /// Persists one immutable, secret-free attestation produced outside the subtask Worker.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn record_subtask_evidence_attestation(
+        authority: &SubtaskToolAuthority,
+        attestation: &SubtaskEvidenceAttestation,
+        _permit: &SubtaskEvidencePermit,
+    ) -> Result<SubtaskEvidenceStatus, String> {
+        validate_subtask_evidence_attestation(attestation)?;
+        validate_subtask_authority_descriptor_shape(authority)?;
+        let store = Self::open_subtask_authority_store(authority)?;
+        let now = now_millis();
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask evidence transaction: {error}"))?;
+        if !subtask_authority_descriptor_matches_on(&transaction, authority)? {
+            return Err(
+                "Subtask evidence authority descriptor is stale or incompatible.".to_string(),
+            );
+        }
+        if let Some(existing) = subtask_evidence_status_on(&transaction, authority.subtask_id)? {
+            if existing.authority_id == authority.authority_id
+                && existing.requirement_digest == attestation.requirement_digest
+                && existing.verdict == attestation.verdict.as_str()
+                && existing.verifier_id == attestation.verifier_id
+                && existing.verification_method == attestation.verification_method
+                && existing.evidence_digest == attestation.evidence_digest
+                && existing.observation_count == attestation.observation_count
+            {
+                transaction.commit().map_err(|error| {
+                    format!("Failed to commit subtask evidence replay: {error}")
+                })?;
+                return Ok(existing);
+            }
+            return Err(
+                "Subtask evidence replay did not match the immutable attestation.".to_string(),
+            );
+        }
+        let current = subtask_authority_status_on(&transaction, authority.authority_id)?
+            .ok_or_else(|| "Subtask evidence authority was not found.".to_string())?;
+        if current.state != "active"
+            || current
+                .lease_expires_at
+                .is_none_or(|lease_expires_at| lease_expires_at <= now)
+        {
+            return Err("Subtask evidence requires a live authority lease.".to_string());
+        }
+        let parent = AssignmentFence {
+            session_id: authority.session_id,
+            attempt_id: authority.parent_attempt_id,
+            attempt: authority.parent_attempt,
+            owner_id: authority.parent_owner_id,
+            fencing_token: authority.parent_fencing_token,
+        };
+        if !assignment_is_current_on(&transaction, parent, now)? {
+            return Err("Subtask evidence cannot outlive its parent assignment.".to_string());
+        }
+        validate_subtask_contract_and_grants_on(&transaction, authority)?;
+        let (contract_id, contract_json) = transaction
+            .query_row(
+                "SELECT contract_id, contract_json FROM scheduler_prepared_subtasks
+                  WHERE subtask_id = ?1 AND session_id = ?2 AND objective_id = ?3",
+                params![
+                    to_i64(authority.subtask_id)?,
+                    to_i64(authority.session_id.0)?,
+                    authority.objective_id
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| format!("Failed to load subtask evidence contract: {error}"))?;
+        let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
+            .map_err(|error| format!("Failed to decode subtask evidence contract: {error}"))?;
+        if contract.schema_version != 2
+            || contract.evidence_requirement_digest != attestation.requirement_digest
+        {
+            return Err("Subtask evidence does not attest the immutable requirement.".to_string());
+        }
+        transaction
+            .execute(
+                "INSERT INTO scheduler_subtask_evidence_attestations
+                   (subtask_id, authority_id, contract_id, evidence_requirement_digest,
+                    verifier_id, verification_method, verdict, evidence_digest,
+                    observation_count, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    to_i64(authority.subtask_id)?,
+                    to_i64(authority.authority_id)?,
+                    contract_id,
+                    attestation.requirement_digest,
+                    attestation.verifier_id,
+                    attestation.verification_method,
+                    attestation.verdict.as_str(),
+                    attestation.evidence_digest,
+                    i64::from(attestation.observation_count),
+                    to_i64(now)?
+                ],
+            )
+            .map_err(|error| format!("Failed to persist subtask evidence: {error}"))?;
+        let status = subtask_evidence_status_on(&transaction, authority.subtask_id)?
+            .ok_or_else(|| "Subtask evidence could not be reloaded.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask evidence: {error}"))?;
+        Ok(status)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subtask_evidence_aggregate(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<SubtaskEvidenceAggregate, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let (total, verified, rejected, completed) = connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN EXISTS (
+                          SELECT 1 FROM scheduler_subtask_evidence_attestations evidence
+                           WHERE evidence.subtask_id = subtasks.subtask_id
+                             AND evidence.verdict = 'verified'
+                        ) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN EXISTS (
+                          SELECT 1 FROM scheduler_subtask_evidence_attestations evidence
+                           WHERE evidence.subtask_id = subtasks.subtask_id
+                             AND evidence.verdict = 'rejected'
+                        ) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN EXISTS (
+                          SELECT 1 FROM scheduler_subtask_attempts attempts
+                          JOIN scheduler_subtask_authorities authorities
+                            ON authorities.subtask_attempt_id = attempts.subtask_attempt_id
+                           WHERE attempts.subtask_id = subtasks.subtask_id
+                             AND authorities.state = 'completed'
+                        ) THEN 1 ELSE 0 END), 0)
+                   FROM scheduler_prepared_subtasks subtasks
+                  WHERE subtasks.session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("Failed to aggregate subtask evidence: {error}"))?;
+        let total_subtasks = count_to_u32(total, "subtask evidence total")?;
+        let verified_subtasks = count_to_u32(verified, "verified subtask evidence")?;
+        let rejected_subtasks = count_to_u32(rejected, "rejected subtask evidence")?;
+        let completed_subtasks = count_to_u32(completed, "completed subtasks")?;
+        if verified_subtasks.saturating_add(rejected_subtasks) > total_subtasks
+            || completed_subtasks > total_subtasks
+        {
+            return Err("Stored subtask evidence aggregate is inconsistent.".to_string());
+        }
+        Ok(SubtaskEvidenceAggregate {
+            total_subtasks,
+            verified_subtasks,
+            rejected_subtasks,
+            pending_subtasks: total_subtasks - verified_subtasks - rejected_subtasks,
+            completed_subtasks,
+            ready_for_parent_completion: total_subtasks > 0
+                && verified_subtasks == total_subtasks
+                && completed_subtasks == total_subtasks,
+        })
+    }
+
     fn resolve_subtask_authority_at(
         authority: &SubtaskToolAuthority,
         outcome: SubtaskAuthorityOutcome,
         now: u64,
     ) -> Result<SubtaskAuthorityStatus, String> {
-        validate_subtask_authority_shape(
-            authority,
-            authority
-                .capabilities
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default(),
-        )?;
+        validate_subtask_authority_descriptor_shape(authority)?;
         let store = Self::open_subtask_authority_store(authority)?;
         let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
@@ -3386,6 +3615,32 @@ impl SchedulerStore {
                 );
             }
             validate_subtask_contract_and_grants_on(&transaction, authority)?;
+            let evidence_verified = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1
+                         FROM scheduler_subtask_evidence_attestations evidence
+                         JOIN scheduler_prepared_subtasks subtasks
+                           ON subtasks.subtask_id = evidence.subtask_id
+                        WHERE evidence.subtask_id = ?1
+                          AND evidence.authority_id = ?2
+                          AND evidence.contract_id = subtasks.contract_id
+                          AND evidence.evidence_requirement_digest =
+                              json_extract(subtasks.contract_json, '$.evidence_requirement_digest')
+                          AND evidence.verdict = 'verified'
+                     )",
+                    params![
+                        to_i64(authority.subtask_id)?,
+                        to_i64(authority.authority_id)?
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    format!("Failed to validate subtask completion evidence: {error}")
+                })?;
+            if evidence_verified == 0 {
+                return Err("Completed subtask requires independent verified evidence.".to_string());
+            }
         }
         let updated = transaction
             .execute(
@@ -5381,21 +5636,30 @@ fn validate_subtask_authority_shape(
     authority: &SubtaskToolAuthority,
     capability: &str,
 ) -> Result<(), String> {
+    validate_subtask_authority_descriptor_shape(authority)?;
+    if capability.trim().is_empty()
+        || capability != capability.trim()
+        || !authority
+            .capabilities
+            .iter()
+            .any(|granted| granted == capability)
+    {
+        return Err("Subtask tool authority shape or capability is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_subtask_authority_descriptor_shape(
+    authority: &SubtaskToolAuthority,
+) -> Result<(), String> {
     if authority.scheduler_instance_id.trim().is_empty()
         || authority.objective_id.trim().is_empty()
         || authority.objective_id != authority.objective_id.trim()
-        || capability.trim().is_empty()
-        || capability != capability.trim()
-        || authority.capabilities.is_empty()
         || authority.capabilities.len() > 64
         || authority
             .capabilities
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
-        || !authority
-            .capabilities
-            .iter()
-            .any(|granted| granted == capability)
         || authority
             .allowed_connector_tools
             .iter()
@@ -5420,6 +5684,39 @@ fn validate_subtask_authority_shape(
         return Err("Subtask tool authority shape or capability is invalid.".to_string());
     }
     Ok(())
+}
+
+fn validate_subtask_evidence_attestation(
+    attestation: &SubtaskEvidenceAttestation,
+) -> Result<(), String> {
+    let canonical_label = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value == value.trim()
+            && !value.contains("..")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let canonical_digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !attestation
+        .requirement_digest
+        .strip_prefix("sha256:")
+        .is_some_and(canonical_digest)
+        || !canonical_label(&attestation.verifier_id)
+        || !canonical_label(&attestation.verification_method)
+        || !canonical_digest(&attestation.evidence_digest)
+        || !(1..=32).contains(&attestation.observation_count)
+    {
+        return Err("Subtask evidence attestation is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn count_to_u32(value: i64, field: &str) -> Result<u32, String> {
+    u32::try_from(from_i64(value, field)?)
+        .map_err(|_| format!("{field} exceeds the supported count."))
 }
 
 fn validate_subtask_tool_operation(
@@ -5499,6 +5796,67 @@ fn validate_subtask_contract_and_grants_on(
         }
     }
     Ok(())
+}
+
+fn subtask_evidence_status_on(
+    connection: &Connection,
+    subtask_id: u64,
+) -> Result<Option<SubtaskEvidenceStatus>, String> {
+    connection
+        .query_row(
+            "SELECT subtask_id, authority_id, evidence_requirement_digest, verdict,
+                    verifier_id, verification_method, evidence_digest, observation_count,
+                    recorded_at
+               FROM scheduler_subtask_evidence_attestations WHERE subtask_id = ?1",
+            params![to_i64(subtask_id)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to load subtask evidence status: {error}"))?
+        .map(
+            |(
+                subtask_id,
+                authority_id,
+                requirement_digest,
+                verdict,
+                verifier_id,
+                verification_method,
+                evidence_digest,
+                observation_count,
+                recorded_at,
+            )| {
+                if !matches!(verdict.as_str(), "verified" | "rejected") {
+                    return Err("Stored subtask evidence verdict is invalid.".to_string());
+                }
+                Ok(SubtaskEvidenceStatus {
+                    subtask_id: from_i64(subtask_id, "subtask evidence ID")?,
+                    authority_id: from_i64(authority_id, "subtask evidence authority ID")?,
+                    requirement_digest,
+                    verdict,
+                    verifier_id,
+                    verification_method,
+                    evidence_digest,
+                    observation_count: count_to_u32(
+                        observation_count,
+                        "subtask evidence observation count",
+                    )?,
+                    recorded_at: from_i64(recorded_at, "subtask evidence timestamp")?,
+                })
+            },
+        )
+        .transpose()
 }
 
 fn subtask_authority_status_on(
@@ -8774,6 +9132,25 @@ mod tests {
         SchedulerStore::admit_subtask_connector_tool_call(authority, capability, tool_name, risk)
     }
 
+    fn attest_test_subtask_evidence(
+        authority: &SubtaskToolAuthority,
+        contract: &PreparedSubtaskContract,
+        verdict: SubtaskEvidenceVerdict,
+    ) -> Result<SubtaskEvidenceStatus, String> {
+        SchedulerStore::record_subtask_evidence_attestation(
+            authority,
+            &SubtaskEvidenceAttestation {
+                requirement_digest: contract.evidence_requirement_digest.clone(),
+                verifier_id: "test-independent-verifier".to_string(),
+                verification_method: "deterministic-state-check".to_string(),
+                verdict,
+                evidence_digest: "a".repeat(64),
+                observation_count: 1,
+            },
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+    }
+
     #[test]
     fn narrowed_builtin_subtask_contract_is_enforced_at_scheduler_admission() {
         let directory = tempdir().expect("temp directory");
@@ -9166,6 +9543,12 @@ mod tests {
         )
         .expect("renewed authority admits tools");
         assert_eq!(admission.tool_calls_used, 1);
+        attest_test_subtask_evidence(
+            &renewed,
+            &subtasks[0].contract,
+            SubtaskEvidenceVerdict::Verified,
+        )
+        .expect("independent evidence verifies");
         let completed =
             SchedulerStore::resolve_subtask_authority(&renewed, SubtaskAuthorityOutcome::Completed)
                 .expect("subtask completes");
@@ -9224,6 +9607,193 @@ mod tests {
                 .subtask_authority_status(completed.authority_id)
                 .expect("status loads after restart"),
             Some(completed)
+        );
+    }
+
+    #[test]
+    fn independent_subtask_evidence_gates_completion_and_aggregates_after_restart() {
+        use sha2::Digest as _;
+
+        let directory = tempdir().expect("evidence directory");
+        let path = directory.path().join("scheduler.db");
+        let (store, session_id, parent, subtasks) = active_subtask_test_context(path.clone());
+        assert_eq!(
+            store
+                .subtask_evidence_aggregate(session_id)
+                .expect("empty aggregate loads"),
+            SubtaskEvidenceAggregate {
+                total_subtasks: 2,
+                verified_subtasks: 0,
+                rejected_subtasks: 0,
+                pending_subtasks: 2,
+                completed_subtasks: 0,
+                ready_for_parent_completion: false,
+            }
+        );
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let first = store
+            .activate_prepared_subtask(parent, subtasks[0].fence, Duration::from_secs(20), &permit)
+            .expect("first subtask activates");
+        assert!(SchedulerStore::resolve_subtask_authority(
+            &first,
+            SubtaskAuthorityOutcome::Completed,
+        )
+        .expect_err("worker completion without independent evidence fails")
+        .contains("requires independent verified evidence"));
+
+        let sensitive_observation = "bearer-token-must-never-be-persisted";
+        let evidence_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(sensitive_observation.as_bytes())
+        );
+        let mut attestation = SubtaskEvidenceAttestation {
+            requirement_digest: format!("sha256:{}", "b".repeat(64)),
+            verifier_id: "test-independent-verifier".to_string(),
+            verification_method: "provider-read-state".to_string(),
+            verdict: SubtaskEvidenceVerdict::Verified,
+            evidence_digest,
+            observation_count: 2,
+        };
+        assert!(SchedulerStore::record_subtask_evidence_attestation(
+            &first,
+            &attestation,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect_err("wrong requirement digest fails closed")
+        .contains("immutable requirement"));
+        attestation.requirement_digest = subtasks[0].contract.evidence_requirement_digest.clone();
+        let verified = SchedulerStore::record_subtask_evidence_attestation(
+            &first,
+            &attestation,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect("independent evidence persists");
+        assert_eq!(verified.verdict, "verified");
+        assert_eq!(verified.observation_count, 2);
+        let mut wrong_requirement_replay = attestation.clone();
+        wrong_requirement_replay.requirement_digest = format!("sha256:{}", "d".repeat(64));
+        assert!(SchedulerStore::record_subtask_evidence_attestation(
+            &first,
+            &wrong_requirement_replay,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect_err("changed requirement replay conflicts")
+        .contains("immutable attestation"));
+        assert_eq!(
+            SchedulerStore::record_subtask_evidence_attestation(
+                &first,
+                &attestation,
+                &SchedulerStore::test_subtask_evidence_permit(),
+            )
+            .expect("identical attestation replay is idempotent"),
+            verified
+        );
+        let mut conflicting = attestation.clone();
+        conflicting.evidence_digest = "c".repeat(64);
+        assert!(SchedulerStore::record_subtask_evidence_attestation(
+            &first,
+            &conflicting,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect_err("conflicting attestation replay fails")
+        .contains("immutable attestation"));
+        SchedulerStore::resolve_subtask_authority(&first, SubtaskAuthorityOutcome::Completed)
+            .expect("verified first subtask completes");
+        assert_eq!(
+            SchedulerStore::record_subtask_evidence_attestation(
+                &first,
+                &attestation,
+                &SchedulerStore::test_subtask_evidence_permit(),
+            )
+            .expect("attestation replay remains idempotent after completion"),
+            verified
+        );
+
+        let second = store
+            .activate_prepared_subtask(parent, subtasks[1].fence, Duration::from_secs(20), &permit)
+            .expect("second subtask activates");
+        attest_test_subtask_evidence(
+            &second,
+            &subtasks[1].contract,
+            SubtaskEvidenceVerdict::Rejected,
+        )
+        .expect("unsatisfied evidence persists");
+        assert!(SchedulerStore::resolve_subtask_authority(
+            &second,
+            SubtaskAuthorityOutcome::Completed,
+        )
+        .expect_err("rejected evidence cannot complete")
+        .contains("requires independent verified evidence"));
+        let aggregate = store
+            .subtask_evidence_aggregate(session_id)
+            .expect("mixed aggregate loads");
+        assert_eq!(aggregate.total_subtasks, 2);
+        assert_eq!(aggregate.verified_subtasks, 1);
+        assert_eq!(aggregate.rejected_subtasks, 1);
+        assert_eq!(aggregate.pending_subtasks, 0);
+        assert_eq!(aggregate.completed_subtasks, 1);
+        assert!(!aggregate.ready_for_parent_completion);
+        let encoded = store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .query_row(
+                "SELECT json_group_array(json_object(
+                    'verifier_id', verifier_id,
+                    'verification_method', verification_method,
+                    'evidence_digest', evidence_digest,
+                    'verdict', verdict
+                 )) FROM scheduler_subtask_evidence_attestations",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("secret-free evidence projection encodes");
+        assert!(!encoded.contains(sensitive_observation));
+        drop(store);
+        let reopened = SchedulerStore::open_at(path).expect("scheduler reopens");
+        assert_eq!(
+            reopened
+                .subtask_evidence_aggregate(session_id)
+                .expect("aggregate survives restart"),
+            aggregate
+        );
+
+        let ready_directory = tempdir().expect("ready evidence directory");
+        let (ready_store, ready_session, ready_parent, ready_subtasks) =
+            active_subtask_test_context(ready_directory.path().join("scheduler.db"));
+        for subtask in &ready_subtasks {
+            let authority = ready_store
+                .activate_prepared_subtask(
+                    ready_parent,
+                    subtask.fence,
+                    Duration::from_secs(20),
+                    &SchedulerStore::test_subtask_dispatch_permit(),
+                )
+                .expect("ready subtask activates");
+            attest_test_subtask_evidence(
+                &authority,
+                &subtask.contract,
+                SubtaskEvidenceVerdict::Verified,
+            )
+            .expect("ready evidence verifies");
+            SchedulerStore::resolve_subtask_authority(
+                &authority,
+                SubtaskAuthorityOutcome::Completed,
+            )
+            .expect("verified subtask completes");
+        }
+        assert_eq!(
+            ready_store
+                .subtask_evidence_aggregate(ready_session)
+                .expect("ready aggregate loads"),
+            SubtaskEvidenceAggregate {
+                total_subtasks: 2,
+                verified_subtasks: 2,
+                rejected_subtasks: 0,
+                pending_subtasks: 0,
+                completed_subtasks: 2,
+                ready_for_parent_completion: true,
+            }
         );
     }
 

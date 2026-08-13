@@ -3146,6 +3146,10 @@ impl TaskExecutor for AgentTaskExecutor {
                     "lease_recovery": "fail_closed",
                     "authority_scope": "deterministic_objective_subset",
                     "grant_policy": "objective_tool_operations_v3",
+                    "evidence_gate": "independent_attestation_required",
+                    "evidence_aggregation": "all_verified_and_completed",
+                    "verified_subtask_count": 0,
+                    "rejected_subtask_count": 0,
                     "parent_capability_count": parent_capabilities.len(),
                     "aggregate_capability_grants": prepared_subtask_capability_grants,
                     "aggregate_connector_operation_grants": prepared_subtask_connector_operation_grants,
@@ -6016,6 +6020,16 @@ mod tests {
             subtask_authority.payload["grant_policy"],
             "objective_tool_operations_v3"
         );
+        assert_eq!(
+            subtask_authority.payload["evidence_gate"],
+            "independent_attestation_required"
+        );
+        assert_eq!(
+            subtask_authority.payload["evidence_aggregation"],
+            "all_verified_and_completed"
+        );
+        assert_eq!(subtask_authority.payload["verified_subtask_count"], 0);
+        assert_eq!(subtask_authority.payload["rejected_subtask_count"], 0);
         assert_eq!(subtask_authority.payload["parent_capability_count"], 1);
         assert_eq!(subtask_authority.payload["aggregate_capability_grants"], 0);
         assert_eq!(

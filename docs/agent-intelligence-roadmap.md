@@ -541,6 +541,17 @@ Completed ninth increment: exact per-objective connector-operation authority.
 
 This increment completes exact connector-tool authority for staged subtasks, not dispatch. Built-in calls continue through their existing path/file/command/Git policy layers. Independent evidence verification and aggregation plus a scheduler-owned Worker launch/heartbeat path remain required before multi-agent execution can be enabled.
 
+Completed tenth increment: independent subtask evidence attestations and parent aggregation.
+
+- Independent evidence is persisted separately from Worker/model objective checkpoints. Only code holding a module-private verifier permit can attest evidence for an exact live subtask authority; the permit is not serialized or included in Worker tool authority.
+- Each immutable attestation binds the prepared subtask, active authority, content-addressed contract, exact evidence-requirement digest, bounded verifier identity/method, verified or rejected verdict, observation count, and digest of the verifier's evidence.
+- The ledger retains no raw evidence payload, model text, tool arguments/results, paths, commands, connector configuration, or credentials. Exact replay returns the retained record; a changed replay conflicts.
+- Successful subtask resolution now requires a matching verified attestation in addition to the existing live lease, parent fence, current grants, immutable capabilities, and exact connector-operation map. Missing or rejected evidence cannot be represented as completion.
+- A restart-safe aggregate counts total, pending, verified, rejected, and completed subtasks. Parent readiness requires every prepared subtask to be both verified and completed; one rejected, pending, or unfinished subtask keeps the aggregate closed.
+- Activity explains this evidence and aggregation boundary at preparation time while continuing to state that dispatch, authority activation, and additional Workers are disabled.
+
+This increment builds the independent evidence gate behind private permits. It does not launch a verifier, bind provider-specific verifier adapters to objectives, dispatch a Worker, or complete a parent automatically. Those production orchestration paths remain required before multi-agent execution can be enabled.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

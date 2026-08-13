@@ -715,6 +715,10 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       lease_recovery: "fail_closed",
       authority_scope: "deterministic_objective_subset",
       grant_policy: "objective_tool_operations_v3",
+      evidence_gate: "independent_attestation_required",
+      evidence_aggregation: "all_verified_and_completed",
+      verified_subtask_count: 0,
+      rejected_subtask_count: 0,
       parent_capability_count: 4,
       aggregate_capability_grants: 5,
       aggregate_connector_operation_grants: 3,
@@ -767,6 +771,27 @@ assertEqual(
   ),
   true,
   "subtask preparation should explain exact connector operation enforcement",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Evidence gate: independent verifier attestation required",
+  ),
+  true,
+  "subtask preparation should explain the independent evidence gate",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Parent aggregation requires every subtask to be verified and completed",
+  ),
+  true,
+  "subtask preparation should explain the all-objective aggregation boundary",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Evidence payloads remain digest-only; Worker claims cannot satisfy this gate",
+  ),
+  true,
+  "subtask preparation should distinguish verifier evidence from Worker claims",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

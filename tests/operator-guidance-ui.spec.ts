@@ -242,6 +242,13 @@ test("prepared subtask authority is visible without implying multi-agent executi
   await expect(activity).toContainText("Objectives with narrowed authority: 2 of 2");
   await expect(activity).toContainText("Exact connector operation grants: 3");
   await expect(activity).toContainText("Unlisted connector tools are rejected before forwarding.");
+  await expect(activity).toContainText("Evidence gate: independent verifier attestation required.");
+  await expect(activity).toContainText(
+    "Parent aggregation requires every subtask to be verified and completed.",
+  );
+  await expect(activity).toContainText(
+    "Evidence payloads remain digest-only; Worker claims cannot satisfy this gate.",
+  );
   await expect(activity).toContainText(
     "Built-in mutation authority requires local scope and a mutation objective.",
   );

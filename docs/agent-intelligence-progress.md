@@ -13,9 +13,32 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Nine vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, and exact per-objective connector-operation authority. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Ten vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, and independent digest-only evidence aggregation. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed tenth vertical slice: independent subtask evidence attestations and parent aggregation.
+
+- The scheduler now owns a separate immutable evidence-attestation ledger keyed by the prepared subtask and its exact active authority. A subtask Worker cannot construct the module-private evidence permit, so model text and Worker-authored objective checkpoints cannot satisfy this gate.
+- The future verifier must attest the exact content-addressed evidence-requirement digest from the version-2 subtask contract. Verifier identity, provider-neutral verification method, verified/rejected verdict, observation count, and an evidence digest are bounded and validated before persistence.
+- Raw observations, task text, tool arguments/results, paths, commands, connector configuration, and credentials are not stored in the attestation. Tests hash a credential-shaped observation and prove the raw value is absent from the persisted projection.
+- Identical attestation replay is idempotent before and after subtask completion. A changed verdict, verifier, method, observation count, authority, or evidence digest conflicts with the immutable record.
+- A staged subtask can no longer report `Completed` without a matching `verified` attestation. Missing or rejected evidence fails closed; cancellation and failure can still revoke authority without claiming successful evidence.
+- Restart-safe parent aggregation reports total, verified, rejected, pending, and completed subtask counts. `ready_for_parent_completion` becomes true only when every prepared subtask is independently verified and terminally completed.
+- The preparation event and rendered Activity explain the independent evidence gate, all-subtask aggregation rule, and digest-only boundary without implying that a specialized Worker or verifier process was launched.
+
+Phase 14 tenth-increment regression evidence:
+
+- Scheduler integration covers completion without evidence, wrong requirement digest, verified and rejected verdicts, exact replay, conflicting replay, replay after completion, mixed parent aggregation, all-verified readiness, restart persistence, and sensitive-observation redaction.
+- Scheduler suite: 62 passed, 2 ignored, 0 failed. Full Rust suite: 534 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator suite: 6 passed, 0 failed. Full rendered browser suite: 12 passed, 0 failed. Existing browser-only native-theme mock warnings remain non-failing.
+
+Known limitations:
+
+- The verifier permit and subtask dispatch permit remain module-private and have test-only constructors. No production path launches a Worker or verifier, submits an attestation, or completes a parent from the aggregate yet.
+- This slice defines provider-neutral persistence and enforcement; it does not assign existing Git, Kubernetes, Bamboo, Jira, or Confluence verifier adapters to individual subtasks.
+- A rejected attestation is immutable for that subtask attempt. A future retry design must mint a new fenced subtask attempt rather than rewriting evidence history.
 
 Completed ninth vertical slice: exact per-objective connector-operation authority.
 
@@ -40,7 +63,7 @@ Known limitations:
 
 - Operation matching is intentionally conservative and depends on bounded semantic objective hints plus the immutable discovered capability plan. Missing or ambiguous evidence removes authority rather than asking the model to widen it.
 - Exact file paths, shell commands, and Git sub-operations remain governed by their existing built-in containment and policy layers rather than this connector-operation map.
-- Scheduler-owned Worker launch, heartbeat orchestration, independent evidence aggregation, and production enablement remain future Phase 14 increments.
+- Scheduler-owned Worker/verifier launch, heartbeat orchestration, adapter binding, and production enablement remain future Phase 14 increments.
 
 Completed eighth vertical slice: deterministic per-objective built-in workspace, file, shell, and Git authority.
 
