@@ -64,6 +64,8 @@
         tool_call_budget: 64,
         mutation_call_budget: 1,
         scheduler_state: "dormant",
+        activation_gate: "closed",
+        budget_admission: "atomic_before_forward",
         authority_scope: "parent_subset",
         authority_active: false,
         delegation_allowed: false,

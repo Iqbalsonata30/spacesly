@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBTASK_AUTHORITY_MAX_LEASE: Duration = Duration::from_secs(30);
 pub(crate) const RECOVERY_REQUIRES_RETRY_FRESH: &str =
     "[recovery_requires_retry_fresh] Spacesly cannot safely resume this Agent task because no durable OpenCode session identity was recorded. Use Retry Fresh explicitly.";
 pub(crate) const RECOVERY_REQUIRES_MUTATION_RECONCILIATION: &str =
@@ -85,6 +86,8 @@ pub struct ExternalAssignmentAuthority {
     pub connector_binding_digest: String,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtask_authority: Option<SubtaskToolAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -183,7 +186,52 @@ pub struct TaskToolAuthority {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_branch: Option<String>,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtask_authority: Option<SubtaskToolAuthority>,
 }
+
+/// Scheduler-minted authority for one isolated subtask.
+///
+/// The current application has no constructor for `SubtaskDispatchPermit`, so this descriptor
+/// cannot reach a tool process until the scheduler dispatch path is implemented deliberately.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubtaskToolAuthority {
+    pub scheduler_database: PathBuf,
+    pub scheduler_instance_id: String,
+    pub session_id: TaskSessionId,
+    pub parent_attempt_id: u64,
+    pub parent_attempt: u32,
+    pub parent_owner_id: u64,
+    pub parent_fencing_token: u64,
+    pub subtask_id: u64,
+    pub subtask_attempt_id: u64,
+    pub subtask_attempt: u32,
+    pub subtask_fencing_token: u64,
+    pub authority_id: u64,
+    pub authority_fencing_token: u64,
+    pub objective_id: String,
+    pub capabilities: Vec<String>,
+    pub lease_expires_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubtaskToolRisk {
+    Read,
+    Mutation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskToolAdmission {
+    pub authority_id: u64,
+    pub tool_calls_used: u32,
+    pub mutation_calls_used: u32,
+    pub max_tool_calls: u32,
+    pub max_mutation_calls: u32,
+}
+
+/// Unforgeable module-private capability required to activate dormant subtask authority.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SubtaskDispatchPermit(());
 
 /// Identity required for a Worker to renew or finish one assignment attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,6 +539,25 @@ impl SchedulerStore {
                   );
                   CREATE INDEX IF NOT EXISTS idx_scheduler_subtask_attempts_subtask
                     ON scheduler_subtask_attempts(subtask_id, attempt_number);
+                  CREATE TABLE IF NOT EXISTS scheduler_subtask_authorities (
+                    authority_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subtask_attempt_id INTEGER NOT NULL UNIQUE,
+                    parent_attempt_id INTEGER NOT NULL,
+                    parent_fencing_token INTEGER NOT NULL,
+                    authority_fencing_token INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('active', 'revoked', 'completed')),
+                    lease_expires_at INTEGER NOT NULL,
+                    tool_calls_used INTEGER NOT NULL DEFAULT 0 CHECK (tool_calls_used >= 0),
+                    mutation_calls_used INTEGER NOT NULL DEFAULT 0 CHECK (mutation_calls_used >= 0),
+                    activated_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(subtask_attempt_id) REFERENCES scheduler_subtask_attempts(subtask_attempt_id)
+                      ON DELETE CASCADE,
+                    FOREIGN KEY(parent_attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_subtask_authorities_active
+                    ON scheduler_subtask_authorities(state, lease_expires_at);
                   CREATE TABLE IF NOT EXISTS scheduler_task_events (
                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    session_id INTEGER NOT NULL,
@@ -865,6 +932,7 @@ impl SchedulerStore {
             connector_id: connector_id.to_string(),
             connector_binding_digest: connector_binding_digest.to_ascii_lowercase(),
             allowed_tools: Vec::new(),
+            subtask_authority: None,
         })
     }
 
@@ -912,6 +980,7 @@ impl SchedulerStore {
             default_repository_root: None,
             bound_branch: None,
             capabilities,
+            subtask_authority: None,
         })
     }
 
@@ -1395,6 +1464,47 @@ impl SchedulerStore {
             #[cfg(test)]
             resolution_failures: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn open_subtask_authority_store(authority: &SubtaskToolAuthority) -> Result<Self, String> {
+        let canonical_path = fs::canonicalize(&authority.scheduler_database)
+            .map_err(|error| format!("Failed to resolve subtask authority database: {error}"))?;
+        let connection = Connection::open_with_flags(
+            &canonical_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Failed to open subtask authority database: {error}"))?;
+        connection
+            .busy_timeout(STORE_BUSY_TIMEOUT)
+            .map_err(|error| format!("Failed to configure subtask authority timeout: {error}"))?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|error| format!("Failed to configure subtask authority database: {error}"))?;
+        connection
+            .prepare("SELECT authority_id FROM scheduler_subtask_authorities LIMIT 1")
+            .map_err(|error| format!("Subtask authority schema is not ready: {error}"))?;
+        let instance_id = connection
+            .query_row(
+                "SELECT instance_id FROM scheduler_metadata WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Failed to read subtask authority instance: {error}"))?;
+        if instance_id != authority.scheduler_instance_id {
+            return Err("Subtask authority belongs to another scheduler instance.".to_string());
+        }
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            instance_id: Arc::from(instance_id),
+            database_path: Some(Arc::new(canonical_path)),
+            #[cfg(test)]
+            resolution_failures: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    fn test_subtask_dispatch_permit() -> SubtaskDispatchPermit {
+        SubtaskDispatchPermit(())
     }
 
     pub(crate) fn register_owner(&self) -> Result<u64, String> {
@@ -2694,6 +2804,353 @@ impl SchedulerStore {
             )
             .map(|value| value != 0)
             .map_err(|error| format!("Failed to inspect dormant subtask fence: {error}"))
+    }
+
+    /// Activates one exact dormant identity under the current parent assignment.
+    ///
+    /// No production caller can construct `SubtaskDispatchPermit` yet. Keeping that permit
+    /// module-private makes the implemented authority and budget checks testable without opening
+    /// a multi-agent dispatch path prematurely.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn activate_prepared_subtask(
+        &self,
+        parent: AssignmentFence,
+        dormant: DormantSubtaskFence,
+        lease_duration: Duration,
+        _permit: &SubtaskDispatchPermit,
+    ) -> Result<SubtaskToolAuthority, String> {
+        if lease_duration.is_zero() || lease_duration > SUBTASK_AUTHORITY_MAX_LEASE {
+            return Err("Subtask authority lease must be between 1 ms and 30 seconds.".to_string());
+        }
+        let database_path = self.database_path.as_ref().ok_or_else(|| {
+            "Subtask authority requires a persistent scheduler store.".to_string()
+        })?;
+        let now = now_millis();
+        let requested_lease_expires_at = now
+            .checked_add(duration_millis(lease_duration)?)
+            .ok_or_else(|| "Subtask authority lease timestamp overflowed.".to_string())?;
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask activation transaction: {error}"))?;
+        if !assignment_is_current_on(&transaction, parent, now)? {
+            return Err("Parent assignment fence is stale, expired, or cancelled.".to_string());
+        }
+        let parent_lease_expires_at = transaction
+            .query_row(
+                "SELECT lease_expires_at FROM scheduler_task_attempts WHERE attempt_id = ?1",
+                params![to_i64(parent.attempt_id)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to load parent assignment lease: {error}"))?;
+        let lease_expires_at = requested_lease_expires_at.min(from_i64(
+            parent_lease_expires_at,
+            "parent assignment lease",
+        )?);
+        if lease_expires_at <= now {
+            return Err("Parent assignment lease cannot contain a subtask lease.".to_string());
+        }
+        let (objective_id, contract_json) = transaction
+            .query_row(
+                "SELECT subtasks.objective_id, subtasks.contract_json
+                   FROM scheduler_prepared_subtasks subtasks
+                   JOIN scheduler_subtask_attempts attempts
+                     ON attempts.subtask_id = subtasks.subtask_id
+                  WHERE subtasks.session_id = ?1
+                    AND subtasks.subtask_id = ?2
+                    AND subtasks.state = 'prepared'
+                    AND subtasks.execution_enabled = 0
+                    AND attempts.subtask_attempt_id = ?3
+                    AND attempts.attempt_number = ?4
+                    AND attempts.fencing_token = ?5
+                    AND attempts.state = 'dormant'
+                    AND attempts.authority_active = 0",
+                params![
+                    to_i64(parent.session_id.0)?,
+                    to_i64(dormant.subtask_id)?,
+                    to_i64(dormant.subtask_attempt_id)?,
+                    i64::from(dormant.attempt),
+                    to_i64(dormant.fencing_token)?
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect dormant subtask activation: {error}"))?
+            .ok_or_else(|| "Dormant subtask fence is stale or incompatible.".to_string())?;
+        let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
+            .map_err(|error| format!("Failed to decode subtask activation contract: {error}"))?;
+        if contract.objective_id != objective_id || contract.execution_enabled {
+            return Err("Prepared subtask activation contract is inconsistent.".to_string());
+        }
+        for capability in &contract.granted_capabilities {
+            let still_granted = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM scheduler_task_grants
+                        WHERE session_id = ?1 AND capability = ?2
+                     )",
+                    params![to_i64(parent.session_id.0)?, capability],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("Failed to recheck parent subtask grants: {error}"))?;
+            if still_granted == 0 {
+                return Err(
+                    "Prepared subtask capability is no longer granted to its parent.".to_string(),
+                );
+            }
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT authority_id, parent_attempt_id, parent_fencing_token,
+                        authority_fencing_token, state, lease_expires_at,
+                        tool_calls_used, mutation_calls_used
+                   FROM scheduler_subtask_authorities WHERE subtask_attempt_id = ?1",
+                params![to_i64(dormant.subtask_attempt_id)?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect existing subtask authority: {error}"))?;
+        let (authority_id, authority_fencing_token, retained_lease_expires_at) = match existing {
+            Some((
+                authority_id,
+                parent_attempt_id,
+                parent_fencing_token,
+                authority_fencing_token,
+                state,
+                existing_lease_expires_at,
+                tool_calls_used,
+                mutation_calls_used,
+            )) if parent_attempt_id == to_i64(parent.attempt_id)?
+                && parent_fencing_token == to_i64(parent.fencing_token)?
+                && state == "active"
+                && existing_lease_expires_at > to_i64(now)? =>
+            {
+                if tool_calls_used < 0 || mutation_calls_used < 0 {
+                    return Err("Stored subtask authority usage is invalid.".to_string());
+                }
+                (
+                    from_i64(authority_id, "subtask authority ID")?,
+                    from_i64(authority_fencing_token, "subtask authority fencing token")?,
+                    from_i64(existing_lease_expires_at, "subtask authority lease")?,
+                )
+            }
+            Some(_) => {
+                return Err(
+                    "Subtask authority already exists but is stale or requires recovery."
+                        .to_string(),
+                )
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO scheduler_subtask_authorities
+                           (subtask_attempt_id, parent_attempt_id, parent_fencing_token,
+                            authority_fencing_token, state, lease_expires_at, tool_calls_used,
+                            mutation_calls_used, activated_at, updated_at)
+                         VALUES (?1, ?2, ?3, 1, 'active', ?4, 0, 0, ?5, ?5)",
+                        params![
+                            to_i64(dormant.subtask_attempt_id)?,
+                            to_i64(parent.attempt_id)?,
+                            to_i64(parent.fencing_token)?,
+                            to_i64(lease_expires_at)?,
+                            to_i64(now)?
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to persist subtask authority: {error}"))?;
+                (
+                    from_i64(transaction.last_insert_rowid(), "subtask authority ID")?,
+                    1,
+                    lease_expires_at,
+                )
+            }
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask activation: {error}"))?;
+        Ok(SubtaskToolAuthority {
+            scheduler_database: database_path.as_ref().clone(),
+            scheduler_instance_id: self.instance_id.to_string(),
+            session_id: parent.session_id,
+            parent_attempt_id: parent.attempt_id,
+            parent_attempt: parent.attempt,
+            parent_owner_id: parent.owner_id,
+            parent_fencing_token: parent.fencing_token,
+            subtask_id: dormant.subtask_id,
+            subtask_attempt_id: dormant.subtask_attempt_id,
+            subtask_attempt: dormant.attempt,
+            subtask_fencing_token: dormant.fencing_token,
+            authority_id,
+            authority_fencing_token,
+            objective_id,
+            capabilities: contract.granted_capabilities,
+            lease_expires_at: retained_lease_expires_at,
+        })
+    }
+
+    /// Atomically admits one future subtask tool call and consumes its conservative budget.
+    /// Budget is charged at admission time, so a transport failure cannot accidentally permit an
+    /// extra retry beyond the immutable contract.
+    pub fn admit_subtask_tool_call(
+        authority: &SubtaskToolAuthority,
+        capability: &str,
+        risk: SubtaskToolRisk,
+    ) -> Result<SubtaskToolAdmission, String> {
+        validate_subtask_authority_shape(authority, capability)?;
+        let store = Self::open_subtask_authority_store(authority)?;
+        let now = now_millis();
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask tool admission: {error}"))?;
+        let parent = AssignmentFence {
+            session_id: authority.session_id,
+            attempt_id: authority.parent_attempt_id,
+            attempt: authority.parent_attempt,
+            owner_id: authority.parent_owner_id,
+            fencing_token: authority.parent_fencing_token,
+        };
+        if !assignment_is_current_on(&transaction, parent, now)? {
+            return Err("Subtask parent assignment is stale, expired, or cancelled.".to_string());
+        }
+        let (
+            contract_json,
+            max_tool_calls,
+            max_mutation_calls,
+            tool_calls_used,
+            mutation_calls_used,
+        ) = transaction
+            .query_row(
+                "SELECT subtasks.contract_json, attempts.max_tool_calls,
+                            attempts.max_mutation_calls, authorities.tool_calls_used,
+                            authorities.mutation_calls_used
+                       FROM scheduler_subtask_authorities authorities
+                       JOIN scheduler_subtask_attempts attempts
+                         ON attempts.subtask_attempt_id = authorities.subtask_attempt_id
+                       JOIN scheduler_prepared_subtasks subtasks
+                         ON subtasks.subtask_id = attempts.subtask_id
+                      WHERE authorities.authority_id = ?1
+                        AND authorities.authority_fencing_token = ?2
+                        AND authorities.subtask_attempt_id = ?3
+                        AND authorities.parent_attempt_id = ?4
+                        AND authorities.parent_fencing_token = ?5
+                        AND authorities.state = 'active'
+                        AND authorities.lease_expires_at > ?6
+                        AND authorities.lease_expires_at = ?12
+                        AND subtasks.session_id = ?7
+                        AND subtasks.subtask_id = ?8
+                        AND subtasks.objective_id = ?9
+                        AND attempts.attempt_number = ?10
+                        AND attempts.fencing_token = ?11
+                        AND EXISTS (
+                          SELECT 1 FROM scheduler_task_grants grants
+                           WHERE grants.session_id = subtasks.session_id
+                             AND grants.capability = ?13
+                        )",
+                params![
+                    to_i64(authority.authority_id)?,
+                    to_i64(authority.authority_fencing_token)?,
+                    to_i64(authority.subtask_attempt_id)?,
+                    to_i64(authority.parent_attempt_id)?,
+                    to_i64(authority.parent_fencing_token)?,
+                    to_i64(now)?,
+                    to_i64(authority.session_id.0)?,
+                    to_i64(authority.subtask_id)?,
+                    authority.objective_id,
+                    i64::from(authority.subtask_attempt),
+                    to_i64(authority.subtask_fencing_token)?,
+                    to_i64(authority.lease_expires_at)?,
+                    capability
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to validate subtask tool authority: {error}"))?
+            .ok_or_else(|| {
+                "Subtask tool authority is stale, expired, or incompatible.".to_string()
+            })?;
+        let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
+            .map_err(|error| format!("Failed to decode subtask tool contract: {error}"))?;
+        if contract.objective_id != authority.objective_id
+            || contract.granted_capabilities != authority.capabilities
+            || !contract
+                .granted_capabilities
+                .iter()
+                .any(|granted| granted == capability)
+        {
+            return Err(
+                "Subtask tool capability is not granted by its immutable contract.".to_string(),
+            );
+        }
+        let max_tool_calls = u32::try_from(from_i64(max_tool_calls, "subtask tool budget")?)
+            .map_err(|_| "Subtask tool budget exceeds u32.".to_string())?;
+        let max_mutation_calls =
+            u32::try_from(from_i64(max_mutation_calls, "subtask mutation budget")?)
+                .map_err(|_| "Subtask mutation budget exceeds u32.".to_string())?;
+        let tool_calls_used = u32::try_from(from_i64(tool_calls_used, "subtask tool usage")?)
+            .map_err(|_| "Subtask tool usage exceeds u32.".to_string())?;
+        let mutation_calls_used =
+            u32::try_from(from_i64(mutation_calls_used, "subtask mutation usage")?)
+                .map_err(|_| "Subtask mutation usage exceeds u32.".to_string())?;
+        if tool_calls_used >= max_tool_calls {
+            return Err("Subtask tool-call budget is exhausted.".to_string());
+        }
+        let mutation_delta = u32::from(risk == SubtaskToolRisk::Mutation);
+        if mutation_delta == 1 && mutation_calls_used >= max_mutation_calls {
+            return Err("Subtask mutation-call budget is exhausted.".to_string());
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_subtask_authorities
+                    SET tool_calls_used = tool_calls_used + 1,
+                        mutation_calls_used = mutation_calls_used + ?2,
+                        updated_at = ?3
+                  WHERE authority_id = ?1 AND authority_fencing_token = ?4
+                    AND state = 'active' AND lease_expires_at > ?3
+                    AND tool_calls_used < ?5
+                    AND mutation_calls_used + ?2 <= ?6",
+                params![
+                    to_i64(authority.authority_id)?,
+                    i64::from(mutation_delta),
+                    to_i64(now)?,
+                    to_i64(authority.authority_fencing_token)?,
+                    i64::from(max_tool_calls),
+                    i64::from(max_mutation_calls)
+                ],
+            )
+            .map_err(|error| format!("Failed to consume subtask tool budget: {error}"))?;
+        if updated != 1 {
+            return Err("Subtask tool admission lost its authority or budget fence.".to_string());
+        }
+        let admission = SubtaskToolAdmission {
+            authority_id: authority.authority_id,
+            tool_calls_used: tool_calls_used + 1,
+            mutation_calls_used: mutation_calls_used + mutation_delta,
+            max_tool_calls,
+            max_mutation_calls,
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask tool admission: {error}"))?;
+        Ok(admission)
     }
 
     pub(crate) fn bind_opencode_session(
@@ -4607,6 +5064,31 @@ fn validate_external_authority_shape(
     Ok(())
 }
 
+fn validate_subtask_authority_shape(
+    authority: &SubtaskToolAuthority,
+    capability: &str,
+) -> Result<(), String> {
+    if authority.scheduler_instance_id.trim().is_empty()
+        || authority.objective_id.trim().is_empty()
+        || authority.objective_id != authority.objective_id.trim()
+        || capability.trim().is_empty()
+        || capability != capability.trim()
+        || authority.capabilities.is_empty()
+        || authority.capabilities.len() > 64
+        || authority
+            .capabilities
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || !authority
+            .capabilities
+            .iter()
+            .any(|granted| granted == capability)
+    {
+        return Err("Subtask tool authority shape or capability is invalid.".to_string());
+    }
+    Ok(())
+}
+
 fn external_authority_is_current_on(
     connection: &Connection,
     authority: &ExternalAssignmentAuthority,
@@ -5463,7 +5945,11 @@ mod tests {
             .expect("scheduler tables queried")
             .collect::<Result<Vec<_>, _>>()
             .expect("scheduler tables read");
-        for expected in ["scheduler_prepared_subtasks", "scheduler_subtask_attempts"] {
+        for expected in [
+            "scheduler_prepared_subtasks",
+            "scheduler_subtask_attempts",
+            "scheduler_subtask_authorities",
+        ] {
             assert!(scheduler_tables.iter().any(|table| table == expected));
         }
     }
@@ -7618,6 +8104,242 @@ mod tests {
             None,
             "the manifest insert must roll back with the failed allocation",
         );
+    }
+
+    fn active_subtask_test_context(
+        path: PathBuf,
+    ) -> (
+        SchedulerStore,
+        TaskSessionId,
+        AssignmentFence,
+        Vec<SchedulerPreparedSubtask>,
+    ) {
+        let store = SchedulerStore::open_at(path).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("subtasks", &test_agent_envelope())
+                    .expect("request encodes"),
+                &["external_tools:jira".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(30), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        store
+            .bind_execution_manifest(
+                assignment.fence,
+                &test_execution_manifest_with_prepared_subtasks("runtime-safe"),
+            )
+            .expect("prepared subtasks bind");
+        let subtasks = store
+            .prepared_subtasks_for_session(session.id)
+            .expect("prepared subtasks load");
+        (store, session.id, assignment.fence, subtasks)
+    }
+
+    #[test]
+    fn subtask_activation_is_fenced_idempotent_and_budgeted_across_reopen() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let (store, session_id, parent, subtasks) = active_subtask_test_context(path.clone());
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let read_only = store
+            .activate_prepared_subtask(parent, subtasks[0].fence, Duration::from_secs(20), &permit)
+            .expect("read-only subtask activates");
+        assert_eq!(
+            store
+                .activate_prepared_subtask(
+                    parent,
+                    subtasks[0].fence,
+                    Duration::from_secs(20),
+                    &permit,
+                )
+                .expect("identical activation is idempotent"),
+            read_only
+        );
+        assert!(store
+            .activate_prepared_subtask(
+                parent,
+                DormantSubtaskFence {
+                    fencing_token: subtasks[0].fence.fencing_token + 1,
+                    ..subtasks[0].fence
+                },
+                Duration::from_secs(20),
+                &permit,
+            )
+            .expect_err("stale dormant fence fails")
+            .contains("stale or incompatible"));
+
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "external_tools:jira",
+            SubtaskToolRisk::Mutation,
+        )
+        .expect_err("read-only objective has no mutation authority")
+        .contains("mutation-call budget is exhausted"));
+        let first = SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect("first read admitted");
+        assert_eq!(first.tool_calls_used, 1);
+        assert_eq!(first.mutation_calls_used, 0);
+
+        let mutable = store
+            .activate_prepared_subtask(parent, subtasks[1].fence, Duration::from_secs(20), &permit)
+            .expect("mutation subtask activates independently");
+        for expected in 1..=subtasks[1].contract.budget.max_mutation_calls {
+            let admitted = SchedulerStore::admit_subtask_tool_call(
+                &mutable,
+                "external_tools:jira",
+                SubtaskToolRisk::Mutation,
+            )
+            .expect("bounded mutation admitted");
+            assert_eq!(admitted.mutation_calls_used, expected);
+        }
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &mutable,
+            "external_tools:jira",
+            SubtaskToolRisk::Mutation,
+        )
+        .expect_err("mutation budget remains a separate hard limit")
+        .contains("mutation-call budget is exhausted"));
+        let post_mutation_read = SchedulerStore::admit_subtask_tool_call(
+            &mutable,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect("remaining general tool budget still admits reads");
+        assert_eq!(
+            post_mutation_read.tool_calls_used,
+            subtasks[1].contract.budget.max_mutation_calls + 1
+        );
+        assert_eq!(
+            post_mutation_read.mutation_calls_used,
+            subtasks[1].contract.budget.max_mutation_calls
+        );
+
+        drop(store);
+        let second = SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect("budget survives process reopen");
+        assert_eq!(second.tool_calls_used, 2);
+        let reopened = SchedulerStore::open_at(path).expect("store reopens");
+        let mut expanded = read_only.clone();
+        expanded
+            .capabilities
+            .push("external_tools:other".to_string());
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &expanded,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("capability expansion fails")
+        .contains("immutable contract"));
+        let mut stale_authority = read_only.clone();
+        stale_authority.authority_fencing_token += 1;
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &stale_authority,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("stale authority fence fails")
+        .contains("stale, expired, or incompatible"));
+        let mut altered_lease = read_only.clone();
+        altered_lease.lease_expires_at += 1;
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &altered_lease,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("altered authority lease fails")
+        .contains("stale, expired, or incompatible"));
+        reopened
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .execute(
+                "DELETE FROM scheduler_task_grants
+                  WHERE session_id = ?1 AND capability = 'external_tools:jira'",
+                params![to_i64(session_id.0).expect("session ID fits")],
+            )
+            .expect("test revokes parent capability");
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("revoked parent grant invalidates retained subtask authority")
+        .contains("stale, expired, or incompatible"));
+        reopened
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .execute(
+                "INSERT INTO scheduler_task_grants
+                   (session_id, capability, grant_source, granted_at)
+                 VALUES (?1, 'external_tools:jira', 'test-restored', 1)",
+                params![to_i64(session_id.0).expect("session ID fits")],
+            )
+            .expect("test restores parent capability");
+        reopened
+            .cancel(session_id)
+            .expect("parent cancellation starts");
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("cancelled parent revokes effective subtask authority")
+        .contains("parent assignment is stale"));
+    }
+
+    #[test]
+    fn concurrent_subtask_admission_never_exceeds_the_contract_budget() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let (store, _session_id, parent, subtasks) = active_subtask_test_context(path);
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let authority = store
+            .activate_prepared_subtask(parent, subtasks[0].fence, Duration::from_secs(30), &permit)
+            .expect("subtask activates");
+        let expected_budget = subtasks[0].contract.budget.max_tool_calls as usize;
+        let barrier = Arc::new(Barrier::new(expected_budget + 9));
+        let handles = (0..expected_budget + 8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let authority = authority.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    SchedulerStore::admit_subtask_tool_call(
+                        &authority,
+                        "external_tools:jira",
+                        SubtaskToolRisk::Read,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread joins"))
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(admitted, expected_budget);
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &authority,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("budget remains exhausted")
+        .contains("budget is exhausted"));
     }
 
     #[test]

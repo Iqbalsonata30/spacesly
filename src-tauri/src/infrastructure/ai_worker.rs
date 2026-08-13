@@ -3945,6 +3945,7 @@ mod tests {
                 )
                 .expect("connector binding"),
                 allowed_tools: Vec::new(),
+                subtask_authority: None,
             }),
         });
 
@@ -3991,6 +3992,7 @@ mod tests {
             default_repository_root: None,
             bound_branch: None,
             capabilities: vec!["workspace_read".to_string(), "shell".to_string()],
+            subtask_authority: None,
         });
 
         let serialized = opencode_mcp_config(&config).expect("OpenCode config");

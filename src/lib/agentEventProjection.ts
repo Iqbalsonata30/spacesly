@@ -141,6 +141,8 @@ export function projectAgentTaskSessionEvent(
     summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
     details.push(
       "- Scheduler state: dormant",
+      "- Activation gate: closed",
+      "- Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
       `- Dormant fencing identities: ${dormantFenceCount}`,
       "- Tool authority active: no",
       "- Authority scope: subset of the parent task grants",

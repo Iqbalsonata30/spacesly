@@ -3125,6 +3125,8 @@ impl TaskExecutor for AgentTaskExecutor {
                     "tool_call_budget": prepared_subtask_tool_budget,
                     "mutation_call_budget": prepared_subtask_mutation_budget,
                     "scheduler_state": "dormant",
+                    "activation_gate": "closed",
+                    "budget_admission": "atomic_before_forward",
                     "authority_scope": "parent_subset",
                     "authority_active": false,
                     "delegation_allowed": false,

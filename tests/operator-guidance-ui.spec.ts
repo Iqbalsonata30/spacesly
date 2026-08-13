@@ -229,6 +229,10 @@ test("prepared subtask authority is visible without implying multi-agent executi
   );
   await activity.getByRole("button", { name: "Show Technical Details" }).click();
   await expect(activity).toContainText("Scheduler state: dormant");
+  await expect(activity).toContainText("Activation gate: closed");
+  await expect(activity).toContainText(
+    "Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
+  );
   await expect(activity).toContainText("Dormant fencing identities: 2");
   await expect(activity).toContainText("Tool authority active: no");
   await expect(activity).toContainText("Authority scope: subset of the parent task grants");

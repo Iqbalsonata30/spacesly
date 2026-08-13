@@ -484,6 +484,18 @@ Completed fourth increment: scheduler-owned dormant subtask records and independ
 
 This increment establishes scheduler identity and persistence, not execution authority. The next increment must define an explicit activation transaction, enforce capability and operation budgets at every tool boundary, and prove cancellation/recovery before any subtask dispatch is enabled.
 
+Completed fifth increment: staged scheduler activation and atomic tool-budget admission.
+
+- A module-private scheduler dispatch permit is now required to convert one exact dormant fence into a short-lived subtask tool authority. No application or Worker path can construct the permit, so multi-agent dispatch remains disabled.
+- Activation binds the current parent assignment attempt/fence, the exact dormant identity, an independent authority ID/fencing token, a lease capped at 30 seconds and by the parent lease, the objective identity, and the immutable contract capability set.
+- Activation is idempotent only for the same live parent/dormant identity. Stale dormant fences, expired parents, changed allocations, revoked parent grants, and prior authority requiring recovery fail closed.
+- Workspace and MCP authority descriptors can carry an optional nested subtask authority. Both forwarding boundaries require exact parent-descriptor equality and then atomically charge the durable tool budget before a request reaches the filesystem, shell, Git, or connector.
+- Every admitted call consumes the general tool-call budget; non-read calls also consume the separate mutation-call budget. Admission persists at the start of the call, so uncertain transport outcomes cannot create free retries. Concurrent admissions cannot exceed either hard limit.
+- Parent cancellation, lease expiry, scheduler-instance mismatch, stale authority fencing, capability expansion, or removal from the current parent grant table invalidates future admissions.
+- The rendered Activity continues to report dormant state and inactive authority, and now explicitly shows `Activation gate: closed` plus the staged atomic budget behavior.
+
+This increment deliberately does not create subtask Workers, activate authority from the application, renew/recover subtask leases, or aggregate subtask evidence. Those lifecycle paths must be completed and tested before the private dispatch permit can be exposed.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

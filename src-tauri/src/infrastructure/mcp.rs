@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::global_environment::redact_global_environment_values;
 use super::jira_rest;
 use super::ocp::trusted_resource_operation_identity_from_environment;
+#[cfg(test)]
+use super::scheduler_store::SubtaskToolAuthority;
 use super::scheduler_store::{
     ExternalAssignmentAuthority, ResourceMutationRecord, ResourceMutationReservation,
     ResourceMutationResolution, ResourceMutationState, SchedulerStore,
@@ -596,6 +598,31 @@ fn validate_proxy_request(
     let risk = validate_proxy_tool_call(message, exposed_tools)?;
     validate_proxy_assignment_authority(authority, connector_id, connector_binding)?;
     validate_proxy_repair_scope(message, authority)?;
+    if let ProxyAssignmentAuthority::Fenced(authority) = authority {
+        if let Some(subtask) = authority.subtask_authority.as_ref() {
+            if subtask.scheduler_database != authority.scheduler_database
+                || subtask.scheduler_instance_id != authority.scheduler_instance_id
+                || subtask.session_id != authority.session_id
+                || subtask.parent_attempt_id != authority.attempt_id
+                || subtask.parent_attempt != authority.attempt
+                || subtask.parent_owner_id != authority.owner_id
+                || subtask.parent_fencing_token != authority.fencing_token
+            {
+                return Err(
+                    "Subtask authority does not match its parent connector authority.".to_string(),
+                );
+            }
+            SchedulerStore::admit_subtask_tool_call(
+                subtask,
+                &authority.capability,
+                if risk == super::tool_broker::ToolRisk::Read {
+                    crate::infrastructure::scheduler_store::SubtaskToolRisk::Read
+                } else {
+                    crate::infrastructure::scheduler_store::SubtaskToolRisk::Mutation
+                },
+            )?;
+        }
+    }
     Ok(risk)
 }
 
@@ -3381,6 +3408,50 @@ done
             &connector_binding,
         )
         .is_ok());
+
+        let mut unbound_subtask = authority.clone();
+        unbound_subtask.subtask_authority = Some(SubtaskToolAuthority {
+            scheduler_database: directory.path().join("scheduler.db"),
+            scheduler_instance_id: store.instance_id().to_string(),
+            session_id: session.id,
+            parent_attempt_id: assignment.fence.attempt_id,
+            parent_attempt: assignment.fence.attempt,
+            parent_owner_id: assignment.fence.owner_id,
+            parent_fencing_token: assignment.fence.fencing_token,
+            subtask_id: 999,
+            subtask_attempt_id: 999,
+            subtask_attempt: 1,
+            subtask_fencing_token: 1,
+            authority_id: 999,
+            authority_fencing_token: 1,
+            objective_id: "unbound-objective".to_string(),
+            capabilities: vec!["external_tools:jira-a".to_string()],
+            lease_expires_at: i64::MAX as u64,
+        });
+        let mut mismatched_parent = unbound_subtask.clone();
+        mismatched_parent
+            .subtask_authority
+            .as_mut()
+            .expect("nested authority")
+            .parent_fencing_token += 1;
+        let error = validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(mismatched_parent),
+            "jira-a",
+            &connector_binding,
+        )
+        .expect_err("mismatched nested parent must fail before connector forwarding");
+        assert!(error.contains("does not match its parent connector authority"));
+        let error = validate_proxy_request(
+            &request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(unbound_subtask),
+            "jira-a",
+            &connector_binding,
+        )
+        .expect_err("unbound subtask must fail before connector forwarding");
+        assert!(error.contains("Subtask tool authority is stale"));
 
         let mut repair_scoped = authority.clone();
         repair_scoped.allowed_tools = vec!["jira_read_issue".to_string()];

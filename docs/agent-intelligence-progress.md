@@ -17,6 +17,27 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 ## Phase 14 In Progress
 
+Completed fifth vertical slice: scheduler-only subtask activation and atomic tool-budget admission.
+
+- A private `SubtaskDispatchPermit` gates activation. Only scheduler-store code and focused tests can construct it; the application executor and Worker pool have no activation or subtask-dispatch call site.
+- Activation is one immediate SQLite transaction over the current parent assignment fence and the exact dormant subtask tuple. It persists an independent authority identity/fencing token and a lease bounded to 30 seconds and the remaining parent lease.
+- Identical live activation returns the same authority. Stale dormant tuples, expired/cancelled parents, a different parent attempt, invalid stored state, or an authority requiring recovery are rejected.
+- Activation and every admission recheck that contract capabilities remain present in the current parent Task Session grant table. Retained contracts therefore cannot preserve a capability removed during continuation.
+- `TaskToolAuthority` and `ExternalAssignmentAuthority` may carry a nested subtask descriptor. Workspace and MCP forwarding require that its scheduler, session, parent attempt, owner, and fence exactly match the containing parent authority.
+- Workspace read/write, shell, Git and all proxied MCP calls run atomic budget admission before forwarding. Read calls consume one tool call; every other risk consumes one tool call and one mutation call. Git `info` and `status` are classified read-only; other Git operations are mutations.
+- Admission uses an immediate transaction and fenced compare/update, charges before execution, survives reopen, and cannot exceed the immutable general or mutation budget under concurrent callers.
+- Cancellation, parent lease expiry, scheduler-instance mismatch, stale nested fences, unbound nested descriptors, capability expansion, parent grant revocation, and budget exhaustion all fail before the external side effect.
+- The operator Activity still states that no Worker or tool authority is active. It now also shows `Activation gate: closed` and explains that tool budgets will be charged atomically before forwarding after dispatch is enabled.
+
+Phase 14 fifth-increment regression evidence:
+
+- Scheduler tests cover idempotent activation, exact/stale dormant fencing, independent mutation and general budgets, reopen persistence, parent grant revocation, parent cancellation, stale authority fencing, capability expansion, and a concurrent admission race that stops exactly at the contract budget.
+- Workspace and MCP integration tests attach an unbound nested descriptor and prove rejection before file or connector access; MCP additionally rejects a nested descriptor whose parent fence differs from its containing authority.
+- Legacy migration testing confirms the new authority table is created alongside prepared-subtask tables.
+- Full Rust suite: 524 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered dormant-subtask journey: 1 passed. Full rendered browser suite: 12 passed, 0 failed.
+
 Completed first vertical slice: uncertain-mutation recovery fencing.
 
 - Lease-expiry and scheduler-owner recovery remain one transaction: the old attempt is interrupted, its authority becomes stale, unresolved mutation reservations become `uncertain`, and the Task Session transition is committed with its durable event.
@@ -99,7 +120,7 @@ Phase 14 fourth-increment regression evidence:
 
 Remaining Phase 14 work:
 
-- Add an explicit scheduler activation/dispatch transaction, cancellation and lease recovery for subtask attempts, and enforce the prepared budgets at every tool boundary.
+- Add scheduler-owned subtask dispatch, renewal, explicit revocation/completion, and lease/owner recovery before exposing the private activation permit.
 - Narrow grants deterministically per objective and aggregate independently verified subtask evidence into the parent result.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

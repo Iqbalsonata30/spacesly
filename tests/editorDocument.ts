@@ -709,6 +709,8 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       tool_call_budget: 64,
       mutation_call_budget: 1,
       scheduler_state: "dormant",
+      activation_gate: "closed",
+      budget_admission: "atomic_before_forward",
       authority_scope: "parent_subset",
       authority_active: false,
       delegation_allowed: false,
@@ -747,6 +749,18 @@ assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes("Tool authority active: no"),
   true,
   "subtask preparation should expose that dormant records cannot call tools",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes("Activation gate: closed"),
+  true,
+  "subtask preparation should expose that scheduler dispatch remains unavailable",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Tool budgets will be charged atomically before forwarding",
+  ),
+  true,
+  "subtask preparation should explain the staged budget boundary",
 );
 const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
   {

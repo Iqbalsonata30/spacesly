@@ -15,7 +15,7 @@ use super::git::{
     workspace_git_status,
 };
 use super::mcp::{read_stdout_message, write_proxy_message};
-use super::scheduler_store::{SchedulerStore, TaskToolAuthority};
+use super::scheduler_store::{SchedulerStore, SubtaskToolRisk, TaskToolAuthority};
 use super::shell::{run_shell_command_cancellable, ShellCommandRequest};
 
 pub(crate) const TASK_TOOLS_AUTHORITY_ENV: &str = "SPACESLY_TASK_TOOLS_AUTHORITY";
@@ -207,6 +207,7 @@ fn call_tool(
                 &authority.workspace_root,
                 string_argument(arguments, "path")?,
             )?;
+            admit_subtask(authority, "workspace_read", SubtaskToolRisk::Read)?;
             if arguments
                 .get("list")
                 .and_then(Value::as_bool)
@@ -238,6 +239,7 @@ fn call_tool(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             authorize(authority, "workspace_write")?;
+            admit_subtask(authority, "workspace_write", SubtaskToolRisk::Mutation)?;
             let write_authority = authority.clone();
             serde_json::to_value(write_file_authorized(
                 roots,
@@ -260,6 +262,7 @@ fn call_tool(
                 arguments.get("workdir").and_then(Value::as_str),
             )?;
             authorize(authority, "shell")?;
+            admit_subtask(authority, "shell", SubtaskToolRisk::Mutation)?;
             let monitored_authority = authority.clone();
             serde_json::to_value(run_shell_command_cancellable(
                 ShellCommandRequest {
@@ -276,10 +279,43 @@ fn call_tool(
         }
         "git" => {
             authorize(authority, "git")?;
+            let operation = string_argument(arguments, "operation")?;
+            admit_subtask(
+                authority,
+                "git",
+                if matches!(operation, "info" | "status") {
+                    SubtaskToolRisk::Read
+                } else {
+                    SubtaskToolRisk::Mutation
+                },
+            )?;
             call_git(authority, roots, arguments)
         }
         _ => Err("Task tool was not exposed by this server.".to_string()),
     }
+}
+
+fn admit_subtask(
+    authority: &TaskToolAuthority,
+    capability: &str,
+    risk: SubtaskToolRisk,
+) -> Result<(), String> {
+    if let Some(subtask) = authority.subtask_authority.as_ref() {
+        if subtask.scheduler_database != authority.scheduler_database
+            || subtask.scheduler_instance_id != authority.scheduler_instance_id
+            || subtask.session_id != authority.session_id
+            || subtask.parent_attempt_id != authority.attempt_id
+            || subtask.parent_attempt != authority.attempt
+            || subtask.parent_owner_id != authority.owner_id
+            || subtask.parent_fencing_token != authority.fencing_token
+        {
+            return Err(
+                "Subtask authority does not match its parent workspace authority.".to_string(),
+            );
+        }
+        SchedulerStore::admit_subtask_tool_call(subtask, capability, risk)?;
+    }
+    Ok(())
 }
 
 fn call_git(
@@ -603,6 +639,7 @@ mod tests {
     use crate::domain::task_session::{
         TaskRequest, TaskSessionEnvelope, TaskSessionEnvelopeV1, TaskSessionKind,
     };
+    use crate::infrastructure::scheduler_store::SubtaskToolAuthority;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
@@ -941,11 +978,93 @@ mod tests {
             default_repository_root: None,
             bound_branch: None,
             capabilities: vec!["workspace_read".to_string()],
+            subtask_authority: None,
         };
         let names = tool_definitions(&authority)
             .into_iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
         assert_eq!(names, ["workspace_read"]);
+    }
+
+    #[test]
+    fn workspace_tool_rejects_an_unbound_subtask_fence_before_file_access() {
+        let directory = tempdir().expect("test directory");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        std::fs::write(workspace.join("evidence.txt"), "safe").expect("fixture writes");
+        let root = workspace.canonicalize().expect("workspace root");
+        let database = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(database.clone()).expect("scheduler store");
+        let owner = store.register_owner().expect("scheduler owner");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope(
+                    "subtask-workspace",
+                    &TaskSessionEnvelope::V1(TaskSessionEnvelopeV1 {
+                        workspace_id: "workspace-test".to_string(),
+                        kind: TaskSessionKind::Agent,
+                        subject_id: None,
+                        conversation_id: Some("subtask-workspace".to_string()),
+                        execution_run_id: Some("subtask-workspace-run".to_string()),
+                        context_digest: "digest".to_string(),
+                        runtime_profile_id: "profile".to_string(),
+                        model: "openai/test".to_string(),
+                        connector_ids: Vec::new(),
+                        requested_capabilities: vec!["workspace_read".to_string()],
+                        prompt_template_version: "agent-v1".to_string(),
+                        context_revision: None,
+                        rules_revision: None,
+                        skills_revision: None,
+                    }),
+                )
+                .expect("request encodes"),
+                &["workspace_read".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 1, Duration::from_secs(30), 1)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let mut authority = store
+            .task_tool_authority(
+                assignment.fence,
+                "workspace-test",
+                root.clone(),
+                &["workspace_read".to_string()],
+            )
+            .expect("parent authority");
+        authority.subtask_authority = Some(SubtaskToolAuthority {
+            scheduler_database: database,
+            scheduler_instance_id: store.instance_id().to_string(),
+            session_id: session.id,
+            parent_attempt_id: assignment.fence.attempt_id,
+            parent_attempt: assignment.fence.attempt,
+            parent_owner_id: assignment.fence.owner_id,
+            parent_fencing_token: assignment.fence.fencing_token,
+            subtask_id: 999,
+            subtask_attempt_id: 999,
+            subtask_attempt: 1,
+            subtask_fencing_token: 1,
+            authority_id: 999,
+            authority_fencing_token: 1,
+            objective_id: "unbound-objective".to_string(),
+            capabilities: vec!["workspace_read".to_string()],
+            lease_expires_at: i64::MAX as u64,
+        });
+        let roots = WorkspaceRoot::scoped("workspace-test", &root).expect("workspace registered");
+        let error = call_tool(
+            &authority,
+            &roots,
+            &json!({
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": { "path": "evidence.txt" }
+                }
+            }),
+        )
+        .expect_err("unbound subtask must fail before file access");
+        assert!(error.contains("Subtask tool authority is stale"));
     }
 }
