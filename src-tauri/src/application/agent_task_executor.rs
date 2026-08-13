@@ -705,6 +705,48 @@ fn resolve_evidence_verifier_bindings(
     (records, blockers)
 }
 
+fn prepare_subtask_verifier_candidates(
+    bindings: &[EvidenceVerifierBindingRecord],
+    trusted_kubernetes_connector_id: Option<&str>,
+) -> Vec<crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate> {
+    bindings
+        .iter()
+        .filter(|binding| binding.status == "ready")
+        .filter_map(|binding| match binding.provider.as_str() {
+            "git" => Some(
+                crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
+                    verifier_id: binding.verifier_id.clone(),
+                    provider: binding.provider.clone(),
+                    verification_method: "git_terminal_state_v1".to_string(),
+                    required_states: binding.required_states.clone(),
+                    required_capability: "git".to_string(),
+                    resource_identity: None,
+                },
+            ),
+            "kubernetes" => Some(
+                crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
+                    verifier_id: binding.verifier_id.clone(),
+                    provider: binding.provider.clone(),
+                    verification_method: "kubernetes_deployment_available_v1".to_string(),
+                    required_states: binding.required_states.clone(),
+                    required_capability: format!(
+                        "external_tools:{}",
+                        trusted_kubernetes_connector_id?
+                    ),
+                    resource_identity: Some(
+                        crate::domain::subtask_authority::SubtaskVerifierResourceIdentity {
+                            resource_kind: binding.resource_kind.clone()?,
+                            resource_name: binding.resource_name.clone()?,
+                            scope: binding.namespace.clone()?,
+                        },
+                    ),
+                },
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 fn run_git_evidence_command(repository_root: &Path, arguments: &[&str]) -> Result<String, String> {
     let git = crate::infrastructure::git::git_executable()?;
     let output = std::process::Command::new(git)
@@ -2916,25 +2958,16 @@ impl TaskExecutor for AgentTaskExecutor {
                 },
             );
         examination.evidence_verifier_bindings = evidence_verifier_bindings;
-        let git_verifier_candidates = examination
-            .evidence_verifier_bindings
-            .iter()
-            .filter(|binding| binding.provider == "git" && binding.status == "ready")
-            .map(
-                |binding| crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
-                    verifier_id: binding.verifier_id.clone(),
-                    provider: binding.provider.clone(),
-                    verification_method: "git_terminal_state_v1".to_string(),
-                    required_states: binding.required_states.clone(),
-                },
-            )
-            .collect::<Vec<_>>();
+        let subtask_verifier_candidates = prepare_subtask_verifier_candidates(
+            &examination.evidence_verifier_bindings,
+            trusted_kubernetes_connector_id.as_deref(),
+        );
         let subtask_verifier_summary =
             crate::domain::subtask_authority::prepare_subtask_contracts_with_verifiers(
                 &evidence_contract,
                 &envelope.context_digest,
                 &parent_capabilities,
-                &git_verifier_candidates,
+                &subtask_verifier_candidates,
             )
             .map_err(TaskExecutionError::new)?;
         let assigned_subtask_verifiers = subtask_verifier_summary.assigned_verifiers;
@@ -3161,7 +3194,7 @@ impl TaskExecutor for AgentTaskExecutor {
                     "grant_policy": "objective_tool_operations_v3",
                     "evidence_gate": "independent_attestation_required",
                     "evidence_aggregation": "all_verified_and_completed",
-                    "verifier_binding_policy": "objective_git_terminal_state_v1",
+                    "verifier_binding_policy": "objective_terminal_state_v2",
                     "assigned_verifier_count": assigned_subtask_verifiers,
                     "unassigned_verifier_count": unassigned_subtask_verifiers,
                     "verified_subtask_count": 0,
@@ -7463,6 +7496,24 @@ mod tests {
         assert_eq!(records[0].namespace.as_deref(), Some("qcash-prerelease"));
         assert_eq!(records[0].poll_interval_seconds, Some(5));
         assert_eq!(records[0].timeout_seconds, Some(120));
+        let candidates = prepare_subtask_verifier_candidates(&records, Some("ocp-dev"));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].verification_method,
+            "kubernetes_deployment_available_v1"
+        );
+        assert_eq!(candidates[0].required_capability, "external_tools:ocp-dev");
+        assert_eq!(
+            candidates[0].resource_identity,
+            Some(
+                crate::domain::subtask_authority::SubtaskVerifierResourceIdentity {
+                    resource_kind: "deployment".to_string(),
+                    resource_name: "payroll-api".to_string(),
+                    scope: "qcash-prerelease".to_string(),
+                }
+            )
+        );
+        assert!(prepare_subtask_verifier_candidates(&records, None).is_empty());
 
         let (missing, blockers) = resolve_evidence_verifier_bindings(
             &json!({"deployment": {}}),

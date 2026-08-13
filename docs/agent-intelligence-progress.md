@@ -13,9 +13,27 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Eleven vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, independent digest-only evidence aggregation, and exact Git verifier-to-objective binding. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Twelve vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, independent digest-only evidence aggregation, and exact Git and Kubernetes verifier-to-objective binding. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed twelfth vertical slice: exact Kubernetes Deployment verifier-to-objective binding.
+
+- Version-4 prepared subtask contracts bind every new verifier assignment to explicit `read_only` mode and a digest of its required parent capability. The Kubernetes slice also binds a digest of provider, Deployment kind/name, and Rules-resolved namespace.
+- Kubernetes assignment requires exactly one objective containing Kubernetes/Deployment scope and every meaningful token from the exact workload name. That objective must independently retain the trusted connector capability through existing deterministic connector and exact-tool narrowing.
+- Missing or generic-only workload signals, ambiguous objectives, missing trusted connector configuration, missing objective authority, malformed candidates, and unsupported providers stay unassigned. No model result can expand or redirect verifier authority.
+- Raw Deployment names and namespaces are absent from prepared contracts and Activity. The UI exposes only aggregate Git/Kubernetes assignment counts and explains the digest/read-only boundary.
+- Retained schema-version 2 and 3 contracts remain readable. Scheduler lifecycle and evidence admission accept version 4, and version-4 attestations require the assigned verifier identity/method plus immutable `read_only` mode.
+- The existing parent Worker still performs terminal Kubernetes verification. Production subtask/verifier activation, connector invocation, heartbeat, and parent aggregation remain disabled.
+
+Phase 14 twelfth-increment regression evidence:
+
+- Domain tests cover exact workload assignment, resource-identity and capability digests, raw identity redaction, namespace identity drift, ambiguity, missing connector authority, and Git binding compatibility.
+- Executor binding tests cover trusted Kubernetes connector candidate construction and fail closed when the trusted connector identity is absent.
+- Scheduler integration retains private activation/evidence permits and accepts only the exact assigned verifier identity/method with read-only version-4 authority.
+- Verifier-focused Rust suite: 17 passed, 0 failed. Agent executor suite: 56 passed, 0 failed. Full serial Rust regression: 542 passed, 3 ignored.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- The focused rendered suite passed the changed verifier-authority journey; its first run had one existing approval-startup race, which passed immediately in isolation. The complete rendered browser suite passed all 12 scenarios.
 
 Completed eleventh vertical slice: exact Git verifier-to-objective binding.
 
@@ -37,7 +55,7 @@ Phase 14 eleventh-increment regression evidence:
 
 Known limitations:
 
-- Kubernetes, Bamboo, Jira, and Confluence verifier records are not yet assigned to individual subtask contracts. They continue to verify only the existing single-Worker parent result.
+- Bamboo, Jira, and Confluence verifier records are not yet assigned to individual subtask contracts. They continue to verify only the existing single-Worker parent result.
 - No production code can construct the subtask dispatch or evidence permit, launch a specialized Worker/verifier, renew its lease, or aggregate its result into parent completion.
 - Ambiguous Git objectives remain unassigned instead of asking the model to choose. A later operator-facing planning diagnostic may explain which semantic objectives must be clarified without exposing task content in durable events.
 
@@ -267,7 +285,7 @@ Phase 14 fourth-increment regression evidence:
 Remaining Phase 14 work:
 
 - Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
-- Bind Kubernetes, Bamboo, Jira, and Confluence verifier adapters to exact objectives and read-only verifier authority.
+- Bind Bamboo, Jira, and Confluence verifier adapters to exact objectives and read-only verifier authority.
 - Launch independent verifiers and aggregate their already-enforced attestations into parent completion without trusting Worker claims.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

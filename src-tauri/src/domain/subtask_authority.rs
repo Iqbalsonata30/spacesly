@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 2;
-const VERIFIER_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 3;
+const RESOURCE_BOUND_VERIFIER_SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 4;
 const MAX_SUBTASKS: usize = 8;
 const TOTAL_WALL_CLOCK_SECONDS: u64 = 3_600;
 const TOTAL_TOOL_CALLS: u32 = 64;
@@ -29,6 +29,19 @@ pub struct PreparedSubtaskEvidenceVerifier {
     pub provider: String,
     pub verification_method: String,
     pub required_states_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority_mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority_capability_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_identity_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskVerifierResourceIdentity {
+    pub resource_kind: String,
+    pub resource_name: String,
+    pub scope: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +50,8 @@ pub struct SubtaskEvidenceVerifierCandidate {
     pub provider: String,
     pub verification_method: String,
     pub required_states: Vec<String>,
+    pub required_capability: String,
+    pub resource_identity: Option<SubtaskVerifierResourceIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,10 +191,11 @@ pub fn prepare_subtask_contracts(
         .collect()
 }
 
-/// Prepares version-3 contracts and assigns each supported verifier to one unambiguous objective.
+/// Prepares version-4 contracts and assigns each supported verifier to one unambiguous objective.
 ///
-/// Git terminal-state verification is the first production binding slice. Unknown providers,
-/// missing objective signals, and ties stay unassigned and therefore cannot attest a subtask.
+/// Git terminal-state and Kubernetes Deployment-availability verification are the supported
+/// binding slices. Unknown providers, missing objective signals, missing narrowed authority, and
+/// ties stay unassigned and therefore cannot attest a subtask.
 pub fn prepare_subtask_contracts_with_verifiers(
     contract: &Value,
     parent_contract_digest: &str,
@@ -214,15 +230,11 @@ pub fn prepare_subtask_contracts_with_verifiers(
     }
     for candidate in normalized_candidates {
         validate_verifier_candidate(&candidate)?;
-        let matching_objectives = if candidate.provider == "git" {
-            objectives
-                .iter()
-                .filter(|objective| git_verifier_matches_objective(&candidate, objective))
-                .filter_map(|objective| objective.get("id").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let matching_objectives = objectives
+            .iter()
+            .filter(|objective| verifier_matches_objective(&candidate, objective))
+            .filter_map(|objective| objective.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
         if matching_objectives.len() != 1 {
             unassigned = unassigned.saturating_add(1);
             continue;
@@ -235,8 +247,7 @@ pub fn prepare_subtask_contracts_with_verifiers(
         };
         if !prepared
             .granted_capabilities
-            .iter()
-            .any(|value| value == "git")
+            .contains(&candidate.required_capability)
         {
             unassigned = unassigned.saturating_add(1);
             continue;
@@ -250,12 +261,31 @@ pub fn prepare_subtask_contracts_with_verifiers(
             .collect::<Vec<_>>();
         let encoded_states = serde_json::to_vec(&required_states)
             .map_err(|_| "Failed to encode subtask verifier states.".to_string())?;
+        let authority_capability_digest =
+            subtask_authority_capability_digest(&candidate.required_capability);
+        let resource_identity_digest = candidate
+            .resource_identity
+            .as_ref()
+            .map(|identity| {
+                serde_json::to_vec(&serde_json::json!({
+                    "provider": candidate.provider.as_str(),
+                    "resource_kind": identity.resource_kind.as_str(),
+                    "resource_name": identity.resource_name.as_str(),
+                    "scope": identity.scope.as_str(),
+                }))
+                .map(|encoded| digest(&encoded))
+                .map_err(|_| "Failed to encode subtask verifier resource identity.".to_string())
+            })
+            .transpose()?;
         bindings.entry(objective_id.to_string()).or_default().push(
             PreparedSubtaskEvidenceVerifier {
                 verifier_id: candidate.verifier_id,
                 provider: candidate.provider,
                 verification_method: candidate.verification_method,
                 required_states_digest: digest(&encoded_states),
+                authority_mode: "read_only".to_string(),
+                authority_capability_digest,
+                resource_identity_digest,
             },
         );
         assigned = assigned.saturating_add(1);
@@ -275,7 +305,7 @@ pub fn prepare_subtask_contracts_with_verifiers(
         let mut objective_bindings = bindings.remove(&prepared.objective_id).unwrap_or_default();
         objective_bindings.sort();
         contracts.push(compile_subtask_contract_with_tools_and_verifiers(
-            VERIFIER_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION,
+            RESOURCE_BOUND_VERIFIER_SUBTASK_CONTRACT_SCHEMA_VERSION,
             parent_contract_digest,
             parent_capabilities,
             evidence,
@@ -637,7 +667,7 @@ fn compile_subtask_contract_with_tools_and_verifiers(
     allowed_connector_tools: BTreeMap<String, Vec<String>>,
     evidence_verifiers: Vec<PreparedSubtaskEvidenceVerifier>,
 ) -> Result<PreparedSubtaskContract, String> {
-    if !matches!(schema_version, 2 | 3)
+    if !matches!(schema_version, 2 | 3 | 4)
         || (schema_version < 3 && !evidence_verifiers.is_empty())
         || evidence_verifiers.len() > 64
         || evidence_verifiers.windows(2).any(|pair| pair[0] >= pair[1])
@@ -646,6 +676,19 @@ fn compile_subtask_contract_with_tools_and_verifiers(
                 || !canonical_name(&binding.provider)
                 || !canonical_name(&binding.verification_method)
                 || !valid_sha256_digest(&binding.required_states_digest)
+                || (schema_version < 4
+                    && (!binding.authority_mode.is_empty()
+                        || !binding.authority_capability_digest.is_empty()
+                        || binding.resource_identity_digest.is_some()))
+                || (schema_version == 4
+                    && (binding.authority_mode != "read_only"
+                        || !valid_sha256_digest(&binding.authority_capability_digest)
+                        || binding
+                            .resource_identity_digest
+                            .as_deref()
+                            .is_some_and(|value| !valid_sha256_digest(value))
+                        || (binding.provider == "kubernetes"
+                            && binding.resource_identity_digest.is_none())))
         })
     {
         return Err("Subtask verifier authority is invalid.".to_string());
@@ -677,6 +720,16 @@ fn compile_subtask_contract_with_tools_and_verifiers(
         .any(|capability| !parent.contains(capability))
     {
         return Err("Subtask requested authority that the parent does not possess.".to_string());
+    }
+    if schema_version == 4
+        && evidence_verifiers.iter().any(|binding| {
+            !requested.iter().any(|capability| {
+                subtask_authority_capability_digest(capability)
+                    == binding.authority_capability_digest
+            })
+        })
+    {
+        return Err("Subtask verifier capability authority is not granted.".to_string());
     }
     if allowed_connector_tools.iter().any(|(capability, tools)| {
         !capability.starts_with("external_tools:")
@@ -728,16 +781,43 @@ fn validate_verifier_candidate(candidate: &SubtaskEvidenceVerifierCandidate) -> 
     if !canonical_name(&candidate.verifier_id)
         || !canonical_name(&candidate.provider)
         || !canonical_name(&candidate.verification_method)
+        || !canonical_capability(&candidate.required_capability)
         || candidate.required_states.is_empty()
         || candidate.required_states.len() > 16
         || candidate
             .required_states
             .iter()
             .any(|state| !canonical_name(state))
+        || candidate
+            .resource_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                !canonical_name(&identity.resource_kind)
+                    || !canonical_resource_identity_component(&identity.resource_name)
+                    || !canonical_resource_identity_component(&identity.scope)
+            })
+        || (candidate.provider == "git" && candidate.resource_identity.is_some())
+        || (candidate.provider == "kubernetes"
+            && (candidate.required_states != ["deployment_available"]
+                || candidate
+                    .resource_identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.resource_kind != "deployment")))
     {
         return Err("Subtask verifier candidate is invalid.".to_string());
     }
     Ok(())
+}
+
+fn verifier_matches_objective(
+    candidate: &SubtaskEvidenceVerifierCandidate,
+    objective: &Value,
+) -> bool {
+    match candidate.provider.as_str() {
+        "git" => git_verifier_matches_objective(candidate, objective),
+        "kubernetes" => kubernetes_verifier_matches_objective(candidate, objective),
+        _ => false,
+    }
 }
 
 fn git_verifier_matches_objective(
@@ -757,6 +837,26 @@ fn git_verifier_matches_objective(
             "pushed_upstream" => contains_signal(&signals, &["push", "pushed", "upstream"]),
             _ => false,
         })
+}
+
+fn kubernetes_verifier_matches_objective(
+    candidate: &SubtaskEvidenceVerifierCandidate,
+    objective: &Value,
+) -> bool {
+    let Some(identity) = candidate.resource_identity.as_ref() else {
+        return false;
+    };
+    let signals = objective_all_signal_tokens(objective);
+    let has_deployment_scope = contains_signal(
+        &signals,
+        &["deployment", "kubernetes", "openshift", "ocp", "workload"],
+    );
+    let resource_signals = signal_tokens(&identity.resource_name);
+    has_deployment_scope
+        && !resource_signals.is_empty()
+        && resource_signals
+            .iter()
+            .all(|signal| signals.contains(signal))
 }
 
 fn normalized_capabilities(values: &[String]) -> Result<Vec<String>, String> {
@@ -789,6 +889,15 @@ fn canonical_capability(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
 }
 
+fn canonical_resource_identity_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value == value.trim()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn valid_parent_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
         !digest.is_empty()
@@ -805,6 +914,10 @@ fn valid_sha256_digest(value: &str) -> bool {
 
 fn digest(value: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(value))
+}
+
+pub(crate) fn subtask_authority_capability_digest(capability: &str) -> String {
+    digest(capability.as_bytes())
 }
 
 #[cfg(test)]
@@ -877,6 +990,8 @@ mod tests {
                     "new_commit".to_string(),
                     "pushed_upstream".to_string(),
                 ],
+                required_capability: "git".to_string(),
+                resource_identity: None,
             }],
         )
         .expect("Git verifier binds");
@@ -886,7 +1001,7 @@ mod tests {
         assert!(summary
             .contracts
             .iter()
-            .all(|item| item.schema_version == 3));
+            .all(|item| item.schema_version == 4));
         assert!(summary.contracts[0].evidence_verifiers.is_empty());
         assert_eq!(summary.contracts[1].evidence_verifiers.len(), 1);
         assert_eq!(
@@ -916,6 +1031,8 @@ mod tests {
                     "new_commit".to_string(),
                     "clean_worktree".to_string(),
                 ],
+                required_capability: "git".to_string(),
+                resource_identity: None,
             }],
         )
         .expect("state and capability order is canonical");
@@ -930,6 +1047,8 @@ mod tests {
                 provider: "git".to_string(),
                 verification_method: "git_terminal_state_v1".to_string(),
                 required_states: vec!["new_commit".to_string()],
+                required_capability: "git".to_string(),
+                resource_identity: None,
             }],
         )
         .expect("changed verifier requirement prepares");
@@ -937,6 +1056,156 @@ mod tests {
             summary.contracts[1].contract_id, changed_requirement.contracts[1].contract_id,
             "required terminal states must be bound into contract identity"
         );
+    }
+
+    #[test]
+    fn binds_kubernetes_verifier_to_exact_resource_objective_and_read_authority() {
+        let contract = serde_json::json!({
+            "capability_plan": {"connectors": [{
+                "connector_id": "trusted-ocp",
+                "matched_domains": ["kubernetes"],
+                "matched_intents": ["deployment health"],
+                "matched_tools": ["ocp_get_deployment"]
+            }]},
+            "semantic_plan": {"objectives": [
+                {
+                    "id": "edit-chart",
+                    "summary": "Edit the Helm chart",
+                    "success_evidence": "Chart values are updated",
+                    "operation_hints": ["edit file"],
+                    "resource_hints": ["helm values"],
+                    "mutation_expected": true
+                },
+                {
+                    "id": "verify-payroll",
+                    "summary": "Read Kubernetes payroll-api Deployment availability",
+                    "success_evidence": "The payroll-api Deployment is available",
+                    "operation_hints": ["get deployment"],
+                    "resource_hints": ["payroll-api deployment"],
+                    "mutation_expected": false
+                }
+            ]}
+        });
+        let candidate = SubtaskEvidenceVerifierCandidate {
+            verifier_id: "deployment-health".to_string(),
+            provider: "kubernetes".to_string(),
+            verification_method: "kubernetes_deployment_available_v1".to_string(),
+            required_states: vec!["deployment_available".to_string()],
+            required_capability: "external_tools:trusted-ocp".to_string(),
+            resource_identity: Some(SubtaskVerifierResourceIdentity {
+                resource_kind: "deployment".to_string(),
+                resource_name: "payroll-api".to_string(),
+                scope: "prerelease".to_string(),
+            }),
+        };
+        let summary = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &[
+                "workspace_read".to_string(),
+                "workspace_write".to_string(),
+                "external_tools:trusted-ocp".to_string(),
+            ],
+            std::slice::from_ref(&candidate),
+        )
+        .expect("Kubernetes verifier binds");
+
+        assert_eq!(summary.assigned_verifiers, 1);
+        assert_eq!(summary.unassigned_verifiers, 0);
+        assert!(summary.contracts[0].evidence_verifiers.is_empty());
+        let binding = &summary.contracts[1].evidence_verifiers[0];
+        assert_eq!(summary.contracts[1].schema_version, 4);
+        assert_eq!(binding.authority_mode, "read_only");
+        assert!(valid_sha256_digest(&binding.authority_capability_digest));
+        assert!(binding
+            .resource_identity_digest
+            .as_deref()
+            .is_some_and(valid_sha256_digest));
+        let encoded = serde_json::to_string(&summary.contracts).expect("contracts encode");
+        assert!(!encoded.contains("payroll-api"));
+        assert!(!encoded.contains("prerelease"));
+
+        let mut changed_identity = candidate.clone();
+        changed_identity.resource_identity = Some(SubtaskVerifierResourceIdentity {
+            resource_kind: "deployment".to_string(),
+            resource_name: "payroll-api".to_string(),
+            scope: "disaster-recovery".to_string(),
+        });
+        let changed = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["external_tools:trusted-ocp".to_string()],
+            &[changed_identity],
+        )
+        .expect("changed resource identity prepares");
+        assert_ne!(
+            summary.contracts[1].contract_id, changed.contracts[1].contract_id,
+            "resolved resource identity must be bound into contract identity"
+        );
+    }
+
+    #[test]
+    fn ambiguous_kubernetes_objectives_and_missing_connector_authority_stay_closed() {
+        let contract = serde_json::json!({
+            "capability_plan": {"connectors": [{
+                "connector_id": "trusted-ocp",
+                "matched_domains": ["kubernetes"],
+                "matched_intents": ["deployment health"],
+                "matched_tools": ["ocp_get_deployment"]
+            }]},
+            "semantic_plan": {"objectives": [
+                {
+                    "id": "verify-one",
+                    "summary": "Read the Kubernetes payroll-api Deployment",
+                    "success_evidence": "payroll-api Deployment is available",
+                    "operation_hints": ["get deployment"],
+                    "resource_hints": ["payroll-api deployment"],
+                    "mutation_expected": false
+                },
+                {
+                    "id": "verify-two",
+                    "summary": "Inspect payroll-api Deployment health in Kubernetes",
+                    "success_evidence": "payroll-api Deployment remains ready",
+                    "operation_hints": ["inspect deployment"],
+                    "resource_hints": ["payroll-api deployment"],
+                    "mutation_expected": false
+                }
+            ]}
+        });
+        let candidate = SubtaskEvidenceVerifierCandidate {
+            verifier_id: "deployment-health".to_string(),
+            provider: "kubernetes".to_string(),
+            verification_method: "kubernetes_deployment_available_v1".to_string(),
+            required_states: vec!["deployment_available".to_string()],
+            required_capability: "external_tools:trusted-ocp".to_string(),
+            resource_identity: Some(SubtaskVerifierResourceIdentity {
+                resource_kind: "deployment".to_string(),
+                resource_name: "payroll-api".to_string(),
+                scope: "prerelease".to_string(),
+            }),
+        };
+        let ambiguous = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["external_tools:trusted-ocp".to_string()],
+            std::slice::from_ref(&candidate),
+        )
+        .expect("ambiguous Kubernetes binding narrows closed");
+        assert_eq!(ambiguous.assigned_verifiers, 0);
+        assert_eq!(ambiguous.unassigned_verifiers, 1);
+
+        let one_objective = serde_json::json!({
+            "semantic_plan": {"objectives": [contract["semantic_plan"]["objectives"][0].clone()]}
+        });
+        let missing_authority = prepare_subtask_contracts_with_verifiers(
+            &one_objective,
+            parent_digest(),
+            &[],
+            &[candidate],
+        )
+        .expect("missing Kubernetes connector authority narrows closed");
+        assert_eq!(missing_authority.assigned_verifiers, 0);
+        assert_eq!(missing_authority.unassigned_verifiers, 1);
     }
 
     #[test]
@@ -969,12 +1238,16 @@ mod tests {
                     provider: "git".to_string(),
                     verification_method: "git_terminal_state_v1".to_string(),
                     required_states: vec!["new_commit".to_string()],
+                    required_capability: "git".to_string(),
+                    resource_identity: None,
                 },
                 SubtaskEvidenceVerifierCandidate {
                     verifier_id: "future-state".to_string(),
                     provider: "future".to_string(),
                     verification_method: "future_read_v1".to_string(),
                     required_states: vec!["ready".to_string()],
+                    required_capability: "external_tools:future".to_string(),
+                    resource_identity: None,
                 },
             ],
         )
@@ -985,7 +1258,7 @@ mod tests {
         assert!(summary
             .contracts
             .iter()
-            .all(|item| item.schema_version == 3 && item.evidence_verifiers.is_empty()));
+            .all(|item| item.schema_version == 4 && item.evidence_verifiers.is_empty()));
 
         let one_git_objective = serde_json::json!({"semantic_plan": {"objectives": [{
             "id": "commit-one",
@@ -1004,6 +1277,8 @@ mod tests {
                 provider: "git".to_string(),
                 verification_method: "git_terminal_state_v1".to_string(),
                 required_states: vec!["new_commit".to_string()],
+                required_capability: "git".to_string(),
+                resource_identity: None,
             }],
         )
         .expect("missing Git authority narrows closed");

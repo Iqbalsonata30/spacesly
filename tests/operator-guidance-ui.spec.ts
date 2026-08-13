@@ -243,11 +243,12 @@ test("prepared subtask authority is visible without implying multi-agent executi
   await expect(activity).toContainText("Exact connector operation grants: 3");
   await expect(activity).toContainText("Unlisted connector tools are rejected before forwarding.");
   await expect(activity).toContainText("Evidence gate: independent verifier attestation required.");
+  await expect(activity).toContainText("Git/Kubernetes verifiers assigned to exact objectives: 2");
   await expect(activity).toContainText(
-    "Git terminal-state verifiers assigned to exact objectives: 1",
+    "Verifier bindings left closed by missing, ambiguous, or unauthorized objective signals: 0",
   );
   await expect(activity).toContainText(
-    "Git verifier bindings left closed by missing or ambiguous objective signals: 0",
+    "Kubernetes verifier authority binds a digested Deployment identity and remains read-only.",
   );
   await expect(activity).toContainText(
     "Scheduler attestations reject verifier identities or methods not assigned by the subtask contract.",

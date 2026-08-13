@@ -717,8 +717,8 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       grant_policy: "objective_tool_operations_v3",
       evidence_gate: "independent_attestation_required",
       evidence_aggregation: "all_verified_and_completed",
-      verifier_binding_policy: "objective_git_terminal_state_v1",
-      assigned_verifier_count: 1,
+      verifier_binding_policy: "objective_terminal_state_v2",
+      assigned_verifier_count: 2,
       unassigned_verifier_count: 0,
       verified_subtask_count: 0,
       rejected_subtask_count: 0,
@@ -744,7 +744,7 @@ assertEqual(
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(
-    "Git terminal-state verifiers assigned to exact objectives: 1",
+    "Git/Kubernetes verifiers assigned to exact objectives: 2",
   ),
   true,
   "subtask preparation should expose only the safe assigned verifier count",
@@ -755,6 +755,13 @@ assertEqual(
   ),
   true,
   "subtask preparation should explain exact verifier admission",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Kubernetes verifier authority binds a digested Deployment identity and remains read-only",
+  ),
+  true,
+  "subtask preparation should explain Kubernetes verifier identity and authority",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

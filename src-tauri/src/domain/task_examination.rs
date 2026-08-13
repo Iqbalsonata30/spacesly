@@ -351,7 +351,7 @@ impl TaskExaminationRecord {
             || prepared_tool_budget > 64
             || prepared_mutation_budget > 8
             || self.prepared_subtasks.iter().any(|subtask| {
-                !matches!(subtask.schema_version, 1 | 2 | 3)
+                !matches!(subtask.schema_version, 1 | 2 | 3 | 4)
                     || (subtask.schema_version == 1 && !subtask.allowed_connector_tools.is_empty())
                     || (subtask.schema_version < 3 && !subtask.evidence_verifiers.is_empty())
                     || subtask.parent_contract_digest != self.contract_digest
@@ -386,6 +386,38 @@ impl TaskExaminationRecord {
                                     digest.len() != 64
                                         || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                                 })
+                            || (subtask.schema_version < 4
+                                && (!binding.authority_mode.is_empty()
+                                    || !binding.authority_capability_digest.is_empty()
+                                    || binding.resource_identity_digest.is_some()))
+                            || (subtask.schema_version == 4
+                                && (binding.authority_mode != "read_only"
+                                    || binding
+                                        .authority_capability_digest
+                                        .strip_prefix("sha256:")
+                                        .is_none_or(|digest| {
+                                            digest.len() != 64
+                                                || !digest
+                                                    .bytes()
+                                                    .all(|byte| byte.is_ascii_hexdigit())
+                                        })
+                                    || binding.resource_identity_digest.as_deref().is_some_and(
+                                        |value| {
+                                            value.strip_prefix("sha256:").is_none_or(|digest| {
+                                                digest.len() != 64
+                                                    || !digest
+                                                        .bytes()
+                                                        .all(|byte| byte.is_ascii_hexdigit())
+                                            })
+                                        },
+                                    )
+                                    || (binding.provider == "kubernetes"
+                                        && binding.resource_identity_digest.is_none())
+                                    || !subtask.granted_capabilities.iter().any(|capability| {
+                                        crate::domain::subtask_authority::subtask_authority_capability_digest(
+                                            capability,
+                                        ) == binding.authority_capability_digest
+                                    })))
                     })
                     || subtask.delegation_depth != 1
                     || subtask.may_delegate

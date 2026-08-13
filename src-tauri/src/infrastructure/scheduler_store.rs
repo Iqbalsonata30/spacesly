@@ -3009,7 +3009,7 @@ impl SchedulerStore {
             .ok_or_else(|| "Dormant subtask fence is stale or incompatible.".to_string())?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask activation contract: {error}"))?;
-        if !matches!(contract.schema_version, 2 | 3)
+        if !matches!(contract.schema_version, 2 | 3 | 4)
             || contract.objective_id != objective_id
             || contract.execution_enabled
         {
@@ -3242,7 +3242,7 @@ impl SchedulerStore {
             })?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask tool contract: {error}"))?;
-        if !matches!(contract.schema_version, 2 | 3)
+        if !matches!(contract.schema_version, 2 | 3 | 4)
             || contract.objective_id != authority.objective_id
             || contract.granted_capabilities != authority.capabilities
             || contract.allowed_connector_tools != authority.allowed_connector_tools
@@ -3472,15 +3472,22 @@ impl SchedulerStore {
             .map_err(|error| format!("Failed to load subtask evidence contract: {error}"))?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask evidence contract: {error}"))?;
-        if !matches!(contract.schema_version, 2 | 3)
+        if !matches!(contract.schema_version, 2 | 3 | 4)
             || contract.evidence_requirement_digest != attestation.requirement_digest
         {
             return Err("Subtask evidence does not attest the immutable requirement.".to_string());
         }
-        if contract.schema_version == 3
+        if contract.schema_version >= 3
             && !contract.evidence_verifiers.iter().any(|binding| {
                 binding.verifier_id == attestation.verifier_id
                     && binding.verification_method == attestation.verification_method
+                    && (contract.schema_version < 4 || binding.authority_mode == "read_only")
+                    && (contract.schema_version < 4
+                        || contract.granted_capabilities.iter().any(|capability| {
+                            crate::domain::subtask_authority::subtask_authority_capability_digest(
+                                capability,
+                            ) == binding.authority_capability_digest
+                        }))
             })
         {
             return Err(
@@ -5783,7 +5790,7 @@ fn validate_subtask_contract_and_grants_on(
         .ok_or_else(|| "Subtask contract identity is stale or incompatible.".to_string())?;
     let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
         .map_err(|error| format!("Failed to decode subtask lifecycle contract: {error}"))?;
-    if !matches!(contract.schema_version, 2 | 3)
+    if !matches!(contract.schema_version, 2 | 3 | 4)
         || contract.objective_id != authority.objective_id
         || contract.granted_capabilities != authority.capabilities
         || contract.allowed_connector_tools != authority.allowed_connector_tools
@@ -9176,6 +9183,8 @@ mod tests {
                     provider: "git".to_string(),
                     verification_method: "git_terminal_state_v1".to_string(),
                     required_states: vec!["new_commit".to_string(), "pushed_upstream".to_string()],
+                    required_capability: "git".to_string(),
+                    resource_identity: None,
                 },
             ],
         )
@@ -9907,8 +9916,12 @@ mod tests {
         let directory = tempdir().expect("verifier evidence directory");
         let (store, _session_id, parent, subtask) =
             active_verifier_bound_subtask_test_context(directory.path().join("scheduler.db"));
-        assert_eq!(subtask.contract.schema_version, 3);
+        assert_eq!(subtask.contract.schema_version, 4);
         assert_eq!(subtask.contract.evidence_verifiers.len(), 1);
+        assert_eq!(
+            subtask.contract.evidence_verifiers[0].authority_mode,
+            "read_only"
+        );
         let authority = store
             .activate_prepared_subtask(
                 parent,

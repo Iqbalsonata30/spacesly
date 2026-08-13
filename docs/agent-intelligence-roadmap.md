@@ -561,7 +561,18 @@ Completed eleventh increment: exact Git verifier-to-objective binding.
 - Activity reports only assigned and unassigned aggregate counts and explains the exact admission boundary. Objective text, required states, repository paths, observations, tool arguments/results, and credentials are not emitted.
 - Dispatch remains disabled. This increment binds policy identity; it does not launch the Git verifier, activate a specialized Worker, heartbeat authority, or complete the parent automatically.
 
-The next verifier-binding increments should add Kubernetes, Bamboo, Jira, and Confluence with provider-neutral assignment inputs and exact read-only authority. Only after every supported verifier has scheduler-owned launch, cancellation, recovery, and digest-only result handling should the private production permits be opened.
+This established the first provider-neutral verifier assignment boundary. Additional adapters still require exact resource and read-authority binding before production permits can be opened.
+
+Completed twelfth increment: exact Kubernetes Deployment verifier-to-objective binding.
+
+- Prepared subtask contract schema version 4 extends each verifier assignment with explicit `read_only` mode and a digest of the exact parent-bounded capability it requires. Kubernetes assignments additionally bind a digest of the Rules-resolved namespace, resource kind, and Deployment name.
+- The trusted Deployment-availability adapter is assigned only when one semantic objective names the exact workload and contains Kubernetes/Deployment scope, and that objective independently received the trusted connector capability through existing per-objective narrowing.
+- Workload and namespace values are used only while compiling identity. Durable subtask authority and Activity retain their digests or aggregate counts, never the raw resource identity.
+- Missing workload signals, multiple matching objectives, missing trusted connector identity, absent objective connector authority, malformed resource identity, and unsupported providers remain unassigned.
+- Scheduler evidence admission accepts schema versions 2 through 4 for compatibility. Version-4 attestations must match an assigned verifier identity/method whose immutable authority mode is `read_only`.
+- Production dispatch remains closed. This increment does not invoke Kubernetes, activate verifier authority, or aggregate a verifier result into parent completion.
+
+The next binding increments should add Bamboo, Jira, and Confluence with exact connector read-tool authority and provider resource identity. Scheduler-owned verifier launch and parent aggregation remain separate later work.
 
 Benefits:
 
