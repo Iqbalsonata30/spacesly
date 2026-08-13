@@ -13,7 +13,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. The first vertical slice hardens lease/restart recovery so an in-flight external mutation becomes an operator-reconciliation block before any replacement Worker can resume the task.
+- Phase 14 is in progress. Four vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, and scheduler-owned dormant subtask identities. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
 
@@ -78,9 +78,28 @@ Phase 14 third-increment regression evidence:
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Production frontend build, Rust compilation, Rust formatting, and focused Prettier checks passed.
 
+Completed fourth vertical slice: scheduler-owned dormant subtask records and independent fence identities.
+
+- Execution Manifest binding now persists prepared contracts into normalized scheduler tables in the same immediate SQLite transaction. A failed subtask allocation cannot leave a committed manifest, and the user-visible preparation event is emitted only after the committed records are read back.
+- Each semantic objective owns a stable scheduler subtask identity and an independent dormant attempt tuple: subtask ID, subtask-attempt ID, attempt number, and fencing token. Exact tuple lookup rejects a stale token and a fence assembled from two different subtask identities.
+- Repeating the same manifest binding returns the same records without inserting duplicate subtasks or attempts. Query-only reopen restores the same records after process restart.
+- Rebinding fails closed if the contract/objective set or the stored dormant allocation changes. Loaded rows must match the contract budgets, remain in `prepared`/`dormant` state, have zero usage, and keep authority inactive.
+- Database constraints keep prepared execution and dormant authority disabled. The runtime has no activation or dispatch path for these records, so a valid dormant fence is audit identity only and cannot authorize a tool call.
+- Only digested success-evidence requirements are stored in subtask contracts. Tests inspect the database file and confirm that sensitive source evidence is absent.
+- Activity now reports `Scheduler state: dormant`, the number of dormant fencing identities, and `Tool authority active: no`, alongside the existing parent-bound, non-delegable budget explanation.
+
+Phase 14 fourth-increment regression evidence:
+
+- Scheduler tests cover atomic first bind and rollback, identical retry, independent identities, exact and stale/mixed fence matching, incompatible stored allocation rejection, sensitive-evidence redaction, and query-store reopen/restart compatibility.
+- Legacy-schema migration testing confirms both normalized subtask tables are created without losing prior scheduler data.
+- Agent-executor suite: 55 passed, 0 failed. Focused scheduler/migration tests: 4 passed, 0 failed.
+- Full Rust suite: 521 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- The focused rendered dormant-subtask journey passed, then the complete rendered browser suite passed all 12 scenarios.
+
 Remaining Phase 14 work:
 
-- Add scheduler-owned subtask attempts and independent fencing tokens, then enforce the prepared budgets at every tool boundary.
+- Add an explicit scheduler activation/dispatch transaction, cancellation and lease recovery for subtask attempts, and enforce the prepared budgets at every tool boundary.
 - Narrow grants deterministically per objective and aggregate independently verified subtask evidence into the parent result.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

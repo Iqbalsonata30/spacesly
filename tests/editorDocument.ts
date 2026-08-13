@@ -705,9 +705,12 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       type: "subtask_contracts_prepared",
       schema_version: 1,
       subtask_count: 2,
+      dormant_fence_count: 2,
       tool_call_budget: 64,
       mutation_call_budget: 1,
+      scheduler_state: "dormant",
       authority_scope: "parent_subset",
+      authority_active: false,
       delegation_allowed: false,
       execution_enabled: false,
     },
@@ -734,6 +737,16 @@ assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes("No additional Worker was started"),
   true,
   "subtask preparation should not imply that multi-agent execution is enabled",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes("Dormant fencing identities: 2"),
+  true,
+  "subtask preparation should expose scheduler-owned dormant fencing",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes("Tool authority active: no"),
+  true,
+  "subtask preparation should expose that dormant records cannot call tools",
 );
 const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
   {

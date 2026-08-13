@@ -2953,32 +2953,6 @@ impl TaskExecutor for AgentTaskExecutor {
                     .sum::<usize>(),
             }),
         )?;
-        if !examination.prepared_subtasks.is_empty() {
-            let prepared_subtask_count = examination.prepared_subtasks.len();
-            let prepared_subtask_tool_budget = examination
-                .prepared_subtasks
-                .iter()
-                .map(|subtask| u64::from(subtask.budget.max_tool_calls))
-                .sum::<u64>();
-            let prepared_subtask_mutation_budget = examination
-                .prepared_subtasks
-                .iter()
-                .map(|subtask| u64::from(subtask.budget.max_mutation_calls))
-                .sum::<u64>();
-            context.emit_event(
-                TaskSessionEventKind::Runtime,
-                json!({
-                    "type": "subtask_contracts_prepared",
-                    "schema_version": 1,
-                    "subtask_count": prepared_subtask_count,
-                    "tool_call_budget": prepared_subtask_tool_budget,
-                    "mutation_call_budget": prepared_subtask_mutation_budget,
-                    "authority_scope": "parent_subset",
-                    "delegation_allowed": false,
-                    "execution_enabled": false,
-                }),
-            )?;
-        }
         if let Some(preflight) = workspace_git_preflight {
             context.emit_event(TaskSessionEventKind::Runtime, preflight)?;
         }
@@ -3131,6 +3105,33 @@ impl TaskExecutor for AgentTaskExecutor {
                 "mcp_connection_ids".to_string(),
             ],
         })?;
+        let prepared_subtasks = context.prepared_subtasks()?;
+        if !prepared_subtasks.is_empty() {
+            let prepared_subtask_tool_budget = prepared_subtasks
+                .iter()
+                .map(|subtask| u64::from(subtask.contract.budget.max_tool_calls))
+                .sum::<u64>();
+            let prepared_subtask_mutation_budget = prepared_subtasks
+                .iter()
+                .map(|subtask| u64::from(subtask.contract.budget.max_mutation_calls))
+                .sum::<u64>();
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "subtask_contracts_prepared",
+                    "schema_version": 1,
+                    "subtask_count": prepared_subtasks.len(),
+                    "dormant_fence_count": prepared_subtasks.len(),
+                    "tool_call_budget": prepared_subtask_tool_budget,
+                    "mutation_call_budget": prepared_subtask_mutation_budget,
+                    "scheduler_state": "dormant",
+                    "authority_scope": "parent_subset",
+                    "authority_active": false,
+                    "delegation_allowed": false,
+                    "execution_enabled": false,
+                }),
+            )?;
+        }
         if !rule_contradiction_blockers.is_empty() {
             let runtime_preparation_duration = runtime_preparation.finish();
             emit_execution_trace_stage(

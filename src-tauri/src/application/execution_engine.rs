@@ -7,6 +7,7 @@
 
 use crate::domain::execution_manifest::{ExecutionManifest, ExecutionManifestDraft};
 use crate::domain::governance::GovernanceResolutionRecord;
+use crate::domain::subtask_authority::SchedulerPreparedSubtask;
 use crate::domain::task_session::{
     AgentTaskObjectiveCheckpoint, AgentTaskObjectiveToolReceipt, TaskCapabilityGrant,
     TaskExecutionOutput, TaskProgress, TaskRequest, TaskSessionEnvelope, TaskSessionEvent,
@@ -323,6 +324,29 @@ impl TaskExecutionContext {
             .store
             .bind_execution_manifest(self.event_sink.fence, draft)
             .map_err(TaskExecutionError::new)
+    }
+
+    /// Loads scheduler-owned dormant subtask records and verifies each exact fence identity.
+    pub fn prepared_subtasks(&self) -> Result<Vec<SchedulerPreparedSubtask>, TaskExecutionError> {
+        self.ensure_current()?;
+        let subtasks = self
+            .event_sink
+            .store
+            .prepared_subtasks_for_session(self.session_id)
+            .map_err(TaskExecutionError::new)?;
+        for subtask in &subtasks {
+            let exact_fence_exists = self
+                .event_sink
+                .store
+                .dormant_subtask_fence_exists(self.session_id, subtask.fence)
+                .map_err(TaskExecutionError::new)?;
+            if !exact_fence_exists {
+                return Err(TaskExecutionError::new(
+                    "Prepared subtask has no matching dormant scheduler fence.",
+                ));
+            }
+        }
+        Ok(subtasks)
     }
 
     /// Appends a structured event using this assignment's durable fencing token.

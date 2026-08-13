@@ -11,6 +11,9 @@ use crate::domain::execution_manifest::{
 };
 use crate::domain::governance::GovernanceResolutionRecord;
 use crate::domain::resource_idempotency::{ResourceMutationEvidence, ResourceOperationIdentity};
+use crate::domain::subtask_authority::{
+    DormantSubtaskFence, PreparedSubtaskContract, SchedulerPreparedSubtask,
+};
 #[cfg(test)]
 use crate::domain::task_session::TaskMcpConnectorContext;
 use crate::domain::task_session::{
@@ -449,6 +452,45 @@ impl SchedulerStore {
                    ON scheduler_task_attempts(state, lease_expires_at);
                  CREATE INDEX IF NOT EXISTS idx_scheduler_attempt_owner
                    ON scheduler_task_attempts(owner_id, state);
+                  CREATE TABLE IF NOT EXISTS scheduler_prepared_subtasks (
+                    subtask_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    objective_id TEXT NOT NULL,
+                    contract_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state = 'prepared'),
+                    execution_enabled INTEGER NOT NULL DEFAULT 0 CHECK (execution_enabled = 0),
+                    created_from_attempt_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(session_id, contract_id),
+                    UNIQUE(session_id, objective_id),
+                    FOREIGN KEY(session_id) REFERENCES scheduler_task_sessions(session_id)
+                      ON DELETE CASCADE,
+                    FOREIGN KEY(created_from_attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_prepared_subtasks_session
+                    ON scheduler_prepared_subtasks(session_id, subtask_id);
+                  CREATE TABLE IF NOT EXISTS scheduler_subtask_attempts (
+                    subtask_attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subtask_id INTEGER NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state = 'dormant'),
+                    wall_clock_seconds INTEGER NOT NULL,
+                    max_tool_calls INTEGER NOT NULL,
+                    max_mutation_calls INTEGER NOT NULL,
+                    tool_calls_used INTEGER NOT NULL DEFAULT 0,
+                    mutation_calls_used INTEGER NOT NULL DEFAULT 0,
+                    authority_active INTEGER NOT NULL DEFAULT 0 CHECK (authority_active = 0),
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(subtask_id, attempt_number),
+                    UNIQUE(subtask_id, fencing_token),
+                    FOREIGN KEY(subtask_id) REFERENCES scheduler_prepared_subtasks(subtask_id)
+                      ON DELETE CASCADE
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scheduler_subtask_attempts_subtask
+                    ON scheduler_subtask_attempts(subtask_id, attempt_number);
                   CREATE TABLE IF NOT EXISTS scheduler_task_events (
                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    session_id INTEGER NOT NULL,
@@ -2441,6 +2483,12 @@ impl SchedulerStore {
                     .map_err(|error| format!("Failed to persist Execution Manifest: {error}"))?;
             }
         }
+        bind_prepared_subtasks_on(
+            &transaction,
+            fence,
+            &draft.task_examination.prepared_subtasks,
+            now,
+        )?;
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit Execution Manifest: {error}"))?;
@@ -2473,6 +2521,179 @@ impl SchedulerStore {
                 Ok(manifest)
             })
             .transpose()
+    }
+
+    /// Loads scheduler-owned dormant subtask allocations for one Task Session.
+    pub(crate) fn prepared_subtasks_for_session(
+        &self,
+        session_id: TaskSessionId,
+    ) -> Result<Vec<SchedulerPreparedSubtask>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT subtasks.subtask_id, subtasks.objective_id, subtasks.contract_json,
+                        subtasks.state, subtasks.created_at,
+                        attempts.subtask_attempt_id, attempts.attempt_number,
+                        attempts.fencing_token, attempts.state,
+                        attempts.wall_clock_seconds, attempts.max_tool_calls,
+                        attempts.max_mutation_calls, attempts.tool_calls_used,
+                        attempts.mutation_calls_used, attempts.authority_active
+                   FROM scheduler_prepared_subtasks subtasks
+                   JOIN scheduler_subtask_attempts attempts
+                     ON attempts.subtask_id = subtasks.subtask_id
+                  WHERE subtasks.session_id = ?1
+                  ORDER BY subtasks.subtask_id, attempts.attempt_number",
+            )
+            .map_err(|error| format!("Failed to prepare subtask allocation query: {error}"))?;
+        let rows = statement
+            .query_map(params![to_i64(session_id.0)?], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
+                ))
+            })
+            .map_err(|error| format!("Failed to query subtask allocations: {error}"))?;
+        let allocations = rows
+            .map(|row| {
+                let (
+                    subtask_id,
+                    objective_id,
+                    contract_json,
+                    state,
+                    created_at,
+                    subtask_attempt_id,
+                    attempt,
+                    fencing_token,
+                    attempt_state,
+                    wall_clock_seconds,
+                    max_tool_calls,
+                    max_mutation_calls,
+                    tool_calls_used,
+                    mutation_calls_used,
+                    authority_active,
+                ) = row.map_err(|error| format!("Failed to decode subtask allocation: {error}"))?;
+                let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
+                    .map_err(|error| {
+                        format!("Failed to decode prepared subtask contract: {error}")
+                    })?;
+                if state != "prepared"
+                    || attempt_state != "dormant"
+                    || objective_id != contract.objective_id
+                    || contract.execution_enabled
+                    || from_i64(wall_clock_seconds, "subtask wall-clock budget")?
+                        != contract.budget.wall_clock_seconds
+                    || from_i64(max_tool_calls, "subtask tool-call budget")?
+                        != u64::from(contract.budget.max_tool_calls)
+                    || from_i64(max_mutation_calls, "subtask mutation-call budget")?
+                        != u64::from(contract.budget.max_mutation_calls)
+                    || tool_calls_used != 0
+                    || mutation_calls_used != 0
+                    || authority_active != 0
+                {
+                    return Err("Stored prepared subtask allocation is inconsistent.".to_string());
+                }
+                Ok(SchedulerPreparedSubtask {
+                    session_id: session_id.0,
+                    objective_id,
+                    contract,
+                    state,
+                    fence: DormantSubtaskFence {
+                        subtask_id: from_i64(subtask_id, "subtask ID")?,
+                        subtask_attempt_id: from_i64(subtask_attempt_id, "subtask attempt ID")?,
+                        attempt: u32::try_from(from_i64(attempt, "subtask attempt")?)
+                            .map_err(|_| "Subtask attempt exceeds u32.".to_string())?,
+                        fencing_token: from_i64(fencing_token, "subtask fencing token")?,
+                    },
+                    tool_calls_used: u32::try_from(from_i64(
+                        tool_calls_used,
+                        "subtask tool usage",
+                    )?)
+                    .map_err(|_| "Subtask tool usage exceeds u32.".to_string())?,
+                    mutation_calls_used: u32::try_from(from_i64(
+                        mutation_calls_used,
+                        "subtask mutation usage",
+                    )?)
+                    .map_err(|_| "Subtask mutation usage exceeds u32.".to_string())?,
+                    authority_active: false,
+                    created_at: from_i64(created_at, "subtask creation timestamp")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        drop(statement);
+        let prepared_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduler_prepared_subtasks WHERE session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to count prepared subtasks: {error}"))?;
+        let attempt_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM scheduler_subtask_attempts attempts
+                   JOIN scheduler_prepared_subtasks subtasks
+                     ON subtasks.subtask_id = attempts.subtask_id
+                  WHERE subtasks.session_id = ?1",
+                params![to_i64(session_id.0)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to count dormant subtask attempts: {error}"))?;
+        if prepared_count != allocations.len() as u64 || attempt_count != prepared_count {
+            return Err(
+                "Stored prepared subtask allocation cardinality is inconsistent.".to_string(),
+            );
+        }
+        Ok(allocations)
+    }
+
+    /// Checks an exact dormant fence identity. A match does not activate tool authority.
+    pub(crate) fn dormant_subtask_fence_exists(
+        &self,
+        session_id: TaskSessionId,
+        fence: DormantSubtaskFence,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                     FROM scheduler_prepared_subtasks subtasks
+                     JOIN scheduler_subtask_attempts attempts
+                       ON attempts.subtask_id = subtasks.subtask_id
+                    WHERE subtasks.session_id = ?1
+                      AND subtasks.subtask_id = ?2
+                      AND subtasks.state = 'prepared'
+                      AND subtasks.execution_enabled = 0
+                      AND attempts.subtask_attempt_id = ?3
+                      AND attempts.attempt_number = ?4
+                      AND attempts.fencing_token = ?5
+                      AND attempts.state = 'dormant'
+                      AND attempts.authority_active = 0
+                 )",
+                params![
+                    to_i64(session_id.0)?,
+                    to_i64(fence.subtask_id)?,
+                    to_i64(fence.subtask_attempt_id)?,
+                    i64::from(fence.attempt),
+                    to_i64(fence.fencing_token)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(|error| format!("Failed to inspect dormant subtask fence: {error}"))
     }
 
     pub(crate) fn bind_opencode_session(
@@ -3646,6 +3867,131 @@ impl SchedulerStore {
             .map(|updated| updated == 1)
             .map_err(|error| format!("Failed to remove terminal task session: {error}"))
     }
+}
+
+fn bind_prepared_subtasks_on(
+    transaction: &Transaction<'_>,
+    fence: AssignmentFence,
+    contracts: &[PreparedSubtaskContract],
+    now: u64,
+) -> Result<(), String> {
+    let existing_count: u64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM scheduler_prepared_subtasks WHERE session_id = ?1",
+            params![to_i64(fence.session_id.0)?],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Failed to inspect prepared subtask records: {error}"))?;
+    if existing_count > 0 && existing_count != contracts.len() as u64 {
+        return Err("Prepared subtask set changed across assignment attempts.".to_string());
+    }
+    for contract in contracts {
+        let contract_json = serde_json::to_string(contract)
+            .map_err(|error| format!("Failed to encode prepared subtask contract: {error}"))?;
+        let existing = transaction
+            .query_row(
+                "SELECT subtask_id, contract_json
+                   FROM scheduler_prepared_subtasks
+                  WHERE session_id = ?1 AND objective_id = ?2",
+                params![to_i64(fence.session_id.0)?, contract.objective_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect prepared subtask identity: {error}"))?;
+        let subtask_id = match existing {
+            Some((subtask_id, existing)) if existing == contract_json => subtask_id,
+            Some(_) => {
+                return Err(
+                    "Prepared subtask contract changed across assignment attempts.".to_string(),
+                )
+            }
+            None if existing_count > 0 => {
+                return Err(
+                    "Prepared subtask objective changed across assignment attempts.".to_string(),
+                )
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO scheduler_prepared_subtasks
+                           (session_id, contract_id, objective_id, contract_json, state,
+                            execution_enabled, created_from_attempt_id, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 'prepared', 0, ?5, ?6)",
+                        params![
+                            to_i64(fence.session_id.0)?,
+                            contract.contract_id,
+                            contract.objective_id,
+                            contract_json,
+                            to_i64(fence.attempt_id)?,
+                            to_i64(now)?
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to persist prepared subtask: {error}"))?;
+                transaction.last_insert_rowid()
+            }
+        };
+        let attempt_count: u64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scheduler_subtask_attempts WHERE subtask_id = ?1",
+                params![subtask_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to inspect dormant subtask attempt: {error}"))?;
+        if attempt_count == 0 {
+            transaction
+                .execute(
+                    "INSERT INTO scheduler_subtask_attempts
+                       (subtask_id, attempt_number, fencing_token, state,
+                        wall_clock_seconds, max_tool_calls, max_mutation_calls,
+                        tool_calls_used, mutation_calls_used, authority_active, created_at)
+                     VALUES (?1, 1, 1, 'dormant', ?2, ?3, ?4, 0, 0, 0, ?5)",
+                    params![
+                        subtask_id,
+                        to_i64(contract.budget.wall_clock_seconds)?,
+                        i64::from(contract.budget.max_tool_calls),
+                        i64::from(contract.budget.max_mutation_calls),
+                        to_i64(now)?
+                    ],
+                )
+                .map_err(|error| format!("Failed to persist dormant subtask attempt: {error}"))?;
+        } else if attempt_count != 1 {
+            return Err("Prepared subtask has an invalid dormant attempt count.".to_string());
+        } else {
+            let stored_attempt = transaction
+                .query_row(
+                    "SELECT state, wall_clock_seconds, max_tool_calls, max_mutation_calls,
+                            tool_calls_used, mutation_calls_used, authority_active
+                       FROM scheduler_subtask_attempts WHERE subtask_id = ?1",
+                    params![subtask_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .map_err(|error| format!("Failed to validate dormant subtask attempt: {error}"))?;
+            if stored_attempt
+                != (
+                    "dormant".to_string(),
+                    to_i64(contract.budget.wall_clock_seconds)?,
+                    i64::from(contract.budget.max_tool_calls),
+                    i64::from(contract.budget.max_mutation_calls),
+                    0,
+                    0,
+                    0,
+                )
+            {
+                return Err("Prepared subtask dormant allocation changed unexpectedly.".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 const SESSION_COLUMNS: &str =
@@ -4960,6 +5306,11 @@ mod tests {
         ResourceExecutionResult, ResourceExecutionStatus, ResourceIdentity, ResourceLookupResult,
         ResourceLookupStatus, ResourceRetryResumeStatus,
     };
+    use crate::domain::subtask_authority::prepare_subtask_contracts;
+    use crate::domain::task_examination::{
+        SemanticPlannerEvidence, TaskCapabilityRecord, TaskExaminationRecord,
+        TaskExaminationStatus, TASK_EXAMINATION_SCHEMA_VERSION, TASK_EXAMINER_VERSION,
+    };
     use crate::domain::task_session::{TaskSessionEnvelopeV1, TaskSessionKind};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -5101,6 +5452,19 @@ mod tests {
             "checkpoint_recorded_at",
         ] {
             assert!(mutation_columns.iter().any(|column| column == expected));
+        }
+        let scheduler_tables = store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .expect("scheduler tables prepared")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("scheduler tables queried")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scheduler tables read");
+        for expected in ["scheduler_prepared_subtasks", "scheduler_subtask_attempts"] {
+            assert!(scheduler_tables.iter().any(|table| table == expected));
         }
     }
 
@@ -7046,6 +7410,214 @@ mod tests {
             tool_permission_mode: "fenced_tools_only".to_string(),
             unknown_fields: vec!["git_revision".to_string()],
         }
+    }
+
+    fn test_execution_manifest_with_prepared_subtasks(runtime_id: &str) -> ExecutionManifestDraft {
+        let mut draft = test_execution_manifest_draft(runtime_id);
+        let sensitive_evidence = "page exists with sensitive-evidence-never-persist-this";
+        let prepared_subtasks = prepare_subtask_contracts(
+            &json!({"semantic_plan": {"objectives": [
+                {"id": "inspect-page", "success_evidence": sensitive_evidence, "mutation_expected": false},
+                {"id": "apply-change", "success_evidence": "deployment exists", "mutation_expected": true}
+            ]}}),
+            &draft.context_digest,
+            &["external_tools:jira".to_string()],
+        )
+        .expect("subtask contracts prepared");
+        draft.task_examination = TaskExaminationRecord {
+            schema_version: TASK_EXAMINATION_SCHEMA_VERSION,
+            examiner_version: TASK_EXAMINER_VERSION.to_string(),
+            contract_digest: draft.context_digest.clone(),
+            status: TaskExaminationStatus::Ready,
+            capability_catalog: vec![TaskCapabilityRecord {
+                capability: "external_tools:jira".to_string(),
+                provider: "jira".to_string(),
+                connector_id: Some("jira".to_string()),
+                discovery: "configured".to_string(),
+                granted: true,
+            }],
+            semantic_planner: Some(SemanticPlannerEvidence {
+                status: "model".to_string(),
+                planner_version: "test-planner-v1".to_string(),
+                model: Some("openai/gpt-5".to_string()),
+                objective_count: prepared_subtasks.len(),
+            }),
+            prepared_subtasks,
+            required_capabilities: vec!["external_tools:jira".to_string()],
+            ..TaskExaminationRecord::default()
+        };
+        draft
+    }
+
+    #[test]
+    fn prepared_subtasks_are_atomic_idempotent_dormant_and_restart_safe() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let store = SchedulerStore::open_at(path.clone()).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("subtasks", &test_agent_envelope())
+                    .expect("request encodes"),
+                &["external_tools:jira".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let draft = test_execution_manifest_with_prepared_subtasks("runtime-safe");
+
+        store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("manifest and dormant subtasks bind atomically");
+        let first = store
+            .prepared_subtasks_for_session(session.id)
+            .expect("prepared subtasks load");
+        assert_eq!(first.len(), 2);
+        assert_ne!(first[0].fence.subtask_id, first[1].fence.subtask_id);
+        assert_ne!(
+            first[0].fence.subtask_attempt_id,
+            first[1].fence.subtask_attempt_id
+        );
+        for subtask in &first {
+            assert_eq!(subtask.state, "prepared");
+            assert_eq!(subtask.fence.attempt, 1);
+            assert_eq!(subtask.fence.fencing_token, 1);
+            assert_eq!(subtask.tool_calls_used, 0);
+            assert_eq!(subtask.mutation_calls_used, 0);
+            assert!(!subtask.authority_active);
+            assert!(!subtask.contract.execution_enabled);
+            assert!(store
+                .dormant_subtask_fence_exists(session.id, subtask.fence)
+                .expect("exact fence checks"));
+            assert!(!store
+                .dormant_subtask_fence_exists(
+                    session.id,
+                    DormantSubtaskFence {
+                        fencing_token: subtask.fence.fencing_token + 1,
+                        ..subtask.fence
+                    },
+                )
+                .expect("stale fence checks"));
+        }
+        assert!(!store
+            .dormant_subtask_fence_exists(
+                session.id,
+                DormantSubtaskFence {
+                    subtask_attempt_id: first[1].fence.subtask_attempt_id,
+                    ..first[0].fence
+                },
+            )
+            .expect("mixed fence checks"));
+
+        store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("identical retry remains idempotent");
+        assert_eq!(
+            store
+                .prepared_subtasks_for_session(session.id)
+                .expect("retried subtasks load"),
+            first
+        );
+
+        let database = fs::read(&path).expect("scheduler database reads");
+        assert!(
+            !String::from_utf8_lossy(&database).contains("sensitive-evidence-never-persist-this")
+        );
+        drop(store);
+        let reopened = SchedulerStore::open_query_at(path).expect("query store reopens");
+        assert_eq!(
+            reopened
+                .prepared_subtasks_for_session(session.id)
+                .expect("reopened subtasks load"),
+            first
+        );
+    }
+
+    #[test]
+    fn prepared_subtask_rebind_rejects_incompatible_scheduler_state() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("subtasks", &test_agent_envelope())
+                    .expect("request encodes"),
+                &["external_tools:jira".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let draft = test_execution_manifest_with_prepared_subtasks("runtime-safe");
+        store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("initial bind succeeds");
+        store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .execute(
+                "UPDATE scheduler_subtask_attempts SET max_tool_calls = max_tool_calls + 1
+                  WHERE subtask_id = (
+                    SELECT MIN(subtask_id) FROM scheduler_prepared_subtasks WHERE session_id = ?1
+                  )",
+                params![to_i64(session.id.0).expect("session ID fits")],
+            )
+            .expect("test corrupts dormant allocation");
+        assert!(store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect_err("incompatible scheduler state fails closed")
+            .contains("changed unexpectedly"));
+    }
+
+    #[test]
+    fn prepared_subtask_allocation_failure_rolls_back_the_manifest() {
+        let store = SchedulerStore::open_in_memory().expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("subtasks", &test_agent_envelope())
+                    .expect("request encodes"),
+                &["external_tools:jira".to_string()],
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(5), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .execute(
+                "INSERT INTO scheduler_prepared_subtasks
+                   (session_id, contract_id, objective_id, contract_json, state,
+                    execution_enabled, created_from_attempt_id, created_at)
+                 VALUES (?1, 'rogue-contract', 'rogue-objective', '{}', 'prepared', 0, ?2, 1)",
+                params![
+                    to_i64(session.id.0).expect("session ID fits"),
+                    to_i64(assignment.fence.attempt_id).expect("attempt ID fits")
+                ],
+            )
+            .expect("test inserts incompatible allocation");
+
+        let draft = test_execution_manifest_with_prepared_subtasks("runtime-safe");
+        assert!(store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect_err("allocation mismatch fails")
+            .contains("set changed"));
+        assert_eq!(
+            store
+                .latest_execution_manifest(session.id)
+                .expect("manifest lookup succeeds"),
+            None,
+            "the manifest insert must roll back with the failed allocation",
+        );
     }
 
     #[test]

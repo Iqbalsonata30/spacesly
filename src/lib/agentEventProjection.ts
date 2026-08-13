@@ -132,8 +132,17 @@ export function projectAgentTaskSessionEvent(
       Number.isSafeInteger(payload.mutation_call_budget)
         ? payload.mutation_call_budget
         : 0;
+    const dormantFenceCount =
+      typeof payload.dormant_fence_count === "number" &&
+      Number.isSafeInteger(payload.dormant_fence_count) &&
+      payload.dormant_fence_count > 0
+        ? payload.dormant_fence_count
+        : subtaskCount;
     summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
     details.push(
+      "- Scheduler state: dormant",
+      `- Dormant fencing identities: ${dormantFenceCount}`,
+      "- Tool authority active: no",
       "- Authority scope: subset of the parent task grants",
       `- Aggregate tool-call budget: ${toolBudget}`,
       `- Aggregate mutation-call budget: ${mutationBudget}`,

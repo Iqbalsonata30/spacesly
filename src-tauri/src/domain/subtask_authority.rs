@@ -37,6 +37,31 @@ pub struct PreparedSubtaskContract {
     pub execution_enabled: bool,
 }
 
+/// Durable scheduler identity reserved for one future isolated subtask attempt.
+///
+/// A dormant fence is an audit identity, not execution authority. Tool authorization must reject
+/// it until the scheduler explicitly activates a later supported attempt state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DormantSubtaskFence {
+    pub subtask_id: u64,
+    pub subtask_attempt_id: u64,
+    pub attempt: u32,
+    pub fencing_token: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SchedulerPreparedSubtask {
+    pub session_id: u64,
+    pub objective_id: String,
+    pub contract: PreparedSubtaskContract,
+    pub state: String,
+    pub fence: DormantSubtaskFence,
+    pub tool_calls_used: u32,
+    pub mutation_calls_used: u32,
+    pub authority_active: bool,
+    pub created_at: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtaskContractRequest {
     pub objective_id: String,

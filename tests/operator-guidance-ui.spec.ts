@@ -228,6 +228,9 @@ test("prepared subtask authority is visible without implying multi-agent executi
     "2 isolated subtask contracts were prepared; execution remains disabled.",
   );
   await activity.getByRole("button", { name: "Show Technical Details" }).click();
+  await expect(activity).toContainText("Scheduler state: dormant");
+  await expect(activity).toContainText("Dormant fencing identities: 2");
+  await expect(activity).toContainText("Tool authority active: no");
   await expect(activity).toContainText("Authority scope: subset of the parent task grants");
   await expect(activity).toContainText("Aggregate tool-call budget: 64");
   await expect(activity).toContainText("Aggregate mutation-call budget: 1");

@@ -474,6 +474,16 @@ Completed third increment: prepared subtask authority contracts without multi-ag
 
 This increment prepares authority but does not execute it. Prepared contracts currently retain the parent grant set rather than a narrower per-objective allocation. Scheduler-owned subtask attempts/fences, enforced operation budgets, least-privilege capability allocation, cancellation/recovery, and parent evidence aggregation remain mandatory before concurrent execution.
 
+Completed fourth increment: scheduler-owned dormant subtask records and independent fence identities.
+
+- The fenced Execution Manifest transaction now creates one durable scheduler subtask and one dormant attempt for each prepared semantic objective. Manifest persistence and scheduler allocation either commit together or fail together.
+- Every dormant attempt has its own subtask ID, subtask-attempt ID, attempt number, and fencing token. Exact tuple checks reject stale tokens and identities assembled from different subtasks.
+- Identical manifest binding is idempotent. Reopen/restart reads restore the same allocations, while changed contracts, objective sets, budgets, usage, state, or authority fail closed.
+- Dormant records retain bounded wall-clock, tool-call, and mutation-call budgets with zero usage. Both scheduler state and schema constraints keep `authority_active=false`; these identities cannot authorize tools or dispatch a Worker.
+- The preparation event is emitted only after allocations are read back and their exact dormant fences are verified. The rendered Activity shows dormant state, fencing-identity count, and inactive tool authority without exposing objective text, capability names, evidence text, or credentials.
+
+This increment establishes scheduler identity and persistence, not execution authority. The next increment must define an explicit activation transaction, enforce capability and operation budgets at every tool boundary, and prove cancellation/recovery before any subtask dispatch is enabled.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.
@@ -486,7 +496,7 @@ Trade-offs:
 
 Exit criteria:
 
-- Subtasks have independent contracts, grants, fences, budgets, and evidence.
+- Subtasks have independent contracts, least-privilege grants, active fences, enforced budgets, and independently verified evidence.
 - No agent can delegate authority it does not possess.
 
 ## Success Metrics
