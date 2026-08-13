@@ -508,6 +508,17 @@ Completed sixth increment: staged subtask dispatch lifecycle and fail-closed rec
 
 This increment completes the scheduler lifecycle API behind the module-private dispatch permit. No application path creates a specialized Worker, sends it a subtask descriptor, or heartbeats that descriptor, so multi-agent execution remains disabled. Least-privilege per-objective grants, independent evidence verification/aggregation, and an end-to-end scheduler-owned dispatch path remain required before activation can be exposed.
 
+Completed seventh increment: deterministic per-objective external connector grants.
+
+- Prepared contracts no longer copy every parent connector grant into every semantic objective. The authority compiler compares one objective's bounded summary/evidence/hints with the immutable connector plan's connector ID, matched domains, matched intents, and matched tool names.
+- Matching is provider-neutral and deterministic across lowercase, snake/kebab/namespaced, and camelCase signals. Generic operation words are discarded, and only a non-generic signal owned by exactly one planned connector can retain that parent connector capability.
+- Missing, malformed, or ambiguous connector evidence grants no subtask connector authority. A model hint can therefore remove authority but cannot add a capability absent from the parent Task Session.
+- Built-in capabilities remain parent-bounded in this increment. The resulting normalized grant vector is included in the existing content-addressed subtask contract and enforced unchanged by activation, workspace/MCP forwarding, renewal, and lifecycle validation.
+- Durable Activity evidence reports only the grant-policy identity, parent/aggregate counts, and number of narrowed objectives. It excludes objective text, capability names, connector names, tool names, evidence text, and credentials.
+- The rendered Activity explains deterministic per-objective connector narrowing and the fail-closed ambiguity rule while continuing to state that specialized Workers and activation remain disabled.
+
+This is connector-level least privilege, not tool-level authority within one connector. Built-in workspace/file/shell/Git narrowing, exact per-objective connector-operation allowlists, independent evidence aggregation, and scheduler-owned Worker dispatch remain required before multi-agent execution can be enabled.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

@@ -713,7 +713,11 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       budget_admission: "atomic_before_forward",
       dispatch_lifecycle: "staged",
       lease_recovery: "fail_closed",
-      authority_scope: "parent_subset",
+      authority_scope: "deterministic_objective_subset",
+      grant_policy: "objective_connector_signals_v1",
+      parent_capability_count: 4,
+      aggregate_capability_grants: 5,
+      narrowed_subtask_count: 2,
       authority_active: false,
       delegation_allowed: false,
       execution_enabled: false,
@@ -743,6 +747,20 @@ assertEqual(
   ),
   true,
   "subtask preparation should explain fail-closed lifecycle recovery",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Grant policy: deterministic per-objective connector subset",
+  ),
+  true,
+  "subtask preparation should explain deterministic authority narrowing",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Objectives with narrowed authority: 2 of 2",
+  ),
+  true,
+  "subtask preparation should expose only the safe aggregate narrowing count",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

@@ -237,11 +237,17 @@ test("prepared subtask authority is visible without implying multi-agent executi
     "Lease expiry, cancellation, and parent completion revoke staged authority.",
   );
   await expect(activity).toContainText(
+    "Grant policy: deterministic per-objective connector subset",
+  );
+  await expect(activity).toContainText("Objectives with narrowed authority: 2 of 2");
+  await expect(activity).toContainText(
+    "Ambiguous connector evidence grants no subtask connector authority.",
+  );
+  await expect(activity).toContainText(
     "Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
   );
   await expect(activity).toContainText("Dormant fencing identities: 2");
   await expect(activity).toContainText("Tool authority active: no");
-  await expect(activity).toContainText("Authority scope: subset of the parent task grants");
   await expect(activity).toContainText("Aggregate tool-call budget: 64");
   await expect(activity).toContainText("Aggregate mutation-call budget: 1");
   await expect(activity).toContainText("Subtasks cannot delegate authority to another agent.");

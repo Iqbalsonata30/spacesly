@@ -138,6 +138,13 @@ export function projectAgentTaskSessionEvent(
       payload.dormant_fence_count > 0
         ? payload.dormant_fence_count
         : subtaskCount;
+    const narrowedSubtaskCount =
+      typeof payload.narrowed_subtask_count === "number" &&
+      Number.isSafeInteger(payload.narrowed_subtask_count) &&
+      payload.narrowed_subtask_count >= 0 &&
+      payload.narrowed_subtask_count <= subtaskCount
+        ? payload.narrowed_subtask_count
+        : 0;
     summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
     details.push(
       "- Scheduler state: dormant",
@@ -147,7 +154,9 @@ export function projectAgentTaskSessionEvent(
       "- Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
       `- Dormant fencing identities: ${dormantFenceCount}`,
       "- Tool authority active: no",
-      "- Authority scope: subset of the parent task grants",
+      "- Grant policy: deterministic per-objective connector subset",
+      `- Objectives with narrowed authority: ${narrowedSubtaskCount} of ${subtaskCount}`,
+      "- Ambiguous connector evidence grants no subtask connector authority.",
       `- Aggregate tool-call budget: ${toolBudget}`,
       `- Aggregate mutation-call budget: ${mutationBudget}`,
       "- Subtasks cannot delegate authority to another agent.",

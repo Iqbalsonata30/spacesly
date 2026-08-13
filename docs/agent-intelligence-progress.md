@@ -13,9 +13,29 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Six vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, and fail-closed subtask lifecycle recovery. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Seven vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, and deterministic per-objective external connector narrowing. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed seventh vertical slice: deterministic per-objective external connector grant narrowing.
+
+- Each prepared objective starts from the normalized parent grant set but retains an external connector only when its own bounded summary/evidence/hints share a non-generic signal with exactly one immutable connector-plan entry.
+- Connector evidence is derived from connector IDs, matched domains, matched intents, and matched tool names. Signal normalization handles provider-neutral snake case, kebab/namespaced names, and camelCase without hard-coding Jira, Confluence, Bamboo, Kubernetes, or another provider.
+- Common operation words do not establish authority. A signal shared by multiple planned connectors is ambiguous and grants neither; missing or malformed connector-plan evidence also grants no external authority.
+- The compiler intersects only with capabilities already held by the parent Task Session. Model-produced semantic hints can narrow the set but cannot introduce an ungranted or unplanned connector.
+- Non-connector built-in capabilities remain parent-bounded for compatibility in this slice. Connector grants are still connector-wide rather than exact per-tool operation allowlists.
+- The normalized objective grant vector remains part of the content-addressed prepared contract. Existing scheduler activation, grant revalidation, atomic budget admission, exact renewal, and lifecycle recovery enforce that vector without widening it.
+- The durable preparation event exposes only `objective_connector_signals_v1`, parent and aggregate grant counts, and the number of narrowed objectives. It contains no objective text, capability/connector/tool names, success evidence, arguments, responses, or credentials.
+- Activity now explains `deterministic per-objective connector subset`, reports the safe narrowed-objective count, and states that ambiguous evidence grants no connector authority. Specialized Workers and the activation gate remain disabled.
+
+Phase 14 seventh-increment regression evidence:
+
+- Domain tests cover separate Confluence/Bamboo-style objectives, parent-intersection enforcement, ambiguous connector signals, missing evidence, parent-order stability, content-addressed identity stability, and a provider-neutral unknown connector with a camelCase operation.
+- Scheduler activation/lifecycle tests continue to prove that narrowed contract grants are the exact authority admitted at tool boundaries.
+- The Agent executor integration suite passed all 55 tests. A real blocked/continued Task Session verifies safe aggregate narrowing evidence and confirms objective/success-evidence text is absent from the event.
+- Full Rust suite: 529 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator journey: 6 passed after replacing one stale assertion for the former parent-wide wording. Full rendered browser suite: 12 passed, 0 failed.
 
 Completed sixth vertical slice: staged subtask dispatch lifecycle and fail-closed recovery.
 
@@ -139,7 +159,8 @@ Phase 14 fourth-increment regression evidence:
 Remaining Phase 14 work:
 
 - Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
-- Narrow grants deterministically per objective and independently verify and aggregate subtask evidence into the parent result before accepting parent completion.
+- Narrow built-in workspace/file/shell/Git grants and connector operations to exact per-objective tool allowlists; connector-level narrowing is now implemented.
+- Independently verify and aggregate subtask evidence into the parent result before accepting parent completion.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.
 

@@ -8441,10 +8441,18 @@ mod tests {
         let mut draft = test_execution_manifest_draft(runtime_id);
         let sensitive_evidence = "page exists with sensitive-evidence-never-persist-this";
         let prepared_subtasks = prepare_subtask_contracts(
-            &json!({"semantic_plan": {"objectives": [
-                {"id": "inspect-page", "success_evidence": sensitive_evidence, "mutation_expected": false},
-                {"id": "apply-change", "success_evidence": "deployment exists", "mutation_expected": true}
-            ]}}),
+            &json!({
+                "semantic_plan": {"objectives": [
+                    {"id": "inspect-page", "summary": "Inspect Jira issue", "success_evidence": sensitive_evidence, "operation_hints": ["read issue"], "resource_hints": ["jira issue"], "mutation_expected": false},
+                    {"id": "apply-change", "summary": "Update Jira issue", "success_evidence": "deployment exists", "operation_hints": ["update issue"], "resource_hints": ["jira issue"], "mutation_expected": true}
+                ]},
+                "capability_plan": {"connectors": [{
+                    "connector_id": "jira",
+                    "matched_domains": ["jira"],
+                    "matched_intents": [],
+                    "matched_tools": ["jira_get_issue", "jira_update_issue"]
+                }]}
+            }),
             &draft.context_digest,
             &["external_tools:jira".to_string()],
         )

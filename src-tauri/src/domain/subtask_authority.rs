@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const MAX_SUBTASKS: usize = 8;
@@ -122,13 +122,15 @@ pub fn prepare_subtask_contracts(
                 .get("mutation_expected")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let objective_capabilities =
+                narrow_objective_capabilities(contract, objective, &parent_capabilities)?;
             compile_subtask_contract(
                 parent_contract_digest,
                 &parent_capabilities,
                 evidence,
                 SubtaskContractRequest {
                     objective_id: objective_id.to_string(),
-                    requested_capabilities: parent_capabilities.clone(),
+                    requested_capabilities: objective_capabilities,
                     budget: SubtaskBudget {
                         max_mutation_calls: if mutation_expected {
                             (TOTAL_MUTATION_CALLS / u32::try_from(objective_count).unwrap_or(8))
@@ -143,6 +145,137 @@ pub fn prepare_subtask_contracts(
             )
         })
         .collect()
+}
+
+/// Narrows external connector authority from immutable, secret-free routing evidence.
+///
+/// Model-produced objective hints may only remove grants from the parent set. A connector is
+/// retained when the objective and exactly one connector-plan entry share a non-generic signal.
+/// Ambiguous or malformed routing evidence grants no external connector. Built-in capabilities
+/// remain parent-bounded in this first narrowing slice.
+fn narrow_objective_capabilities(
+    contract: &Value,
+    objective: &Value,
+    parent_capabilities: &[String],
+) -> Result<Vec<String>, String> {
+    let mut selected = parent_capabilities
+        .iter()
+        .filter(|capability| !capability.starts_with("external_tools:"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let objective_signals = objective_signal_tokens(objective);
+    let connectors = contract
+        .get("capability_plan")
+        .and_then(|plan| plan.get("connectors"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(64)
+        .filter_map(|connector| {
+            let connector_id = connector.get("connector_id")?.as_str()?;
+            let capability = format!("external_tools:{connector_id}");
+            if !canonical_connector_id(connector_id) || !parent_capabilities.contains(&capability) {
+                return None;
+            }
+            let mut signals = signal_tokens(connector_id);
+            for field in ["matched_domains", "matched_intents", "matched_tools"] {
+                for value in connector
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(64)
+                {
+                    signals.extend(signal_tokens(value));
+                }
+            }
+            Some((capability, signals))
+        })
+        .collect::<Vec<_>>();
+    let mut signal_owners = BTreeMap::<String, usize>::new();
+    for (_, signals) in &connectors {
+        for signal in signals {
+            *signal_owners.entry(signal.clone()).or_default() += 1;
+        }
+    }
+    for (capability, signals) in connectors {
+        if signals.iter().any(|signal| {
+            objective_signals.contains(signal) && signal_owners.get(signal) == Some(&1)
+        }) {
+            selected.insert(capability);
+        }
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn objective_signal_tokens(objective: &Value) -> BTreeSet<String> {
+    let mut signals = BTreeSet::new();
+    for field in ["summary", "success_evidence"] {
+        if let Some(value) = objective.get(field).and_then(Value::as_str) {
+            signals.extend(signal_tokens(value));
+        }
+    }
+    for field in ["operation_hints", "resource_hints"] {
+        for value in objective
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(16)
+        {
+            signals.extend(signal_tokens(value));
+        }
+    }
+    signals
+}
+
+fn signal_tokens(value: &str) -> BTreeSet<String> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_was_lower_or_digit = false;
+    for character in value.chars() {
+        if character.is_ascii_uppercase() && previous_was_lower_or_digit {
+            normalized.push(' ');
+        }
+        normalized.push(character.to_ascii_lowercase());
+        previous_was_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_string)
+        .filter(|token| token.len() >= 3 && !generic_signal(token))
+        .take(64)
+        .collect()
+}
+
+fn generic_signal(value: &str) -> bool {
+    matches!(
+        value,
+        "api"
+            | "create"
+            | "delete"
+            | "get"
+            | "inspect"
+            | "list"
+            | "mcp"
+            | "read"
+            | "search"
+            | "tool"
+            | "trigger"
+            | "update"
+            | "verify"
+    )
+}
+
+fn canonical_connector_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value == value.trim()
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub fn compile_subtask_contract(
@@ -285,6 +418,155 @@ mod tests {
         assert!(contracts.iter().all(|contract| {
             !contract.execution_enabled && !contract.may_delegate && contract.delegation_depth == 1
         }));
+    }
+
+    #[test]
+    fn narrows_external_connectors_per_objective_without_expanding_parent_authority() {
+        let contracts = prepare_subtask_contracts(
+            &serde_json::json!({
+                "semantic_plan": {"objectives": [
+                    {
+                        "id": "read-page",
+                        "summary": "Read the Confluence page",
+                        "success_evidence": "Page content is observed",
+                        "operation_hints": ["read page"],
+                        "resource_hints": ["confluence page"],
+                        "mutation_expected": false
+                    },
+                    {
+                        "id": "trigger-build",
+                        "summary": "Trigger the Bamboo build",
+                        "success_evidence": "Build result is observed",
+                        "operation_hints": ["trigger build"],
+                        "resource_hints": ["bamboo plan"],
+                        "mutation_expected": true
+                    }
+                ]},
+                "capability_plan": {"connectors": [
+                    {
+                        "connector_id": "confluence",
+                        "matched_domains": ["confluence"],
+                        "matched_intents": ["page"],
+                        "matched_tools": ["confluence_get_page"]
+                    },
+                    {
+                        "connector_id": "bamboo",
+                        "matched_domains": ["bamboo"],
+                        "matched_intents": ["build"],
+                        "matched_tools": ["bamboo_trigger_build"]
+                    },
+                    {
+                        "connector_id": "ungranted",
+                        "matched_domains": ["ungranted"],
+                        "matched_intents": [],
+                        "matched_tools": ["ungranted_mutate"]
+                    }
+                ]}
+            }),
+            parent_digest(),
+            &[
+                "workspace_read".to_string(),
+                "external_tools:confluence".to_string(),
+                "external_tools:bamboo".to_string(),
+            ],
+        )
+        .expect("objective grants narrow");
+
+        assert_eq!(
+            contracts[0].granted_capabilities,
+            vec![
+                "external_tools:confluence".to_string(),
+                "workspace_read".to_string()
+            ]
+        );
+        assert_eq!(
+            contracts[1].granted_capabilities,
+            vec![
+                "external_tools:bamboo".to_string(),
+                "workspace_read".to_string()
+            ]
+        );
+        assert!(contracts.iter().all(|contract| !contract
+            .granted_capabilities
+            .iter()
+            .any(|capability| capability == "external_tools:ungranted")));
+    }
+
+    #[test]
+    fn ambiguous_or_missing_connector_evidence_grants_no_external_authority() {
+        let contract = serde_json::json!({
+            "semantic_plan": {"objectives": [{
+                "id": "inspect-item",
+                "summary": "Inspect the shared item",
+                "success_evidence": "Item is observed",
+                "operation_hints": ["read item"],
+                "resource_hints": ["item"],
+                "mutation_expected": false
+            }]},
+            "capability_plan": {"connectors": [
+                {
+                    "connector_id": "system-one",
+                    "matched_domains": [],
+                    "matched_intents": ["item"],
+                    "matched_tools": ["read_item"]
+                },
+                {
+                    "connector_id": "system-two",
+                    "matched_domains": [],
+                    "matched_intents": ["item"],
+                    "matched_tools": ["read_item"]
+                }
+            ]}
+        });
+        let capabilities = vec![
+            "workspace_read".to_string(),
+            "external_tools:system-one".to_string(),
+            "external_tools:system-two".to_string(),
+        ];
+        let first = prepare_subtask_contracts(&contract, parent_digest(), &capabilities)
+            .expect("ambiguous routing narrows closed");
+        let reversed = prepare_subtask_contracts(
+            &contract,
+            parent_digest(),
+            &capabilities.into_iter().rev().collect::<Vec<_>>(),
+        )
+        .expect("parent order does not change narrowing");
+
+        assert_eq!(
+            first[0].granted_capabilities,
+            vec!["workspace_read".to_string()]
+        );
+        assert_eq!(first[0].contract_id, reversed[0].contract_id);
+    }
+
+    #[test]
+    fn unknown_connector_tools_use_provider_neutral_camel_case_signals() {
+        let contracts = prepare_subtask_contracts(
+            &serde_json::json!({
+                "semantic_plan": {"objectives": [{
+                    "id": "promote-release",
+                    "summary": "Promote the release",
+                    "success_evidence": "Release promotion is observed",
+                    "operation_hints": ["promote release"],
+                    "resource_hints": [],
+                    "mutation_expected": true
+                }]},
+                "capability_plan": {"connectors": [{
+                    "connector_id": "future-system",
+                    "matched_domains": [],
+                    "matched_intents": [],
+                    "matched_tools": ["promoteRelease"]
+                }]}
+            }),
+            parent_digest(),
+            &["external_tools:future-system".to_string()],
+        )
+        .expect("unknown connector signal narrows deterministically");
+
+        assert_eq!(
+            contracts[0].granted_capabilities,
+            vec!["external_tools:future-system".to_string()]
+        );
     }
 
     #[test]

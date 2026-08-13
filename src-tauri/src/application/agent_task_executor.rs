@@ -3115,6 +3115,16 @@ impl TaskExecutor for AgentTaskExecutor {
                 .iter()
                 .map(|subtask| u64::from(subtask.contract.budget.max_mutation_calls))
                 .sum::<u64>();
+            let prepared_subtask_capability_grants = prepared_subtasks
+                .iter()
+                .map(|subtask| subtask.contract.granted_capabilities.len())
+                .sum::<usize>();
+            let narrowed_subtask_count = prepared_subtasks
+                .iter()
+                .filter(|subtask| {
+                    subtask.contract.granted_capabilities.len() < parent_capabilities.len()
+                })
+                .count();
             context.emit_event(
                 TaskSessionEventKind::Runtime,
                 json!({
@@ -3129,7 +3139,11 @@ impl TaskExecutor for AgentTaskExecutor {
                     "budget_admission": "atomic_before_forward",
                     "dispatch_lifecycle": "staged",
                     "lease_recovery": "fail_closed",
-                    "authority_scope": "parent_subset",
+                    "authority_scope": "deterministic_objective_subset",
+                    "grant_policy": "objective_connector_signals_v1",
+                    "parent_capability_count": parent_capabilities.len(),
+                    "aggregate_capability_grants": prepared_subtask_capability_grants,
+                    "narrowed_subtask_count": narrowed_subtask_count,
                     "authority_active": false,
                     "delegation_allowed": false,
                     "execution_enabled": false,
@@ -5984,6 +5998,25 @@ mod tests {
             event.payload["type"] == "task_examined"
                 && event.payload["objective_checkpoint_count"] == 1
         }));
+        let subtask_authority = events
+            .iter()
+            .find(|event| event.payload["type"] == "subtask_contracts_prepared")
+            .expect("subtask authority preparation is journaled");
+        assert_eq!(
+            subtask_authority.payload["authority_scope"],
+            "deterministic_objective_subset"
+        );
+        assert_eq!(
+            subtask_authority.payload["grant_policy"],
+            "objective_connector_signals_v1"
+        );
+        assert_eq!(subtask_authority.payload["parent_capability_count"], 1);
+        assert_eq!(subtask_authority.payload["aggregate_capability_grants"], 0);
+        assert_eq!(subtask_authority.payload["narrowed_subtask_count"], 2);
+        let encoded = serde_json::to_string(&subtask_authority.payload)
+            .expect("subtask authority event encodes");
+        assert!(!encoded.contains("Trigger Bamboo build"));
+        assert!(!encoded.contains("healthy rollout"));
     }
 
     #[test]
