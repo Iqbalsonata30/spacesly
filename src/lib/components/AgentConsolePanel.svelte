@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import { AlertCircle, Check, ChevronDown, Circle, Loader2, X } from "lucide-svelte";
   import {
     getTaskSessionContextInspection,
@@ -50,6 +51,8 @@
     onTerminalInputChange: (value: string) => void;
     onSubmitTerminalInput: () => void;
     onOpenCard: (cardId: string) => void;
+    onContinue: (cardId: string) => void;
+    onRetryFresh: (cardId: string) => void;
     onMarkBlockedDone: (cardId: string) => void;
     onApprove: (cardId: string) => void;
     onDecline: (cardId: string) => void;
@@ -77,6 +80,8 @@
     onTerminalInputChange,
     onSubmitTerminalInput,
     onOpenCard,
+    onContinue,
+    onRetryFresh,
     onMarkBlockedDone,
     onApprove,
     onDecline,
@@ -271,6 +276,14 @@
       }
       return;
     }
+    if (operatorGuidance.action.kind === "continue") {
+      onContinue(runCardId);
+      return;
+    }
+    if (operatorGuidance.action.kind === "retry_fresh") {
+      onRetryFresh(runCardId);
+      return;
+    }
     onOpenCard(runCardId);
   }
 
@@ -292,7 +305,7 @@
     try {
       const page = await listTaskSessionExecutionTrace(sessionId, cursor, 100);
       if (generation !== traceGeneration || taskSessionId !== sessionId) return;
-      const bySequence = new Map<number, TaskExecutionTraceEntry>();
+      const bySequence = new SvelteMap<number, TaskExecutionTraceEntry>();
       for (const entry of replace ? [] : traceEntries) bySequence.set(entry.sequence, entry);
       for (const entry of page.entries) bySequence.set(entry.sequence, entry);
       traceEntries = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence).slice(-200);
@@ -636,6 +649,14 @@
         Review this action before allowing the Agent to continue. Approval applies only to this
         exact operation and arguments in the next run.
       </p>
+      {#if operatorGuidance?.action.kind === "approve"}
+        <small class="guidance-source"
+          >Cause: {operatorGuidance.cause_code.replaceAll("_", " ")} · Source: {operatorGuidance.source.replaceAll(
+            "_",
+            " ",
+          )}</small
+        >
+      {/if}
       <dl class="approval-details">
         <div>
           <dt>Operation</dt>
@@ -705,7 +726,7 @@
             >
           {/if}
           <div class="attention-actions">
-            {#if runCardId && operatorGuidance}<button
+            {#if runCardId && operatorGuidance && !(operatorGuidance.action.kind === "approve" && approval)}<button
                 type="button"
                 class="primary-action"
                 onclick={openOperatorAction}>{operatorGuidance.action.label}</button
@@ -937,9 +958,9 @@
                 >
               {:else}
                 <div class="context-notice">
-                  This ledger currently covers Deployment scaling only. Releasing a fence does not
-                  retry, undo, approve, or authorize an operation, but it may permit a later task to
-                  perform the same mutation.
+                  This ledger records supported external mutations with deterministic operation
+                  identity. Releasing a fence does not retry, undo, approve, or authorize an
+                  operation, but it may permit a later task to perform the same mutation.
                 </div>
                 {#if mutationsError}<p class="trace-error" role="alert">{mutationsError}</p>{/if}
                 {#if mutationsNotice}<p class="mutation-notice" aria-live="polite">
@@ -950,7 +971,11 @@
                 {:else}
                   <ol class="mutation-list">
                     {#each resourceMutations as record (record.mutation_id)}
-                      <li class="mutation-record">
+                      <li
+                        class="mutation-record"
+                        class:recommended={operatorGuidance?.action.mutation?.mutation_id ===
+                          record.mutation_id}
+                      >
                         <div class="mutation-record-heading">
                           <strong
                             >#{record.mutation_id} · {record.identity.operation.replaceAll(
@@ -2419,6 +2444,9 @@
     border: 1px solid var(--border-subtle);
     border-radius: 9px;
     background: var(--code-block-bg);
+  }
+  .mutation-record.recommended {
+    box-shadow: inset 3px 0 0 var(--warning);
   }
   .mutation-record-heading {
     display: flex;

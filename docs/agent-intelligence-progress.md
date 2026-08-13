@@ -23,12 +23,16 @@ Implemented authoritative operator guidance:
 - Each cause maps to exactly one action: `approve`, `supersede_mutation`, `retry_fresh`, or `continue`. Approval takes precedence, followed by an uncertain mutation fence, missing resumable identity, and ordinary interrupted/blocked execution.
 - The projection contains only schema/session identity, cause code, a fixed safe summary, source class, action label/confirmation requirement, and an optional canonical mutation ID/key/revision. It never returns the raw scheduler error, provider response, connector configuration, arguments, URLs, task content, or credentials.
 - The Agent console loads this projection only for attention states, shows its cause and source, and offers the backend-selected action. When authoritative guidance exists, the legacy manual-completion shortcut is hidden.
-- Approval still uses exact operation/argument UI approval. Mutation supersede still requires an operator reason plus expected operation key and revision. Continue and Retry Fresh route to the owning task so existing ownership and capability checks remain authoritative.
+- Approval still uses exact operation/argument UI approval. Mutation supersede still requires an operator reason plus expected operation key and revision. Continue and Retry Fresh invoke the existing guarded task actions so ownership and capability checks remain authoritative.
 - Connector/tool choice and repository/environment selection remain inspectable through the existing immutable Task Examination, manifest, context, MCP, trace, and mutation projections.
 
 Phase 13 regression evidence:
 
 - Focused cause priority, approval redaction, uncertain-fence identity, continuation/retry selection, and non-terminal omission tests: 5 passed.
+- Browser user-flow coverage creates a representative blocked deployment task and drives all four authoritative actions through the rendered Agent console: structured approval, same-session continuation, Retry Fresh, and exact uncertain-fence review/release.
+- The browser diagnosis found and fixed duplicate approval actions, Continue/Retry Fresh buttons that only opened the task instead of performing their named action, missing visual emphasis for the backend-selected mutation fence, and stale Deployment-scaling-only ledger copy.
+- Exact fence release is tested with its session ID, mutation ID, operation key, expected revision, and operator reason; the UI confirms the fence was superseded and that no task was retried.
+- Full Playwright suite: 10 passed, 0 failed in deterministic serial mode. Serial execution prevents Vite/browser startup saturation from producing unrelated navigation timeouts on constrained CI runners.
 - Full Rust suite: 510 passed, 3 ignored, 0 failed in serial mode.
 - Frontend unit tests: 7 passed, 0 failed; Rust compilation and Svelte type checking passed.
 

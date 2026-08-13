@@ -423,7 +423,8 @@ Implemented operator-guidance increment:
 - A backend-owned projection derives terminal guidance only from scheduler state, durable runtime identity, and the resource-mutation ledger.
 - Every blocked or failed session receives one stable cause and exactly one bounded next action: approve, continue, retry fresh, or review and supersede an uncertain mutation fence.
 - Approval markers and canonical mutation-fence identity are checked before an action is offered. Invalid mutation identity and raw scheduler/provider errors are never copied into guidance.
-- The Agent console displays the authoritative cause/source and action. Approval uses the structured approval path, uncertain mutations open the existing reason-and-revision-fenced supersede control, and continuation/retry actions route to the owning task rather than executing silently.
+- The Agent console displays the authoritative cause/source and action. Approval uses the structured approval path, uncertain mutations open the existing reason-and-revision-fenced supersede control, and Continue/Retry Fresh invoke their existing guarded task actions directly.
+- Browser-level user flows verify that approval resumes through the structured action, Continue resumes the retained task, Retry Fresh starts a new attempt, and uncertain guidance highlights and releases only the exact backend-selected fence after an operator reason.
 - Existing Task Examination, execution manifest, context inspection, MCP context, resource-mutation history, and execution trace projections explain connector, tool, repository, environment, policy, and recovery selections without relying on model-authored summaries.
 
 Benefits:

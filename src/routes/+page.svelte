@@ -1478,7 +1478,7 @@
         typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
           ? await listTaskSessions()
           : [];
-      const latestTaskSessionByRunId = new Map<string, TaskSessionSnapshot>();
+      const latestTaskSessionByRunId = new SvelteMap<string, TaskSessionSnapshot>();
       for (const session of retainedTaskSessions) {
         const executionRunId = agentEnvelopeFromSnapshot(session)?.execution_run_id;
         if (!executionRunId) continue;
@@ -5645,9 +5645,7 @@
     selectedServerId = nextServer?.id ?? "";
   }
 
-  function updateSelectedServer(
-    values: Partial<McpServerSettings>,
-  ) {
+  function updateSelectedServer(values: Partial<McpServerSettings>) {
     if (!selectedServer) return;
 
     const serverId = selectedServer.id;
@@ -7133,7 +7131,8 @@
       sections.push(
         "OBJECTIVES:",
         ...result.objective_results.map((objective) => {
-          const evidence = objective.evidence.length > 0 ? ` — ${objective.evidence.join("; ")}` : "";
+          const evidence =
+            objective.evidence.length > 0 ? ` — ${objective.evidence.join("; ")}` : "";
           const blocker = objective.blocked_reason ? ` — ${objective.blocked_reason}` : "";
           return `- ${objective.objective_id}: ${objective.completion_status.toUpperCase()}${evidence}${blocker}`;
         }),
@@ -10129,6 +10128,8 @@
                 onTerminalInputChange={(value) => (agentTerminalInput = value)}
                 onSubmitTerminalInput={submitAgentTerminalInput}
                 onOpenCard={(cardId) => (selectedCardId = cardId)}
+                onContinue={(cardId) => void startWorkerForCard(cardId, true, "continue")}
+                onRetryFresh={(cardId) => void startWorkerForCard(cardId, false, "fresh")}
                 onMarkBlockedDone={requestManualDoneConfirmation}
                 onApprove={(cardId) => void approveAgentAction(cardId)}
                 onDecline={declineAgentAction}
