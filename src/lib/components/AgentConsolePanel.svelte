@@ -1494,6 +1494,20 @@
                       <dd>{executionManifest.task_examination.objectives.length}</dd>
                     </div>
                     <div>
+                      <dt>Prepared subtasks</dt>
+                      <dd>{executionManifest.task_examination.prepared_subtasks?.length ?? 0}</dd>
+                    </div>
+                    <div>
+                      <dt>Subtask execution</dt>
+                      <dd>
+                        {executionManifest.task_examination.prepared_subtasks?.some(
+                          (subtask) => subtask.execution_enabled,
+                        )
+                          ? "Enabled"
+                          : "Not enabled"}
+                      </dd>
+                    </div>
+                    <div>
                       <dt>Semantic planner</dt>
                       <dd>
                         {executionManifest.task_examination.semantic_planner

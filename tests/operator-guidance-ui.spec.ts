@@ -215,3 +215,23 @@ test("read-only connector recovery remains visible after task completion", async
   await expect(activity).toContainText("Connector attempts: 2");
   await expect(activity).toContainText("No mutation authority was replayed or expanded.");
 });
+
+test("prepared subtask authority is visible without implying multi-agent execution", async ({
+  page,
+}) => {
+  await page.goto("/__operator-guidance?subtaskPreparation=1");
+
+  const activity = page.getByRole("article").filter({
+    has: page.getByText("Subtask Authority Prepared", { exact: true }),
+  });
+  await expect(activity).toContainText(
+    "2 isolated subtask contracts were prepared; execution remains disabled.",
+  );
+  await activity.getByRole("button", { name: "Show Technical Details" }).click();
+  await expect(activity).toContainText("Authority scope: subset of the parent task grants");
+  await expect(activity).toContainText("Aggregate tool-call budget: 64");
+  await expect(activity).toContainText("Aggregate mutation-call budget: 1");
+  await expect(activity).toContainText("Subtasks cannot delegate authority to another agent.");
+  await expect(activity).toContainText("No additional Worker was started.");
+  await expect(page.locator("#task-status")).toHaveText("running");
+});

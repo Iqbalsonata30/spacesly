@@ -116,6 +116,30 @@ export function projectAgentTaskSessionEvent(
       `- Connector attempts: ${connectorAttempts}`,
       "- No mutation authority was replayed or expanded.",
     );
+  } else if (event.kind === "runtime" && eventType === "subtask_contracts_prepared") {
+    const subtaskCount =
+      typeof payload.subtask_count === "number" &&
+      Number.isSafeInteger(payload.subtask_count) &&
+      payload.subtask_count > 0
+        ? payload.subtask_count
+        : 1;
+    const toolBudget =
+      typeof payload.tool_call_budget === "number" && Number.isSafeInteger(payload.tool_call_budget)
+        ? payload.tool_call_budget
+        : 0;
+    const mutationBudget =
+      typeof payload.mutation_call_budget === "number" &&
+      Number.isSafeInteger(payload.mutation_call_budget)
+        ? payload.mutation_call_budget
+        : 0;
+    summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
+    details.push(
+      "- Authority scope: subset of the parent task grants",
+      `- Aggregate tool-call budget: ${toolBudget}`,
+      `- Aggregate mutation-call budget: ${mutationBudget}`,
+      "- Subtasks cannot delegate authority to another agent.",
+      "- No additional Worker was started.",
+    );
   } else if (event.kind === "runtime" && eventType === "capability_repair_decision") {
     const repairable = payload.repairable === true;
     const failedTool =

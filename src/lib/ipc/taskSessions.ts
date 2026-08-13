@@ -534,6 +534,23 @@ export type TaskExecutionManifest = {
       model: string | null;
       objective_count: number;
     } | null;
+    prepared_subtasks?: Array<{
+      schema_version: number;
+      contract_id: string;
+      parent_contract_digest: string;
+      objective_id: string;
+      granted_capabilities: string[];
+      budget: {
+        wall_clock_seconds: number;
+        max_tool_calls: number;
+        max_mutation_calls: number;
+      };
+      evidence_requirement_digest: string;
+      evidence_source: string;
+      delegation_depth: number;
+      may_delegate: boolean;
+      execution_enabled: boolean;
+    }>;
     objective_checkpoints?: Array<{
       objective_id: string;
       evidence: string[];

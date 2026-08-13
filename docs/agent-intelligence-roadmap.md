@@ -464,6 +464,16 @@ Completed second increment: bounded connector-session recreation for strict read
 
 This increment recreates an MCP transport session; it does not recover provider-side conversational state. Stateful connectors will require an explicit provider-neutral resume token contract before they can use automatic recovery.
 
+Completed third increment: prepared subtask authority contracts without multi-agent dispatch.
+
+- Each semantic objective receives a deterministic contract identity, parent-bounded capability grants, an independent wall-clock/tool/mutation budget, an evidence-requirement digest, and an explicit non-delegable authority depth.
+- Compilation and retained-manifest validation both reject capability expansion. A planner or future specialized agent cannot mark a prepared contract delegable, and the contract remains `execution_enabled=false`.
+- Prepared contracts are retained in the Task Examination/Execution Manifest. Durable events and execution traces expose only safe counts, aggregate budgets, and preparation state.
+- Retained pre-semantic-plan contracts remain on the existing single-Worker path and receive no synthetic subtask authority.
+- The rendered Activity view explains that subtask authority was prepared while no additional Worker was started.
+
+This increment prepares authority but does not execute it. Prepared contracts currently retain the parent grant set rather than a narrower per-objective allocation. Scheduler-owned subtask attempts/fences, enforced operation budgets, least-privilege capability allocation, cancellation/recovery, and parent evidence aggregation remain mandatory before concurrent execution.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

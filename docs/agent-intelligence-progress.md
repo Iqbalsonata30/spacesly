@@ -53,10 +53,36 @@ Phase 14 second-increment regression evidence:
 - Full Rust suite: 513 passed, 3 ignored, 0 failed in serial mode. One initial parallel run had a timing-only governance performance assertion; its focused rerun passed and the serial suite passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 
+Completed third vertical slice: prepared, non-executable subtask authority contracts.
+
+- Every immutable semantic objective is deterministically projected into one versioned subtask contract before the Worker starts. Contract identity binds the parent contract digest, objective ID, normalized capability grant set, budget, evidence-requirement digest, delegation depth, and execution state.
+- A subtask may retain only capabilities already present in the parent Task Session's durable grants. Compilation rejects added capabilities, malformed authority, excessive budgets, duplicate objective identities, and any request for delegable authority.
+- Each contract receives independent wall-clock, tool-call, and mutation-call budgets from bounded aggregate limits. Read-only objectives receive no mutation-call budget.
+- Success-evidence text is hashed rather than duplicated into the prepared authority record. The existing immutable execution contract remains the semantic source, while the subtask record retains only its evidence digest and source class.
+- Prepared contracts persist inside the fenced Task Examination/Execution Manifest. Retained-manifest validation rechecks parent-grant containment, unique identities, aggregate budgets, non-delegation, and the disabled execution state.
+- Retained Agent contracts created before semantic planning prepare no subtask authority and continue through the existing single-Worker path unchanged.
+- A durable `subtask_contracts_prepared` event and safe execution-trace entry expose counts and aggregate budgets without contract content, capability names, objective text, evidence text, or credentials.
+- The Activity timeline shows `Subtask Authority Prepared`, explicitly says execution remains disabled, and confirms that no additional Worker was started.
+
+This increment does not execute subtasks. Current prepared contracts conservatively retain the parent grant set, which is a valid non-expanding subset but not yet per-objective least privilege. Operation-level budget enforcement, independent scheduler attempts/fences, deterministic per-objective capability narrowing, evidence aggregation, and concurrent dispatch remain required before multi-agent execution can be enabled.
+
+Phase 14 third-increment regression evidence:
+
+- Domain tests cover deterministic contract identity, independent objective contracts, bounded mutation budgets, capability-expansion rejection, delegable-authority rejection, stable capability normalization, and evidence-text redaction.
+- Retained Task Examination validation rejects a prepared contract whose capability set is altered beyond the parent grant catalog.
+- Execution-trace tests retain the safe `subtask_authority_prepared` status while excluding private contract content.
+- Frontend projection tests verify the non-delegable and non-executing user explanation.
+- The rendered browser journey shows two prepared subtask contracts, aggregate budgets, parent-bounded authority, non-delegation, disabled execution, and a still-running parent task. The final focused browser suite passed all 6 scenarios; an earlier run had one existing approval startup race that passed immediately in isolation and in the final suite.
+- The first full regression run exposed and then drove a compatibility fix for retained contracts without `semantic_plan`; they now produce no synthetic subtask contracts instead of failing preflight.
+- Final full Rust suite after the compatibility fix: 518 passed, 3 ignored, 0 failed in serial mode.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Production frontend build, Rust compilation, Rust formatting, and focused Prettier checks passed.
+
 Remaining Phase 14 work:
 
-- Give decomposed subtasks independent contracts, grants, fences, budgets, and evidence before enabling multiple executing agents.
-- Prove that no planner or specialized agent can delegate authority it was not granted.
+- Add scheduler-owned subtask attempts and independent fencing tokens, then enforce the prepared budgets at every tool boundary.
+- Narrow grants deterministically per objective and aggregate independently verified subtask evidence into the parent result.
+- Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.
 
 ## Phase 13 Completed

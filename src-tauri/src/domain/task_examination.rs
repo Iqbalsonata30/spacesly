@@ -1,6 +1,7 @@
 //! Deterministic, secret-free examination of an Agent task before worker execution.
 
 use crate::domain::governance::RuleFactsRecord;
+use crate::domain::subtask_authority::PreparedSubtaskContract;
 use crate::domain::task_session::{AgentTaskObjectiveCheckpoint, TaskSessionEnvelopeV1};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -200,6 +201,8 @@ pub struct TaskExaminationRecord {
     pub capability_mappings: Vec<ConnectorCapabilityMapping>,
     #[serde(default)]
     pub semantic_planner: Option<SemanticPlannerEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_subtasks: Vec<PreparedSubtaskContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_resolution: Option<RepositoryResolutionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +253,7 @@ impl TaskExaminationRecord {
             self.capability_catalog.len(),
             self.connector_capabilities.len(),
             self.capability_mappings.len(),
+            self.prepared_subtasks.len(),
             usize::from(self.repository_resolution.is_some()),
             usize::from(self.deployment_target_resolution.is_some()),
             self.connector_configuration_preflights.len(),
@@ -304,6 +308,78 @@ impl TaskExaminationRecord {
                 || planner.objective_count > 8
         }) {
             return Err("Task Examination semantic planner evidence is invalid.".to_string());
+        }
+        let granted_parent_capabilities = self
+            .capability_catalog
+            .iter()
+            .filter(|capability| capability.granted)
+            .map(|capability| capability.capability.as_str())
+            .collect::<HashSet<_>>();
+        let prepared_contract_ids = self
+            .prepared_subtasks
+            .iter()
+            .map(|subtask| subtask.contract_id.as_str())
+            .collect::<HashSet<_>>();
+        let prepared_objective_ids = self
+            .prepared_subtasks
+            .iter()
+            .map(|subtask| subtask.objective_id.as_str())
+            .collect::<HashSet<_>>();
+        let prepared_wall_clock_budget = self
+            .prepared_subtasks
+            .iter()
+            .map(|subtask| subtask.budget.wall_clock_seconds)
+            .sum::<u64>();
+        let prepared_tool_budget = self
+            .prepared_subtasks
+            .iter()
+            .map(|subtask| u64::from(subtask.budget.max_tool_calls))
+            .sum::<u64>();
+        let prepared_mutation_budget = self
+            .prepared_subtasks
+            .iter()
+            .map(|subtask| u64::from(subtask.budget.max_mutation_calls))
+            .sum::<u64>();
+        if (!self.prepared_subtasks.is_empty()
+            && self
+                .semantic_planner
+                .as_ref()
+                .is_none_or(|planner| planner.objective_count != self.prepared_subtasks.len()))
+            || prepared_contract_ids.len() != self.prepared_subtasks.len()
+            || prepared_objective_ids.len() != self.prepared_subtasks.len()
+            || prepared_wall_clock_budget > 3_600
+            || prepared_tool_budget > 64
+            || prepared_mutation_budget > 8
+            || self.prepared_subtasks.iter().any(|subtask| {
+                subtask.schema_version != 1
+                    || subtask.parent_contract_digest != self.contract_digest
+                    || subtask
+                        .contract_id
+                        .strip_prefix("sha256:")
+                        .is_none_or(|digest| {
+                            digest.len() != 64
+                                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                    || subtask
+                        .evidence_requirement_digest
+                        .strip_prefix("sha256:")
+                        .is_none_or(|digest| {
+                            digest.len() != 64
+                                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                    || subtask.evidence_source != "semantic_objective_success_evidence"
+                    || subtask.delegation_depth != 1
+                    || subtask.may_delegate
+                    || subtask.execution_enabled
+                    || subtask.budget.wall_clock_seconds == 0
+                    || subtask.budget.max_tool_calls == 0
+                    || subtask.budget.max_mutation_calls > subtask.budget.max_tool_calls
+                    || subtask.granted_capabilities.iter().any(|capability| {
+                        !granted_parent_capabilities.contains(capability.as_str())
+                    })
+            })
+        {
+            return Err("Task Examination prepared subtask authority is invalid.".to_string());
         }
         if self
             .repository_resolution
@@ -870,6 +946,7 @@ pub fn examine_task(
         connector_capabilities: connector_capabilities.to_vec(),
         capability_mappings,
         semantic_planner,
+        prepared_subtasks: Vec::new(),
         repository_resolution: None,
         deployment_target_resolution: None,
         connector_configuration_preflights: Vec::new(),
@@ -1369,5 +1446,53 @@ mod tests {
         assert_eq!(examined.status, TaskExaminationStatus::Blocked);
         assert_eq!(examined.capability_mappings[0].status, "stale");
         assert!(examined.unresolved_requirements[0].contains("no longer exposes"));
+    }
+
+    #[test]
+    fn retained_subtask_contracts_cannot_expand_parent_grants() {
+        let contract = serde_json::json!({
+            "semantic_plan": {
+                "status": "model",
+                "planner_version": "agent-semantic-planner-v1",
+                "objectives": [{
+                    "id": "objective-1",
+                    "summary": "Inspect an item",
+                    "success_evidence": "The item identity is verified",
+                    "mutation_expected": false
+                }]
+            },
+            "constraints": { "may_modify_files": false, "may_update_jira": false }
+        });
+        let granted = HashSet::from(["external_tools:future-system", "workspace_read"]);
+        let mut examined = examine_task(
+            &contract,
+            "sha256:contract",
+            &envelope(),
+            &granted,
+            &RuleFactsRecord::default(),
+            &[],
+        );
+        examined.prepared_subtasks = crate::domain::subtask_authority::prepare_subtask_contracts(
+            &contract,
+            "sha256:contract",
+            &[
+                "external_tools:future-system".to_string(),
+                "workspace_read".to_string(),
+            ],
+        )
+        .expect("prepared contracts");
+        examined
+            .validate("sha256:contract")
+            .expect("parent-bounded authority remains valid");
+
+        examined.prepared_subtasks[0]
+            .granted_capabilities
+            .push("git".to_string());
+        assert_eq!(
+            examined
+                .validate("sha256:contract")
+                .expect_err("retained authority expansion rejected"),
+            "Task Examination prepared subtask authority is invalid."
+        );
     }
 }

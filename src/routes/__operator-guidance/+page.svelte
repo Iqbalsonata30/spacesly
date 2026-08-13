@@ -48,8 +48,35 @@
     "02:44:02 PM",
   ).logs;
   const connectorRecovery = page.url.searchParams.get("connectorRecovery") === "1";
+  const subtaskPreparationLogs = projectAgentTaskSessionEvent(
+    {
+      id: 93,
+      session_id: 43,
+      attempt_id: 1,
+      fencing_token: 1,
+      sequence: 93,
+      kind: "runtime",
+      payload: {
+        type: "subtask_contracts_prepared",
+        schema_version: 1,
+        subtask_count: 2,
+        tool_call_budget: 64,
+        mutation_call_budget: 1,
+        authority_scope: "parent_subset",
+        delegation_allowed: false,
+        execution_enabled: false,
+      },
+      progress: null,
+      created_at: 93,
+    },
+    "subtask-preparation-93",
+    "02:44:03 PM",
+  ).logs;
+  const subtaskPreparation = page.url.searchParams.get("subtaskPreparation") === "1";
 
-  let runStatus = $state<AgentRunStatus>(connectorRecovery ? "completed" : "blocked");
+  let runStatus = $state<AgentRunStatus>(
+    connectorRecovery ? "completed" : subtaskPreparation ? "running" : "blocked",
+  );
   let approval = $state<AgentApprovalRequest | null>(
     page.url.searchParams.get("approval") === "1"
       ? {
@@ -76,22 +103,28 @@
   title="Deploy payroll configuration"
   status={runStatus}
   progress={58}
-  logs={connectorRecovery ? connectorRecoveryLogs : leaseRecoveryLogs}
+  logs={connectorRecovery
+    ? connectorRecoveryLogs
+    : subtaskPreparation
+      ? subtaskPreparationLogs
+      : leaseRecoveryLogs}
   transcript={[]}
   output=""
-  result={{
-    summary: connectorRecovery
-      ? "The Confluence page was verified after connector recovery."
-      : "The task needs operator action.",
-    evidence: connectorRecovery ? ["Exact Confluence page identity verified."] : [],
-    details: [],
-    next: [],
-    completion_status: connectorRecovery ? "completed" : "blocked",
-    blocked_reason: connectorRecovery
-      ? null
-      : "Raw model-authored fallback should not replace backend guidance.",
-    objective_results: [],
-  }}
+  result={subtaskPreparation
+    ? null
+    : {
+        summary: connectorRecovery
+          ? "The Confluence page was verified after connector recovery."
+          : "The task needs operator action.",
+        evidence: connectorRecovery ? ["Exact Confluence page identity verified."] : [],
+        details: [],
+        next: [],
+        completion_status: connectorRecovery ? "completed" : "blocked",
+        blocked_reason: connectorRecovery
+          ? null
+          : "Raw model-authored fallback should not replace backend guidance.",
+        objective_results: [],
+      }}
   executionRun={null}
   {runStatus}
   terminalLines={[]}

@@ -672,14 +672,16 @@ impl SchedulerStore {
                   WHERE execution_run_id IS NOT NULL AND state IN ('running', 'cancelling', 'committing');
                  DROP INDEX IF EXISTS idx_scheduler_events_trace_v3;
                  DROP INDEX IF EXISTS idx_scheduler_events_trace_v4;
-                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace_v5
+                 DROP INDEX IF EXISTS idx_scheduler_events_trace_v5;
+                 CREATE INDEX IF NOT EXISTS idx_scheduler_events_trace_v6
                    ON scheduler_task_events(session_id, sequence)
                   WHERE event_type IN (
                     'lifecycle', 'tool_started', 'tool_completed',
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
                     'approval_requested', 'runtime_recovery_decision',
                     'objective_checkpointed',
-                    'capability_repair_decision', 'connector_session_recovered'
+                    'capability_repair_decision', 'connector_session_recovered',
+                    'subtask_contracts_prepared'
                   );
                  CREATE INDEX IF NOT EXISTS idx_scheduler_events_tool_state
                    ON scheduler_task_events(session_id, sequence)
@@ -701,7 +703,8 @@ impl SchedulerStore {
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
                             'approval_requested', 'runtime_recovery_decision',
                             'objective_checkpointed',
-                            'capability_repair_decision', 'connector_session_recovered'
+                            'capability_repair_decision', 'connector_session_recovered',
+                            'subtask_contracts_prepared'
                           ) THEN json_extract(NEW.payload_json, '$.type')
                         ELSE NULL
                       END
@@ -716,7 +719,7 @@ impl SchedulerStore {
                 |row| row.get(0),
             )
             .map_err(|error| format!("Failed to inspect trace event migration: {error}"))?;
-        if event_type_backfill_version < 5 {
+        if event_type_backfill_version < 6 {
             migration
                 .execute_batch(
                     "UPDATE scheduler_task_events
@@ -733,7 +736,8 @@ impl SchedulerStore {
                               'execution_trace_stage', 'usage_updated', 'opencode_session',
                               'approval_requested', 'runtime_recovery_decision',
                               'objective_checkpointed',
-                              'capability_repair_decision', 'connector_session_recovered'
+                              'capability_repair_decision', 'connector_session_recovered',
+                              'subtask_contracts_prepared'
                             ) THEN json_extract(payload_json, '$.type')
                           ELSE NULL
                         END
@@ -744,10 +748,11 @@ impl SchedulerStore {
                             'execution_trace_stage', 'usage_updated', 'opencode_session',
                             'approval_requested', 'runtime_recovery_decision',
                             'objective_checkpointed',
-                            'capability_repair_decision', 'connector_session_recovered'
+                            'capability_repair_decision', 'connector_session_recovered',
+                            'subtask_contracts_prepared'
                           ))
                       );
-                     UPDATE scheduler_metadata SET event_type_backfill_version = 5
+                     UPDATE scheduler_metadata SET event_type_backfill_version = 6
                       WHERE singleton = 1;",
                 )
                 .map_err(|error| format!("Failed to backfill trace event types: {error}"))?;
@@ -2107,7 +2112,8 @@ impl SchedulerStore {
                       'execution_trace_stage', 'usage_updated', 'opencode_session',
                       'approval_requested', 'runtime_recovery_decision',
                       'objective_checkpointed',
-                      'capability_repair_decision', 'connector_session_recovered'
+                      'capability_repair_decision', 'connector_session_recovered',
+                      'subtask_contracts_prepared'
                     )
                  ORDER BY sequence
                  LIMIT ?3",
@@ -4685,6 +4691,9 @@ fn indexed_event_type(kind: TaskSessionEventKind, payload: &serde_json::Value) -
         (TaskSessionEventKind::Runtime, Some("connector_session_recovered")) => {
             "connector_session_recovered"
         }
+        (TaskSessionEventKind::Runtime, Some("subtask_contracts_prepared")) => {
+            "subtask_contracts_prepared"
+        }
         (TaskSessionEventKind::Runtime, _) => "runtime",
     }
 }
@@ -4716,10 +4725,10 @@ fn trace_entry(
             .map(|value| value.chars().take(limit).collect::<String>())
             .filter(|value| !value.trim().is_empty())
     };
-    let recovery = if event_type == "connector_session_recovered" {
-        Some("connector_session_recreated".to_string())
-    } else {
-        string("recovery", 64).or_else(|| string("action", 64))
+    let recovery = match event_type.as_str() {
+        "connector_session_recovered" => Some("connector_session_recreated".to_string()),
+        "subtask_contracts_prepared" => Some("subtask_authority_prepared".to_string()),
+        _ => string("recovery", 64).or_else(|| string("action", 64)),
     };
     Ok(TaskExecutionTraceEntry {
         sequence: from_i64(event.sequence, "task event sequence")?,
@@ -5839,10 +5848,30 @@ mod tests {
                 assignment.fence,
                 TaskSessionEventInput {
                     kind: TaskSessionEventKind::Runtime,
-                    payload: json!({ "type": "text_delta", "text": "trailing secret" }),
+                    payload: json!({
+                        "type": "subtask_contracts_prepared",
+                        "subtask_count": 2,
+                        "tool_call_budget": 64,
+                        "mutation_call_budget": 1,
+                        "authority_scope": "parent_subset",
+                        "delegation_allowed": false,
+                        "execution_enabled": false,
+                        "private_contract": "secret-subtask-contract"
+                    }),
                     progress: None,
                 },
                 27,
+            )
+            .expect("subtask authority appended");
+        store
+            .append_assignment_event_at(
+                assignment.fence,
+                TaskSessionEventInput {
+                    kind: TaskSessionEventKind::Runtime,
+                    payload: json!({ "type": "text_delta", "text": "trailing secret" }),
+                    progress: None,
+                },
+                28,
             )
             .expect("trailing delta appended");
 
@@ -5858,7 +5887,7 @@ mod tests {
             .execution_trace_page(session.id, first.next_cursor, 10)
             .expect("second trace page");
         assert!(!second.has_more);
-        assert_eq!(second.next_cursor, 9);
+        assert_eq!(second.next_cursor, 10);
         assert_eq!(
             second
                 .entries
@@ -5869,21 +5898,30 @@ mod tests {
                 "usage_updated",
                 "tool_started",
                 "tool_completed",
-                "connector_session_recovered"
+                "connector_session_recovered",
+                "subtask_contracts_prepared"
             ]
+        );
+        assert_eq!(
+            second
+                .entries
+                .get(3)
+                .and_then(|entry| entry.recovery.as_deref()),
+            Some("connector_session_recreated")
         );
         assert_eq!(
             second
                 .entries
                 .last()
                 .and_then(|entry| entry.recovery.as_deref()),
-            Some("connector_session_recreated")
+            Some("subtask_authority_prepared")
         );
         let encoded = serde_json::to_string(&(first, second)).expect("trace encoded");
         assert!(!encoded.contains("secret prompt text"));
         assert!(!encoded.contains("secret API response"));
         assert!(!encoded.contains("trailing secret"));
         assert!(!encoded.contains("secret-connector-configuration"));
+        assert!(!encoded.contains("secret-subtask-contract"));
 
         let plan = store
             .connection
@@ -5896,7 +5934,8 @@ mod tests {
                     'execution_trace_stage', 'usage_updated', 'opencode_session',
                     'approval_requested', 'runtime_recovery_decision',
                     'objective_checkpointed',
-                    'capability_repair_decision', 'connector_session_recovered'
+                    'capability_repair_decision', 'connector_session_recovered',
+                    'subtask_contracts_prepared'
                   ) ORDER BY sequence LIMIT 100",
             )
             .unwrap()

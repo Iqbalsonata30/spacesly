@@ -693,6 +693,48 @@ assertEqual(
   true,
   "connector recovery should state that mutation authority was not expanded",
 );
+const subtaskPreparationProjection = projectAgentTaskSessionEvent(
+  {
+    id: 125,
+    session_id: 1,
+    attempt_id: 1,
+    fencing_token: 1,
+    sequence: 125,
+    kind: "runtime",
+    payload: {
+      type: "subtask_contracts_prepared",
+      schema_version: 1,
+      subtask_count: 2,
+      tool_call_budget: 64,
+      mutation_call_budget: 1,
+      authority_scope: "parent_subset",
+      delegation_allowed: false,
+      execution_enabled: false,
+    },
+    progress: null,
+    created_at: 125,
+  },
+  "subtask-preparation-125",
+  "04:30:12 AM",
+);
+const subtaskPreparationActivities = timelineActivities(subtaskPreparationProjection.logs);
+assertEqual(
+  subtaskPreparationActivities[0]?.title,
+  "Subtask Authority Prepared",
+  "prepared subtask authority should remain visible in Activity",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Subtasks cannot delegate authority to another agent",
+  ),
+  true,
+  "subtask preparation should explain its non-delegable authority boundary",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes("No additional Worker was started"),
+  true,
+  "subtask preparation should not imply that multi-agent execution is enabled",
+);
 const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
   {
     id: 124,

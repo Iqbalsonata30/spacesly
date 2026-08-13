@@ -2666,6 +2666,23 @@ impl TaskExecutor for AgentTaskExecutor {
             &resolved.governance.rules.facts,
             &resolved.connector_capabilities,
         );
+        let parent_capabilities = envelope
+            .requested_capabilities
+            .iter()
+            .filter(|capability| granted_capabilities.contains(capability.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        examination.prepared_subtasks =
+            crate::domain::subtask_authority::prepare_subtask_contracts(
+                resolved
+                    .task
+                    .execution_contract
+                    .as_ref()
+                    .expect("validated execution contract"),
+                &envelope.context_digest,
+                &parent_capabilities,
+            )
+            .map_err(TaskExecutionError::new)?;
         let (connector_configuration_preflights, connector_configuration_blockers) =
             resolve_connector_configuration_preflights(
                 &envelope.connector_ids,
@@ -2927,6 +2944,7 @@ impl TaskExecutor for AgentTaskExecutor {
                 "unresolved_requirement_count": examination.unresolved_requirements.len(),
                 "approval_boundary_count": examination.approval_boundaries.len(),
                 "objective_checkpoint_count": examination.objective_checkpoints.len(),
+                "prepared_subtask_count": examination.prepared_subtasks.len(),
                 "live_connector_count": examination.connector_capabilities.iter()
                     .filter(|connector| connector.status == crate::domain::task_examination::ConnectorDiscoveryStatus::Available)
                     .count(),
@@ -2935,6 +2953,32 @@ impl TaskExecutor for AgentTaskExecutor {
                     .sum::<usize>(),
             }),
         )?;
+        if !examination.prepared_subtasks.is_empty() {
+            let prepared_subtask_count = examination.prepared_subtasks.len();
+            let prepared_subtask_tool_budget = examination
+                .prepared_subtasks
+                .iter()
+                .map(|subtask| u64::from(subtask.budget.max_tool_calls))
+                .sum::<u64>();
+            let prepared_subtask_mutation_budget = examination
+                .prepared_subtasks
+                .iter()
+                .map(|subtask| u64::from(subtask.budget.max_mutation_calls))
+                .sum::<u64>();
+            context.emit_event(
+                TaskSessionEventKind::Runtime,
+                json!({
+                    "type": "subtask_contracts_prepared",
+                    "schema_version": 1,
+                    "subtask_count": prepared_subtask_count,
+                    "tool_call_budget": prepared_subtask_tool_budget,
+                    "mutation_call_budget": prepared_subtask_mutation_budget,
+                    "authority_scope": "parent_subset",
+                    "delegation_allowed": false,
+                    "execution_enabled": false,
+                }),
+            )?;
+        }
         if let Some(preflight) = workspace_git_preflight {
             context.emit_event(TaskSessionEventKind::Runtime, preflight)?;
         }

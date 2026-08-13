@@ -205,6 +205,9 @@ function presentationForLog(
   if (log.label === "runtime" && /connector session was recreated/i.test(rawSummary)) {
     return activity("connector-recovered", "Connector Session Recovered", rawSummary, "completed");
   }
+  if (log.label === "runtime" && /isolated subtask .* prepared/i.test(rawSummary)) {
+    return activity("subtasks-prepared", "Subtask Authority Prepared", rawSummary, "completed");
+  }
   if (log.label === "start" || log.label === "context") {
     return activity(
       "preparing-task",
