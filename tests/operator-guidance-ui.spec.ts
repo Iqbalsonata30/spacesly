@@ -231,6 +231,12 @@ test("prepared subtask authority is visible without implying multi-agent executi
   await expect(activity).toContainText("Scheduler state: dormant");
   await expect(activity).toContainText("Activation gate: closed");
   await expect(activity).toContainText(
+    "Dispatch lifecycle: staged; specialized Workers remain disabled.",
+  );
+  await expect(activity).toContainText(
+    "Lease expiry, cancellation, and parent completion revoke staged authority.",
+  );
+  await expect(activity).toContainText(
     "Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
   );
   await expect(activity).toContainText("Dormant fencing identities: 2");

@@ -66,6 +66,8 @@
         scheduler_state: "dormant",
         activation_gate: "closed",
         budget_admission: "atomic_before_forward",
+        dispatch_lifecycle: "staged",
+        lease_recovery: "fail_closed",
         authority_scope: "parent_subset",
         authority_active: false,
         delegation_allowed: false,

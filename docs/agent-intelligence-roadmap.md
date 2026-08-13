@@ -496,6 +496,18 @@ Completed fifth increment: staged scheduler activation and atomic tool-budget ad
 
 This increment deliberately does not create subtask Workers, activate authority from the application, renew/recover subtask leases, or aggregate subtask evidence. Those lifecycle paths must be completed and tested before the private dispatch permit can be exposed.
 
+Completed sixth increment: staged subtask dispatch lifecycle and fail-closed recovery.
+
+- Exact renewal revalidates the current parent assignment, immutable subtask contract, parent grants, and authority fence. The returned descriptor carries a new lease capped by the parent lease; the prior descriptor immediately becomes stale.
+- Explicit completion, cancellation, and failure transitions persist a terminal timestamp and fixed, secret-free reason. Replaying the same exact terminal outcome is idempotent, while a different outcome or forged descriptor conflicts.
+- Completion is accepted only while the child and exact parent authority remain live. Cancellation and failure can safely revoke an authority after work stops without asserting successful evidence.
+- Parent cancellation and parent resolution revoke active child authority in the same immediate transaction as the parent transition. Lease expiry, owner loss, and parent recovery revoke remaining children through the scheduler recovery transaction.
+- Recovery distinguishes only bounded lifecycle reasons: `lease_expired`, `parent_inactive`, `parent_cancelled`, and `parent_resolved`. It does not retain runtime errors, task text, tool arguments, connector output, or credentials.
+- Restart-safe status lookup exposes lifecycle state, terminal reason, lease or completion time, and consumed tool/mutation budgets. It cannot be used as tool authority.
+- The Activity view labels this as a staged dispatch lifecycle, states that lease and parent transitions revoke authority, and continues to show the activation gate as closed.
+
+This increment completes the scheduler lifecycle API behind the module-private dispatch permit. No application path creates a specialized Worker, sends it a subtask descriptor, or heartbeats that descriptor, so multi-agent execution remains disabled. Least-privilege per-objective grants, independent evidence verification/aggregation, and an end-to-end scheduler-owned dispatch path remain required before activation can be exposed.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

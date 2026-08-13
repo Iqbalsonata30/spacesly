@@ -142,6 +142,8 @@ export function projectAgentTaskSessionEvent(
     details.push(
       "- Scheduler state: dormant",
       "- Activation gate: closed",
+      "- Dispatch lifecycle: staged; specialized Workers remain disabled.",
+      "- Lease expiry, cancellation, and parent completion revoke staged authority.",
       "- Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
       `- Dormant fencing identities: ${dormantFenceCount}`,
       "- Tool authority active: no",

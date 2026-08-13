@@ -711,6 +711,8 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       scheduler_state: "dormant",
       activation_gate: "closed",
       budget_admission: "atomic_before_forward",
+      dispatch_lifecycle: "staged",
+      lease_recovery: "fail_closed",
       authority_scope: "parent_subset",
       authority_active: false,
       delegation_allowed: false,
@@ -727,6 +729,20 @@ assertEqual(
   subtaskPreparationActivities[0]?.title,
   "Subtask Authority Prepared",
   "prepared subtask authority should remain visible in Activity",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Dispatch lifecycle: staged; specialized Workers remain disabled",
+  ),
+  true,
+  "subtask preparation should explain that dispatch lifecycle is staged only",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Lease expiry, cancellation, and parent completion revoke staged authority",
+  ),
+  true,
+  "subtask preparation should explain fail-closed lifecycle recovery",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

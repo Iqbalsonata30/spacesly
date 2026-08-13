@@ -229,6 +229,42 @@ pub struct SubtaskToolAdmission {
     pub max_mutation_calls: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum SubtaskAuthorityOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl SubtaskAuthorityOutcome {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled | Self::Failed => "revoked",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskAuthorityStatus {
+    pub authority_id: u64,
+    pub state: String,
+    pub terminal_reason: Option<String>,
+    pub lease_expires_at: Option<u64>,
+    pub tool_calls_used: u32,
+    pub mutation_calls_used: u32,
+    pub completed_at: Option<u64>,
+}
+
 /// Unforgeable module-private capability required to activate dormant subtask authority.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubtaskDispatchPermit(());
@@ -551,6 +587,8 @@ impl SchedulerStore {
                     mutation_calls_used INTEGER NOT NULL DEFAULT 0 CHECK (mutation_calls_used >= 0),
                     activated_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    terminal_reason TEXT,
                     FOREIGN KEY(subtask_attempt_id) REFERENCES scheduler_subtask_attempts(subtask_attempt_id)
                       ON DELETE CASCADE,
                     FOREIGN KEY(parent_attempt_id) REFERENCES scheduler_task_attempts(attempt_id)
@@ -765,6 +803,18 @@ impl SchedulerStore {
             "scheduler_resource_mutations",
             "checkpoint_recorded_at",
             "checkpoint_recorded_at INTEGER",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_subtask_authorities",
+            "completed_at",
+            "completed_at INTEGER",
+        )?;
+        ensure_column(
+            &migration,
+            "scheduler_subtask_authorities",
+            "terminal_reason",
+            "terminal_reason TEXT",
         )?;
         migration
             .execute_batch(
@@ -3153,6 +3203,220 @@ impl SchedulerStore {
         Ok(admission)
     }
 
+    /// Extends one exact staged subtask dispatch lease without widening its parent authority.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn renew_subtask_authority(
+        authority: &SubtaskToolAuthority,
+        lease_duration: Duration,
+    ) -> Result<SubtaskToolAuthority, String> {
+        Self::renew_subtask_authority_at(authority, now_millis(), duration_millis(lease_duration)?)
+    }
+
+    fn renew_subtask_authority_at(
+        authority: &SubtaskToolAuthority,
+        now: u64,
+        lease_millis: u64,
+    ) -> Result<SubtaskToolAuthority, String> {
+        if lease_millis == 0 || lease_millis > duration_millis(SUBTASK_AUTHORITY_MAX_LEASE)? {
+            return Err("Subtask authority lease must be between 1 ms and 30 seconds.".to_string());
+        }
+        validate_subtask_authority_shape(
+            authority,
+            authority
+                .capabilities
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )?;
+        let store = Self::open_subtask_authority_store(authority)?;
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask renewal: {error}"))?;
+        let parent = AssignmentFence {
+            session_id: authority.session_id,
+            attempt_id: authority.parent_attempt_id,
+            attempt: authority.parent_attempt,
+            owner_id: authority.parent_owner_id,
+            fencing_token: authority.parent_fencing_token,
+        };
+        if !assignment_is_current_on(&transaction, parent, now)? {
+            return Err("Subtask parent assignment is stale, expired, or cancelled.".to_string());
+        }
+        validate_subtask_contract_and_grants_on(&transaction, authority)?;
+        let parent_lease_expires_at = transaction
+            .query_row(
+                "SELECT lease_expires_at FROM scheduler_task_attempts WHERE attempt_id = ?1",
+                params![to_i64(authority.parent_attempt_id)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to load parent lease for subtask renewal: {error}"))?;
+        let lease_expires_at = now
+            .checked_add(lease_millis)
+            .ok_or_else(|| "Subtask renewal timestamp overflowed.".to_string())?
+            .min(from_i64(
+                parent_lease_expires_at,
+                "parent assignment lease",
+            )?);
+        if lease_expires_at <= authority.lease_expires_at {
+            return Err("Subtask authority renewal must extend the current lease.".to_string());
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_subtask_authorities
+                    SET lease_expires_at = ?2, updated_at = ?3
+                  WHERE authority_id = ?1 AND authority_fencing_token = ?4
+                    AND subtask_attempt_id = ?5 AND parent_attempt_id = ?6
+                    AND parent_fencing_token = ?7 AND state = 'active'
+                    AND lease_expires_at = ?8 AND lease_expires_at > ?3",
+                params![
+                    to_i64(authority.authority_id)?,
+                    to_i64(lease_expires_at)?,
+                    to_i64(now)?,
+                    to_i64(authority.authority_fencing_token)?,
+                    to_i64(authority.subtask_attempt_id)?,
+                    to_i64(authority.parent_attempt_id)?,
+                    to_i64(authority.parent_fencing_token)?,
+                    to_i64(authority.lease_expires_at)?
+                ],
+            )
+            .map_err(|error| format!("Failed to renew subtask authority: {error}"))?;
+        if updated != 1 {
+            return Err("Subtask authority renewal lost its exact lease fence.".to_string());
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask renewal: {error}"))?;
+        Ok(SubtaskToolAuthority {
+            lease_expires_at,
+            ..authority.clone()
+        })
+    }
+
+    /// Resolves one staged subtask dispatch. Identical terminal replay is idempotent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn resolve_subtask_authority(
+        authority: &SubtaskToolAuthority,
+        outcome: SubtaskAuthorityOutcome,
+    ) -> Result<SubtaskAuthorityStatus, String> {
+        Self::resolve_subtask_authority_at(authority, outcome, now_millis())
+    }
+
+    fn resolve_subtask_authority_at(
+        authority: &SubtaskToolAuthority,
+        outcome: SubtaskAuthorityOutcome,
+        now: u64,
+    ) -> Result<SubtaskAuthorityStatus, String> {
+        validate_subtask_authority_shape(
+            authority,
+            authority
+                .capabilities
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )?;
+        let store = Self::open_subtask_authority_store(authority)?;
+        let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask resolution: {error}"))?;
+        if !subtask_authority_descriptor_matches_on(&transaction, authority)? {
+            return Err(
+                "Subtask authority resolution descriptor is stale or incompatible.".to_string(),
+            );
+        }
+        let current = subtask_authority_status_on(&transaction, authority.authority_id)?
+            .ok_or_else(|| "Subtask authority was not found.".to_string())?;
+        if current.state == outcome.state()
+            && current.terminal_reason.as_deref() == Some(outcome.reason())
+        {
+            transaction
+                .commit()
+                .map_err(|error| format!("Failed to commit subtask resolution replay: {error}"))?;
+            return Ok(current);
+        }
+        if current.state != "active" {
+            return Err("Subtask authority already has a different terminal outcome.".to_string());
+        }
+        if outcome == SubtaskAuthorityOutcome::Completed {
+            if current
+                .lease_expires_at
+                .is_none_or(|lease_expires_at| lease_expires_at <= now)
+            {
+                return Err("Expired subtask authority cannot report completion.".to_string());
+            }
+            let parent = AssignmentFence {
+                session_id: authority.session_id,
+                attempt_id: authority.parent_attempt_id,
+                attempt: authority.parent_attempt,
+                owner_id: authority.parent_owner_id,
+                fencing_token: authority.parent_fencing_token,
+            };
+            if !assignment_is_current_on(&transaction, parent, now)? {
+                return Err(
+                    "Completed subtask cannot outlive its parent assignment authority.".to_string(),
+                );
+            }
+            validate_subtask_contract_and_grants_on(&transaction, authority)?;
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE scheduler_subtask_authorities
+                    SET state = ?2, terminal_reason = ?3, completed_at = ?4, updated_at = ?4
+                  WHERE authority_id = ?1 AND authority_fencing_token = ?5
+                    AND subtask_attempt_id = ?6 AND parent_attempt_id = ?7
+                    AND parent_fencing_token = ?8 AND lease_expires_at = ?9
+                    AND state = 'active'",
+                params![
+                    to_i64(authority.authority_id)?,
+                    outcome.state(),
+                    outcome.reason(),
+                    to_i64(now)?,
+                    to_i64(authority.authority_fencing_token)?,
+                    to_i64(authority.subtask_attempt_id)?,
+                    to_i64(authority.parent_attempt_id)?,
+                    to_i64(authority.parent_fencing_token)?,
+                    to_i64(authority.lease_expires_at)?
+                ],
+            )
+            .map_err(|error| format!("Failed to resolve subtask authority: {error}"))?;
+        if updated != 1 {
+            return Err("Subtask authority resolution lost its exact fence.".to_string());
+        }
+        let status = subtask_authority_status_on(&transaction, authority.authority_id)?
+            .ok_or_else(|| "Resolved subtask authority could not be reloaded.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask resolution: {error}"))?;
+        Ok(status)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn recover_subtask_authorities(&self) -> Result<usize, String> {
+        self.recover_subtask_authorities_at(now_millis())
+    }
+
+    fn recover_subtask_authorities_at(&self, now: u64) -> Result<usize, String> {
+        let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Failed to start subtask recovery: {error}"))?;
+        let recovered = recover_subtask_authorities_on(&transaction, now)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit subtask recovery: {error}"))?;
+        Ok(recovered)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subtask_authority_status(
+        &self,
+        authority_id: u64,
+    ) -> Result<Option<SubtaskAuthorityStatus>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        subtask_authority_status_on(&connection, authority_id)
+    }
+
     pub(crate) fn bind_opencode_session(
         &self,
         fence: AssignmentFence,
@@ -3526,11 +3790,11 @@ impl SchedulerStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("Failed to start scheduler cancellation: {error}"))?;
-        let state = transaction
+        let (state, active_attempt_id) = transaction
             .query_row(
-                "SELECT state FROM scheduler_task_sessions WHERE session_id = ?1",
+                "SELECT state, active_attempt_id FROM scheduler_task_sessions WHERE session_id = ?1",
                 params![to_i64(id.0)?],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .optional()
             .map_err(|error| format!("Failed to read scheduler session state: {error}"))?
@@ -3560,6 +3824,14 @@ impl SchedulerStore {
             _ => false,
         };
         if changed {
+            if let Some(active_attempt_id) = active_attempt_id {
+                revoke_subtask_authorities_for_parent_on(
+                    &transaction,
+                    from_i64(active_attempt_id, "active task attempt ID")?,
+                    now,
+                    "parent_cancelled",
+                )?;
+            }
             let next_state = if state == "queued" {
                 "cancelled"
             } else {
@@ -3689,6 +3961,18 @@ impl SchedulerStore {
             fence.attempt_id,
             now,
             "assignment_finished_without_resolution",
+        )?;
+        let parent_cancelled =
+            session_state == "cancelling" || matches!(&outcome, DurableOutcome::Cancelled);
+        revoke_subtask_authorities_for_parent_on(
+            &transaction,
+            fence.attempt_id,
+            now,
+            if parent_cancelled {
+                "parent_cancelled"
+            } else {
+                "parent_resolved"
+            },
         )?;
 
         if session_state == "cancelling" {
@@ -4302,6 +4586,7 @@ impl SchedulerStore {
             "Scheduler owner shut down.",
             "scheduler_owner_shutdown",
         )?;
+        recover_subtask_authorities_on(&transaction, now)?;
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit scheduler owner cleanup: {error}"))?;
@@ -5089,6 +5374,243 @@ fn validate_subtask_authority_shape(
     Ok(())
 }
 
+fn validate_subtask_contract_and_grants_on(
+    connection: &Connection,
+    authority: &SubtaskToolAuthority,
+) -> Result<(), String> {
+    let contract_json = connection
+        .query_row(
+            "SELECT subtasks.contract_json
+               FROM scheduler_prepared_subtasks subtasks
+               JOIN scheduler_subtask_attempts attempts
+                 ON attempts.subtask_id = subtasks.subtask_id
+              WHERE subtasks.session_id = ?1 AND subtasks.subtask_id = ?2
+                AND subtasks.objective_id = ?3
+                AND attempts.subtask_attempt_id = ?4
+                AND attempts.attempt_number = ?5
+                AND attempts.fencing_token = ?6",
+            params![
+                to_i64(authority.session_id.0)?,
+                to_i64(authority.subtask_id)?,
+                authority.objective_id,
+                to_i64(authority.subtask_attempt_id)?,
+                i64::from(authority.subtask_attempt),
+                to_i64(authority.subtask_fencing_token)?
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to validate subtask contract identity: {error}"))?
+        .ok_or_else(|| "Subtask contract identity is stale or incompatible.".to_string())?;
+    let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
+        .map_err(|error| format!("Failed to decode subtask lifecycle contract: {error}"))?;
+    if contract.objective_id != authority.objective_id
+        || contract.granted_capabilities != authority.capabilities
+    {
+        return Err("Subtask lifecycle authority changed its immutable contract.".to_string());
+    }
+    for capability in &authority.capabilities {
+        let still_granted = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM scheduler_task_grants
+                    WHERE session_id = ?1 AND capability = ?2
+                 )",
+                params![to_i64(authority.session_id.0)?, capability],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to validate subtask lifecycle grants: {error}"))?;
+        if still_granted == 0 {
+            return Err("Subtask lifecycle capability was revoked from its parent.".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn subtask_authority_status_on(
+    connection: &Connection,
+    authority_id: u64,
+) -> Result<Option<SubtaskAuthorityStatus>, String> {
+    connection
+        .query_row(
+            "SELECT authority_id, state, terminal_reason, lease_expires_at,
+                    tool_calls_used, mutation_calls_used, completed_at
+               FROM scheduler_subtask_authorities WHERE authority_id = ?1",
+            params![to_i64(authority_id)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to load subtask authority status: {error}"))?
+        .map(
+            |(
+                authority_id,
+                state,
+                terminal_reason,
+                lease_expires_at,
+                tool_calls_used,
+                mutation_calls_used,
+                completed_at,
+            )| {
+                let terminal_reason_valid = match (state.as_str(), terminal_reason.as_deref()) {
+                    ("active", None) | ("completed", Some("completed")) => true,
+                    (
+                        "revoked",
+                        Some(
+                            "cancelled" | "failed" | "lease_expired" | "parent_inactive"
+                            | "parent_cancelled" | "parent_resolved",
+                        ),
+                    ) => true,
+                    _ => false,
+                };
+                if !terminal_reason_valid
+                    || (state == "active" && completed_at.is_some())
+                    || (state != "active" && completed_at.is_none())
+                {
+                    return Err("Stored subtask authority lifecycle is inconsistent.".to_string());
+                }
+                Ok(SubtaskAuthorityStatus {
+                    authority_id: from_i64(authority_id, "subtask authority ID")?,
+                    state: state.clone(),
+                    terminal_reason,
+                    lease_expires_at: (state == "active")
+                        .then(|| from_i64(lease_expires_at, "subtask authority lease"))
+                        .transpose()?,
+                    tool_calls_used: u32::try_from(from_i64(
+                        tool_calls_used,
+                        "subtask tool usage",
+                    )?)
+                    .map_err(|_| "Subtask tool usage exceeds u32.".to_string())?,
+                    mutation_calls_used: u32::try_from(from_i64(
+                        mutation_calls_used,
+                        "subtask mutation usage",
+                    )?)
+                    .map_err(|_| "Subtask mutation usage exceeds u32.".to_string())?,
+                    completed_at: completed_at
+                        .map(|value| from_i64(value, "subtask completion timestamp"))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn subtask_authority_descriptor_matches_on(
+    connection: &Connection,
+    authority: &SubtaskToolAuthority,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1
+                 FROM scheduler_subtask_authorities authorities
+                 JOIN scheduler_subtask_attempts subtask_attempts
+                   ON subtask_attempts.subtask_attempt_id = authorities.subtask_attempt_id
+                 JOIN scheduler_prepared_subtasks subtasks
+                   ON subtasks.subtask_id = subtask_attempts.subtask_id
+                 JOIN scheduler_task_attempts parent_attempts
+                   ON parent_attempts.attempt_id = authorities.parent_attempt_id
+                WHERE authorities.authority_id = ?1
+                  AND authorities.authority_fencing_token = ?2
+                  AND authorities.lease_expires_at = ?3
+                  AND authorities.parent_attempt_id = ?4
+                  AND authorities.parent_fencing_token = ?5
+                  AND subtask_attempts.subtask_attempt_id = ?6
+                  AND subtask_attempts.attempt_number = ?7
+                  AND subtask_attempts.fencing_token = ?8
+                  AND subtasks.subtask_id = ?9
+                  AND subtasks.session_id = ?10
+                  AND subtasks.objective_id = ?11
+                  AND parent_attempts.session_id = ?10
+                  AND parent_attempts.attempt_number = ?12
+                  AND parent_attempts.owner_id = ?13
+                  AND parent_attempts.fencing_token = ?5
+             )",
+            params![
+                to_i64(authority.authority_id)?,
+                to_i64(authority.authority_fencing_token)?,
+                to_i64(authority.lease_expires_at)?,
+                to_i64(authority.parent_attempt_id)?,
+                to_i64(authority.parent_fencing_token)?,
+                to_i64(authority.subtask_attempt_id)?,
+                i64::from(authority.subtask_attempt),
+                to_i64(authority.subtask_fencing_token)?,
+                to_i64(authority.subtask_id)?,
+                to_i64(authority.session_id.0)?,
+                authority.objective_id,
+                i64::from(authority.parent_attempt),
+                to_i64(authority.parent_owner_id)?
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| format!("Failed to validate subtask authority descriptor: {error}"))
+}
+
+fn recover_subtask_authorities_on(
+    transaction: &Transaction<'_>,
+    now: u64,
+) -> Result<usize, String> {
+    transaction
+        .execute(
+            "UPDATE scheduler_subtask_authorities AS authorities
+                SET state = 'revoked',
+                    terminal_reason = CASE
+                      WHEN authorities.lease_expires_at <= ?1 THEN 'lease_expired'
+                      ELSE 'parent_inactive'
+                    END,
+                    completed_at = ?1,
+                    updated_at = ?1
+              WHERE authorities.state = 'active'
+                AND (
+                  authorities.lease_expires_at <= ?1
+                  OR NOT EXISTS (
+                    SELECT 1
+                      FROM scheduler_task_attempts attempts
+                      JOIN scheduler_task_sessions sessions
+                        ON sessions.active_attempt_id = attempts.attempt_id
+                     WHERE attempts.attempt_id = authorities.parent_attempt_id
+                       AND attempts.fencing_token = authorities.parent_fencing_token
+                       AND attempts.state = 'running'
+                       AND attempts.lease_expires_at > ?1
+                       AND sessions.state = 'running'
+                       AND sessions.lease_expires_at > ?1
+                  )
+                )",
+            params![to_i64(now)?],
+        )
+        .map_err(|error| format!("Failed to recover expired subtask authorities: {error}"))
+}
+
+fn revoke_subtask_authorities_for_parent_on(
+    transaction: &Transaction<'_>,
+    parent_attempt_id: u64,
+    now: u64,
+    reason: &str,
+) -> Result<usize, String> {
+    if !matches!(reason, "parent_cancelled" | "parent_resolved") {
+        return Err("Subtask parent revocation reason is invalid.".to_string());
+    }
+    transaction
+        .execute(
+            "UPDATE scheduler_subtask_authorities
+                SET state = 'revoked', terminal_reason = ?2,
+                    completed_at = ?3, updated_at = ?3
+              WHERE parent_attempt_id = ?1 AND state = 'active'",
+            params![to_i64(parent_attempt_id)?, reason, to_i64(now)?],
+        )
+        .map_err(|error| format!("Failed to revoke parent subtask authorities: {error}"))
+}
+
 fn external_authority_is_current_on(
     connection: &Connection,
     authority: &ExternalAssignmentAuthority,
@@ -5233,14 +5755,16 @@ fn recover_expired_in_transaction(
     transaction: &Transaction<'_>,
     now: u64,
 ) -> Result<Vec<TaskSessionId>, String> {
-    recover_matching_attempts(
+    let recovered = recover_matching_attempts(
         transaction,
         "attempts.lease_expires_at <= ?1",
         params![to_i64(now)?],
         now,
         "Assignment lease expired.",
         "assignment_lease_expired",
-    )
+    )?;
+    recover_subtask_authorities_on(transaction, now)?;
+    Ok(recovered)
 }
 
 fn recover_matching_attempts<P: rusqlite::Params>(
@@ -5951,6 +6475,21 @@ mod tests {
             "scheduler_subtask_authorities",
         ] {
             assert!(scheduler_tables.iter().any(|table| table == expected));
+        }
+        let subtask_authority_columns = store
+            .connection
+            .lock()
+            .expect("scheduler connection")
+            .prepare("PRAGMA table_info(scheduler_subtask_authorities)")
+            .expect("subtask authority columns prepared")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("subtask authority columns queried")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("subtask authority columns read");
+        for expected in ["completed_at", "terminal_reason"] {
+            assert!(subtask_authority_columns
+                .iter()
+                .any(|column| column == expected));
         }
     }
 
@@ -8340,6 +8879,255 @@ mod tests {
         )
         .expect_err("budget remains exhausted")
         .contains("budget is exhausted"));
+    }
+
+    #[test]
+    fn subtask_renewal_and_terminal_resolution_are_exact_and_restart_safe() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("scheduler.db");
+        let (store, _session_id, parent, subtasks) = active_subtask_test_context(path.clone());
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let authority = store
+            .activate_prepared_subtask(parent, subtasks[0].fence, Duration::from_secs(5), &permit)
+            .expect("subtask activates");
+        assert_eq!(
+            store
+                .recover_subtask_authorities()
+                .expect("live authority needs no recovery"),
+            0
+        );
+        let renewed = SchedulerStore::renew_subtask_authority(&authority, Duration::from_secs(20))
+            .expect("exact lease renews");
+        let now = now_millis();
+        assert!(renewed.lease_expires_at > authority.lease_expires_at);
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &authority,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("old lease descriptor becomes stale")
+        .contains("stale, expired, or incompatible"));
+        assert!(
+            SchedulerStore::renew_subtask_authority_at(&authority, now, 25_000)
+                .expect_err("old lease cannot renew twice")
+                .contains("exact lease fence")
+        );
+
+        let admission = SchedulerStore::admit_subtask_tool_call(
+            &renewed,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect("renewed authority admits tools");
+        assert_eq!(admission.tool_calls_used, 1);
+        let completed =
+            SchedulerStore::resolve_subtask_authority(&renewed, SubtaskAuthorityOutcome::Completed)
+                .expect("subtask completes");
+        assert_eq!(completed.state, "completed");
+        assert_eq!(completed.terminal_reason.as_deref(), Some("completed"));
+        assert_eq!(completed.tool_calls_used, 1);
+        assert_eq!(completed.lease_expires_at, None);
+        assert_eq!(
+            SchedulerStore::resolve_subtask_authority_at(
+                &renewed,
+                SubtaskAuthorityOutcome::Completed,
+                now + 2,
+            )
+            .expect("identical completion replay is idempotent"),
+            completed
+        );
+        assert!(SchedulerStore::resolve_subtask_authority_at(
+            &renewed,
+            SubtaskAuthorityOutcome::Failed,
+            now + 2,
+        )
+        .expect_err("different terminal outcome conflicts")
+        .contains("different terminal outcome"));
+        let mut forged = renewed.clone();
+        forged.subtask_id += 1;
+        assert!(SchedulerStore::resolve_subtask_authority_at(
+            &forged,
+            SubtaskAuthorityOutcome::Completed,
+            now + 2,
+        )
+        .expect_err("forged terminal replay fails")
+        .contains("descriptor is stale"));
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &renewed,
+            "external_tools:jira",
+            SubtaskToolRisk::Read,
+        )
+        .expect_err("completed authority cannot call tools")
+        .contains("stale, expired, or incompatible"));
+
+        let cancelled_authority = store
+            .activate_prepared_subtask(parent, subtasks[1].fence, Duration::from_secs(10), &permit)
+            .expect("second subtask activates");
+        let cancelled = SchedulerStore::resolve_subtask_authority(
+            &cancelled_authority,
+            SubtaskAuthorityOutcome::Cancelled,
+        )
+        .expect("explicit cancellation revokes authority");
+        assert_eq!(cancelled.state, "revoked");
+        assert_eq!(cancelled.terminal_reason.as_deref(), Some("cancelled"));
+
+        drop(store);
+        let reopened = SchedulerStore::open_query_at(path).expect("query store reopens");
+        assert_eq!(
+            reopened
+                .subtask_authority_status(completed.authority_id)
+                .expect("status loads after restart"),
+            Some(completed)
+        );
+    }
+
+    #[test]
+    fn subtask_expiry_cancellation_and_parent_resolution_revoke_durably() {
+        let expiry_directory = tempdir().expect("expiry directory");
+        let (expiry_store, _session_id, expiry_parent, expiry_subtasks) =
+            active_subtask_test_context(expiry_directory.path().join("scheduler.db"));
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let expiring = expiry_store
+            .activate_prepared_subtask(
+                expiry_parent,
+                expiry_subtasks[0].fence,
+                Duration::from_secs(5),
+                &permit,
+            )
+            .expect("expiring subtask activates");
+        assert!(SchedulerStore::resolve_subtask_authority_at(
+            &expiring,
+            SubtaskAuthorityOutcome::Completed,
+            expiring.lease_expires_at,
+        )
+        .expect_err("expired authority cannot claim completion")
+        .contains("cannot report completion"));
+        assert_eq!(
+            expiry_store
+                .recover_subtask_authorities_at(expiring.lease_expires_at)
+                .expect("expired authority recovers"),
+            1
+        );
+        let expired = expiry_store
+            .subtask_authority_status(expiring.authority_id)
+            .expect("expired status loads")
+            .expect("expired status exists");
+        assert_eq!(expired.state, "revoked");
+        assert_eq!(expired.terminal_reason.as_deref(), Some("lease_expired"));
+        assert_eq!(
+            expiry_store
+                .recover_subtask_authorities_at(expiring.lease_expires_at + 1)
+                .expect("recovery is idempotent"),
+            0
+        );
+
+        let cancel_directory = tempdir().expect("cancel directory");
+        let (cancel_store, cancel_session, cancel_parent, cancel_subtasks) =
+            active_subtask_test_context(cancel_directory.path().join("scheduler.db"));
+        let cancelled = cancel_store
+            .activate_prepared_subtask(
+                cancel_parent,
+                cancel_subtasks[0].fence,
+                Duration::from_secs(20),
+                &SchedulerStore::test_subtask_dispatch_permit(),
+            )
+            .expect("cancelled subtask activates");
+        cancel_store
+            .cancel_at(cancel_session, now_millis())
+            .expect("parent cancellation starts");
+        let cancelled_status = cancel_store
+            .subtask_authority_status(cancelled.authority_id)
+            .expect("cancelled status loads")
+            .expect("cancelled status exists");
+        assert_eq!(cancelled_status.state, "revoked");
+        assert_eq!(
+            cancelled_status.terminal_reason.as_deref(),
+            Some("parent_cancelled")
+        );
+
+        let resolved_directory = tempdir().expect("resolved directory");
+        let (resolved_store, _resolved_session, resolved_parent, resolved_subtasks) =
+            active_subtask_test_context(resolved_directory.path().join("scheduler.db"));
+        let resolved = resolved_store
+            .activate_prepared_subtask(
+                resolved_parent,
+                resolved_subtasks[0].fence,
+                Duration::from_secs(20),
+                &SchedulerStore::test_subtask_dispatch_permit(),
+            )
+            .expect("resolved subtask activates");
+        resolved_store
+            .resolve_assignment_at(
+                resolved_parent,
+                DurableOutcome::Failed("parent failed".to_string()),
+                now_millis(),
+            )
+            .expect("parent resolves");
+        let resolved_status = resolved_store
+            .subtask_authority_status(resolved.authority_id)
+            .expect("resolved status loads")
+            .expect("resolved status exists");
+        assert_eq!(resolved_status.state, "revoked");
+        assert_eq!(
+            resolved_status.terminal_reason.as_deref(),
+            Some("parent_resolved")
+        );
+
+        let direct_cancel_directory = tempdir().expect("direct cancel directory");
+        let (
+            direct_cancel_store,
+            _direct_cancel_session,
+            direct_cancel_parent,
+            direct_cancel_subtasks,
+        ) = active_subtask_test_context(direct_cancel_directory.path().join("scheduler.db"));
+        let directly_cancelled = direct_cancel_store
+            .activate_prepared_subtask(
+                direct_cancel_parent,
+                direct_cancel_subtasks[0].fence,
+                Duration::from_secs(20),
+                &SchedulerStore::test_subtask_dispatch_permit(),
+            )
+            .expect("directly cancelled subtask activates");
+        direct_cancel_store
+            .resolve_assignment_at(
+                direct_cancel_parent,
+                DurableOutcome::Cancelled,
+                now_millis(),
+            )
+            .expect("parent reports cancellation");
+        let directly_cancelled_status = direct_cancel_store
+            .subtask_authority_status(directly_cancelled.authority_id)
+            .expect("direct cancellation status loads")
+            .expect("direct cancellation status exists");
+        assert_eq!(directly_cancelled_status.state, "revoked");
+        assert_eq!(
+            directly_cancelled_status.terminal_reason.as_deref(),
+            Some("parent_cancelled")
+        );
+
+        let owner_directory = tempdir().expect("owner directory");
+        let (owner_store, _owner_session, owner_parent, owner_subtasks) =
+            active_subtask_test_context(owner_directory.path().join("scheduler.db"));
+        let abandoned = owner_store
+            .activate_prepared_subtask(
+                owner_parent,
+                owner_subtasks[0].fence,
+                Duration::from_secs(20),
+                &SchedulerStore::test_subtask_dispatch_permit(),
+            )
+            .expect("owner subtask activates");
+        owner_store
+            .abandon_owner(owner_parent.owner_id)
+            .expect("scheduler owner shuts down");
+        let abandoned_status = owner_store
+            .subtask_authority_status(abandoned.authority_id)
+            .expect("abandoned status loads")
+            .expect("abandoned status exists");
+        assert_eq!(abandoned_status.state, "revoked");
+        assert_eq!(
+            abandoned_status.terminal_reason.as_deref(),
+            Some("parent_inactive")
+        );
     }
 
     #[test]

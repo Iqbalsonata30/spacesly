@@ -13,9 +13,27 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Four vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, and scheduler-owned dormant subtask identities. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Six vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, and fail-closed subtask lifecycle recovery. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed sixth vertical slice: staged subtask dispatch lifecycle and fail-closed recovery.
+
+- Exact lease renewal reopens the authority's scheduler instance, verifies the current parent attempt/fence/owner/session, revalidates the immutable subtask contract and current parent grants, and returns a new descriptor whose lease cannot exceed the parent lease. The old descriptor cannot renew or call tools afterward.
+- Completion, cancellation, and failure are explicit fenced transitions. An identical exact-descriptor replay returns the persisted terminal result; a different outcome, forged identity, stale fence, or incompatible stored row fails closed.
+- Successful completion requires an unexpired child lease and live exact parent authority. Cancellation and failure revoke without claiming completion. Terminal rows retain only fixed lifecycle reasons, timestamps, and consumed budget counters.
+- Parent cancellation and result resolution revoke active subtasks atomically with the parent transition. Periodic lease recovery, claim-time recovery, and owner abandonment also recover child rows, using `lease_expired` when the child lease elapsed and `parent_inactive` when its exact parent is no longer live.
+- Restart-safe status queries expose the bounded lifecycle projection without granting tool access. Migration adds nullable terminal timestamp/reason columns so existing dormant and active records remain compatible.
+- The executor's preparation event and rendered Activity now report `Dispatch lifecycle: staged`, `Lease recovery: fail closed`, and that lease expiry, cancellation, or parent completion revokes staged authority. The existing `Activation gate: closed` statement remains visible.
+- The private dispatch permit is still inaccessible to the application executor and Worker pool. This slice proves scheduler lifecycle behavior only; it does not start specialized Workers or advertise multi-agent execution.
+
+Phase 14 sixth-increment regression evidence:
+
+- Scheduler lifecycle tests cover first renewal, stale old descriptors, double-renew fencing, post-renew admission, exact completion replay, conflicting and forged terminal outcomes, explicit cancellation, post-terminal rejection, restart-safe status, expired-completion rejection, idempotent expiry recovery, parent cancellation/resolution, and owner abandonment.
+- Existing activation tests continue to cover exact authority binding, parent-grant containment, persisted budget accounting, and concurrent admission limits. Legacy migration coverage verifies the terminal lifecycle columns.
+- Full Rust suite: 526 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Full rendered browser suite: 12 passed, 0 failed, including the staged subtask lifecycle explanation.
 
 Completed fifth vertical slice: scheduler-only subtask activation and atomic tool-budget admission.
 
@@ -120,8 +138,8 @@ Phase 14 fourth-increment regression evidence:
 
 Remaining Phase 14 work:
 
-- Add scheduler-owned subtask dispatch, renewal, explicit revocation/completion, and lease/owner recovery before exposing the private activation permit.
-- Narrow grants deterministically per objective and aggregate independently verified subtask evidence into the parent result.
+- Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
+- Narrow grants deterministically per objective and independently verify and aggregate subtask evidence into the parent result before accepting parent completion.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.
 
