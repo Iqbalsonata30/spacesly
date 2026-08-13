@@ -572,7 +572,18 @@ Completed twelfth increment: exact Kubernetes Deployment verifier-to-objective b
 - Scheduler evidence admission accepts schema versions 2 through 4 for compatibility. Version-4 attestations must match an assigned verifier identity/method whose immutable authority mode is `read_only`.
 - Production dispatch remains closed. This increment does not invoke Kubernetes, activate verifier authority, or aggregate a verifier result into parent completion.
 
-The next binding increments should add Bamboo, Jira, and Confluence with exact connector read-tool authority and provider resource identity. Scheduler-owned verifier launch and parent aggregation remain separate later work.
+This established resource-bound verifier authority for the trusted Kubernetes adapter. Connector-backed providers additionally require an exact read-operation binding.
+
+Completed thirteenth increment: exact Bamboo build-result verifier-to-objective binding.
+
+- Prepared subtask contract schema version 5 adds canonical read tool and argument identities to connector-backed verifier assignments. Compilation and retained validation require that exact tool to exist in the assigned objective's already-narrowed connector allowlist.
+- A ready Bamboo verifier binds only when `build.result_key` is immutable, exactly one Bamboo/build objective contains that full normalized result key, and the objective retained the Rules-selected connector plus read operation.
+- Bamboo assignments persist the canonical read tool and result-key argument, `read_only` mode, capability digest, terminal-state digest, and a digest of connector/build/result identity. The raw build key is not retained in subtask verifier authority or Activity.
+- Full identity matching preserves numeric suffixes and token boundaries, preventing similar result keys such as `...-42` and `...-43` from cross-binding.
+- Missing or ambiguous objectives, dynamic trigger-derived result identities, absent read-tool authority, malformed candidates, and mismatched build keys remain unassigned.
+- Production dispatch remains closed. The existing parent Worker still resolves trusted trigger receipts and performs Bamboo terminal verification.
+
+The next binding increments should add Jira and Confluence. Dynamic Bamboo trigger-result handoff requires a later scheduler-owned, receipt-bound contract revision rather than model inference.
 
 Benefits:
 

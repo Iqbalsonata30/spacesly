@@ -717,8 +717,8 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       grant_policy: "objective_tool_operations_v3",
       evidence_gate: "independent_attestation_required",
       evidence_aggregation: "all_verified_and_completed",
-      verifier_binding_policy: "objective_terminal_state_v2",
-      assigned_verifier_count: 2,
+      verifier_binding_policy: "objective_terminal_state_v3",
+      assigned_verifier_count: 3,
       unassigned_verifier_count: 0,
       verified_subtask_count: 0,
       rejected_subtask_count: 0,
@@ -744,7 +744,7 @@ assertEqual(
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(
-    "Git/Kubernetes verifiers assigned to exact objectives: 2",
+    "Git/Kubernetes/Bamboo verifiers assigned to exact objectives: 3",
   ),
   true,
   "subtask preparation should expose only the safe assigned verifier count",
@@ -762,6 +762,13 @@ assertEqual(
   ),
   true,
   "subtask preparation should explain Kubernetes verifier identity and authority",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Bamboo verifier authority binds the exact read tool and argument plus a digested build identity",
+  ),
+  true,
+  "subtask preparation should explain exact Bamboo read authority",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

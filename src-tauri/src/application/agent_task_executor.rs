@@ -721,6 +721,8 @@ fn prepare_subtask_verifier_candidates(
                     required_states: binding.required_states.clone(),
                     required_capability: "git".to_string(),
                     resource_identity: None,
+                    read_tool: None,
+                    read_argument: None,
                 },
             ),
             "kubernetes" => Some(
@@ -740,6 +742,29 @@ fn prepare_subtask_verifier_candidates(
                             scope: binding.namespace.clone()?,
                         },
                     ),
+                    read_tool: None,
+                    read_argument: None,
+                },
+            ),
+            "bamboo" => Some(
+                crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
+                    verifier_id: binding.verifier_id.clone(),
+                    provider: binding.provider.clone(),
+                    verification_method: "bamboo_build_result_v1".to_string(),
+                    required_states: binding.required_states.clone(),
+                    required_capability: format!(
+                        "external_tools:{}",
+                        binding.connector_id.as_deref()?
+                    ),
+                    resource_identity: Some(
+                        crate::domain::subtask_authority::SubtaskVerifierResourceIdentity {
+                            resource_kind: binding.resource_kind.clone()?,
+                            resource_name: binding.resource_name.clone()?,
+                            scope: binding.connector_id.clone()?,
+                        },
+                    ),
+                    read_tool: binding.read_tool.clone(),
+                    read_argument: binding.read_argument.clone(),
                 },
             ),
             _ => None,
@@ -2958,6 +2983,14 @@ impl TaskExecutor for AgentTaskExecutor {
                 },
             );
         examination.evidence_verifier_bindings = evidence_verifier_bindings;
+        let supported_ready_subtask_verifiers = examination
+            .evidence_verifier_bindings
+            .iter()
+            .filter(|binding| {
+                binding.status == "ready"
+                    && matches!(binding.provider.as_str(), "git" | "kubernetes" | "bamboo")
+            })
+            .count();
         let subtask_verifier_candidates = prepare_subtask_verifier_candidates(
             &examination.evidence_verifier_bindings,
             trusted_kubernetes_connector_id.as_deref(),
@@ -2971,7 +3004,15 @@ impl TaskExecutor for AgentTaskExecutor {
             )
             .map_err(TaskExecutionError::new)?;
         let assigned_subtask_verifiers = subtask_verifier_summary.assigned_verifiers;
-        let unassigned_subtask_verifiers = subtask_verifier_summary.unassigned_verifiers;
+        let unassigned_subtask_verifiers = subtask_verifier_summary
+            .unassigned_verifiers
+            .saturating_add(
+                u32::try_from(
+                    supported_ready_subtask_verifiers
+                        .saturating_sub(subtask_verifier_candidates.len()),
+                )
+                .unwrap_or(u32::MAX),
+            );
         examination.prepared_subtasks = subtask_verifier_summary.contracts;
         let bound_evidence_verifiers = examination.evidence_verifier_bindings.clone();
         let evidence_repository_root = default_repository_root.clone();
@@ -3194,7 +3235,7 @@ impl TaskExecutor for AgentTaskExecutor {
                     "grant_policy": "objective_tool_operations_v3",
                     "evidence_gate": "independent_attestation_required",
                     "evidence_aggregation": "all_verified_and_completed",
-                    "verifier_binding_policy": "objective_terminal_state_v2",
+                    "verifier_binding_policy": "objective_terminal_state_v3",
                     "assigned_verifier_count": assigned_subtask_verifiers,
                     "unassigned_verifier_count": unassigned_subtask_verifiers,
                     "verified_subtask_count": 0,
@@ -7174,6 +7215,15 @@ mod tests {
             records[0].resource_name.as_deref(),
             Some("PAYROLL-DEPLOY-42")
         );
+        let candidates = prepare_subtask_verifier_candidates(&records, None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].verification_method, "bamboo_build_result_v1");
+        assert_eq!(
+            candidates[0].required_capability,
+            "external_tools:corporate-bamboo"
+        );
+        assert_eq!(candidates[0].read_tool.as_deref(), Some("bamboo_get_build"));
+        assert_eq!(candidates[0].read_argument.as_deref(), Some("result_key"));
 
         let (dynamic_records, dynamic_blockers) = resolve_evidence_verifier_bindings(
             &json!({"build": {"provider": "bamboo"}}),
@@ -7205,6 +7255,7 @@ mod tests {
         assert!(dynamic_records[0]
             .reason
             .contains("trusted trigger receipt"));
+        assert!(prepare_subtask_verifier_candidates(&dynamic_records, None).is_empty());
 
         let (records, blockers) = resolve_evidence_verifier_bindings(
             &json!({"build": {"provider": "bamboo", "result_key": "PAYROLL-DEPLOY-42"}}),

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 2;
-const RESOURCE_BOUND_VERIFIER_SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 4;
+const CONNECTOR_READ_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 5;
 const MAX_SUBTASKS: usize = 8;
 const TOTAL_WALL_CLOCK_SECONDS: u64 = 3_600;
 const TOTAL_TOOL_CALLS: u32 = 64;
@@ -35,6 +35,10 @@ pub struct PreparedSubtaskEvidenceVerifier {
     pub authority_capability_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_identity_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_argument: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +56,8 @@ pub struct SubtaskEvidenceVerifierCandidate {
     pub required_states: Vec<String>,
     pub required_capability: String,
     pub resource_identity: Option<SubtaskVerifierResourceIdentity>,
+    pub read_tool: Option<String>,
+    pub read_argument: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,11 +197,11 @@ pub fn prepare_subtask_contracts(
         .collect()
 }
 
-/// Prepares version-4 contracts and assigns each supported verifier to one unambiguous objective.
+/// Prepares version-5 contracts and assigns each supported verifier to one unambiguous objective.
 ///
-/// Git terminal-state and Kubernetes Deployment-availability verification are the supported
-/// binding slices. Unknown providers, missing objective signals, missing narrowed authority, and
-/// ties stay unassigned and therefore cannot attest a subtask.
+/// Git terminal-state, Kubernetes Deployment-availability, and immutable-result Bamboo
+/// verification are the supported binding slices. Unknown providers, missing objective signals,
+/// missing narrowed authority, and ties stay unassigned and therefore cannot attest a subtask.
 pub fn prepare_subtask_contracts_with_verifiers(
     contract: &Value,
     parent_contract_digest: &str,
@@ -248,6 +254,12 @@ pub fn prepare_subtask_contracts_with_verifiers(
         if !prepared
             .granted_capabilities
             .contains(&candidate.required_capability)
+            || candidate.read_tool.as_ref().is_some_and(|tool| {
+                prepared
+                    .allowed_connector_tools
+                    .get(&candidate.required_capability)
+                    .is_none_or(|tools| !tools.contains(tool))
+            })
         {
             unassigned = unassigned.saturating_add(1);
             continue;
@@ -286,6 +298,8 @@ pub fn prepare_subtask_contracts_with_verifiers(
                 authority_mode: "read_only".to_string(),
                 authority_capability_digest,
                 resource_identity_digest,
+                read_tool: candidate.read_tool,
+                read_argument: candidate.read_argument,
             },
         );
         assigned = assigned.saturating_add(1);
@@ -305,7 +319,7 @@ pub fn prepare_subtask_contracts_with_verifiers(
         let mut objective_bindings = bindings.remove(&prepared.objective_id).unwrap_or_default();
         objective_bindings.sort();
         contracts.push(compile_subtask_contract_with_tools_and_verifiers(
-            RESOURCE_BOUND_VERIFIER_SUBTASK_CONTRACT_SCHEMA_VERSION,
+            CONNECTOR_READ_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION,
             parent_contract_digest,
             parent_capabilities,
             evidence,
@@ -667,7 +681,7 @@ fn compile_subtask_contract_with_tools_and_verifiers(
     allowed_connector_tools: BTreeMap<String, Vec<String>>,
     evidence_verifiers: Vec<PreparedSubtaskEvidenceVerifier>,
 ) -> Result<PreparedSubtaskContract, String> {
-    if !matches!(schema_version, 2 | 3 | 4)
+    if !matches!(schema_version, 2 | 3 | 4 | 5)
         || (schema_version < 3 && !evidence_verifiers.is_empty())
         || evidence_verifiers.len() > 64
         || evidence_verifiers.windows(2).any(|pair| pair[0] >= pair[1])
@@ -679,8 +693,12 @@ fn compile_subtask_contract_with_tools_and_verifiers(
                 || (schema_version < 4
                     && (!binding.authority_mode.is_empty()
                         || !binding.authority_capability_digest.is_empty()
-                        || binding.resource_identity_digest.is_some()))
+                        || binding.resource_identity_digest.is_some()
+                        || binding.read_tool.is_some()
+                        || binding.read_argument.is_some()))
                 || (schema_version == 4
+                    && (binding.read_tool.is_some() || binding.read_argument.is_some()))
+                || (schema_version >= 4
                     && (binding.authority_mode != "read_only"
                         || !valid_sha256_digest(&binding.authority_capability_digest)
                         || binding
@@ -689,6 +707,19 @@ fn compile_subtask_contract_with_tools_and_verifiers(
                             .is_some_and(|value| !valid_sha256_digest(value))
                         || (binding.provider == "kubernetes"
                             && binding.resource_identity_digest.is_none())))
+                || (schema_version == 5
+                    && (binding
+                        .read_tool
+                        .as_deref()
+                        .is_some_and(|value| !canonical_tool_name(value))
+                        || binding
+                            .read_argument
+                            .as_deref()
+                            .is_some_and(|value| !canonical_name(value))
+                        || (binding.provider == "bamboo"
+                            && (binding.resource_identity_digest.is_none()
+                                || binding.read_tool.is_none()
+                                || binding.read_argument.is_none()))))
         })
     {
         return Err("Subtask verifier authority is invalid.".to_string());
@@ -721,7 +752,7 @@ fn compile_subtask_contract_with_tools_and_verifiers(
     {
         return Err("Subtask requested authority that the parent does not possess.".to_string());
     }
-    if schema_version == 4
+    if schema_version >= 4
         && evidence_verifiers.iter().any(|binding| {
             !requested.iter().any(|capability| {
                 subtask_authority_capability_digest(capability)
@@ -730,6 +761,21 @@ fn compile_subtask_contract_with_tools_and_verifiers(
         })
     {
         return Err("Subtask verifier capability authority is not granted.".to_string());
+    }
+    if schema_version == 5
+        && evidence_verifiers.iter().any(|binding| {
+            binding.read_tool.as_ref().is_some_and(|tool| {
+                !requested.iter().any(|capability| {
+                    subtask_authority_capability_digest(capability)
+                        == binding.authority_capability_digest
+                        && allowed_connector_tools
+                            .get(capability)
+                            .is_some_and(|tools| tools.contains(tool))
+                })
+            })
+        })
+    {
+        return Err("Subtask verifier read operation authority is not granted.".to_string());
     }
     if allowed_connector_tools.iter().any(|(capability, tools)| {
         !capability.starts_with("external_tools:")
@@ -797,12 +843,29 @@ fn validate_verifier_candidate(candidate: &SubtaskEvidenceVerifierCandidate) -> 
                     || !canonical_resource_identity_component(&identity.scope)
             })
         || (candidate.provider == "git" && candidate.resource_identity.is_some())
+        || candidate
+            .read_tool
+            .as_deref()
+            .is_some_and(|value| !canonical_tool_name(value))
+        || candidate
+            .read_argument
+            .as_deref()
+            .is_some_and(|value| !canonical_name(value))
+        || (candidate.read_tool.is_some() != candidate.read_argument.is_some())
         || (candidate.provider == "kubernetes"
             && (candidate.required_states != ["deployment_available"]
                 || candidate
                     .resource_identity
                     .as_ref()
                     .is_none_or(|identity| identity.resource_kind != "deployment")))
+        || (candidate.provider == "bamboo"
+            && (candidate.required_states != ["successful_build"]
+                || candidate
+                    .resource_identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.resource_kind != "build")
+                || candidate.read_tool.is_none()
+                || candidate.read_argument.is_none()))
     {
         return Err("Subtask verifier candidate is invalid.".to_string());
     }
@@ -816,6 +879,7 @@ fn verifier_matches_objective(
     match candidate.provider.as_str() {
         "git" => git_verifier_matches_objective(candidate, objective),
         "kubernetes" => kubernetes_verifier_matches_objective(candidate, objective),
+        "bamboo" => bamboo_verifier_matches_objective(candidate, objective),
         _ => false,
     }
 }
@@ -851,12 +915,56 @@ fn kubernetes_verifier_matches_objective(
         &signals,
         &["deployment", "kubernetes", "openshift", "ocp", "workload"],
     );
-    let resource_signals = signal_tokens(&identity.resource_name);
-    has_deployment_scope
-        && !resource_signals.is_empty()
-        && resource_signals
-            .iter()
-            .all(|signal| signals.contains(signal))
+    has_deployment_scope && objective_contains_resource_identity(objective, &identity.resource_name)
+}
+
+fn bamboo_verifier_matches_objective(
+    candidate: &SubtaskEvidenceVerifierCandidate,
+    objective: &Value,
+) -> bool {
+    let Some(identity) = candidate.resource_identity.as_ref() else {
+        return false;
+    };
+    let signals = objective_all_signal_tokens(objective);
+    let has_build_scope = contains_signal(&signals, &["bamboo", "build", "result"]);
+    has_build_scope && objective_contains_resource_identity(objective, &identity.resource_name)
+}
+
+fn objective_contains_resource_identity(objective: &Value, resource_identity: &str) -> bool {
+    let expected = normalized_identity_sequence(resource_identity);
+    if expected.is_empty() {
+        return false;
+    }
+    let needle = format!("-{expected}-");
+    ["summary", "success_evidence"]
+        .into_iter()
+        .filter_map(|field| objective.get(field).and_then(Value::as_str))
+        .chain(
+            ["operation_hints", "resource_hints"]
+                .into_iter()
+                .flat_map(|field| {
+                    objective
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .take(16)
+                }),
+        )
+        .any(|value| {
+            let normalized = normalized_identity_sequence(value);
+            format!("-{normalized}-").contains(&needle)
+        })
+}
+
+fn normalized_identity_sequence(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn normalized_capabilities(values: &[String]) -> Result<Vec<String>, String> {
@@ -992,6 +1100,8 @@ mod tests {
                 ],
                 required_capability: "git".to_string(),
                 resource_identity: None,
+                read_tool: None,
+                read_argument: None,
             }],
         )
         .expect("Git verifier binds");
@@ -1001,7 +1111,7 @@ mod tests {
         assert!(summary
             .contracts
             .iter()
-            .all(|item| item.schema_version == 4));
+            .all(|item| item.schema_version == 5));
         assert!(summary.contracts[0].evidence_verifiers.is_empty());
         assert_eq!(summary.contracts[1].evidence_verifiers.len(), 1);
         assert_eq!(
@@ -1033,6 +1143,8 @@ mod tests {
                 ],
                 required_capability: "git".to_string(),
                 resource_identity: None,
+                read_tool: None,
+                read_argument: None,
             }],
         )
         .expect("state and capability order is canonical");
@@ -1049,6 +1161,8 @@ mod tests {
                 required_states: vec!["new_commit".to_string()],
                 required_capability: "git".to_string(),
                 resource_identity: None,
+                read_tool: None,
+                read_argument: None,
             }],
         )
         .expect("changed verifier requirement prepares");
@@ -1097,6 +1211,8 @@ mod tests {
                 resource_name: "payroll-api".to_string(),
                 scope: "prerelease".to_string(),
             }),
+            read_tool: None,
+            read_argument: None,
         };
         let summary = prepare_subtask_contracts_with_verifiers(
             &contract,
@@ -1114,7 +1230,7 @@ mod tests {
         assert_eq!(summary.unassigned_verifiers, 0);
         assert!(summary.contracts[0].evidence_verifiers.is_empty());
         let binding = &summary.contracts[1].evidence_verifiers[0];
-        assert_eq!(summary.contracts[1].schema_version, 4);
+        assert_eq!(summary.contracts[1].schema_version, 5);
         assert_eq!(binding.authority_mode, "read_only");
         assert!(valid_sha256_digest(&binding.authority_capability_digest));
         assert!(binding
@@ -1183,6 +1299,8 @@ mod tests {
                 resource_name: "payroll-api".to_string(),
                 scope: "prerelease".to_string(),
             }),
+            read_tool: None,
+            read_argument: None,
         };
         let ambiguous = prepare_subtask_contracts_with_verifiers(
             &contract,
@@ -1206,6 +1324,130 @@ mod tests {
         .expect("missing Kubernetes connector authority narrows closed");
         assert_eq!(missing_authority.assigned_verifiers, 0);
         assert_eq!(missing_authority.unassigned_verifiers, 1);
+    }
+
+    #[test]
+    fn binds_bamboo_verifier_to_exact_build_and_connector_read_operation() {
+        let contract = serde_json::json!({
+            "capability_plan": {"connectors": [{
+                "connector_id": "corporate-bamboo",
+                "matched_domains": ["bamboo"],
+                "matched_intents": ["read build result"],
+                "matched_tools": ["bamboo_get_build"]
+            }]},
+            "semantic_plan": {"objectives": [
+                {
+                    "id": "inspect-chart",
+                    "summary": "Inspect the Helm chart",
+                    "success_evidence": "Chart content is understood",
+                    "operation_hints": ["read file"],
+                    "resource_hints": ["helm chart"],
+                    "mutation_expected": false
+                },
+                {
+                    "id": "verify-build",
+                    "summary": "Read Bamboo build result PAYROLL-DEPLOY-42",
+                    "success_evidence": "Bamboo PAYROLL-DEPLOY-42 build is successful",
+                    "operation_hints": ["get build"],
+                    "resource_hints": ["PAYROLL-DEPLOY-42 build result"],
+                    "mutation_expected": false
+                }
+            ]}
+        });
+        let candidate = SubtaskEvidenceVerifierCandidate {
+            verifier_id: "bamboo-build-state".to_string(),
+            provider: "bamboo".to_string(),
+            verification_method: "bamboo_build_result_v1".to_string(),
+            required_states: vec!["successful_build".to_string()],
+            required_capability: "external_tools:corporate-bamboo".to_string(),
+            resource_identity: Some(SubtaskVerifierResourceIdentity {
+                resource_kind: "build".to_string(),
+                resource_name: "PAYROLL-DEPLOY-42".to_string(),
+                scope: "corporate-bamboo".to_string(),
+            }),
+            read_tool: Some("bamboo_get_build".to_string()),
+            read_argument: Some("result_key".to_string()),
+        };
+        let summary = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["external_tools:corporate-bamboo".to_string()],
+            std::slice::from_ref(&candidate),
+        )
+        .expect("Bamboo verifier binds");
+
+        assert_eq!(summary.assigned_verifiers, 1);
+        assert_eq!(summary.unassigned_verifiers, 0);
+        assert!(summary.contracts[0].evidence_verifiers.is_empty());
+        let binding = &summary.contracts[1].evidence_verifiers[0];
+        assert_eq!(summary.contracts[1].schema_version, 5);
+        assert_eq!(binding.read_tool.as_deref(), Some("bamboo_get_build"));
+        assert_eq!(binding.read_argument.as_deref(), Some("result_key"));
+        assert!(binding
+            .resource_identity_digest
+            .as_deref()
+            .is_some_and(valid_sha256_digest));
+        let encoded = serde_json::to_string(&summary.contracts).expect("contracts encode");
+        assert!(!encoded.contains("PAYROLL-DEPLOY-42"));
+
+        let mut changed_identity = candidate.clone();
+        changed_identity.resource_identity = Some(SubtaskVerifierResourceIdentity {
+            resource_kind: "build".to_string(),
+            resource_name: "PAYROLL-DEPLOY-43".to_string(),
+            scope: "corporate-bamboo".to_string(),
+        });
+        let changed = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["external_tools:corporate-bamboo".to_string()],
+            &[changed_identity],
+        )
+        .expect("different build identity stays closed");
+        assert_eq!(changed.assigned_verifiers, 0);
+        assert_eq!(changed.unassigned_verifiers, 1);
+    }
+
+    #[test]
+    fn bamboo_verifier_without_exact_read_tool_authority_stays_closed() {
+        let contract = serde_json::json!({
+            "capability_plan": {"connectors": [{
+                "connector_id": "corporate-bamboo",
+                "matched_domains": ["bamboo"],
+                "matched_intents": ["trigger build"],
+                "matched_tools": ["bamboo_trigger_build"]
+            }]},
+            "semantic_plan": {"objectives": [{
+                "id": "verify-build",
+                "summary": "Read Bamboo build result PAYROLL-DEPLOY-42",
+                "success_evidence": "Bamboo PAYROLL-DEPLOY-42 build is successful",
+                "operation_hints": ["get build"],
+                "resource_hints": ["PAYROLL-DEPLOY-42 build result"],
+                "mutation_expected": false
+            }]}
+        });
+        let summary = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["external_tools:corporate-bamboo".to_string()],
+            &[SubtaskEvidenceVerifierCandidate {
+                verifier_id: "bamboo-build-state".to_string(),
+                provider: "bamboo".to_string(),
+                verification_method: "bamboo_build_result_v1".to_string(),
+                required_states: vec!["successful_build".to_string()],
+                required_capability: "external_tools:corporate-bamboo".to_string(),
+                resource_identity: Some(SubtaskVerifierResourceIdentity {
+                    resource_kind: "build".to_string(),
+                    resource_name: "PAYROLL-DEPLOY-42".to_string(),
+                    scope: "corporate-bamboo".to_string(),
+                }),
+                read_tool: Some("bamboo_get_build".to_string()),
+                read_argument: Some("result_key".to_string()),
+            }],
+        )
+        .expect("missing Bamboo read authority narrows closed");
+        assert_eq!(summary.assigned_verifiers, 0);
+        assert_eq!(summary.unassigned_verifiers, 1);
+        assert!(summary.contracts[0].evidence_verifiers.is_empty());
     }
 
     #[test]
@@ -1240,6 +1482,8 @@ mod tests {
                     required_states: vec!["new_commit".to_string()],
                     required_capability: "git".to_string(),
                     resource_identity: None,
+                    read_tool: None,
+                    read_argument: None,
                 },
                 SubtaskEvidenceVerifierCandidate {
                     verifier_id: "future-state".to_string(),
@@ -1248,6 +1492,8 @@ mod tests {
                     required_states: vec!["ready".to_string()],
                     required_capability: "external_tools:future".to_string(),
                     resource_identity: None,
+                    read_tool: None,
+                    read_argument: None,
                 },
             ],
         )
@@ -1258,7 +1504,7 @@ mod tests {
         assert!(summary
             .contracts
             .iter()
-            .all(|item| item.schema_version == 4 && item.evidence_verifiers.is_empty()));
+            .all(|item| item.schema_version == 5 && item.evidence_verifiers.is_empty()));
 
         let one_git_objective = serde_json::json!({"semantic_plan": {"objectives": [{
             "id": "commit-one",
@@ -1279,6 +1525,8 @@ mod tests {
                 required_states: vec!["new_commit".to_string()],
                 required_capability: "git".to_string(),
                 resource_identity: None,
+                read_tool: None,
+                read_argument: None,
             }],
         )
         .expect("missing Git authority narrows closed");

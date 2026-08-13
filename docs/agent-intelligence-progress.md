@@ -13,9 +13,26 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Twelve vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, independent digest-only evidence aggregation, and exact Git and Kubernetes verifier-to-objective binding. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Thirteen vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, independent digest-only evidence aggregation, and exact Git, Kubernetes, and Bamboo verifier-to-objective binding. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed thirteenth vertical slice: exact Bamboo build-result verifier-to-objective binding.
+
+- Version-5 verifier authority records the canonical Bamboo read tool and result-key argument alongside `read_only` mode, a parent-capability digest, required-state digest, and a digest of connector/build/result identity.
+- Binding requires immutable `build.result_key`, one exact Bamboo/build objective containing the full normalized result identity, and the exact read tool inside that objective's independently narrowed connector allowlist.
+- Resource matching now preserves full normalized identity and numeric boundaries. A candidate for `PAYROLL-DEPLOY-43` cannot bind an objective for `PAYROLL-DEPLOY-42`.
+- Missing, ambiguous, or mismatched result identities and absent connector/read-tool authority remain unassigned. Dynamic result identities derived only after a trusted trigger receipt are counted unassigned and continue through the existing single-Worker parent verifier.
+- Raw result keys are absent from prepared verifier authority and Activity; read tool/argument names are retained because they are the enforceable non-secret operation identity.
+- Retained schema versions 2 through 4 remain readable. Scheduler lifecycle and evidence admission accept version 5 but production activation, connector invocation, heartbeat, and parent aggregation remain closed.
+
+Phase 14 thirteenth-increment regression evidence:
+
+- Domain tests cover exact Bamboo objective/tool/resource binding, build-key redaction, numeric-suffix identity conflicts, missing read-tool authority, dynamic-identity closure, and prior Git/Kubernetes compatibility.
+- Executor tests cover exact Rules/live-inventory candidate construction and omit trigger-derived identities until a trusted receipt exists.
+- Verifier-focused Rust suite: 19 passed, 0 failed. Agent executor suite: 56 passed, 0 failed.
+- Full serial Rust regression: 544 passed, 3 ignored. Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- The focused rendered subtask-authority journey passed, and the complete rendered browser suite passed all 12 scenarios. Existing browser-only native-theme mock warnings remain non-failing.
 
 Completed twelfth vertical slice: exact Kubernetes Deployment verifier-to-objective binding.
 
@@ -55,7 +72,7 @@ Phase 14 eleventh-increment regression evidence:
 
 Known limitations:
 
-- Bamboo, Jira, and Confluence verifier records are not yet assigned to individual subtask contracts. They continue to verify only the existing single-Worker parent result.
+- Jira and Confluence verifier records are not yet assigned to individual subtask contracts. Dynamic Bamboo result identities also remain on the existing single-Worker parent result path.
 - No production code can construct the subtask dispatch or evidence permit, launch a specialized Worker/verifier, renew its lease, or aggregate its result into parent completion.
 - Ambiguous Git objectives remain unassigned instead of asking the model to choose. A later operator-facing planning diagnostic may explain which semantic objectives must be clarified without exposing task content in durable events.
 
@@ -285,7 +302,7 @@ Phase 14 fourth-increment regression evidence:
 Remaining Phase 14 work:
 
 - Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
-- Bind Bamboo, Jira, and Confluence verifier adapters to exact objectives and read-only verifier authority.
+- Bind Jira and Confluence verifier adapters to exact objectives and read-only verifier authority.
 - Launch independent verifiers and aggregate their already-enforced attestations into parent completion without trusting Worker claims.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

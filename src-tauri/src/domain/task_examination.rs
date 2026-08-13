@@ -351,7 +351,7 @@ impl TaskExaminationRecord {
             || prepared_tool_budget > 64
             || prepared_mutation_budget > 8
             || self.prepared_subtasks.iter().any(|subtask| {
-                !matches!(subtask.schema_version, 1 | 2 | 3 | 4)
+                !matches!(subtask.schema_version, 1 | 2 | 3 | 4 | 5)
                     || (subtask.schema_version == 1 && !subtask.allowed_connector_tools.is_empty())
                     || (subtask.schema_version < 3 && !subtask.evidence_verifiers.is_empty())
                     || subtask.parent_contract_digest != self.contract_digest
@@ -389,8 +389,13 @@ impl TaskExaminationRecord {
                             || (subtask.schema_version < 4
                                 && (!binding.authority_mode.is_empty()
                                     || !binding.authority_capability_digest.is_empty()
-                                    || binding.resource_identity_digest.is_some()))
+                                    || binding.resource_identity_digest.is_some()
+                                    || binding.read_tool.is_some()
+                                    || binding.read_argument.is_some()))
                             || (subtask.schema_version == 4
+                                && (binding.read_tool.is_some()
+                                    || binding.read_argument.is_some()))
+                            || (subtask.schema_version >= 4
                                 && (binding.authority_mode != "read_only"
                                     || binding
                                         .authority_capability_digest
@@ -418,6 +423,28 @@ impl TaskExaminationRecord {
                                             capability,
                                         ) == binding.authority_capability_digest
                                     })))
+                            || (subtask.schema_version == 5
+                                && (binding.read_tool.as_ref().is_some_and(|tool| {
+                                    !canonical_inventory_name(tool, true)
+                                        || !subtask.granted_capabilities.iter().any(|capability| {
+                                            crate::domain::subtask_authority::subtask_authority_capability_digest(
+                                                capability,
+                                            ) == binding.authority_capability_digest
+                                                && subtask
+                                                    .allowed_connector_tools
+                                                    .get(capability)
+                                                    .is_some_and(|tools| tools.contains(tool))
+                                        })
+                                })
+                                    || binding.read_argument.as_ref().is_some_and(|argument| {
+                                        !canonical_inventory_name(argument, true)
+                                    })
+                                    || (binding.read_tool.is_some()
+                                        != binding.read_argument.is_some())
+                                    || (binding.provider == "bamboo"
+                                        && (binding.resource_identity_digest.is_none()
+                                            || binding.read_tool.is_none()
+                                            || binding.read_argument.is_none()))))
                     })
                     || subtask.delegation_depth != 1
                     || subtask.may_delegate
