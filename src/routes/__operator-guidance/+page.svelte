@@ -69,7 +69,7 @@
         dispatch_lifecycle: "staged",
         lease_recovery: "fail_closed",
         authority_scope: "deterministic_objective_subset",
-        grant_policy: "objective_connector_signals_v1",
+        grant_policy: "objective_capability_signals_v2",
         parent_capability_count: 4,
         aggregate_capability_grants: 5,
         narrowed_subtask_count: 2,

@@ -13,9 +13,28 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Seven vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, and deterministic per-objective external connector narrowing. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Eight vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, and deterministic per-objective external and built-in capability narrowing. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed eighth vertical slice: deterministic per-objective built-in workspace, file, shell, and Git authority.
+
+- Prepared objectives now begin with no built-in authority. `workspace_read` requires objective-local workspace/file/source/configuration scope; external-only objectives and ambiguous connector objectives no longer inherit it.
+- `workspace_write` additionally requires `mutation_expected=true` and an explicit file mutation signal such as create, edit, modify, update, write, replace, patch, or apply. Read-only wording cannot retain file-write authority.
+- Shell requires local scope, mutation classification, and an explicit command/script/test/build/compile/lint operation. The local-scope condition prevents an external Bamboo-style build objective from inheriting shell merely because both use the word `build`.
+- Git requires local scope and a Git-specific status/branch/stage/checkout/commit/push/pull/merge/rebase signal. Its admitted operation is still independently classified read or mutation at the task-tool boundary, so a zero mutation budget cannot be bypassed by possessing Git read authority.
+- The allocator intersects only with the canonical built-ins already granted to the parent. Unknown/non-parent capabilities are never introduced, and all normalized objective grants remain content-addressed in the existing prepared contract.
+- Scheduler integration activates two real staged contracts from one parent with all four built-ins: the read-file contract contains only `workspace_read` and is rejected for `workspace_write`; the mutation file contract contains only read/write and consumes its bounded mutation budget successfully.
+- The durable safe policy identity is now `objective_capability_signals_v2`. Activity reports deterministic per-objective capability subsets and explains the local-scope plus mutation gate without retaining matched terms, objectives, paths, commands, capability names, or credentials.
+- Specialized Worker dispatch remains disabled, so this changes only dormant/staged subtask contracts and does not alter current single-Worker execution.
+
+Phase 14 eighth-increment regression evidence:
+
+- Nine domain tests cover local read, file update, repository test, Git commit, external Bamboo build isolation, read-only write/shell rejection, connector ambiguity, unknown connector naming, parent containment, and deterministic contract identity.
+- Scheduler integration proves exact built-in activation/admission and mutation-budget enforcement; the existing three lifecycle tests continue to pass with narrowed contracts.
+- Agent executor integration suite: 55 passed, 0 failed. Full Rust suite: 532 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator suite: 6 passed, 0 failed. Full rendered browser suite: 12 passed, 0 failed.
 
 Completed seventh vertical slice: deterministic per-objective external connector grant narrowing.
 
@@ -159,7 +178,7 @@ Phase 14 fourth-increment regression evidence:
 Remaining Phase 14 work:
 
 - Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
-- Narrow built-in workspace/file/shell/Git grants and connector operations to exact per-objective tool allowlists; connector-level narrowing is now implemented.
+- Narrow connector authority to exact per-objective tool operations; connector-level and built-in-category narrowing are now implemented.
 - Independently verify and aggregate subtask evidence into the parent result before accepting parent completion.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

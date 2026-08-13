@@ -237,9 +237,12 @@ test("prepared subtask authority is visible without implying multi-agent executi
     "Lease expiry, cancellation, and parent completion revoke staged authority.",
   );
   await expect(activity).toContainText(
-    "Grant policy: deterministic per-objective connector subset",
+    "Grant policy: deterministic per-objective capability subset",
   );
   await expect(activity).toContainText("Objectives with narrowed authority: 2 of 2");
+  await expect(activity).toContainText(
+    "Built-in mutation authority requires local scope and a mutation objective.",
+  );
   await expect(activity).toContainText(
     "Ambiguous connector evidence grants no subtask connector authority.",
   );

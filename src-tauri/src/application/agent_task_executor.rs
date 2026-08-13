@@ -3140,7 +3140,7 @@ impl TaskExecutor for AgentTaskExecutor {
                     "dispatch_lifecycle": "staged",
                     "lease_recovery": "fail_closed",
                     "authority_scope": "deterministic_objective_subset",
-                    "grant_policy": "objective_connector_signals_v1",
+                    "grant_policy": "objective_capability_signals_v2",
                     "parent_capability_count": parent_capabilities.len(),
                     "aggregate_capability_grants": prepared_subtask_capability_grants,
                     "narrowed_subtask_count": narrowed_subtask_count,
@@ -6008,7 +6008,7 @@ mod tests {
         );
         assert_eq!(
             subtask_authority.payload["grant_policy"],
-            "objective_connector_signals_v1"
+            "objective_capability_signals_v2"
         );
         assert_eq!(subtask_authority.payload["parent_capability_count"], 1);
         assert_eq!(subtask_authority.payload["aggregate_capability_grants"], 0);

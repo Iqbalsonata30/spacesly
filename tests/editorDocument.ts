@@ -714,7 +714,7 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       dispatch_lifecycle: "staged",
       lease_recovery: "fail_closed",
       authority_scope: "deterministic_objective_subset",
-      grant_policy: "objective_connector_signals_v1",
+      grant_policy: "objective_capability_signals_v2",
       parent_capability_count: 4,
       aggregate_capability_grants: 5,
       narrowed_subtask_count: 2,
@@ -750,10 +750,17 @@ assertEqual(
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(
-    "Grant policy: deterministic per-objective connector subset",
+    "Grant policy: deterministic per-objective capability subset",
   ),
   true,
   "subtask preparation should explain deterministic authority narrowing",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Built-in mutation authority requires local scope and a mutation objective",
+  ),
+  true,
+  "subtask preparation should explain the built-in mutation gate",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

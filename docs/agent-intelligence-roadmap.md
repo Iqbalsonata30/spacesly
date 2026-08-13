@@ -519,6 +519,17 @@ Completed seventh increment: deterministic per-objective external connector gran
 
 This is connector-level least privilege, not tool-level authority within one connector. Built-in workspace/file/shell/Git narrowing, exact per-objective connector-operation allowlists, independent evidence aggregation, and scheduler-owned Worker dispatch remain required before multi-agent execution can be enabled.
 
+Completed eighth increment: deterministic per-objective built-in authority.
+
+- The authority compiler now starts every objective with no built-in grants. `workspace_read` requires explicit local workspace/file/source/configuration scope; file-write additionally requires a mutation-classified objective and an explicit create/edit/update/write/patch-style operation.
+- Shell authority requires local scope, `mutation_expected=true`, and an explicit command/script/test/build/compile/lint operation. An external Bamboo build objective therefore does not receive local shell authority merely because it contains the word `build`.
+- Git authority requires local scope plus a Git-specific branch/status/stage/commit/push/pull/merge/rebase/checkout operation. Read-only Git calls remain possible when granted, while the existing independent mutation-call budget still blocks Git mutations from read-only objectives.
+- The allocator only intersects with the parent Task Session's four canonical built-ins. Unknown capability names are ignored, and a read-only objective cannot gain write or shell authority from model wording.
+- Scheduler activation and tool admission enforce the resulting exact content-addressed grant vector. A staged read-file subtask can consume `workspace_read` but is rejected for `workspace_write`; a mutation-classified file objective receives only its bounded read/write pair.
+- The durable preparation policy advances to `objective_capability_signals_v2`. Activity explains that built-in mutation authority requires both local scope and a mutation objective, without exposing the matched words or capability names.
+
+This increment narrows built-in tool categories, not individual shell commands, Git operations, file paths, or connector tools. Existing workspace containment, Git operation allowlists, shell cancellation/timeouts, parent grants, mutation budgets, and approvals remain the enforcement layers inside an admitted category. Exact connector-operation allowlists, independent evidence aggregation, and scheduler-owned Worker dispatch remain disabled work.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

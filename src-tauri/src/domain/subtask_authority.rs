@@ -152,17 +152,13 @@ pub fn prepare_subtask_contracts(
 /// Model-produced objective hints may only remove grants from the parent set. A connector is
 /// retained when the objective and exactly one connector-plan entry share a non-generic signal.
 /// Ambiguous or malformed routing evidence grants no external connector. Built-in capabilities
-/// remain parent-bounded in this first narrowing slice.
+/// additionally require objective-local resource and operation evidence.
 fn narrow_objective_capabilities(
     contract: &Value,
     objective: &Value,
     parent_capabilities: &[String],
 ) -> Result<Vec<String>, String> {
-    let mut selected = parent_capabilities
-        .iter()
-        .filter(|capability| !capability.starts_with("external_tools:"))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut selected = narrow_builtin_capabilities(objective, parent_capabilities);
     let objective_signals = objective_signal_tokens(objective);
     let connectors = contract
         .get("capability_plan")
@@ -209,11 +205,100 @@ fn narrow_objective_capabilities(
     Ok(selected.into_iter().collect())
 }
 
+fn narrow_builtin_capabilities(
+    objective: &Value,
+    parent_capabilities: &[String],
+) -> BTreeSet<String> {
+    let signals = objective_all_signal_tokens(objective);
+    let mutation_expected = objective
+        .get("mutation_expected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let local_scope = contains_signal(
+        &signals,
+        &[
+            "chart",
+            "code",
+            "config",
+            "configuration",
+            "directory",
+            "file",
+            "helm",
+            "repository",
+            "source",
+            "template",
+            "values",
+            "workspace",
+            "yaml",
+        ],
+    );
+    let mut selected = BTreeSet::new();
+    if local_scope
+        && parent_capabilities
+            .iter()
+            .any(|value| value == "workspace_read")
+    {
+        selected.insert("workspace_read".to_string());
+    }
+    if local_scope
+        && mutation_expected
+        && contains_signal(
+            &signals,
+            &[
+                "apply", "create", "edit", "modify", "patch", "replace", "update", "write",
+            ],
+        )
+        && parent_capabilities
+            .iter()
+            .any(|value| value == "workspace_write")
+    {
+        selected.insert("workspace_write".to_string());
+    }
+    if local_scope
+        && mutation_expected
+        && contains_signal(
+            &signals,
+            &[
+                "build", "command", "compile", "lint", "run", "script", "shell", "test",
+            ],
+        )
+        && parent_capabilities.iter().any(|value| value == "shell")
+    {
+        selected.insert("shell".to_string());
+    }
+    if local_scope
+        && contains_signal(
+            &signals,
+            &[
+                "branch", "checkout", "commit", "git", "merge", "pull", "push", "rebase", "stage",
+                "status",
+            ],
+        )
+        && parent_capabilities.iter().any(|value| value == "git")
+    {
+        selected.insert("git".to_string());
+    }
+    selected
+}
+
+fn contains_signal(signals: &BTreeSet<String>, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| signals.contains(*candidate))
+}
+
 fn objective_signal_tokens(objective: &Value) -> BTreeSet<String> {
+    objective_all_signal_tokens(objective)
+        .into_iter()
+        .filter(|token| !generic_signal(token))
+        .collect()
+}
+
+fn objective_all_signal_tokens(objective: &Value) -> BTreeSet<String> {
     let mut signals = BTreeSet::new();
     for field in ["summary", "success_evidence"] {
         if let Some(value) = objective.get(field).and_then(Value::as_str) {
-            signals.extend(signal_tokens(value));
+            signals.extend(all_signal_tokens(value));
         }
     }
     for field in ["operation_hints", "resource_hints"] {
@@ -225,13 +310,20 @@ fn objective_signal_tokens(objective: &Value) -> BTreeSet<String> {
             .filter_map(Value::as_str)
             .take(16)
         {
-            signals.extend(signal_tokens(value));
+            signals.extend(all_signal_tokens(value));
         }
     }
     signals
 }
 
 fn signal_tokens(value: &str) -> BTreeSet<String> {
+    all_signal_tokens(value)
+        .into_iter()
+        .filter(|token| !generic_signal(token))
+        .collect()
+}
+
+fn all_signal_tokens(value: &str) -> BTreeSet<String> {
     let mut normalized = String::with_capacity(value.len());
     let mut previous_was_lower_or_digit = false;
     for character in value.chars() {
@@ -244,7 +336,7 @@ fn signal_tokens(value: &str) -> BTreeSet<String> {
     normalized
         .split(|character: char| !character.is_ascii_alphanumeric())
         .map(str::to_string)
-        .filter(|token| token.len() >= 3 && !generic_signal(token))
+        .filter(|token| token.len() >= 3)
         .take(64)
         .collect()
 }
@@ -474,17 +566,11 @@ mod tests {
 
         assert_eq!(
             contracts[0].granted_capabilities,
-            vec![
-                "external_tools:confluence".to_string(),
-                "workspace_read".to_string()
-            ]
+            vec!["external_tools:confluence".to_string()]
         );
         assert_eq!(
             contracts[1].granted_capabilities,
-            vec![
-                "external_tools:bamboo".to_string(),
-                "workspace_read".to_string()
-            ]
+            vec!["external_tools:bamboo".to_string()]
         );
         assert!(contracts.iter().all(|contract| !contract
             .granted_capabilities
@@ -532,10 +618,7 @@ mod tests {
         )
         .expect("parent order does not change narrowing");
 
-        assert_eq!(
-            first[0].granted_capabilities,
-            vec!["workspace_read".to_string()]
-        );
+        assert!(first[0].granted_capabilities.is_empty());
         assert_eq!(first[0].contract_id, reversed[0].contract_id);
     }
 
@@ -566,6 +649,119 @@ mod tests {
         assert_eq!(
             contracts[0].granted_capabilities,
             vec!["external_tools:future-system".to_string()]
+        );
+    }
+
+    #[test]
+    fn narrows_builtin_authority_by_local_scope_operation_and_mutation_class() {
+        let contracts = prepare_subtask_contracts(
+            &serde_json::json!({
+                "semantic_plan": {"objectives": [
+                    {
+                        "id": "inspect-template",
+                        "summary": "Inspect the Helm template",
+                        "success_evidence": "Template is understood",
+                        "operation_hints": ["read file"],
+                        "resource_hints": ["helm template"],
+                        "mutation_expected": false
+                    },
+                    {
+                        "id": "modify-values",
+                        "summary": "Update the values YAML file",
+                        "success_evidence": "Values file contains the desired configuration",
+                        "operation_hints": ["update file"],
+                        "resource_hints": ["values yaml"],
+                        "mutation_expected": true
+                    },
+                    {
+                        "id": "run-tests",
+                        "summary": "Run repository tests",
+                        "success_evidence": "The source test command passes",
+                        "operation_hints": ["run test command"],
+                        "resource_hints": ["source repository"],
+                        "mutation_expected": true
+                    },
+                    {
+                        "id": "commit-change",
+                        "summary": "Commit the repository change",
+                        "success_evidence": "Git commit status is clean",
+                        "operation_hints": ["git commit"],
+                        "resource_hints": ["repository branch"],
+                        "mutation_expected": true
+                    },
+                    {
+                        "id": "trigger-build",
+                        "summary": "Trigger the Bamboo build",
+                        "success_evidence": "Bamboo build succeeds",
+                        "operation_hints": ["trigger build"],
+                        "resource_hints": ["bamboo plan"],
+                        "mutation_expected": true
+                    }
+                ]},
+                "capability_plan": {"connectors": [{
+                    "connector_id": "bamboo",
+                    "matched_domains": ["bamboo"],
+                    "matched_intents": ["build"],
+                    "matched_tools": ["bamboo_trigger_build"]
+                }]}
+            }),
+            parent_digest(),
+            &[
+                "workspace_read".to_string(),
+                "workspace_write".to_string(),
+                "shell".to_string(),
+                "git".to_string(),
+                "external_tools:bamboo".to_string(),
+            ],
+        )
+        .expect("built-in authority narrows");
+
+        assert_eq!(
+            contracts[0].granted_capabilities,
+            vec!["workspace_read".to_string()]
+        );
+        assert_eq!(
+            contracts[1].granted_capabilities,
+            vec!["workspace_read".to_string(), "workspace_write".to_string()]
+        );
+        assert_eq!(
+            contracts[2].granted_capabilities,
+            vec!["shell".to_string(), "workspace_read".to_string()]
+        );
+        assert_eq!(
+            contracts[3].granted_capabilities,
+            vec!["git".to_string(), "workspace_read".to_string()]
+        );
+        assert_eq!(
+            contracts[4].granted_capabilities,
+            vec!["external_tools:bamboo".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_only_objective_cannot_gain_write_or_shell_from_operation_words() {
+        let contracts = prepare_subtask_contracts(
+            &serde_json::json!({"semantic_plan": {"objectives": [{
+                "id": "review-command",
+                "summary": "Review a shell command that writes a file",
+                "success_evidence": "The source file is reviewed",
+                "operation_hints": ["write file", "run shell command"],
+                "resource_hints": ["workspace source file"],
+                "mutation_expected": false
+            }]}}),
+            parent_digest(),
+            &[
+                "workspace_read".to_string(),
+                "workspace_write".to_string(),
+                "shell".to_string(),
+                "git".to_string(),
+            ],
+        )
+        .expect("read-only objective narrows closed");
+
+        assert_eq!(
+            contracts[0].granted_capabilities,
+            vec!["workspace_read".to_string()]
         );
     }
 

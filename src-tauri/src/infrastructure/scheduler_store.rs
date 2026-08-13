@@ -8688,6 +8688,136 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_builtin_subtask_contract_is_enforced_at_scheduler_admission() {
+        let directory = tempdir().expect("temp directory");
+        let store =
+            SchedulerStore::open_at(directory.path().join("scheduler.db")).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let mut envelope = test_agent_envelope();
+        let TaskSessionEnvelope::V1(agent) = &mut envelope else {
+            unreachable!("test envelope is Agent V1");
+        };
+        agent.connector_ids.clear();
+        let requested_capabilities = vec![
+            "workspace_read".to_string(),
+            "workspace_write".to_string(),
+            "shell".to_string(),
+            "git".to_string(),
+        ];
+        agent.requested_capabilities = requested_capabilities.clone();
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("builtin-subtasks", &envelope)
+                    .expect("request encodes"),
+                &requested_capabilities,
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 3, Duration::from_secs(30), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let prepared_subtasks = prepare_subtask_contracts(
+            &json!({"semantic_plan": {"objectives": [
+                {
+                    "id": "inspect-file",
+                    "summary": "Inspect source file",
+                    "success_evidence": "Source file is observed",
+                    "operation_hints": ["read file"],
+                    "resource_hints": ["workspace source"],
+                    "mutation_expected": false
+                },
+                {
+                    "id": "modify-file",
+                    "summary": "Modify source file",
+                    "success_evidence": "Source file is updated",
+                    "operation_hints": ["write file"],
+                    "resource_hints": ["workspace source"],
+                    "mutation_expected": true
+                }
+            ]}}),
+            "sha256:contract",
+            &requested_capabilities,
+        )
+        .expect("subtask contracts prepare");
+        let mut draft = test_execution_manifest_draft("runtime-builtins");
+        draft.connectors.clear();
+        draft.task_examination = TaskExaminationRecord {
+            schema_version: TASK_EXAMINATION_SCHEMA_VERSION,
+            examiner_version: TASK_EXAMINER_VERSION.to_string(),
+            contract_digest: draft.context_digest.clone(),
+            status: TaskExaminationStatus::Ready,
+            capability_catalog: requested_capabilities
+                .iter()
+                .map(|capability| TaskCapabilityRecord {
+                    capability: capability.clone(),
+                    provider: "workspace".to_string(),
+                    connector_id: None,
+                    discovery: "configured".to_string(),
+                    granted: true,
+                })
+                .collect(),
+            semantic_planner: Some(SemanticPlannerEvidence {
+                status: "model".to_string(),
+                planner_version: "test-planner-v1".to_string(),
+                model: Some("openai/gpt-5".to_string()),
+                objective_count: prepared_subtasks.len(),
+            }),
+            prepared_subtasks,
+            required_capabilities: requested_capabilities,
+            ..TaskExaminationRecord::default()
+        };
+        store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("manifest binds");
+        let subtasks = store
+            .prepared_subtasks_for_session(session.id)
+            .expect("prepared subtasks load");
+        let permit = SchedulerStore::test_subtask_dispatch_permit();
+        let read_only = store
+            .activate_prepared_subtask(
+                assignment.fence,
+                subtasks[0].fence,
+                Duration::from_secs(20),
+                &permit,
+            )
+            .expect("read-only authority activates");
+        assert_eq!(read_only.capabilities, vec!["workspace_read"]);
+        SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "workspace_read",
+            SubtaskToolRisk::Read,
+        )
+        .expect("read is admitted");
+        assert!(SchedulerStore::admit_subtask_tool_call(
+            &read_only,
+            "workspace_write",
+            SubtaskToolRisk::Mutation,
+        )
+        .expect_err("read-only objective cannot write")
+        .contains("shape or capability is invalid"));
+
+        let mutable = store
+            .activate_prepared_subtask(
+                assignment.fence,
+                subtasks[1].fence,
+                Duration::from_secs(20),
+                &permit,
+            )
+            .expect("mutable authority activates");
+        assert_eq!(
+            mutable.capabilities,
+            vec!["workspace_read", "workspace_write"]
+        );
+        SchedulerStore::admit_subtask_tool_call(
+            &mutable,
+            "workspace_write",
+            SubtaskToolRisk::Mutation,
+        )
+        .expect("bounded write is admitted");
+    }
+
+    #[test]
     fn subtask_activation_is_fenced_idempotent_and_budgeted_across_reopen() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("scheduler.db");
