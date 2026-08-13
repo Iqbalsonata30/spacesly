@@ -402,7 +402,9 @@ function normalizedIntentText(contract: ExecutionContract): string {
 }
 
 function normalizedAuthorizationIntentText(contract: ExecutionContract): string {
-  const activeWorkflow = contract.workflow.filter((step) => step.status !== "completed");
+  const currentWorkflow = contract.workflow.filter(
+    (step) => step.step_id === contract.current_step && step.status !== "completed",
+  );
   return normalizeIntent(
     [
       contract.objective.summary,
@@ -411,7 +413,7 @@ function normalizedAuthorizationIntentText(contract: ExecutionContract): string 
       contract.task_context.execution_detail,
       contract.ticket.title,
       ...contract.ticket.labels,
-      ...activeWorkflow.flatMap((step) => [step.title, step.type]),
+      ...currentWorkflow.flatMap((step) => [step.title, step.type]),
       contract.runtime_inputs.operator_notes ?? "",
     ].join(" "),
   );
@@ -447,9 +449,7 @@ function connectorOperationSignals(
               .toLowerCase()
               .split(/[^a-z0-9]+/),
           )
-          .filter(
-            (token) => token.length >= 3 && !GENERIC_OPERATION_TOKENS.has(token),
-          ),
+          .filter((token) => token.length >= 3 && !GENERIC_OPERATION_TOKENS.has(token)),
       ),
     ),
   ];
@@ -836,6 +836,13 @@ export function validateAgentTaskSessionResult(
     if (authoritative !== null) throw taskSessionResultMismatch(snapshot, authoritative);
     throw new AgentTaskSessionApprovalRequiredError(snapshot);
   }
+  if (snapshot.state === "blocked") {
+    if (authoritative !== null) throw taskSessionResultMismatch(snapshot, authoritative);
+    throw new Error(
+      snapshot.error?.trim() ||
+        `Task Session ${snapshot.id} was blocked without a structured Agent result.`,
+    );
+  }
   if (
     !authoritative ||
     authoritative.session_id !== snapshot.id ||
@@ -928,8 +935,7 @@ function isAgentTaskResult(value: unknown): value is AiWorkerTaskResult {
             (objective.completion_status === "completed" ||
               objective.completion_status === "blocked") &&
             isStringArray(objective.evidence) &&
-            (objective.blocked_reason === null ||
-              typeof objective.blocked_reason === "string"),
+            (objective.blocked_reason === null || typeof objective.blocked_reason === "string"),
         )))
   );
 }

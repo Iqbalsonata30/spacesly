@@ -380,6 +380,28 @@ assertEqual(
   [],
   "a linked ticket should not add Jira schemas to a filesystem-only task",
 );
+const contractWithUiOwnedJiraFollowups: ExecutionContract = {
+  ...contractFor("Create README.md"),
+  workflow: [
+    {
+      step_id: "worker.execute",
+      title: "Execute the already-planned task",
+      type: "worker.execute",
+      status: "current",
+    },
+    {
+      step_id: "jira.comment.result",
+      title: "Spacesly records final result on Jira after worker returns",
+      type: "jira.comment",
+      status: "remaining",
+    },
+  ],
+};
+assertEqual(
+  planAgentTaskConnectors(intentConfig, contractWithUiOwnedJiraFollowups).connectorIds,
+  [],
+  "UI-owned Jira follow-up steps should not grant Jira tools to the current worker",
+);
 assertEqual(
   planAgentTaskConnectors(intentConfig, contractFor("Commit the local changes")).connectorIds,
   [],
@@ -422,10 +444,8 @@ assertEqual(
   "a live operation catalog should route an unknown connector without hard-coded product terms",
 );
 assertEqual(
-  capabilityPlanForAgentTask(
-    intentConfig,
-    contractFor("Publish the generated artifact"),
-  ).connectors,
+  capabilityPlanForAgentTask(intentConfig, contractFor("Publish the generated artifact"))
+    .connectors,
   [
     {
       connector_id: "artifact-vault",
@@ -793,6 +813,24 @@ assertEqual(
   approvalPauseRecognized,
   true,
   "approval-blocked terminal sessions should pause without requiring an authoritative result",
+);
+
+const preflightBlockedSnapshot = {
+  ...terminalSnapshot(13),
+  state: "blocked" as const,
+  error:
+    "MCP capability preflight blocked execution. No configured connector satisfies domain 'jira'.",
+};
+let preflightBlockedError = "";
+try {
+  validateAgentTaskSessionResult(preflightBlockedSnapshot, null, 4, 7, null);
+} catch (reason) {
+  preflightBlockedError = reason instanceof Error ? reason.message : String(reason);
+}
+assertEqual(
+  preflightBlockedError,
+  preflightBlockedSnapshot.error,
+  "preflight-blocked sessions should preserve the scheduler error without requiring a result",
 );
 
 const failedSnapshot = {
