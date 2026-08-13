@@ -351,7 +351,8 @@ impl TaskExaminationRecord {
             || prepared_tool_budget > 64
             || prepared_mutation_budget > 8
             || self.prepared_subtasks.iter().any(|subtask| {
-                subtask.schema_version != 1
+                !matches!(subtask.schema_version, 1 | 2)
+                    || (subtask.schema_version == 1 && !subtask.allowed_connector_tools.is_empty())
                     || subtask.parent_contract_digest != self.contract_digest
                     || subtask
                         .contract_id
@@ -377,6 +378,24 @@ impl TaskExaminationRecord {
                     || subtask.granted_capabilities.iter().any(|capability| {
                         !granted_parent_capabilities.contains(capability.as_str())
                     })
+                    || subtask
+                        .allowed_connector_tools
+                        .iter()
+                        .any(|(capability, tools)| {
+                            !capability.starts_with("external_tools:")
+                                || !subtask.granted_capabilities.contains(capability)
+                                || tools.is_empty()
+                                || tools.len() > MAX_EXAMINATION_ITEMS
+                                || tools.windows(2).any(|pair| pair[0] >= pair[1])
+                                || tools
+                                    .iter()
+                                    .any(|tool| !canonical_inventory_name(tool, true))
+                        })
+                    || (subtask.schema_version == 2
+                        && subtask.granted_capabilities.iter().any(|capability| {
+                            capability.starts_with("external_tools:")
+                                && !subtask.allowed_connector_tools.contains_key(capability)
+                        }))
             })
         {
             return Err("Task Examination prepared subtask authority is invalid.".to_string());

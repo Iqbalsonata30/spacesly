@@ -530,6 +530,17 @@ Completed eighth increment: deterministic per-objective built-in authority.
 
 This increment narrows built-in tool categories, not individual shell commands, Git operations, file paths, or connector tools. Existing workspace containment, Git operation allowlists, shell cancellation/timeouts, parent grants, mutation budgets, and approvals remain the enforcement layers inside an admitted category. Exact connector-operation allowlists, independent evidence aggregation, and scheduler-owned Worker dispatch remain disabled work.
 
+Completed ninth increment: exact per-objective connector-operation authority.
+
+- External connector capabilities now carry a bounded, sorted allowlist of exact tool operations selected from the immutable capability plan. A tool must match the objective's resource signal and normalized operation class; connector-level similarity alone is insufficient.
+- The provider-neutral normalizer supports conventional snake case, kebab/namespaced names, and camelCase without hard-coding Jira, Confluence, Bamboo, Kubernetes, or another provider. Unknown providers therefore use the same fail-closed rules.
+- The operation map is part of version-2 content-addressed subtask identity and is retained in Task Examination, the Execution Manifest, scheduler storage, and active authority descriptors. Legacy version-1 dormant contracts remain readable but cannot activate without exact operation authority.
+- MCP admission supplies the requested tool name to the scheduler. Exact map validation occurs before durable budget consumption and upstream forwarding; a subtask allowed one connector read cannot call another read or mutation tool from that connector unless it is independently listed.
+- Activation, renewal, resolution, and admission revalidate the immutable capability and operation maps alongside parent grants and fences. Forged expansion, stale authority, revoked parents, exhausted budgets, and contract drift continue to fail closed.
+- Activity exposes only policy identity `objective_tool_operations_v3` and aggregate counts. It does not retain objective text, connector/tool names, arguments, responses, or credentials.
+
+This increment completes exact connector-tool authority for staged subtasks, not dispatch. Built-in calls continue through their existing path/file/command/Git policy layers. Independent evidence verification and aggregation plus a scheduler-owned Worker launch/heartbeat path remain required before multi-agent execution can be enabled.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

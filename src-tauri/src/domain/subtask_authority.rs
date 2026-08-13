@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 1;
+const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 2;
 const MAX_SUBTASKS: usize = 8;
 const TOTAL_WALL_CLOCK_SECONDS: u64 = 3_600;
 const TOTAL_TOOL_CALLS: u32 = 64;
@@ -29,6 +29,8 @@ pub struct PreparedSubtaskContract {
     pub parent_contract_digest: String,
     pub objective_id: String,
     pub granted_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed_connector_tools: BTreeMap<String, Vec<String>>,
     pub budget: SubtaskBudget,
     pub evidence_requirement_digest: String,
     pub evidence_source: String,
@@ -122,9 +124,9 @@ pub fn prepare_subtask_contracts(
                 .get("mutation_expected")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let objective_capabilities =
+            let (objective_capabilities, allowed_connector_tools) =
                 narrow_objective_capabilities(contract, objective, &parent_capabilities)?;
-            compile_subtask_contract(
+            compile_subtask_contract_with_tools(
                 parent_contract_digest,
                 &parent_capabilities,
                 evidence,
@@ -142,6 +144,7 @@ pub fn prepare_subtask_contracts(
                     },
                     may_delegate: false,
                 },
+                allowed_connector_tools,
             )
         })
         .collect()
@@ -157,9 +160,10 @@ fn narrow_objective_capabilities(
     contract: &Value,
     objective: &Value,
     parent_capabilities: &[String],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, BTreeMap<String, Vec<String>>), String> {
     let mut selected = narrow_builtin_capabilities(objective, parent_capabilities);
     let objective_signals = objective_signal_tokens(objective);
+    let objective_all_signals = objective_all_signal_tokens(objective);
     let connectors = contract
         .get("capability_plan")
         .and_then(|plan| plan.get("connectors"))
@@ -186,23 +190,97 @@ fn narrow_objective_capabilities(
                     signals.extend(signal_tokens(value));
                 }
             }
-            Some((capability, signals))
+            let planned_tools = connector
+                .get("matched_tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|tool| canonical_tool_name(tool))
+                .take(64)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            Some((capability, signals, planned_tools))
         })
         .collect::<Vec<_>>();
     let mut signal_owners = BTreeMap::<String, usize>::new();
-    for (_, signals) in &connectors {
+    for (_, signals, _) in &connectors {
         for signal in signals {
             *signal_owners.entry(signal.clone()).or_default() += 1;
         }
     }
-    for (capability, signals) in connectors {
+    let mut allowed_connector_tools = BTreeMap::new();
+    for (capability, signals, planned_tools) in connectors {
         if signals.iter().any(|signal| {
             objective_signals.contains(signal) && signal_owners.get(signal) == Some(&1)
         }) {
-            selected.insert(capability);
+            let connector_signals = signal_tokens(
+                capability
+                    .strip_prefix("external_tools:")
+                    .unwrap_or_default(),
+            );
+            let allowed = planned_tools
+                .into_iter()
+                .filter(|tool| {
+                    tool_matches_objective(tool, &objective_all_signals, &connector_signals)
+                })
+                .collect::<Vec<_>>();
+            if !allowed.is_empty() {
+                selected.insert(capability.clone());
+                allowed_connector_tools.insert(capability, allowed);
+            }
         }
     }
-    Ok(selected.into_iter().collect())
+    Ok((selected.into_iter().collect(), allowed_connector_tools))
+}
+
+fn tool_matches_objective(
+    tool: &str,
+    objective_signals: &BTreeSet<String>,
+    connector_signals: &BTreeSet<String>,
+) -> bool {
+    let tool_signals = all_signal_tokens(tool);
+    let resource_overlap = tool_signals.iter().any(|signal| {
+        !connector_signals.contains(signal)
+            && operation_signal(signal).is_none()
+            && objective_signals.contains(signal)
+    });
+    let objective_operations = objective_signals
+        .iter()
+        .filter_map(|signal| operation_signal(signal))
+        .collect::<BTreeSet<_>>();
+    let tool_operations = tool_signals
+        .iter()
+        .filter_map(|signal| operation_signal(signal))
+        .collect::<BTreeSet<_>>();
+    resource_overlap
+        && !objective_operations.is_empty()
+        && !objective_operations.is_disjoint(&tool_operations)
+}
+
+fn operation_signal(value: &str) -> Option<&'static str> {
+    match value {
+        "get" | "inspect" | "list" | "read" | "search" => Some("read"),
+        "add" | "create" | "publish" => Some("create"),
+        "edit" | "modify" | "patch" | "replace" | "update" | "write" => Some("update"),
+        "delete" | "remove" => Some("delete"),
+        "promote" => Some("promote"),
+        "restart" => Some("restart"),
+        "trigger" => Some("trigger"),
+        _ => None,
+    }
+}
+
+fn canonical_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value == value.trim()
+        && !value.contains("..")
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        })
 }
 
 fn narrow_builtin_capabilities(
@@ -370,11 +448,28 @@ fn canonical_connector_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compile_subtask_contract(
     parent_contract_digest: &str,
     parent_capabilities: &[String],
     evidence_requirement: &str,
     request: SubtaskContractRequest,
+) -> Result<PreparedSubtaskContract, String> {
+    compile_subtask_contract_with_tools(
+        parent_contract_digest,
+        parent_capabilities,
+        evidence_requirement,
+        request,
+        BTreeMap::new(),
+    )
+}
+
+fn compile_subtask_contract_with_tools(
+    parent_contract_digest: &str,
+    parent_capabilities: &[String],
+    evidence_requirement: &str,
+    request: SubtaskContractRequest,
+    allowed_connector_tools: BTreeMap<String, Vec<String>>,
 ) -> Result<PreparedSubtaskContract, String> {
     if !valid_parent_digest(parent_contract_digest)
         || !canonical_name(&request.objective_id)
@@ -404,12 +499,26 @@ pub fn compile_subtask_contract(
     {
         return Err("Subtask requested authority that the parent does not possess.".to_string());
     }
+    if allowed_connector_tools.iter().any(|(capability, tools)| {
+        !capability.starts_with("external_tools:")
+            || !requested.contains(capability)
+            || tools.is_empty()
+            || tools.len() > 64
+            || tools.windows(2).any(|pair| pair[0] >= pair[1])
+            || tools.iter().any(|tool| !canonical_tool_name(tool))
+    }) || requested.iter().any(|capability| {
+        capability.starts_with("external_tools:")
+            && !allowed_connector_tools.contains_key(capability)
+    }) {
+        return Err("Subtask connector operation authority is invalid.".to_string());
+    }
     let evidence_requirement_digest = digest(evidence_requirement.as_bytes());
     let identity = serde_json::json!({
         "schema_version": SUBTASK_CONTRACT_SCHEMA_VERSION,
         "parent_contract_digest": parent_contract_digest,
         "objective_id": request.objective_id,
         "granted_capabilities": requested,
+        "allowed_connector_tools": allowed_connector_tools,
         "budget": request.budget,
         "evidence_requirement_digest": evidence_requirement_digest,
         "delegation_depth": 1,
@@ -424,6 +533,7 @@ pub fn compile_subtask_contract(
         parent_contract_digest: parent_contract_digest.to_string(),
         objective_id: request.objective_id,
         granted_capabilities: requested,
+        allowed_connector_tools,
         budget: request.budget,
         evidence_requirement_digest,
         evidence_source: "semantic_objective_success_evidence".to_string(),
@@ -568,9 +678,22 @@ mod tests {
             contracts[0].granted_capabilities,
             vec!["external_tools:confluence".to_string()]
         );
+        assert_eq!(contracts[0].schema_version, 2);
+        assert_eq!(
+            contracts[0]
+                .allowed_connector_tools
+                .get("external_tools:confluence"),
+            Some(&vec!["confluence_get_page".to_string()])
+        );
         assert_eq!(
             contracts[1].granted_capabilities,
             vec!["external_tools:bamboo".to_string()]
+        );
+        assert_eq!(
+            contracts[1]
+                .allowed_connector_tools
+                .get("external_tools:bamboo"),
+            Some(&vec!["bamboo_trigger_build".to_string()])
         );
         assert!(contracts.iter().all(|contract| !contract
             .granted_capabilities
@@ -619,6 +742,7 @@ mod tests {
         .expect("parent order does not change narrowing");
 
         assert!(first[0].granted_capabilities.is_empty());
+        assert!(first[0].allowed_connector_tools.is_empty());
         assert_eq!(first[0].contract_id, reversed[0].contract_id);
     }
 
@@ -650,6 +774,40 @@ mod tests {
             contracts[0].granted_capabilities,
             vec!["external_tools:future-system".to_string()]
         );
+        assert_eq!(
+            contracts[0]
+                .allowed_connector_tools
+                .get("external_tools:future-system"),
+            Some(&vec!["promoteRelease".to_string()])
+        );
+    }
+
+    #[test]
+    fn connector_operation_class_must_match_the_objective() {
+        let contracts = prepare_subtask_contracts(
+            &serde_json::json!({
+                "semantic_plan": {"objectives": [{
+                    "id": "inspect-issue",
+                    "summary": "Inspect the Jira issue",
+                    "success_evidence": "Issue state is observed",
+                    "operation_hints": ["read issue"],
+                    "resource_hints": ["jira issue"],
+                    "mutation_expected": false
+                }]},
+                "capability_plan": {"connectors": [{
+                    "connector_id": "jira",
+                    "matched_domains": ["jira"],
+                    "matched_intents": ["issue"],
+                    "matched_tools": ["jira_update_issue"]
+                }]}
+            }),
+            parent_digest(),
+            &["external_tools:jira".to_string()],
+        )
+        .expect("mismatched planned operation narrows closed");
+
+        assert!(contracts[0].granted_capabilities.is_empty());
+        assert!(contracts[0].allowed_connector_tools.is_empty());
     }
 
     #[test]

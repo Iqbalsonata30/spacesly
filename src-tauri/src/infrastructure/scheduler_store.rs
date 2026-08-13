@@ -30,6 +30,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 #[cfg(test)]
@@ -211,6 +212,8 @@ pub struct SubtaskToolAuthority {
     pub authority_fencing_token: u64,
     pub objective_id: String,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed_connector_tools: BTreeMap<String, Vec<String>>,
     pub lease_expires_at: u64,
 }
 
@@ -2929,7 +2932,10 @@ impl SchedulerStore {
             .ok_or_else(|| "Dormant subtask fence is stale or incompatible.".to_string())?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask activation contract: {error}"))?;
-        if contract.objective_id != objective_id || contract.execution_enabled {
+        if contract.schema_version != 2
+            || contract.objective_id != objective_id
+            || contract.execution_enabled
+        {
             return Err("Prepared subtask activation contract is inconsistent.".to_string());
         }
         for capability in &contract.granted_capabilities {
@@ -3044,6 +3050,7 @@ impl SchedulerStore {
             authority_fencing_token,
             objective_id,
             capabilities: contract.granted_capabilities,
+            allowed_connector_tools: contract.allowed_connector_tools,
             lease_expires_at: retained_lease_expires_at,
         })
     }
@@ -3056,7 +3063,26 @@ impl SchedulerStore {
         capability: &str,
         risk: SubtaskToolRisk,
     ) -> Result<SubtaskToolAdmission, String> {
+        Self::admit_subtask_tool_operation(authority, capability, None, risk)
+    }
+
+    pub fn admit_subtask_connector_tool_call(
+        authority: &SubtaskToolAuthority,
+        capability: &str,
+        tool_name: &str,
+        risk: SubtaskToolRisk,
+    ) -> Result<SubtaskToolAdmission, String> {
+        Self::admit_subtask_tool_operation(authority, capability, Some(tool_name), risk)
+    }
+
+    fn admit_subtask_tool_operation(
+        authority: &SubtaskToolAuthority,
+        capability: &str,
+        tool_name: Option<&str>,
+        risk: SubtaskToolRisk,
+    ) -> Result<SubtaskToolAdmission, String> {
         validate_subtask_authority_shape(authority, capability)?;
+        validate_subtask_tool_operation(authority, capability, tool_name)?;
         let store = Self::open_subtask_authority_store(authority)?;
         let now = now_millis();
         let mut connection = store.connection.lock().map_err(|error| error.to_string())?;
@@ -3139,8 +3165,10 @@ impl SchedulerStore {
             })?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask tool contract: {error}"))?;
-        if contract.objective_id != authority.objective_id
+        if contract.schema_version != 2
+            || contract.objective_id != authority.objective_id
             || contract.granted_capabilities != authority.capabilities
+            || contract.allowed_connector_tools != authority.allowed_connector_tools
             || !contract
                 .granted_capabilities
                 .iter()
@@ -5368,8 +5396,52 @@ fn validate_subtask_authority_shape(
             .capabilities
             .iter()
             .any(|granted| granted == capability)
+        || authority
+            .allowed_connector_tools
+            .iter()
+            .any(|(capability, tools)| {
+                !capability.starts_with("external_tools:")
+                    || !authority.capabilities.contains(capability)
+                    || tools.is_empty()
+                    || tools.len() > 64
+                    || tools.windows(2).any(|pair| pair[0] >= pair[1])
+                    || tools.iter().any(|tool| {
+                        tool.trim().is_empty()
+                            || tool != tool.trim()
+                            || tool.len() > 128
+                            || tool.contains("..")
+                    })
+            })
+        || authority.capabilities.iter().any(|capability| {
+            capability.starts_with("external_tools:")
+                && !authority.allowed_connector_tools.contains_key(capability)
+        })
     {
         return Err("Subtask tool authority shape or capability is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_subtask_tool_operation(
+    authority: &SubtaskToolAuthority,
+    capability: &str,
+    tool_name: Option<&str>,
+) -> Result<(), String> {
+    if capability.starts_with("external_tools:") {
+        let tool_name = tool_name
+            .ok_or_else(|| "Subtask connector tool operation identity is required.".to_string())?;
+        if !authority
+            .allowed_connector_tools
+            .get(capability)
+            .is_some_and(|tools| tools.iter().any(|tool| tool == tool_name))
+        {
+            return Err(
+                "Subtask connector tool operation is not granted by its objective contract."
+                    .to_string(),
+            );
+        }
+    } else if tool_name.is_some() {
+        return Err("Built-in subtask admission cannot carry a connector tool name.".to_string());
     }
     Ok(())
 }
@@ -5404,8 +5476,10 @@ fn validate_subtask_contract_and_grants_on(
         .ok_or_else(|| "Subtask contract identity is stale or incompatible.".to_string())?;
     let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
         .map_err(|error| format!("Failed to decode subtask lifecycle contract: {error}"))?;
-    if contract.objective_id != authority.objective_id
+    if contract.schema_version != 2
+        || contract.objective_id != authority.objective_id
         || contract.granted_capabilities != authority.capabilities
+        || contract.allowed_connector_tools != authority.allowed_connector_tools
     {
         return Err("Subtask lifecycle authority changed its immutable contract.".to_string());
     }
@@ -8687,6 +8761,19 @@ mod tests {
         (store, session.id, assignment.fence, subtasks)
     }
 
+    fn admit_test_subtask_connector_call(
+        authority: &SubtaskToolAuthority,
+        capability: &str,
+        risk: SubtaskToolRisk,
+    ) -> Result<SubtaskToolAdmission, String> {
+        let tool_name = authority
+            .allowed_connector_tools
+            .get(capability)
+            .and_then(|tools| tools.first())
+            .expect("test connector authority includes an exact tool operation");
+        SchedulerStore::admit_subtask_connector_tool_call(authority, capability, tool_name, risk)
+    }
+
     #[test]
     fn narrowed_builtin_subtask_contract_is_enforced_at_scheduler_admission() {
         let directory = tempdir().expect("temp directory");
@@ -8837,6 +8924,18 @@ mod tests {
                 .expect("identical activation is idempotent"),
             read_only
         );
+        assert_eq!(
+            read_only.allowed_connector_tools.get("external_tools:jira"),
+            Some(&vec!["jira_get_issue".to_string()])
+        );
+        assert!(SchedulerStore::admit_subtask_connector_tool_call(
+            &read_only,
+            "external_tools:jira",
+            "jira_update_issue",
+            SubtaskToolRisk::Mutation,
+        )
+        .expect_err("unlisted connector operation is rejected before budget admission")
+        .contains("not granted by its objective contract"));
         assert!(store
             .activate_prepared_subtask(
                 parent,
@@ -8850,14 +8949,14 @@ mod tests {
             .expect_err("stale dormant fence fails")
             .contains("stale or incompatible"));
 
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &read_only,
             "external_tools:jira",
             SubtaskToolRisk::Mutation,
         )
         .expect_err("read-only objective has no mutation authority")
         .contains("mutation-call budget is exhausted"));
-        let first = SchedulerStore::admit_subtask_tool_call(
+        let first = admit_test_subtask_connector_call(
             &read_only,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8869,8 +8968,12 @@ mod tests {
         let mutable = store
             .activate_prepared_subtask(parent, subtasks[1].fence, Duration::from_secs(20), &permit)
             .expect("mutation subtask activates independently");
+        assert_eq!(
+            mutable.allowed_connector_tools.get("external_tools:jira"),
+            Some(&vec!["jira_update_issue".to_string()])
+        );
         for expected in 1..=subtasks[1].contract.budget.max_mutation_calls {
-            let admitted = SchedulerStore::admit_subtask_tool_call(
+            let admitted = admit_test_subtask_connector_call(
                 &mutable,
                 "external_tools:jira",
                 SubtaskToolRisk::Mutation,
@@ -8878,14 +8981,14 @@ mod tests {
             .expect("bounded mutation admitted");
             assert_eq!(admitted.mutation_calls_used, expected);
         }
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &mutable,
             "external_tools:jira",
             SubtaskToolRisk::Mutation,
         )
         .expect_err("mutation budget remains a separate hard limit")
         .contains("mutation-call budget is exhausted"));
-        let post_mutation_read = SchedulerStore::admit_subtask_tool_call(
+        let post_mutation_read = admit_test_subtask_connector_call(
             &mutable,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8901,7 +9004,7 @@ mod tests {
         );
 
         drop(store);
-        let second = SchedulerStore::admit_subtask_tool_call(
+        let second = admit_test_subtask_connector_call(
             &read_only,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8913,7 +9016,12 @@ mod tests {
         expanded
             .capabilities
             .push("external_tools:other".to_string());
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        expanded.capabilities.sort();
+        expanded.allowed_connector_tools.insert(
+            "external_tools:other".to_string(),
+            vec!["other_read".to_string()],
+        );
+        assert!(admit_test_subtask_connector_call(
             &expanded,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8922,7 +9030,7 @@ mod tests {
         .contains("immutable contract"));
         let mut stale_authority = read_only.clone();
         stale_authority.authority_fencing_token += 1;
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &stale_authority,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8931,7 +9039,7 @@ mod tests {
         .contains("stale, expired, or incompatible"));
         let mut altered_lease = read_only.clone();
         altered_lease.lease_expires_at += 1;
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &altered_lease,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8948,7 +9056,7 @@ mod tests {
                 params![to_i64(session_id.0).expect("session ID fits")],
             )
             .expect("test revokes parent capability");
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &read_only,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8969,7 +9077,7 @@ mod tests {
         reopened
             .cancel(session_id)
             .expect("parent cancellation starts");
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &read_only,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -8995,7 +9103,7 @@ mod tests {
                 let authority = authority.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    SchedulerStore::admit_subtask_tool_call(
+                    admit_test_subtask_connector_call(
                         &authority,
                         "external_tools:jira",
                         SubtaskToolRisk::Read,
@@ -9010,7 +9118,7 @@ mod tests {
             .filter(Result::is_ok)
             .count();
         assert_eq!(admitted, expected_budget);
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &authority,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -9038,7 +9146,7 @@ mod tests {
             .expect("exact lease renews");
         let now = now_millis();
         assert!(renewed.lease_expires_at > authority.lease_expires_at);
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &authority,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -9051,7 +9159,7 @@ mod tests {
                 .contains("exact lease fence")
         );
 
-        let admission = SchedulerStore::admit_subtask_tool_call(
+        let admission = admit_test_subtask_connector_call(
             &renewed,
             "external_tools:jira",
             SubtaskToolRisk::Read,
@@ -9090,7 +9198,7 @@ mod tests {
         )
         .expect_err("forged terminal replay fails")
         .contains("descriptor is stale"));
-        assert!(SchedulerStore::admit_subtask_tool_call(
+        assert!(admit_test_subtask_connector_call(
             &renewed,
             "external_tools:jira",
             SubtaskToolRisk::Read,

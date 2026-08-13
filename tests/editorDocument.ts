@@ -714,9 +714,10 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       dispatch_lifecycle: "staged",
       lease_recovery: "fail_closed",
       authority_scope: "deterministic_objective_subset",
-      grant_policy: "objective_capability_signals_v2",
+      grant_policy: "objective_tool_operations_v3",
       parent_capability_count: 4,
       aggregate_capability_grants: 5,
+      aggregate_connector_operation_grants: 3,
       narrowed_subtask_count: 2,
       authority_active: false,
       delegation_allowed: false,
@@ -750,10 +751,22 @@ assertEqual(
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(
-    "Grant policy: deterministic per-objective capability subset",
+    "Grant policy: deterministic per-objective capabilities and connector operations",
   ),
   true,
   "subtask preparation should explain deterministic authority narrowing",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes("Exact connector operation grants: 3"),
+  true,
+  "subtask preparation should expose only the safe aggregate connector operation count",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Unlisted connector tools are rejected before forwarding",
+  ),
+  true,
+  "subtask preparation should explain exact connector operation enforcement",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

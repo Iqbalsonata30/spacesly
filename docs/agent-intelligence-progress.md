@@ -13,9 +13,34 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Eight vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, and deterministic per-objective external and built-in capability narrowing. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Nine vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, and exact per-objective connector-operation authority. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed ninth vertical slice: exact per-objective connector-operation authority.
+
+- A connector capability is retained only when at least one immutable capability-plan tool matches both the objective resource and its normalized operation class. Read/search/inspect, create, update/write, delete, trigger, restart, and promote remain provider-neutral operation classes; snake case, kebab/namespaced, and camelCase tool names are normalized deterministically.
+- Each resulting connector-to-tool allowlist is sorted, bounded, parent-contained, and sealed into version-2 content-addressed subtask contracts. Version-1 dormant contracts remain readable after restart but cannot be activated because they do not carry exact connector-operation authority.
+- Scheduler activation copies the immutable operation map into the short-lived subtask descriptor. Admission revalidates the current parent fence, current parent grant, exact contract capability set, exact operation map, lease, and budgets.
+- The MCP forwarding boundary passes the actual requested tool name into scheduler admission. An unlisted connector operation is rejected before budget consumption and before connector forwarding, even when another operation from the same connector is allowed.
+- Built-in workspace, shell, and Git calls retain their existing category-specific admission and deeper containment/operation policies; connector tool identities cannot be smuggled into that built-in path.
+- Durable Activity uses policy identity `objective_tool_operations_v3`, reports only the aggregate number of exact connector-operation grants, and explains the fail-closed forwarding boundary. Objective text, connector/tool names, arguments, responses, paths, commands, and credentials are not emitted.
+- Specialized Worker dispatch remains disabled. This slice strengthens staged authority and does not claim that a second Worker is launched or that independent evidence is aggregated.
+
+Phase 14 ninth-increment regression evidence:
+
+- Ten domain tests cover separate read/mutation providers, ambiguous routing, unknown camelCase providers, operation-class mismatch, parent containment, deterministic ordering, and exact persisted allowlists.
+- Scheduler tests cover exact read/update maps, rejection of an unlisted same-connector mutation before budget admission, immutable contract mismatch, concurrent budget enforcement, restart, renewal, cancellation, and terminal lifecycle behavior.
+- MCP integration proves the requested connector tool name reaches exact scheduler enforcement and is rejected before stale-authority lookup or upstream forwarding when it is not listed.
+- Full Rust suite: 533 passed, 3 ignored, 0 failed in serial mode; `cargo check` and Rust formatting passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator suite: 6 passed, 0 failed. Full rendered browser suite: 12 passed, 0 failed. Browser-only native-theme mock warnings remain unchanged and non-failing.
+
+Known limitations:
+
+- Operation matching is intentionally conservative and depends on bounded semantic objective hints plus the immutable discovered capability plan. Missing or ambiguous evidence removes authority rather than asking the model to widen it.
+- Exact file paths, shell commands, and Git sub-operations remain governed by their existing built-in containment and policy layers rather than this connector-operation map.
+- Scheduler-owned Worker launch, heartbeat orchestration, independent evidence aggregation, and production enablement remain future Phase 14 increments.
 
 Completed eighth vertical slice: deterministic per-objective built-in workspace, file, shell, and Git authority.
 

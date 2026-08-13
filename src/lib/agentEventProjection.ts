@@ -145,6 +145,12 @@ export function projectAgentTaskSessionEvent(
       payload.narrowed_subtask_count <= subtaskCount
         ? payload.narrowed_subtask_count
         : 0;
+    const connectorOperationGrants =
+      typeof payload.aggregate_connector_operation_grants === "number" &&
+      Number.isSafeInteger(payload.aggregate_connector_operation_grants) &&
+      payload.aggregate_connector_operation_grants >= 0
+        ? payload.aggregate_connector_operation_grants
+        : 0;
     summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
     details.push(
       "- Scheduler state: dormant",
@@ -154,8 +160,10 @@ export function projectAgentTaskSessionEvent(
       "- Tool budgets will be charged atomically before forwarding after dispatch is enabled.",
       `- Dormant fencing identities: ${dormantFenceCount}`,
       "- Tool authority active: no",
-      "- Grant policy: deterministic per-objective capability subset",
+      "- Grant policy: deterministic per-objective capabilities and connector operations",
       `- Objectives with narrowed authority: ${narrowedSubtaskCount} of ${subtaskCount}`,
+      `- Exact connector operation grants: ${connectorOperationGrants}`,
+      "- Unlisted connector tools are rejected before forwarding.",
       "- Built-in mutation authority requires local scope and a mutation objective.",
       "- Ambiguous connector evidence grants no subtask connector authority.",
       `- Aggregate tool-call budget: ${toolBudget}`,

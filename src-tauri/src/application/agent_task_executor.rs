@@ -3119,6 +3119,11 @@ impl TaskExecutor for AgentTaskExecutor {
                 .iter()
                 .map(|subtask| subtask.contract.granted_capabilities.len())
                 .sum::<usize>();
+            let prepared_subtask_connector_operation_grants = prepared_subtasks
+                .iter()
+                .flat_map(|subtask| subtask.contract.allowed_connector_tools.values())
+                .map(Vec::len)
+                .sum::<usize>();
             let narrowed_subtask_count = prepared_subtasks
                 .iter()
                 .filter(|subtask| {
@@ -3140,9 +3145,10 @@ impl TaskExecutor for AgentTaskExecutor {
                     "dispatch_lifecycle": "staged",
                     "lease_recovery": "fail_closed",
                     "authority_scope": "deterministic_objective_subset",
-                    "grant_policy": "objective_capability_signals_v2",
+                    "grant_policy": "objective_tool_operations_v3",
                     "parent_capability_count": parent_capabilities.len(),
                     "aggregate_capability_grants": prepared_subtask_capability_grants,
+                    "aggregate_connector_operation_grants": prepared_subtask_connector_operation_grants,
                     "narrowed_subtask_count": narrowed_subtask_count,
                     "authority_active": false,
                     "delegation_allowed": false,
@@ -6008,10 +6014,14 @@ mod tests {
         );
         assert_eq!(
             subtask_authority.payload["grant_policy"],
-            "objective_capability_signals_v2"
+            "objective_tool_operations_v3"
         );
         assert_eq!(subtask_authority.payload["parent_capability_count"], 1);
         assert_eq!(subtask_authority.payload["aggregate_capability_grants"], 0);
+        assert_eq!(
+            subtask_authority.payload["aggregate_connector_operation_grants"],
+            0
+        );
         assert_eq!(subtask_authority.payload["narrowed_subtask_count"], 2);
         let encoded = serde_json::to_string(&subtask_authority.payload)
             .expect("subtask authority event encodes");

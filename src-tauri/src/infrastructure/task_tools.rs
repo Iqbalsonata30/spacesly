@@ -1051,6 +1051,7 @@ mod tests {
             authority_fencing_token: 1,
             objective_id: "unbound-objective".to_string(),
             capabilities: vec!["workspace_read".to_string()],
+            allowed_connector_tools: std::collections::BTreeMap::new(),
             lease_expires_at: i64::MAX as u64,
         });
         let roots = WorkspaceRoot::scoped("workspace-test", &root).expect("workspace registered");

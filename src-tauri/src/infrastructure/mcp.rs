@@ -612,9 +612,15 @@ fn validate_proxy_request(
                     "Subtask authority does not match its parent connector authority.".to_string(),
                 );
             }
-            SchedulerStore::admit_subtask_tool_call(
+            let tool_name = message
+                .get("params")
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "MCP tool call did not include a tool name.".to_string())?;
+            SchedulerStore::admit_subtask_connector_tool_call(
                 subtask,
                 &authority.capability,
+                tool_name,
                 if risk == super::tool_broker::ToolRisk::Read {
                     crate::infrastructure::scheduler_store::SubtaskToolRisk::Read
                 } else {
@@ -3392,7 +3398,10 @@ done
                 &connector_binding,
             )
             .expect("authority created");
-        let tools = Mutex::new(vec!["jira_search".to_string()]);
+        let tools = Mutex::new(vec![
+            "jira_search".to_string(),
+            "jira_update_issue".to_string(),
+        ]);
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -3426,8 +3435,33 @@ done
             authority_fencing_token: 1,
             objective_id: "unbound-objective".to_string(),
             capabilities: vec!["external_tools:jira-a".to_string()],
+            allowed_connector_tools: std::collections::BTreeMap::from([(
+                "external_tools:jira-a".to_string(),
+                vec!["jira_search".to_string()],
+            )]),
             lease_expires_at: i64::MAX as u64,
         });
+        let unlisted_request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "jira_update_issue",
+                "arguments": {"issue": "APP-1", "summary": "changed"}
+            }
+        });
+        let error = validate_proxy_request(
+            &unlisted_request,
+            &tools,
+            &ProxyAssignmentAuthority::Fenced(unbound_subtask.clone()),
+            "jira-a",
+            &connector_binding,
+        )
+        .expect_err("unlisted subtask connector operation fails before scheduler lookup");
+        assert!(
+            error.contains("not granted by its objective contract"),
+            "unexpected proxy rejection: {error}"
+        );
         let mut mismatched_parent = unbound_subtask.clone();
         mismatched_parent
             .subtask_authority
