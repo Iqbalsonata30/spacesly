@@ -12,6 +12,25 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
+- Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
+
+## Phase 13 Completed
+
+Implemented authoritative operator guidance:
+
+- `get_task_session_operator_guidance` combines the scheduler snapshot with the latest valid uncertain resource-mutation fence and returns no guidance for non-blocked sessions.
+- Stable causes are `approval_required`, `mutation_outcome_uncertain`, `retry_fresh_required`, `execution_interrupted`, and `execution_blocked`.
+- Each cause maps to exactly one action: `approve`, `supersede_mutation`, `retry_fresh`, or `continue`. Approval takes precedence, followed by an uncertain mutation fence, missing resumable identity, and ordinary interrupted/blocked execution.
+- The projection contains only schema/session identity, cause code, a fixed safe summary, source class, action label/confirmation requirement, and an optional canonical mutation ID/key/revision. It never returns the raw scheduler error, provider response, connector configuration, arguments, URLs, task content, or credentials.
+- The Agent console loads this projection only for attention states, shows its cause and source, and offers the backend-selected action. When authoritative guidance exists, the legacy manual-completion shortcut is hidden.
+- Approval still uses exact operation/argument UI approval. Mutation supersede still requires an operator reason plus expected operation key and revision. Continue and Retry Fresh route to the owning task so existing ownership and capability checks remain authoritative.
+- Connector/tool choice and repository/environment selection remain inspectable through the existing immutable Task Examination, manifest, context, MCP, trace, and mutation projections.
+
+Phase 13 regression evidence:
+
+- Focused cause priority, approval redaction, uncertain-fence identity, continuation/retry selection, and non-terminal omission tests: 5 passed.
+- Full Rust suite: 510 passed, 3 ignored, 0 failed in serial mode.
+- Frontend unit tests: 7 passed, 0 failed; Rust compilation and Svelte type checking passed.
 
 ## Phase 12 Completed
 
@@ -37,7 +56,7 @@ Phase 12 regression evidence:
 
 - Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, containment, connector-preflight, and report-redaction tests: 10 passed.
 - Headless embedded corpus: 54 passed, 0 failed; planning, safe execution, recovery, and evidence quality 100%.
-- Full Rust suite: 505 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Full Rust suite: 510 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
@@ -222,7 +241,7 @@ Phase 11 regression evidence:
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
 - Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
-- Full Rust suite: 505 passed, 3 ignored, 0 failed in serial mode.
+- Full Rust suite: 510 passed, 3 ignored, 0 failed in serial mode.
 - Focused Jira Rules compilation/binding, strict identity/status parsing, mismatch/conflict handling, schema compatibility, and diagnostic redaction tests: 7 passed.
 - Focused Jira comment capture, ambiguity, content drift, ADF normalization, checkpoint replay, continuation resolution, and redaction tests: 6 passed.
 - Focused Jira identity, mutation-ledger replay/uncertainty, proxy response enrichment, final-writeback durability, recovery, and redaction tests: 12 passed.

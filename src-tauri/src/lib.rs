@@ -62,9 +62,9 @@ use domain::entity::Workspace;
 use domain::execution::ExecutionRun;
 use domain::execution_manifest::TaskExecutionManifest;
 use domain::task_session::{
-    TaskExecutionTracePage, TaskMcpContext, TaskSessionEnvelope, TaskSessionEventPage,
-    TaskSessionId, TaskSessionInputV2, TaskSessionResult, TaskSessionSnapshot, TaskSessionUpdate,
-    TaskToolState,
+    project_task_operator_guidance, OperatorMutationFenceReference, TaskExecutionTracePage,
+    TaskMcpContext, TaskOperatorGuidance, TaskSessionEnvelope, TaskSessionEventPage, TaskSessionId,
+    TaskSessionInputV2, TaskSessionResult, TaskSessionSnapshot, TaskSessionUpdate, TaskToolState,
 };
 use infrastructure::ai_event::AiRuntimeEvent;
 use infrastructure::ai_run::{AiRun, AiRunKind, AiRunRegistry, AiRunStatus};
@@ -120,7 +120,9 @@ use infrastructure::pty::{
 };
 use infrastructure::recovery_store::{RecoverySnapshot, RecoverySnapshotInput, RecoveryStore};
 use infrastructure::runtime_profile_store::{AgentRuntimeProfile, RuntimeProfileStore};
-use infrastructure::scheduler_store::{ResourceMutationRecord, SchedulerStore};
+use infrastructure::scheduler_store::{
+    ResourceMutationRecord, ResourceMutationState, SchedulerStore,
+};
 use infrastructure::secrets::{AppSecrets, AppSecretsStore, JiraConnectionProfile};
 use infrastructure::shell::{
     complete_shell_input as complete_shell_input_impl, run_shell_command as run_shell_command_impl,
@@ -2534,6 +2536,37 @@ async fn get_task_session(
         .map_err(|error| format!("Get Task Session task failed: {error}"))?
 }
 
+/// Returns one backend-authoritative terminal cause and one bounded operator action.
+#[tauri::command]
+async fn get_task_session_operator_guidance(
+    session_id: u64,
+    scheduler_store: State<'_, SchedulerStore>,
+) -> Result<Option<TaskOperatorGuidance>, String> {
+    let store = scheduler_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let id = TaskSessionId(session_id);
+        let Some(snapshot) = store.get_session(id)? else {
+            return Ok(None);
+        };
+        let uncertain_mutation = store
+            .resource_mutations_for_session(id)?
+            .into_iter()
+            .filter(|record| record.state == ResourceMutationState::Uncertain)
+            .max_by_key(|record| (record.revision, record.mutation_id))
+            .map(|record| OperatorMutationFenceReference {
+                mutation_id: record.mutation_id,
+                operation_key: record.operation_key,
+                revision: record.revision,
+            });
+        Ok(project_task_operator_guidance(
+            &snapshot,
+            uncertain_mutation,
+        ))
+    })
+    .await
+    .map_err(|error| format!("Get Task Session operator guidance task failed: {error}"))?
+}
+
 /// Returns the durable authoritative Agent result once staging has completed, including while the
 /// session is still committing its executions.db projection.
 #[tauri::command]
@@ -3471,6 +3504,7 @@ pub fn run() {
             list_task_sessions,
             get_scheduler_health,
             get_task_session,
+            get_task_session_operator_guidance,
             get_task_session_result,
             list_task_session_events,
             list_task_session_resource_mutations,

@@ -4,6 +4,7 @@
   import {
     getTaskSessionContextInspection,
     getTaskSessionExecutionManifest,
+    getTaskSessionOperatorGuidance,
     listTaskSessionResourceMutations,
     listTaskSessionExecutionTrace,
     supersedeTaskSessionResourceMutation,
@@ -14,6 +15,7 @@
     type TaskExecutionTraceEntry,
     type TaskExecutionTracePage,
     type ResourceMutationRecord,
+    type TaskOperatorGuidance,
   } from "$lib/ipc";
   import { timelineActivities, type TimelineActivity } from "$lib/agentTimeline";
   import type {
@@ -114,6 +116,10 @@
   let supersedingMutationId = $state<number | null>(null);
   let mutationsSessionId: number | null | undefined = undefined;
   let mutationsGeneration = 0;
+  let guidanceState = $state<"idle" | "loading" | "ready" | "error" | "unavailable">("idle");
+  let operatorGuidance = $state<TaskOperatorGuidance | null>(null);
+  let guidanceSessionId: number | null | undefined = undefined;
+  let guidanceGeneration = 0;
 
   let isWorking = $derived(runStatus === "running");
   let isBlocked = $derived(runStatus === "blocked" || runStatus === "timeout");
@@ -130,10 +136,11 @@
   let userActivity = $derived(userFacingActivity(runStatus, progress));
   let summary = $derived(result?.summary?.trim() || userFacingSummary(runStatus));
   let attentionMessage = $derived(
-    runStatus === "timeout"
-      ? "The Agent stopped waiting for a response. Review the task and continue or retry when ready."
-      : result?.blocked_reason?.trim() ||
-          "The Agent paused before it could finish. Review the task for the next action.",
+    operatorGuidance?.summary ??
+      (runStatus === "timeout"
+        ? "The Agent stopped waiting for a response. Review the task and continue or retry when ready."
+        : result?.blocked_reason?.trim() ||
+          "The Agent paused before it could finish. Review the task for the next action."),
   );
   let resultItems = $derived(
     result ? usefulResultLines([...result.details, ...result.evidence]).slice(0, 8) : [],
@@ -163,6 +170,18 @@
     if (contextSessionId === sessionId) return;
     contextSessionId = sessionId;
     resetContext(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    const sessionId = taskSessionId;
+    if (guidanceSessionId === sessionId) return;
+    guidanceSessionId = sessionId;
+    resetOperatorGuidance(sessionId === null ? "unavailable" : "idle");
+  });
+
+  $effect(() => {
+    if (!isBlocked || taskSessionId === null || guidanceState !== "idle") return;
+    void loadOperatorGuidance(taskSessionId);
   });
 
   $effect(() => {
@@ -213,7 +232,47 @@
     contextGeneration += 1;
     manifestGeneration += 1;
     mutationsGeneration += 1;
+    guidanceGeneration += 1;
   });
+
+  function resetOperatorGuidance(state: typeof guidanceState = "idle") {
+    guidanceGeneration += 1;
+    operatorGuidance = null;
+    guidanceState = state;
+  }
+
+  async function loadOperatorGuidance(sessionId: number) {
+    if (guidanceState === "loading") return;
+    const generation = guidanceGeneration;
+    guidanceState = "loading";
+    try {
+      const guidance = await getTaskSessionOperatorGuidance(sessionId);
+      if (generation !== guidanceGeneration || taskSessionId !== sessionId) return;
+      operatorGuidance = guidance;
+      guidanceState = "ready";
+    } catch {
+      if (generation !== guidanceGeneration || taskSessionId !== sessionId) return;
+      operatorGuidance = null;
+      guidanceState = "error";
+    }
+  }
+
+  function openOperatorAction() {
+    if (!operatorGuidance || !runCardId) return;
+    if (operatorGuidance.action.kind === "approve" && approval && approval.status === "pending") {
+      onApprove(runCardId);
+      return;
+    }
+    if (operatorGuidance.action.kind === "supersede_mutation") {
+      technicalOpen = true;
+      mutationsOpen = true;
+      if (taskSessionId !== null && mutationsState === "idle") {
+        void loadResourceMutations(taskSessionId);
+      }
+      return;
+    }
+    onOpenCard(runCardId);
+  }
 
   function resetTrace(state: typeof traceState = "idle") {
     traceGeneration += 1;
@@ -637,13 +696,25 @@
       {#if attentionOpen}
         <div class="attention-body">
           <p>{attentionMessage}</p>
+          {#if operatorGuidance}
+            <small class="guidance-source"
+              >Cause: {operatorGuidance.cause_code.replaceAll("_", " ")} · Source: {operatorGuidance.source.replaceAll(
+                "_",
+                " ",
+              )}</small
+            >
+          {/if}
           <div class="attention-actions">
-            {#if runCardId}<button
+            {#if runCardId && operatorGuidance}<button
+                type="button"
+                class="primary-action"
+                onclick={openOperatorAction}>{operatorGuidance.action.label}</button
+              >{:else if runCardId}<button
                 type="button"
                 class="primary-action"
                 onclick={() => onOpenCard(runCardId)}>Review task</button
               >{/if}
-            {#if runCardId && runStatus === "blocked"}<button
+            {#if runCardId && runStatus === "blocked" && !operatorGuidance}<button
                 type="button"
                 class="secondary-action"
                 onclick={() => onMarkBlockedDone(runCardId)}>Mark done manually</button
@@ -1850,6 +1921,16 @@
     color: var(--text-primary);
     font-size: 12px;
     line-height: 1.5;
+  }
+  .guidance-source {
+    display: block;
+    margin-top: 6px;
+    color: var(--text-dim);
+    font:
+      9px/1.45 ui-monospace,
+      SFMono-Regular,
+      monospace;
+    text-transform: capitalize;
   }
   .attention-actions {
     display: flex;

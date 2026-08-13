@@ -1037,9 +1037,259 @@ pub struct TaskSessionSnapshot {
     pub completed_at: Option<u64>,
 }
 
+/// Secret-free reference needed to release one uncertain resource-mutation fence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OperatorMutationFenceReference {
+    pub mutation_id: u64,
+    pub operation_key: String,
+    pub revision: u64,
+}
+
+/// One backend-authoritative action an operator may take for a terminal Task Session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOperatorActionKind {
+    Approve,
+    Continue,
+    RetryFresh,
+    SupersedeMutation,
+}
+
+/// Stable machine-readable reason a terminal Task Session needs operator action.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOperatorCauseCode {
+    ApprovalRequired,
+    MutationOutcomeUncertain,
+    RetryFreshRequired,
+    ExecutionInterrupted,
+    ExecutionBlocked,
+}
+
+/// Authoritative durable projection from which operator guidance was derived.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOperatorGuidanceSource {
+    SchedulerError,
+    ResourceMutationLedger,
+    SchedulerState,
+}
+
+/// Bounded action associated with one authoritative terminal cause.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskOperatorAction {
+    pub kind: TaskOperatorActionKind,
+    pub label: String,
+    pub requires_confirmation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<OperatorMutationFenceReference>,
+}
+
+/// Durable-state-derived explanation for why a Task Session stopped and what may happen next.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskOperatorGuidance {
+    pub schema_version: u32,
+    pub session_id: TaskSessionId,
+    pub cause_code: TaskOperatorCauseCode,
+    pub summary: String,
+    pub source: TaskOperatorGuidanceSource,
+    pub action: TaskOperatorAction,
+}
+
+/// Projects one secret-free cause and one bounded next action from authoritative scheduler state.
+pub fn project_task_operator_guidance(
+    snapshot: &TaskSessionSnapshot,
+    uncertain_mutation: Option<OperatorMutationFenceReference>,
+) -> Option<TaskOperatorGuidance> {
+    if !matches!(
+        snapshot.state,
+        TaskSessionState::Blocked | TaskSessionState::Failed
+    ) {
+        return None;
+    }
+    let error = snapshot
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let uncertain_mutation = uncertain_mutation.filter(|mutation| {
+        mutation.mutation_id > 0
+            && mutation.revision > 0
+            && mutation.operation_key.len() == 64
+            && mutation
+                .operation_key
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    let guidance = if error.contains("[approval_required]") {
+        (
+            TaskOperatorCauseCode::ApprovalRequired,
+            "A sensitive operation is waiting for explicit operator approval.",
+            TaskOperatorGuidanceSource::SchedulerError,
+            TaskOperatorActionKind::Approve,
+            "Review and approve",
+            true,
+            None,
+        )
+    } else if let Some(mutation) = uncertain_mutation {
+        (
+            TaskOperatorCauseCode::MutationOutcomeUncertain,
+            "An external mutation may have reached its provider, so automatic replay is fenced.",
+            TaskOperatorGuidanceSource::ResourceMutationLedger,
+            TaskOperatorActionKind::SupersedeMutation,
+            "Review mutation fence",
+            true,
+            Some(mutation),
+        )
+    } else if error.contains("[recovery_requires_retry_fresh]")
+        || snapshot.opencode_session_id.is_none()
+    {
+        (
+            TaskOperatorCauseCode::RetryFreshRequired,
+            "The prior runtime session cannot be resumed safely.",
+            TaskOperatorGuidanceSource::SchedulerState,
+            TaskOperatorActionKind::RetryFresh,
+            "Retry as a new task",
+            true,
+            None,
+        )
+    } else if snapshot.state == TaskSessionState::Failed {
+        (
+            TaskOperatorCauseCode::ExecutionInterrupted,
+            "Execution stopped, but its durable runtime session is available for continuation.",
+            TaskOperatorGuidanceSource::SchedulerState,
+            TaskOperatorActionKind::Continue,
+            "Continue interrupted task",
+            true,
+            None,
+        )
+    } else {
+        (
+            TaskOperatorCauseCode::ExecutionBlocked,
+            "Execution reached a deterministic block and retained a resumable runtime session.",
+            TaskOperatorGuidanceSource::SchedulerState,
+            TaskOperatorActionKind::Continue,
+            "Continue after resolving the block",
+            true,
+            None,
+        )
+    };
+    Some(TaskOperatorGuidance {
+        schema_version: 1,
+        session_id: snapshot.id,
+        cause_code: guidance.0,
+        summary: guidance.1.to_string(),
+        source: guidance.2,
+        action: TaskOperatorAction {
+            kind: guidance.3,
+            label: guidance.4.to_string(),
+            requires_confirmation: guidance.5,
+            mutation: guidance.6,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocked_snapshot(error: &str, opencode_session_id: Option<&str>) -> TaskSessionSnapshot {
+        TaskSessionSnapshot {
+            id: TaskSessionId(41),
+            request: TaskRequest::new("operator guidance"),
+            state: TaskSessionState::Blocked,
+            worker_id: None,
+            dispatch_sequence: None,
+            attempt: 1,
+            attempt_id: Some(2),
+            fencing_token: 3,
+            opencode_session_id: opencode_session_id.map(str::to_string),
+            lease_expires_at: None,
+            progress: None,
+            last_event_sequence: 4,
+            error: Some(error.to_string()),
+            created_at: 1,
+            started_at: Some(2),
+            completed_at: Some(3),
+        }
+    }
+
+    #[test]
+    fn operator_guidance_prioritizes_approval_and_redacts_raw_error() {
+        let snapshot = blocked_snapshot(
+            "[approval_required] token=private-value restart production",
+            Some("session-1"),
+        );
+        let guidance = project_task_operator_guidance(&snapshot, None).expect("guidance");
+        assert_eq!(guidance.cause_code, TaskOperatorCauseCode::ApprovalRequired);
+        assert_eq!(guidance.action.kind, TaskOperatorActionKind::Approve);
+        let encoded = serde_json::to_string(&guidance).expect("guidance serializes");
+        assert!(!encoded.contains("private-value"));
+        assert!(!encoded.contains("production"));
+    }
+
+    #[test]
+    fn operator_guidance_fences_uncertain_mutation_before_continuation() {
+        let snapshot = blocked_snapshot("connector response was interrupted", Some("session-1"));
+        let mutation = OperatorMutationFenceReference {
+            mutation_id: 9,
+            operation_key: "a".repeat(64),
+            revision: 2,
+        };
+        let guidance =
+            project_task_operator_guidance(&snapshot, Some(mutation.clone())).expect("guidance");
+        assert_eq!(
+            guidance.cause_code,
+            TaskOperatorCauseCode::MutationOutcomeUncertain
+        );
+        assert_eq!(
+            guidance.action.kind,
+            TaskOperatorActionKind::SupersedeMutation
+        );
+        assert_eq!(guidance.action.mutation, Some(mutation));
+    }
+
+    #[test]
+    fn operator_guidance_never_exposes_invalid_mutation_identity() {
+        let snapshot = blocked_snapshot("connector response was interrupted", Some("session-1"));
+        let guidance = project_task_operator_guidance(
+            &snapshot,
+            Some(OperatorMutationFenceReference {
+                mutation_id: 9,
+                operation_key: "token=private-value".to_string(),
+                revision: 2,
+            }),
+        )
+        .expect("guidance");
+        assert_eq!(guidance.action.kind, TaskOperatorActionKind::Continue);
+        let encoded = serde_json::to_string(&guidance).expect("guidance serializes");
+        assert!(!encoded.contains("private-value"));
+    }
+
+    #[test]
+    fn operator_guidance_selects_continue_or_retry_fresh_from_durable_identity() {
+        let resumable = project_task_operator_guidance(
+            &blocked_snapshot("preflight blocked", Some("session-1")),
+            None,
+        )
+        .expect("resumable guidance");
+        assert_eq!(resumable.action.kind, TaskOperatorActionKind::Continue);
+
+        let fresh = project_task_operator_guidance(
+            &blocked_snapshot("runtime stopped before binding", None),
+            None,
+        )
+        .expect("fresh guidance");
+        assert_eq!(fresh.cause_code, TaskOperatorCauseCode::RetryFreshRequired);
+        assert_eq!(fresh.action.kind, TaskOperatorActionKind::RetryFresh);
+    }
+
+    #[test]
+    fn operator_guidance_is_absent_for_non_blocked_sessions() {
+        let mut snapshot = blocked_snapshot("none", Some("session-1"));
+        snapshot.state = TaskSessionState::Succeeded;
+        assert_eq!(project_task_operator_guidance(&snapshot, None), None);
+    }
 
     #[test]
     fn versioned_envelope_round_trips_without_secrets() {

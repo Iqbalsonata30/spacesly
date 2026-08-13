@@ -414,9 +414,17 @@ Exit criteria:
 
 ### Phase 13 — Operator Explainability and Control
 
-Status: planned.
+Status: completed.
 
 Expose why a connector, tool, repository, environment, approval, recovery action, or replay fence was selected. Provide safe operator actions such as continue, approve, retry fresh, or supersede an idempotency key.
+
+Implemented operator-guidance increment:
+
+- A backend-owned projection derives terminal guidance only from scheduler state, durable runtime identity, and the resource-mutation ledger.
+- Every blocked or failed session receives one stable cause and exactly one bounded next action: approve, continue, retry fresh, or review and supersede an uncertain mutation fence.
+- Approval markers and canonical mutation-fence identity are checked before an action is offered. Invalid mutation identity and raw scheduler/provider errors are never copied into guidance.
+- The Agent console displays the authoritative cause/source and action. Approval uses the structured approval path, uncertain mutations open the existing reason-and-revision-fenced supersede control, and continuation/retry actions route to the owning task rather than executing silently.
+- Existing Task Examination, execution manifest, context inspection, MCP context, resource-mutation history, and execution trace projections explain connector, tool, repository, environment, policy, and recovery selections without relying on model-authored summaries.
 
 Benefits:
 

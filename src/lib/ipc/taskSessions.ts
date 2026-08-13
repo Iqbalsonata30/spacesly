@@ -222,6 +222,31 @@ export type TaskSessionSnapshot = {
   completed_at: number | null;
 };
 
+export type TaskOperatorActionKind = "approve" | "continue" | "retry_fresh" | "supersede_mutation";
+
+export type TaskOperatorGuidance = {
+  schema_version: number;
+  session_id: number;
+  cause_code:
+    | "approval_required"
+    | "mutation_outcome_uncertain"
+    | "retry_fresh_required"
+    | "execution_interrupted"
+    | "execution_blocked";
+  summary: string;
+  source: "scheduler_error" | "resource_mutation_ledger" | "scheduler_state";
+  action: {
+    kind: TaskOperatorActionKind;
+    label: string;
+    requires_confirmation: boolean;
+    mutation?: {
+      mutation_id: number;
+      operation_key: string;
+      revision: number;
+    };
+  };
+};
+
 export type ResourceMutationState =
   "reserved" | "succeeded" | "failed" | "uncertain" | "superseded";
 
@@ -748,6 +773,17 @@ export function supersedeTaskSessionResourceMutation(
 /** Returns the latest durable projection for one Task Session, if it is still retained. */
 export function getTaskSession(sessionId: number): Promise<TaskSessionSnapshot | null> {
   return invokeWithPolicy("get_task_session", { sessionId }, IPC_POLICIES.taskSessionRead);
+}
+
+/** Returns one backend-authoritative terminal cause and one bounded operator action. */
+export function getTaskSessionOperatorGuidance(
+  sessionId: number,
+): Promise<TaskOperatorGuidance | null> {
+  return invokeWithPolicy(
+    "get_task_session_operator_guidance",
+    { sessionId },
+    IPC_POLICIES.taskSessionRead,
+  );
 }
 
 /** Returns a staged or finalized authoritative typed result; available before terminal state. */
