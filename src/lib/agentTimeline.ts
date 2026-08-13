@@ -202,6 +202,9 @@ function presentationForLog(
   if (log.label === "runtime" && /started|initialized|completed|result/i.test(rawSummary)) {
     return hiddenActivity(log.id);
   }
+  if (log.label === "runtime" && /connector session was recreated/i.test(rawSummary)) {
+    return activity("connector-recovered", "Connector Session Recovered", rawSummary, "completed");
+  }
   if (log.label === "start" || log.label === "context") {
     return activity(
       "preparing-task",

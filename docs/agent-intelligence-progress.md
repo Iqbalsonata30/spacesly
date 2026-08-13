@@ -35,9 +35,26 @@ Phase 14 first-increment regression evidence:
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Focused rendered operator-guidance suite: 4 passed, 0 failed. The unchanged broader browser scenarios executed through test 9 before this environment dropped the reporter process; no full-suite pass is claimed for this increment.
 
+Completed second vertical slice: bounded read-only connector-session recovery.
+
+- The provider-neutral MCP evidence boundary can recreate a transport-invalidated stdio connector process once and replay the exact read-only request within the caller's original deadline. The tool name, arguments, connector binding, and authorization are unchanged between attempts.
+- Tool Broker risk classification rejects mutation tools before connector spawn. Provider errors, authentication/authorization failures, invalid requests, and exhausted deadlines are not connector-session retries.
+- The result exposes only `connector_attempts` and `session_recovered` beside the validated response. Environment values remain redacted from errors, and command/environment configuration is absent from durable recovery evidence.
+- Exact Confluence page verification is the first end-to-end adapter. After successful recreation it emits a durable `connector_session_recovered` event before parsing and verifying the same immutable page ID.
+- The execution trace indexes this event and projects only `connector_session_recreated`; connector configuration and raw provider responses are not copied into the trace.
+- The Activity timeline presents `Connector Session Recovered`, explains that the read-only verification resumed safely, and states that no mutation authority was replayed or expanded.
+
+Phase 14 second-increment regression evidence:
+
+- MCP process simulation verifies immediate stdout loss, one fresh-process recreation, exact Confluence read replay, success on attempt two, no retry for a provider validation error, bounded deadline behavior, mutation rejection before spawn, and secret redaction.
+- Execution-trace tests verify durable indexing and ensure connector configuration, prompt text, tool errors, and runtime deltas are excluded from the safe trace projection.
+- The rendered browser journey shows the completed Confluence verification, visible recovery activity, two connector attempts, read-only risk, and the non-expansion of mutation authority.
+- Focused rendered operator-guidance and connector-recovery suite: 5 passed, 0 failed.
+- Full Rust suite: 513 passed, 3 ignored, 0 failed in serial mode. One initial parallel run had a timing-only governance performance assertion; its focused rerun passed and the serial suite passed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+
 Remaining Phase 14 work:
 
-- Resume/recreate connector process sessions under bounded provider-neutral contracts.
 - Give decomposed subtasks independent contracts, grants, fences, budgets, and evidence before enabling multiple executing agents.
 - Prove that no planner or specialized agent can delegate authority it was not granted.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.

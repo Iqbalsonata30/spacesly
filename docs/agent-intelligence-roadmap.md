@@ -453,7 +453,16 @@ Completed first increment: fail closed when lease or owner recovery discovers an
 - Backend-authoritative guidance selects the exact retained mutation fence. The rendered Activity timeline explains that recovery paused safely and that no replacement Worker resumed, while the operator must provide a reason before releasing the fence.
 - Browser-level coverage drives the interrupted-deployment reconciliation journey and verifies that fence release neither retries nor silently authorizes the task.
 
-This increment does not enable multi-agent execution. Connector process resumption, independent subtask contracts/grants/fences/budgets/evidence, and non-delegable specialized-agent authority remain Phase 14 work.
+The first increment does not enable multi-agent execution. Independent subtask contracts/grants/fences/budgets/evidence and non-delegable specialized-agent authority remain Phase 14 work.
+
+Completed second increment: bounded connector-session recreation for strict read-only evidence calls.
+
+- A transport-invalidated MCP process may be replaced once within the original request deadline. The exact authorized connector binding, read tool, and arguments are retained; provider errors and mutation calls remain outside this recovery path.
+- Exact Confluence page verification is the first end-to-end adapter. A recovered process must still return the immutable page ID and a bounded non-empty title before completion is accepted.
+- Durable events and the execution trace retain only provider class, read risk, bounded attempt count, and recovery status. Connector command/environment, credentials, raw responses, page title, and page body are excluded.
+- The rendered task Activity explains the successful recovery and explicitly confirms that no mutation authority was replayed or expanded.
+
+This increment recreates an MCP transport session; it does not recover provider-side conversational state. Stateful connectors will require an explicit provider-neutral resume token contract before they can use automatic recovery.
 
 Benefits:
 

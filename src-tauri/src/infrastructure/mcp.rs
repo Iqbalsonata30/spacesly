@@ -1094,6 +1094,14 @@ pub struct McpServerConfig {
     pub secret_id: Option<String>,
 }
 
+/// Result of one bounded read-only connector call, including secret-free recovery evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpReadToolResult {
+    pub value: Value,
+    pub connector_attempts: u8,
+    pub session_recovered: bool,
+}
+
 /// Validates any stdio MCP server by initializing it and listing tools.
 pub fn test_mcp_connection(server: McpServerConfig) -> Result<McpConnectionStatus, String> {
     with_mcp_client(&server, |client| {
@@ -1201,6 +1209,48 @@ pub fn call_mcp_read_tool(
     arguments: Value,
     request_timeout: Duration,
 ) -> Result<Value, String> {
+    call_mcp_read_tool_bounded(
+        connector_id,
+        command,
+        environment,
+        tool_name,
+        arguments,
+        request_timeout,
+        false,
+    )
+    .map(|result| result.value)
+}
+
+/// Calls one exact read-only tool and recreates its connector process at most once after a
+/// transport-invalidating failure. Both attempts share the caller's original deadline.
+pub fn call_mcp_read_tool_with_recovery(
+    connector_id: &str,
+    command: &[String],
+    environment: &HashMap<String, String>,
+    tool_name: &str,
+    arguments: Value,
+    request_timeout: Duration,
+) -> Result<McpReadToolResult, String> {
+    call_mcp_read_tool_bounded(
+        connector_id,
+        command,
+        environment,
+        tool_name,
+        arguments,
+        request_timeout,
+        true,
+    )
+}
+
+fn call_mcp_read_tool_bounded(
+    connector_id: &str,
+    command: &[String],
+    environment: &HashMap<String, String>,
+    tool_name: &str,
+    arguments: Value,
+    request_timeout: Duration,
+    recover_transport_once: bool,
+) -> Result<McpReadToolResult, String> {
     if !canonical_capability_name(connector_id)
         || !canonical_capability_name(tool_name)
         || ToolBroker::risk_for_tool(tool_name)
@@ -1223,11 +1273,40 @@ pub fn call_mcp_read_tool(
         .min(Duration::from_secs(45))
         .max(Duration::from_millis(1));
     let deadline = Instant::now() + request_timeout;
-    let result = with_mcp_client_until(&server, Some(deadline), |client| {
-        client.call_tool_with_timeout(tool_name, arguments, remaining_mcp_timeout(deadline))
-    });
-    let _ = close_mcp_session(server);
-    result
+    let mut connector_attempts = 0_u8;
+    loop {
+        connector_attempts = connector_attempts.saturating_add(1);
+        let result = with_mcp_client_until(&server, Some(deadline), |client| {
+            client.call_tool_with_timeout(
+                tool_name,
+                arguments.clone(),
+                remaining_mcp_timeout(deadline),
+            )
+        });
+        let _ = close_mcp_session(server.clone());
+        match result {
+            Ok(value) => {
+                return Ok(McpReadToolResult {
+                    value,
+                    connector_attempts,
+                    session_recovered: connector_attempts > 1,
+                });
+            }
+            Err(error)
+                if recover_transport_once
+                    && connector_attempts == 1
+                    && Instant::now() < deadline
+                    && mcp_error_invalidates_session(&error) =>
+            {
+                crate::infrastructure::performance::increment(
+                    "mcp_read_session_recoveries_total",
+                    "mcp",
+                    1,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn unavailable_capability_snapshot(
@@ -2875,6 +2954,112 @@ done
             result.pointer("/content/0/type").and_then(Value::as_str),
             Some("text")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_evidence_recreates_failed_connector_session_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let marker = directory.path().join("first-session-failed");
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"confluence_get_page","inputSchema":{"type":"object","properties":{"page_id":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      if [ ! -f "$RECOVERY_MARKER" ]; then
+        : > "$RECOVERY_MARKER"
+        exit 0
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"{\\"id\\":\\"1997894022\\",\\"title\\":\\"Deployment SOP\\"}"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        let connector_id = format!("confluence-recovery-{}", request_seed());
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let environment = HashMap::from([(
+            "RECOVERY_MARKER".to_string(),
+            marker.to_string_lossy().into_owned(),
+        )]);
+
+        let result = call_mcp_read_tool_with_recovery(
+            &connector_id,
+            &command,
+            &environment,
+            "confluence_get_page",
+            json!({"page_id": "1997894022"}),
+            Duration::from_secs(5),
+        )
+        .expect("read-only connector session recovered");
+
+        assert_eq!(result.connector_attempts, 2);
+        assert!(result.session_recovered);
+        assert_eq!(
+            result
+                .value
+                .pointer("/content/0/type")
+                .and_then(Value::as_str),
+            Some("text")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_evidence_does_not_recreate_session_for_provider_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let attempts = directory.path().join("connector-attempts");
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"confluence_get_page","inputSchema":{"type":"object","properties":{"page_id":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf 'x\n' >> "$ATTEMPT_MARKER"
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"invalid request %s"}}\n' "$id" "$CONNECTOR_SECRET"
+      ;;
+  esac
+done
+"#;
+        let connector_id = format!("confluence-provider-error-{}", request_seed());
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
+        let environment = HashMap::from([
+            (
+                "ATTEMPT_MARKER".to_string(),
+                attempts.to_string_lossy().into_owned(),
+            ),
+            (
+                "CONNECTOR_SECRET".to_string(),
+                "connector-secret-must-not-leak".to_string(),
+            ),
+        ]);
+
+        let error = call_mcp_read_tool_with_recovery(
+            &connector_id,
+            &command,
+            &environment,
+            "confluence_get_page",
+            json!({"page_id": "1997894022"}),
+            Duration::from_secs(5),
+        )
+        .expect_err("provider validation errors are not transport retries");
+
+        assert_eq!(
+            std::fs::read_to_string(attempts).expect("attempt marker read"),
+            "x\n"
+        );
+        assert!(!error.contains("connector-secret-must-not-leak"));
+        assert!(error.contains("[REDACTED]"));
     }
 
     #[cfg(unix)]

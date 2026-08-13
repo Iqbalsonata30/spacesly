@@ -195,3 +195,23 @@ test("uncertain mutation guidance opens the exact retained fence", async ({ page
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Mark done manually" })).toHaveCount(0);
 });
+
+test("read-only connector recovery remains visible after task completion", async ({ page }) => {
+  await page.goto("/__operator-guidance?connectorRecovery=1");
+
+  const activity = page.getByRole("article").filter({
+    has: page.getByText("Connector Session Recovered", { exact: true }),
+  });
+  await expect(activity).toContainText(
+    "Confluence connector session was recreated and its read-only verification resumed safely.",
+  );
+  await expect(
+    page
+      .getByRole("region", { name: "Result" })
+      .getByText("The Confluence page was verified after connector recovery."),
+  ).toBeVisible();
+  await activity.getByRole("button", { name: "Show Technical Details" }).click();
+  await expect(activity).toContainText("Operation risk: read only");
+  await expect(activity).toContainText("Connector attempts: 2");
+  await expect(activity).toContainText("No mutation authority was replayed or expanded.");
+});

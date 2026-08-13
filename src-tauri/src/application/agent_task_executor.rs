@@ -3879,7 +3879,7 @@ impl TaskExecutor for AgentTaskExecutor {
                     argument.to_string(),
                     json!(page_id),
                 )]));
-                let response = crate::infrastructure::mcp::call_mcp_read_tool(
+                let response = crate::infrastructure::mcp::call_mcp_read_tool_with_recovery(
                     connector_id,
                     command,
                     environment,
@@ -3888,6 +3888,25 @@ impl TaskExecutor for AgentTaskExecutor {
                     Duration::from_secs(45),
                 );
                 context.ensure_current()?;
+                let response = match response {
+                    Ok(result) => {
+                        if result.session_recovered {
+                            context.emit_event(
+                                TaskSessionEventKind::Runtime,
+                                json!({
+                                    "type": "connector_session_recovered",
+                                    "schema_version": 1,
+                                    "provider": "confluence",
+                                    "connector_id": connector_id,
+                                    "operation_risk": "read",
+                                    "connector_attempts": result.connector_attempts,
+                                }),
+                            )?;
+                        }
+                        Ok(result.value)
+                    }
+                    Err(error) => Err(error),
+                };
                 let (state, satisfied) = match response {
                     Ok(response) => match parse_confluence_page_evidence(&response, page_id) {
                         Ok(_) => ("satisfied", true),

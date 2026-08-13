@@ -99,9 +99,27 @@ export function projectAgentTaskSessionEvent(
         ? `Transient ${failureClass.replaceAll("_", " ")} failure; Spacesly is retrying safely.`
         : `Runtime recovery requires attention: ${failureClass.replaceAll("_", " ")}.`;
     details.push(`- Recovery action: ${action}`, `- Recovery reason: ${reason}`);
+  } else if (event.kind === "runtime" && eventType === "connector_session_recovered") {
+    const provider =
+      typeof payload.provider === "string" && payload.provider.length > 0
+        ? payload.provider
+        : "external";
+    const connectorAttempts =
+      typeof payload.connector_attempts === "number" &&
+      Number.isSafeInteger(payload.connector_attempts) &&
+      payload.connector_attempts > 1
+        ? payload.connector_attempts
+        : 2;
+    summary = `${provider[0].toUpperCase()}${provider.slice(1)} connector session was recreated and its read-only verification resumed safely.`;
+    details.push(
+      "- Operation risk: read only",
+      `- Connector attempts: ${connectorAttempts}`,
+      "- No mutation authority was replayed or expanded.",
+    );
   } else if (event.kind === "runtime" && eventType === "capability_repair_decision") {
     const repairable = payload.repairable === true;
-    const failedTool = typeof payload.failed_tool === "string" ? payload.failed_tool : "unknown tool";
+    const failedTool =
+      typeof payload.failed_tool === "string" ? payload.failed_tool : "unknown tool";
     const connector = typeof payload.connector_id === "string" ? payload.connector_id : "connector";
     const alternatives = Array.isArray(payload.allowed_alternatives)
       ? payload.allowed_alternatives.filter((tool): tool is string => typeof tool === "string")

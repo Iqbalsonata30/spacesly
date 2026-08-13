@@ -655,6 +655,44 @@ assertEqual(
   true,
   "uncertain-mutation lease recovery should preserve its safe user-facing reason",
 );
+const connectorRecoveryProjection = projectAgentTaskSessionEvent(
+  {
+    id: 124,
+    session_id: 1,
+    attempt_id: 2,
+    fencing_token: 2,
+    sequence: 124,
+    kind: "runtime",
+    payload: {
+      type: "connector_session_recovered",
+      schema_version: 1,
+      provider: "confluence",
+      connector_id: "corporate-confluence",
+      operation_risk: "read",
+      connector_attempts: 2,
+    },
+    progress: null,
+    created_at: 124,
+  },
+  "connector-recovery-124",
+  "04:30:11 AM",
+);
+const connectorRecoveryActivities = timelineActivities(connectorRecoveryProjection.logs);
+assertEqual(
+  connectorRecoveryActivities[0]?.title,
+  "Connector Session Recovered",
+  "bounded read-only connector recovery should remain visible in Activity",
+);
+assertEqual(
+  connectorRecoveryActivities[0]?.summary.includes("read-only verification resumed safely"),
+  true,
+  "connector recovery should explain the bounded safe replay",
+);
+assertEqual(
+  connectorRecoveryProjection.logs[0]?.message.includes("No mutation authority was replayed"),
+  true,
+  "connector recovery should state that mutation authority was not expanded",
+);
 const objectiveCheckpointProjection = projectAgentTaskSessionEvent(
   {
     id: 124,
@@ -691,9 +729,7 @@ assertEqual(
   "objective checkpoints should explain continuation behavior",
 );
 assertEqual(
-  (objectiveCheckpointProjection.logs[0]?.message ?? "").includes(
-    "Bound successful tool calls: 1",
-  ),
+  (objectiveCheckpointProjection.logs[0]?.message ?? "").includes("Bound successful tool calls: 1"),
   true,
   "objective checkpoints should expose authoritative tool receipt counts",
 );

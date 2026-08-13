@@ -25,8 +25,31 @@
     "lease-recovery-91",
     "02:44:01 PM",
   ).logs;
+  const connectorRecoveryLogs = projectAgentTaskSessionEvent(
+    {
+      id: 92,
+      session_id: 42,
+      attempt_id: 1,
+      fencing_token: 1,
+      sequence: 92,
+      kind: "runtime",
+      payload: {
+        type: "connector_session_recovered",
+        schema_version: 1,
+        provider: "confluence",
+        connector_id: "corporate-confluence",
+        operation_risk: "read",
+        connector_attempts: 2,
+      },
+      progress: null,
+      created_at: 92,
+    },
+    "connector-recovery-92",
+    "02:44:02 PM",
+  ).logs;
+  const connectorRecovery = page.url.searchParams.get("connectorRecovery") === "1";
 
-  let runStatus = $state<AgentRunStatus>("blocked");
+  let runStatus = $state<AgentRunStatus>(connectorRecovery ? "completed" : "blocked");
   let approval = $state<AgentApprovalRequest | null>(
     page.url.searchParams.get("approval") === "1"
       ? {
@@ -53,16 +76,20 @@
   title="Deploy payroll configuration"
   status={runStatus}
   progress={58}
-  logs={leaseRecoveryLogs}
+  logs={connectorRecovery ? connectorRecoveryLogs : leaseRecoveryLogs}
   transcript={[]}
   output=""
   result={{
-    summary: "The task needs operator action.",
-    evidence: [],
+    summary: connectorRecovery
+      ? "The Confluence page was verified after connector recovery."
+      : "The task needs operator action.",
+    evidence: connectorRecovery ? ["Exact Confluence page identity verified."] : [],
     details: [],
     next: [],
-    completion_status: "blocked",
-    blocked_reason: "Raw model-authored fallback should not replace backend guidance.",
+    completion_status: connectorRecovery ? "completed" : "blocked",
+    blocked_reason: connectorRecovery
+      ? null
+      : "Raw model-authored fallback should not replace backend guidance.",
     objective_results: [],
   }}
   executionRun={null}
