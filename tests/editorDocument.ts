@@ -717,6 +717,9 @@ const subtaskPreparationProjection = projectAgentTaskSessionEvent(
       grant_policy: "objective_tool_operations_v3",
       evidence_gate: "independent_attestation_required",
       evidence_aggregation: "all_verified_and_completed",
+      verifier_binding_policy: "objective_git_terminal_state_v1",
+      assigned_verifier_count: 1,
+      unassigned_verifier_count: 0,
       verified_subtask_count: 0,
       rejected_subtask_count: 0,
       parent_capability_count: 4,
@@ -738,6 +741,20 @@ assertEqual(
   subtaskPreparationActivities[0]?.title,
   "Subtask Authority Prepared",
   "prepared subtask authority should remain visible in Activity",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Git terminal-state verifiers assigned to exact objectives: 1",
+  ),
+  true,
+  "subtask preparation should expose only the safe assigned verifier count",
+);
+assertEqual(
+  subtaskPreparationProjection.logs[0]?.message.includes(
+    "Scheduler attestations reject verifier identities or methods not assigned by the subtask contract",
+  ),
+  true,
+  "subtask preparation should explain exact verifier admission",
 );
 assertEqual(
   subtaskPreparationProjection.logs[0]?.message.includes(

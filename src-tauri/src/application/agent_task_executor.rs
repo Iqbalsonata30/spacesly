@@ -2672,17 +2672,6 @@ impl TaskExecutor for AgentTaskExecutor {
             .filter(|capability| granted_capabilities.contains(capability.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        examination.prepared_subtasks =
-            crate::domain::subtask_authority::prepare_subtask_contracts(
-                resolved
-                    .task
-                    .execution_contract
-                    .as_ref()
-                    .expect("validated execution contract"),
-                &envelope.context_digest,
-                &parent_capabilities,
-            )
-            .map_err(TaskExecutionError::new)?;
         let (connector_configuration_preflights, connector_configuration_blockers) =
             resolve_connector_configuration_preflights(
                 &envelope.connector_ids,
@@ -2927,6 +2916,30 @@ impl TaskExecutor for AgentTaskExecutor {
                 },
             );
         examination.evidence_verifier_bindings = evidence_verifier_bindings;
+        let git_verifier_candidates = examination
+            .evidence_verifier_bindings
+            .iter()
+            .filter(|binding| binding.provider == "git" && binding.status == "ready")
+            .map(
+                |binding| crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
+                    verifier_id: binding.verifier_id.clone(),
+                    provider: binding.provider.clone(),
+                    verification_method: "git_terminal_state_v1".to_string(),
+                    required_states: binding.required_states.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let subtask_verifier_summary =
+            crate::domain::subtask_authority::prepare_subtask_contracts_with_verifiers(
+                &evidence_contract,
+                &envelope.context_digest,
+                &parent_capabilities,
+                &git_verifier_candidates,
+            )
+            .map_err(TaskExecutionError::new)?;
+        let assigned_subtask_verifiers = subtask_verifier_summary.assigned_verifiers;
+        let unassigned_subtask_verifiers = subtask_verifier_summary.unassigned_verifiers;
+        examination.prepared_subtasks = subtask_verifier_summary.contracts;
         let bound_evidence_verifiers = examination.evidence_verifier_bindings.clone();
         let evidence_repository_root = default_repository_root.clone();
         let semantic_objective_mutations = Arc::new(semantic_objective_mutations);
@@ -3148,6 +3161,9 @@ impl TaskExecutor for AgentTaskExecutor {
                     "grant_policy": "objective_tool_operations_v3",
                     "evidence_gate": "independent_attestation_required",
                     "evidence_aggregation": "all_verified_and_completed",
+                    "verifier_binding_policy": "objective_git_terminal_state_v1",
+                    "assigned_verifier_count": assigned_subtask_verifiers,
+                    "unassigned_verifier_count": unassigned_subtask_verifiers,
                     "verified_subtask_count": 0,
                     "rejected_subtask_count": 0,
                     "parent_capability_count": parent_capabilities.len(),

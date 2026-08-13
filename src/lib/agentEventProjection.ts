@@ -151,6 +151,18 @@ export function projectAgentTaskSessionEvent(
       payload.aggregate_connector_operation_grants >= 0
         ? payload.aggregate_connector_operation_grants
         : 0;
+    const assignedVerifierCount =
+      typeof payload.assigned_verifier_count === "number" &&
+      Number.isSafeInteger(payload.assigned_verifier_count) &&
+      payload.assigned_verifier_count >= 0
+        ? payload.assigned_verifier_count
+        : 0;
+    const unassignedVerifierCount =
+      typeof payload.unassigned_verifier_count === "number" &&
+      Number.isSafeInteger(payload.unassigned_verifier_count) &&
+      payload.unassigned_verifier_count >= 0
+        ? payload.unassigned_verifier_count
+        : 0;
     summary = `${subtaskCount} isolated subtask ${subtaskCount === 1 ? "contract was" : "contracts were"} prepared; execution remains disabled.`;
     details.push(
       "- Scheduler state: dormant",
@@ -165,6 +177,9 @@ export function projectAgentTaskSessionEvent(
       `- Exact connector operation grants: ${connectorOperationGrants}`,
       "- Unlisted connector tools are rejected before forwarding.",
       "- Evidence gate: independent verifier attestation required.",
+      `- Git terminal-state verifiers assigned to exact objectives: ${assignedVerifierCount}`,
+      `- Git verifier bindings left closed by missing or ambiguous objective signals: ${unassignedVerifierCount}`,
+      "- Scheduler attestations reject verifier identities or methods not assigned by the subtask contract.",
       "- Parent aggregation requires every subtask to be verified and completed.",
       "- Evidence payloads remain digest-only; Worker claims cannot satisfy this gate.",
       "- Built-in mutation authority requires local scope and a mutation objective.",

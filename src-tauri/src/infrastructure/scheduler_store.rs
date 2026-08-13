@@ -3009,7 +3009,7 @@ impl SchedulerStore {
             .ok_or_else(|| "Dormant subtask fence is stale or incompatible.".to_string())?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask activation contract: {error}"))?;
-        if contract.schema_version != 2
+        if !matches!(contract.schema_version, 2 | 3)
             || contract.objective_id != objective_id
             || contract.execution_enabled
         {
@@ -3242,7 +3242,7 @@ impl SchedulerStore {
             })?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask tool contract: {error}"))?;
-        if contract.schema_version != 2
+        if !matches!(contract.schema_version, 2 | 3)
             || contract.objective_id != authority.objective_id
             || contract.granted_capabilities != authority.capabilities
             || contract.allowed_connector_tools != authority.allowed_connector_tools
@@ -3472,10 +3472,20 @@ impl SchedulerStore {
             .map_err(|error| format!("Failed to load subtask evidence contract: {error}"))?;
         let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
             .map_err(|error| format!("Failed to decode subtask evidence contract: {error}"))?;
-        if contract.schema_version != 2
+        if !matches!(contract.schema_version, 2 | 3)
             || contract.evidence_requirement_digest != attestation.requirement_digest
         {
             return Err("Subtask evidence does not attest the immutable requirement.".to_string());
+        }
+        if contract.schema_version == 3
+            && !contract.evidence_verifiers.iter().any(|binding| {
+                binding.verifier_id == attestation.verifier_id
+                    && binding.verification_method == attestation.verification_method
+            })
+        {
+            return Err(
+                "Subtask evidence verifier is not assigned by its immutable contract.".to_string(),
+            );
         }
         transaction
             .execute(
@@ -5773,7 +5783,7 @@ fn validate_subtask_contract_and_grants_on(
         .ok_or_else(|| "Subtask contract identity is stale or incompatible.".to_string())?;
     let contract = serde_json::from_str::<PreparedSubtaskContract>(&contract_json)
         .map_err(|error| format!("Failed to decode subtask lifecycle contract: {error}"))?;
-    if contract.schema_version != 2
+    if !matches!(contract.schema_version, 2 | 3)
         || contract.objective_id != authority.objective_id
         || contract.granted_capabilities != authority.capabilities
         || contract.allowed_connector_tools != authority.allowed_connector_tools
@@ -9119,6 +9129,101 @@ mod tests {
         (store, session.id, assignment.fence, subtasks)
     }
 
+    fn active_verifier_bound_subtask_test_context(
+        path: PathBuf,
+    ) -> (
+        SchedulerStore,
+        TaskSessionId,
+        AssignmentFence,
+        SchedulerPreparedSubtask,
+    ) {
+        let store = SchedulerStore::open_at(path).expect("store opens");
+        let owner = store.register_owner().expect("owner registered");
+        let mut envelope = test_agent_envelope();
+        let TaskSessionEnvelope::V1(agent) = &mut envelope else {
+            unreachable!("test envelope is Agent V1")
+        };
+        agent.requested_capabilities.push("git".to_string());
+        let grants = vec!["external_tools:jira".to_string(), "git".to_string()];
+        let session = store
+            .enqueue_with_grants(
+                &TaskRequest::from_envelope("verifier-bound-subtask", &envelope)
+                    .expect("request encodes"),
+                &grants,
+                "test",
+            )
+            .expect("task enqueued");
+        let assignment = store
+            .claim_next(owner, 4, Duration::from_secs(30), 5)
+            .expect("claim succeeds")
+            .expect("assignment exists");
+        let mut draft = test_execution_manifest_draft("runtime-verifier-bound");
+        let contract = json!({"semantic_plan": {"objectives": [{
+            "id": "commit-change",
+            "summary": "Commit and push the Git repository change",
+            "success_evidence": "Git commit is pushed upstream",
+            "operation_hints": ["git commit", "git push"],
+            "resource_hints": ["repository branch"],
+            "mutation_expected": true
+        }]}});
+        let prepared = crate::domain::subtask_authority::prepare_subtask_contracts_with_verifiers(
+            &contract,
+            &draft.context_digest,
+            &grants,
+            &[
+                crate::domain::subtask_authority::SubtaskEvidenceVerifierCandidate {
+                    verifier_id: "git-release-state".to_string(),
+                    provider: "git".to_string(),
+                    verification_method: "git_terminal_state_v1".to_string(),
+                    required_states: vec!["new_commit".to_string(), "pushed_upstream".to_string()],
+                },
+            ],
+        )
+        .expect("verifier-bound contract prepares")
+        .contracts;
+        draft.task_examination = TaskExaminationRecord {
+            schema_version: TASK_EXAMINATION_SCHEMA_VERSION,
+            examiner_version: TASK_EXAMINER_VERSION.to_string(),
+            contract_digest: draft.context_digest.clone(),
+            status: TaskExaminationStatus::Ready,
+            capability_catalog: vec![
+                TaskCapabilityRecord {
+                    capability: "external_tools:jira".to_string(),
+                    provider: "jira".to_string(),
+                    connector_id: Some("jira".to_string()),
+                    discovery: "configured".to_string(),
+                    granted: true,
+                },
+                TaskCapabilityRecord {
+                    capability: "git".to_string(),
+                    provider: "builtin".to_string(),
+                    connector_id: None,
+                    discovery: "builtin".to_string(),
+                    granted: true,
+                },
+            ],
+            semantic_planner: Some(SemanticPlannerEvidence {
+                status: "model".to_string(),
+                planner_version: "test-planner-v1".to_string(),
+                model: Some("openai/gpt-5".to_string()),
+                objective_count: prepared.len(),
+            }),
+            prepared_subtasks: prepared,
+            required_capabilities: grants,
+            ..TaskExaminationRecord::default()
+        };
+        store
+            .bind_execution_manifest(assignment.fence, &draft)
+            .expect("verifier-bound manifest binds");
+        let subtask = store
+            .prepared_subtasks_for_session(session.id)
+            .expect("prepared subtask loads")
+            .into_iter()
+            .next()
+            .expect("one subtask exists");
+        (store, session.id, assignment.fence, subtask)
+    }
+
     fn admit_test_subtask_connector_call(
         authority: &SubtaskToolAuthority,
         capability: &str,
@@ -9795,6 +9900,54 @@ mod tests {
                 ready_for_parent_completion: true,
             }
         );
+    }
+
+    #[test]
+    fn verifier_bound_subtask_rejects_unassigned_attestation_identity_and_method() {
+        let directory = tempdir().expect("verifier evidence directory");
+        let (store, _session_id, parent, subtask) =
+            active_verifier_bound_subtask_test_context(directory.path().join("scheduler.db"));
+        assert_eq!(subtask.contract.schema_version, 3);
+        assert_eq!(subtask.contract.evidence_verifiers.len(), 1);
+        let authority = store
+            .activate_prepared_subtask(
+                parent,
+                subtask.fence,
+                Duration::from_secs(20),
+                &SchedulerStore::test_subtask_dispatch_permit(),
+            )
+            .expect("verifier-bound subtask activates behind the private permit");
+        let mut attestation = SubtaskEvidenceAttestation {
+            requirement_digest: subtask.contract.evidence_requirement_digest.clone(),
+            verifier_id: "unassigned-verifier".to_string(),
+            verification_method: "git_terminal_state_v1".to_string(),
+            verdict: SubtaskEvidenceVerdict::Verified,
+            evidence_digest: "a".repeat(64),
+            observation_count: 1,
+        };
+        assert!(SchedulerStore::record_subtask_evidence_attestation(
+            &authority,
+            &attestation,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect_err("unassigned verifier fails closed")
+        .contains("not assigned"));
+        attestation.verifier_id = "git-release-state".to_string();
+        attestation.verification_method = "different_method_v1".to_string();
+        assert!(SchedulerStore::record_subtask_evidence_attestation(
+            &authority,
+            &attestation,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect_err("unassigned method fails closed")
+        .contains("not assigned"));
+        attestation.verification_method = "git_terminal_state_v1".to_string();
+        SchedulerStore::record_subtask_evidence_attestation(
+            &authority,
+            &attestation,
+            &SchedulerStore::test_subtask_evidence_permit(),
+        )
+        .expect("exact assigned verifier persists");
     }
 
     #[test]

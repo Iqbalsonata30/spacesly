@@ -351,8 +351,9 @@ impl TaskExaminationRecord {
             || prepared_tool_budget > 64
             || prepared_mutation_budget > 8
             || self.prepared_subtasks.iter().any(|subtask| {
-                !matches!(subtask.schema_version, 1 | 2)
+                !matches!(subtask.schema_version, 1 | 2 | 3)
                     || (subtask.schema_version == 1 && !subtask.allowed_connector_tools.is_empty())
+                    || (subtask.schema_version < 3 && !subtask.evidence_verifiers.is_empty())
                     || subtask.parent_contract_digest != self.contract_digest
                     || subtask
                         .contract_id
@@ -369,6 +370,23 @@ impl TaskExaminationRecord {
                                 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                         })
                     || subtask.evidence_source != "semantic_objective_success_evidence"
+                    || subtask.evidence_verifiers.len() > MAX_EXAMINATION_ITEMS
+                    || subtask
+                        .evidence_verifiers
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+                    || subtask.evidence_verifiers.iter().any(|binding| {
+                        !canonical_inventory_name(&binding.verifier_id, false)
+                            || !canonical_inventory_name(&binding.provider, false)
+                            || !canonical_inventory_name(&binding.verification_method, false)
+                            || binding
+                                .required_states_digest
+                                .strip_prefix("sha256:")
+                                .is_none_or(|digest| {
+                                    digest.len() != 64
+                                        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                    })
                     || subtask.delegation_depth != 1
                     || subtask.may_delegate
                     || subtask.execution_enabled
@@ -391,7 +409,7 @@ impl TaskExaminationRecord {
                                     .iter()
                                     .any(|tool| !canonical_inventory_name(tool, true))
                         })
-                    || (subtask.schema_version == 2
+                    || (subtask.schema_version >= 2
                         && subtask.granted_capabilities.iter().any(|capability| {
                             capability.starts_with("external_tools:")
                                 && !subtask.allowed_connector_tools.contains_key(capability)

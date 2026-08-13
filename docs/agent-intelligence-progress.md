@@ -13,9 +13,33 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is complete with a replayable, headless production-policy corpus, deterministic scorecard across all four categories, and mandatory CI/release gates.
 - Phase 13 is complete with backend-authoritative terminal causes and one bounded operator action for every blocked or failed Task Session.
-- Phase 14 is in progress. Ten vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, and independent digest-only evidence aggregation. Multi-agent dispatch remains disabled.
+- Phase 14 is in progress. Eleven vertical slices now cover uncertain-mutation recovery fencing, bounded read-only connector recreation, prepared subtask contracts, scheduler-owned dormant identities, staged budget enforcement, fail-closed subtask lifecycle recovery, deterministic per-objective external and built-in capability narrowing, exact per-objective connector-operation authority, independent digest-only evidence aggregation, and exact Git verifier-to-objective binding. Multi-agent dispatch remains disabled.
 
 ## Phase 14 In Progress
+
+Completed eleventh vertical slice: exact Git verifier-to-objective binding.
+
+- Prepared subtask contract schema version 3 adds a bounded, sorted verifier assignment list to content-addressed authority. Assignments persist only canonical verifier identity, provider class, deterministic verification method, and a digest of required terminal states.
+- Ready Rules-bound Git terminal-state verifiers are assigned only when one semantic objective uniquely matches Git or its required clean-worktree/new-commit/pushed-upstream signals and already has parent-bounded Git capability authority.
+- Missing, ambiguous, unsupported, malformed, duplicate, or capability-incompatible candidates remain unassigned. No model text or provider-specific fallback can guess the target objective.
+- Scheduler evidence admission now rejects an attestation whose verifier identity or method is absent from a version-3 subtask contract. The existing immutable requirement digest, live child/parent fences, private verifier permit, and digest-only evidence ledger remain mandatory.
+- Retained version-2 contracts stay readable and keep their prior staged evidence semantics. Version-1 contracts remain non-activatable because they lack exact connector-operation authority.
+- Activity exposes only assigned/unassigned verifier counts and the exact scheduler admission rule. It does not expose objective text, terminal-state names, repository paths, evidence observations, tool arguments/results, connector configuration, or credentials.
+- Dispatch and production verification remain disabled. This slice binds the existing Git adapter to authority but does not invoke it through a scheduler-owned verifier process.
+
+Phase 14 eleventh-increment regression evidence:
+
+- Domain tests cover exact unique Git assignment, required-state digest binding, versioned contract identity, ambiguous assignment, unsupported-provider closure, and missing-authority closure.
+- Scheduler integration proves version-3 activation remains behind the private permit and rejects unassigned verifier identities and methods before accepting the exact assigned attestation.
+- Agent executor suite: 56 passed, 0 failed. Verifier-focused Rust suite: 16 passed, 0 failed.
+- Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
+- Focused rendered operator suite: 6 passed, 0 failed. Full Rust regression with the serial test runner: 540 passed, 3 ignored; the parallel runner's skill-catalog timing assertion passed in isolation but remained load-sensitive. Full rendered browser suite: 12 passed, 0 failed. Existing browser-only native-theme mock warnings remain non-failing.
+
+Known limitations:
+
+- Kubernetes, Bamboo, Jira, and Confluence verifier records are not yet assigned to individual subtask contracts. They continue to verify only the existing single-Worker parent result.
+- No production code can construct the subtask dispatch or evidence permit, launch a specialized Worker/verifier, renew its lease, or aggregate its result into parent completion.
+- Ambiguous Git objectives remain unassigned instead of asking the model to choose. A later operator-facing planning diagnostic may explain which semantic objectives must be clarified without exposing task content in durable events.
 
 Operational Chat/Agent session-boundary bug fix after the tenth vertical slice:
 
@@ -243,8 +267,8 @@ Phase 14 fourth-increment regression evidence:
 Remaining Phase 14 work:
 
 - Add a scheduler-owned specialized-Worker dispatch and heartbeat path only after its end-to-end authority transfer, cancellation, recovery, and shutdown behavior are proven. Until then the private activation permit remains closed.
-- Narrow connector authority to exact per-objective tool operations; connector-level and built-in-category narrowing are now implemented.
-- Independently verify and aggregate subtask evidence into the parent result before accepting parent completion.
+- Bind Kubernetes, Bamboo, Jira, and Confluence verifier adapters to exact objectives and read-only verifier authority.
+- Launch independent verifiers and aggregate their already-enforced attestations into parent completion without trusting Worker claims.
 - Keep multi-agent dispatch disabled until authority, budget, fence, cancellation, recovery, and evidence isolation pass end-to-end tests.
 - Expand the long-running corpus beyond operations already protected by the resource-mutation ledger.
 

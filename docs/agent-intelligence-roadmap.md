@@ -552,6 +552,17 @@ Completed tenth increment: independent subtask evidence attestations and parent 
 
 This increment builds the independent evidence gate behind private permits. It does not launch a verifier, bind provider-specific verifier adapters to objectives, dispatch a Worker, or complete a parent automatically. Those production orchestration paths remain required before multi-agent execution can be enabled.
 
+Completed eleventh increment: exact Git verifier-to-objective binding.
+
+- New version-3 prepared subtask contracts carry a bounded, sorted verifier assignment list inside their content-addressed identity. Each assignment retains only verifier identity, provider class, deterministic method, and a digest of required terminal states.
+- The existing Git terminal-state adapter is the first vertical slice. A ready Rules-bound Git verifier is assigned only when exactly one semantic objective contains Git or the required clean-worktree/new-commit/pushed-upstream signals and that objective independently received Git capability authority.
+- Zero matches, multiple matches, unsupported providers, missing Git authority, malformed candidates, and duplicate verifier identities stay closed. They do not guess an objective or widen authority.
+- Scheduler evidence admission for version-3 contracts requires the exact assigned verifier identity and verification method in addition to the existing requirement digest, live authority, parent fence, and private evidence permit. Version-2 retained contracts preserve their earlier evidence behavior.
+- Activity reports only assigned and unassigned aggregate counts and explains the exact admission boundary. Objective text, required states, repository paths, observations, tool arguments/results, and credentials are not emitted.
+- Dispatch remains disabled. This increment binds policy identity; it does not launch the Git verifier, activate a specialized Worker, heartbeat authority, or complete the parent automatically.
+
+The next verifier-binding increments should add Kubernetes, Bamboo, Jira, and Confluence with provider-neutral assignment inputs and exact read-only authority. Only after every supported verifier has scheduler-owned launch, cancellation, recovery, and digest-only result handling should the private production permits be opened.
+
 Benefits:
 
 - Long deployments and process restarts retain progress safely.

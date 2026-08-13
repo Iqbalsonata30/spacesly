@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 2;
+const VERIFIER_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION: u32 = 3;
 const MAX_SUBTASKS: usize = 8;
 const TOTAL_WALL_CLOCK_SECONDS: u64 = 3_600;
 const TOTAL_TOOL_CALLS: u32 = 64;
@@ -22,6 +23,29 @@ pub struct SubtaskBudget {
     pub max_mutation_calls: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PreparedSubtaskEvidenceVerifier {
+    pub verifier_id: String,
+    pub provider: String,
+    pub verification_method: String,
+    pub required_states_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskEvidenceVerifierCandidate {
+    pub verifier_id: String,
+    pub provider: String,
+    pub verification_method: String,
+    pub required_states: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtaskVerifierBindingSummary {
+    pub contracts: Vec<PreparedSubtaskContract>,
+    pub assigned_verifiers: u32,
+    pub unassigned_verifiers: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedSubtaskContract {
     pub schema_version: u32,
@@ -31,6 +55,8 @@ pub struct PreparedSubtaskContract {
     pub granted_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub allowed_connector_tools: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_verifiers: Vec<PreparedSubtaskEvidenceVerifier>,
     pub budget: SubtaskBudget,
     pub evidence_requirement_digest: String,
     pub evidence_source: String,
@@ -148,6 +174,126 @@ pub fn prepare_subtask_contracts(
             )
         })
         .collect()
+}
+
+/// Prepares version-3 contracts and assigns each supported verifier to one unambiguous objective.
+///
+/// Git terminal-state verification is the first production binding slice. Unknown providers,
+/// missing objective signals, and ties stay unassigned and therefore cannot attest a subtask.
+pub fn prepare_subtask_contracts_with_verifiers(
+    contract: &Value,
+    parent_contract_digest: &str,
+    parent_capabilities: &[String],
+    candidates: &[SubtaskEvidenceVerifierCandidate],
+) -> Result<SubtaskVerifierBindingSummary, String> {
+    let base = prepare_subtask_contracts(contract, parent_contract_digest, parent_capabilities)?;
+    if base.is_empty() {
+        return Ok(SubtaskVerifierBindingSummary {
+            contracts: Vec::new(),
+            assigned_verifiers: 0,
+            unassigned_verifiers: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+        });
+    }
+    if candidates.len() > 64 {
+        return Err("Subtask verifier candidates exceed their bounded limit.".to_string());
+    }
+    let objectives = contract
+        .pointer("/semantic_plan/objectives")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Subtask verifier binding requires semantic objectives.".to_string())?;
+    let mut bindings = BTreeMap::<String, Vec<PreparedSubtaskEvidenceVerifier>>::new();
+    let mut assigned = 0_u32;
+    let mut unassigned = 0_u32;
+    let mut normalized_candidates = candidates.to_vec();
+    normalized_candidates.sort_by(|left, right| left.verifier_id.cmp(&right.verifier_id));
+    if normalized_candidates
+        .windows(2)
+        .any(|pair| pair[0].verifier_id == pair[1].verifier_id)
+    {
+        return Err("Subtask verifier candidate identities must be unique.".to_string());
+    }
+    for candidate in normalized_candidates {
+        validate_verifier_candidate(&candidate)?;
+        let matching_objectives = if candidate.provider == "git" {
+            objectives
+                .iter()
+                .filter(|objective| git_verifier_matches_objective(&candidate, objective))
+                .filter_map(|objective| objective.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if matching_objectives.len() != 1 {
+            unassigned = unassigned.saturating_add(1);
+            continue;
+        }
+        let objective_id = matching_objectives[0];
+        let Some(prepared) = base.iter().find(|item| item.objective_id == objective_id) else {
+            return Err(
+                "Verifier objective is absent from prepared subtask authority.".to_string(),
+            );
+        };
+        if !prepared
+            .granted_capabilities
+            .iter()
+            .any(|value| value == "git")
+        {
+            unassigned = unassigned.saturating_add(1);
+            continue;
+        }
+        let required_states = candidate
+            .required_states
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let encoded_states = serde_json::to_vec(&required_states)
+            .map_err(|_| "Failed to encode subtask verifier states.".to_string())?;
+        bindings.entry(objective_id.to_string()).or_default().push(
+            PreparedSubtaskEvidenceVerifier {
+                verifier_id: candidate.verifier_id,
+                provider: candidate.provider,
+                verification_method: candidate.verification_method,
+                required_states_digest: digest(&encoded_states),
+            },
+        );
+        assigned = assigned.saturating_add(1);
+    }
+    let mut contracts = Vec::with_capacity(base.len());
+    for prepared in base {
+        let objective = objectives
+            .iter()
+            .find(|objective| {
+                objective.get("id").and_then(Value::as_str) == Some(prepared.objective_id.as_str())
+            })
+            .ok_or_else(|| "Prepared subtask objective is absent.".to_string())?;
+        let evidence = objective
+            .get("success_evidence")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Subtask evidence requirement is absent.".to_string())?;
+        let mut objective_bindings = bindings.remove(&prepared.objective_id).unwrap_or_default();
+        objective_bindings.sort();
+        contracts.push(compile_subtask_contract_with_tools_and_verifiers(
+            VERIFIER_BOUND_SUBTASK_CONTRACT_SCHEMA_VERSION,
+            parent_contract_digest,
+            parent_capabilities,
+            evidence,
+            SubtaskContractRequest {
+                objective_id: prepared.objective_id,
+                requested_capabilities: prepared.granted_capabilities,
+                budget: prepared.budget,
+                may_delegate: false,
+            },
+            prepared.allowed_connector_tools,
+            objective_bindings,
+        )?);
+    }
+    Ok(SubtaskVerifierBindingSummary {
+        contracts,
+        assigned_verifiers: assigned,
+        unassigned_verifiers: unassigned,
+    })
 }
 
 /// Narrows external connector authority from immutable, secret-free routing evidence.
@@ -471,6 +617,39 @@ fn compile_subtask_contract_with_tools(
     request: SubtaskContractRequest,
     allowed_connector_tools: BTreeMap<String, Vec<String>>,
 ) -> Result<PreparedSubtaskContract, String> {
+    compile_subtask_contract_with_tools_and_verifiers(
+        SUBTASK_CONTRACT_SCHEMA_VERSION,
+        parent_contract_digest,
+        parent_capabilities,
+        evidence_requirement,
+        request,
+        allowed_connector_tools,
+        Vec::new(),
+    )
+}
+
+fn compile_subtask_contract_with_tools_and_verifiers(
+    schema_version: u32,
+    parent_contract_digest: &str,
+    parent_capabilities: &[String],
+    evidence_requirement: &str,
+    request: SubtaskContractRequest,
+    allowed_connector_tools: BTreeMap<String, Vec<String>>,
+    evidence_verifiers: Vec<PreparedSubtaskEvidenceVerifier>,
+) -> Result<PreparedSubtaskContract, String> {
+    if !matches!(schema_version, 2 | 3)
+        || (schema_version < 3 && !evidence_verifiers.is_empty())
+        || evidence_verifiers.len() > 64
+        || evidence_verifiers.windows(2).any(|pair| pair[0] >= pair[1])
+        || evidence_verifiers.iter().any(|binding| {
+            !canonical_name(&binding.verifier_id)
+                || !canonical_name(&binding.provider)
+                || !canonical_name(&binding.verification_method)
+                || !valid_sha256_digest(&binding.required_states_digest)
+        })
+    {
+        return Err("Subtask verifier authority is invalid.".to_string());
+    }
     if !valid_parent_digest(parent_contract_digest)
         || !canonical_name(&request.objective_id)
         || evidence_requirement.trim().is_empty()
@@ -514,11 +693,12 @@ fn compile_subtask_contract_with_tools(
     }
     let evidence_requirement_digest = digest(evidence_requirement.as_bytes());
     let identity = serde_json::json!({
-        "schema_version": SUBTASK_CONTRACT_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "parent_contract_digest": parent_contract_digest,
         "objective_id": request.objective_id,
         "granted_capabilities": requested,
         "allowed_connector_tools": allowed_connector_tools,
+        "evidence_verifiers": evidence_verifiers,
         "budget": request.budget,
         "evidence_requirement_digest": evidence_requirement_digest,
         "delegation_depth": 1,
@@ -528,12 +708,13 @@ fn compile_subtask_contract_with_tools(
     let encoded = serde_json::to_vec(&identity)
         .map_err(|_| "Failed to encode the subtask authority identity.".to_string())?;
     Ok(PreparedSubtaskContract {
-        schema_version: SUBTASK_CONTRACT_SCHEMA_VERSION,
+        schema_version,
         contract_id: digest(&encoded),
         parent_contract_digest: parent_contract_digest.to_string(),
         objective_id: request.objective_id,
         granted_capabilities: requested,
         allowed_connector_tools,
+        evidence_verifiers,
         budget: request.budget,
         evidence_requirement_digest,
         evidence_source: "semantic_objective_success_evidence".to_string(),
@@ -541,6 +722,41 @@ fn compile_subtask_contract_with_tools(
         may_delegate: false,
         execution_enabled: false,
     })
+}
+
+fn validate_verifier_candidate(candidate: &SubtaskEvidenceVerifierCandidate) -> Result<(), String> {
+    if !canonical_name(&candidate.verifier_id)
+        || !canonical_name(&candidate.provider)
+        || !canonical_name(&candidate.verification_method)
+        || candidate.required_states.is_empty()
+        || candidate.required_states.len() > 16
+        || candidate
+            .required_states
+            .iter()
+            .any(|state| !canonical_name(state))
+    {
+        return Err("Subtask verifier candidate is invalid.".to_string());
+    }
+    Ok(())
+}
+
+fn git_verifier_matches_objective(
+    candidate: &SubtaskEvidenceVerifierCandidate,
+    objective: &Value,
+) -> bool {
+    let signals = objective_all_signal_tokens(objective);
+    if signals.contains("git") {
+        return true;
+    }
+    candidate
+        .required_states
+        .iter()
+        .any(|state| match state.as_str() {
+            "clean_worktree" => contains_signal(&signals, &["clean", "status", "worktree"]),
+            "new_commit" => signals.contains("commit"),
+            "pushed_upstream" => contains_signal(&signals, &["push", "pushed", "upstream"]),
+            _ => false,
+        })
 }
 
 fn normalized_capabilities(values: &[String]) -> Result<Vec<String>, String> {
@@ -578,6 +794,12 @@ fn valid_parent_digest(value: &str) -> bool {
         !digest.is_empty()
             && digest.len() <= 128
             && digest.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
 }
 
@@ -620,6 +842,174 @@ mod tests {
         assert!(contracts.iter().all(|contract| {
             !contract.execution_enabled && !contract.may_delegate && contract.delegation_depth == 1
         }));
+    }
+
+    #[test]
+    fn binds_git_terminal_state_verifier_to_one_exact_objective() {
+        let contract = serde_json::json!({"semantic_plan": {"objectives": [
+            {
+                "id": "inspect-template",
+                "summary": "Inspect the Helm template",
+                "success_evidence": "Template content is understood",
+                "operation_hints": ["read file"],
+                "resource_hints": ["helm template"],
+                "mutation_expected": false
+            },
+            {
+                "id": "commit-change",
+                "summary": "Commit and push the Git repository change",
+                "success_evidence": "Git worktree is clean and the commit is pushed upstream",
+                "operation_hints": ["git commit", "git push"],
+                "resource_hints": ["repository branch"],
+                "mutation_expected": true
+            }
+        ]}});
+        let summary = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["workspace_read".to_string(), "git".to_string()],
+            &[SubtaskEvidenceVerifierCandidate {
+                verifier_id: "git-release-state".to_string(),
+                provider: "git".to_string(),
+                verification_method: "git_terminal_state_v1".to_string(),
+                required_states: vec![
+                    "clean_worktree".to_string(),
+                    "new_commit".to_string(),
+                    "pushed_upstream".to_string(),
+                ],
+            }],
+        )
+        .expect("Git verifier binds");
+
+        assert_eq!(summary.assigned_verifiers, 1);
+        assert_eq!(summary.unassigned_verifiers, 0);
+        assert!(summary
+            .contracts
+            .iter()
+            .all(|item| item.schema_version == 3));
+        assert!(summary.contracts[0].evidence_verifiers.is_empty());
+        assert_eq!(summary.contracts[1].evidence_verifiers.len(), 1);
+        assert_eq!(
+            summary.contracts[1].evidence_verifiers[0].verification_method,
+            "git_terminal_state_v1"
+        );
+        assert_ne!(
+            summary.contracts[1].contract_id,
+            prepare_subtask_contracts(
+                &contract,
+                parent_digest(),
+                &["workspace_read".to_string(), "git".to_string()],
+            )
+            .expect("legacy staged contracts prepare")[1]
+                .contract_id
+        );
+        let reversed = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["git".to_string(), "workspace_read".to_string()],
+            &[SubtaskEvidenceVerifierCandidate {
+                verifier_id: "git-release-state".to_string(),
+                provider: "git".to_string(),
+                verification_method: "git_terminal_state_v1".to_string(),
+                required_states: vec![
+                    "pushed_upstream".to_string(),
+                    "new_commit".to_string(),
+                    "clean_worktree".to_string(),
+                ],
+            }],
+        )
+        .expect("state and capability order is canonical");
+        assert_eq!(summary.contracts, reversed.contracts);
+
+        let changed_requirement = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["workspace_read".to_string(), "git".to_string()],
+            &[SubtaskEvidenceVerifierCandidate {
+                verifier_id: "git-release-state".to_string(),
+                provider: "git".to_string(),
+                verification_method: "git_terminal_state_v1".to_string(),
+                required_states: vec!["new_commit".to_string()],
+            }],
+        )
+        .expect("changed verifier requirement prepares");
+        assert_ne!(
+            summary.contracts[1].contract_id, changed_requirement.contracts[1].contract_id,
+            "required terminal states must be bound into contract identity"
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_unsupported_verifier_binding_stays_closed() {
+        let contract = serde_json::json!({"semantic_plan": {"objectives": [
+            {
+                "id": "commit-one",
+                "summary": "Create a Git commit",
+                "success_evidence": "New commit exists",
+                "operation_hints": ["git commit"],
+                "resource_hints": ["repository"],
+                "mutation_expected": true
+            },
+            {
+                "id": "commit-two",
+                "summary": "Verify the Git commit",
+                "success_evidence": "Git commit is observed",
+                "operation_hints": ["git status"],
+                "resource_hints": ["repository"],
+                "mutation_expected": false
+            }
+        ]}});
+        let summary = prepare_subtask_contracts_with_verifiers(
+            &contract,
+            parent_digest(),
+            &["workspace_read".to_string(), "git".to_string()],
+            &[
+                SubtaskEvidenceVerifierCandidate {
+                    verifier_id: "git-state".to_string(),
+                    provider: "git".to_string(),
+                    verification_method: "git_terminal_state_v1".to_string(),
+                    required_states: vec!["new_commit".to_string()],
+                },
+                SubtaskEvidenceVerifierCandidate {
+                    verifier_id: "future-state".to_string(),
+                    provider: "future".to_string(),
+                    verification_method: "future_read_v1".to_string(),
+                    required_states: vec!["ready".to_string()],
+                },
+            ],
+        )
+        .expect("ambiguous bindings narrow closed");
+
+        assert_eq!(summary.assigned_verifiers, 0);
+        assert_eq!(summary.unassigned_verifiers, 2);
+        assert!(summary
+            .contracts
+            .iter()
+            .all(|item| item.schema_version == 3 && item.evidence_verifiers.is_empty()));
+
+        let one_git_objective = serde_json::json!({"semantic_plan": {"objectives": [{
+            "id": "commit-one",
+            "summary": "Create a Git commit",
+            "success_evidence": "New commit exists",
+            "operation_hints": ["git commit"],
+            "resource_hints": ["repository"],
+            "mutation_expected": true
+        }]}});
+        let missing_authority = prepare_subtask_contracts_with_verifiers(
+            &one_git_objective,
+            parent_digest(),
+            &["workspace_read".to_string()],
+            &[SubtaskEvidenceVerifierCandidate {
+                verifier_id: "git-state".to_string(),
+                provider: "git".to_string(),
+                verification_method: "git_terminal_state_v1".to_string(),
+                required_states: vec!["new_commit".to_string()],
+            }],
+        )
+        .expect("missing Git authority narrows closed");
+        assert_eq!(missing_authority.assigned_verifiers, 0);
+        assert_eq!(missing_authority.unassigned_verifiers, 1);
+        assert!(missing_authority.contracts[0].evidence_verifiers.is_empty());
     }
 
     #[test]

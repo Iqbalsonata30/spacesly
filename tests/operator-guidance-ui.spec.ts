@@ -244,6 +244,15 @@ test("prepared subtask authority is visible without implying multi-agent executi
   await expect(activity).toContainText("Unlisted connector tools are rejected before forwarding.");
   await expect(activity).toContainText("Evidence gate: independent verifier attestation required.");
   await expect(activity).toContainText(
+    "Git terminal-state verifiers assigned to exact objectives: 1",
+  );
+  await expect(activity).toContainText(
+    "Git verifier bindings left closed by missing or ambiguous objective signals: 0",
+  );
+  await expect(activity).toContainText(
+    "Scheduler attestations reject verifier identities or methods not assigned by the subtask contract.",
+  );
+  await expect(activity).toContainText(
     "Parent aggregation requires every subtask to be verified and completed.",
   );
   await expect(activity).toContainText(
