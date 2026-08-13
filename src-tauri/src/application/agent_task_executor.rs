@@ -28,6 +28,9 @@ use crate::infrastructure::bamboo::{
     canonical_bamboo_result_key, parse_bamboo_build_evidence, BambooBuildStatus,
     BambooEvidenceError,
 };
+use crate::infrastructure::confluence::{
+    canonical_confluence_page_id, parse_confluence_page_evidence, ConfluenceEvidenceError,
+};
 use crate::infrastructure::git::repository_root_at;
 use crate::infrastructure::jira::{
     canonical_jira_issue_key, parse_jira_comment_evidence, parse_jira_issue_status_evidence,
@@ -331,7 +334,9 @@ fn resolve_evidence_verifier_bindings(
             requested_capabilities
                 .iter()
                 .any(|capability| capability == "git")
-        } else if verifier.provider == "bamboo" && verifier.connector_id.is_some() {
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "confluence")
+            && verifier.connector_id.is_some()
+        {
             verifier
                 .connector_id
                 .as_ref()
@@ -374,6 +379,7 @@ fn resolve_evidence_verifier_bindings(
             }),
             "kubernetes" => verifier.required_states == ["deployment_available"],
             "bamboo" => verifier.required_states == ["successful_build"],
+            "confluence" => verifier.required_states == ["page_exists"],
             "jira" => matches!(
                 verifier.required_states.as_slice(),
                 [state] if matches!(state.as_str(), "expected_status" | "comment_matches")
@@ -395,6 +401,15 @@ fn resolve_evidence_verifier_bindings(
             .and_then(Value::as_str)
             .map(str::trim)
             .is_some_and(|provider| provider.eq_ignore_ascii_case("bamboo"));
+        let confluence_page_id = contract
+            .pointer("/document/page_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| canonical_confluence_page_id(value));
+        let confluence_document_provider = contract
+            .pointer("/document/provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("confluence"));
         let jira_issue_key = contract
             .pointer("/ticket/key")
             .and_then(Value::as_str)
@@ -459,6 +474,9 @@ fn resolve_evidence_verifier_bindings(
                             | "buildKey"
                     ),
                     "jira" => matches!(argument.as_str(), "issue_key" | "issueKey" | "key"),
+                    "confluence" => {
+                        matches!(argument.as_str(), "page_id" | "pageId" | "id")
+                    }
                     _ => false,
                 })
                 .collect::<Vec<_>>();
@@ -498,7 +516,7 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Expected status is supported only by the Jira evidence adapter.",
             )
-        } else if !matches!(verifier.provider.as_str(), "bamboo" | "jira")
+        } else if !matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
             && (verifier.connector_id.is_some() || verifier.read_operation.is_some())
         {
             (
@@ -507,7 +525,7 @@ fn resolve_evidence_verifier_bindings(
             )
         } else if !matches!(
             verifier.provider.as_str(),
-            "git" | "kubernetes" | "bamboo" | "jira"
+            "git" | "kubernetes" | "bamboo" | "confluence" | "jira"
         ) {
             (
                 "unsupported_provider",
@@ -518,7 +536,7 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "Evidence Verifier required states are not supported by this provider adapter.",
             )
-        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
             && (verifier
                 .connector_id
                 .as_deref()
@@ -532,14 +550,14 @@ fn resolve_evidence_verifier_bindings(
                 "invalid_rule",
                 "External evidence verification requires canonical Connector and Read operation fields.",
             )
-        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
             && (external_connector_rule.is_none() || external_capability.is_none())
         {
             (
                 "missing_connector",
                 "External evidence verification requires one selected, available matching Connector Rule.",
             )
-        } else if matches!(verifier.provider.as_str(), "bamboo" | "jira")
+        } else if matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
             && (external_read_tool.is_none() || external_read_argument.is_none())
         {
             (
@@ -576,6 +594,13 @@ fn resolve_evidence_verifier_bindings(
             (
                 "missing_resource",
                 "Bamboo successful-build verification requires build.provider=bamboo authority.",
+            )
+        } else if verifier.provider == "confluence"
+            && (!confluence_document_provider || confluence_page_id.is_none())
+        {
+            (
+                "missing_resource",
+                "Confluence page verification requires document.provider=confluence and one canonical document.page_id.",
             )
         } else if verifier.provider == "jira" && (!jira_ticket_provider || jira_issue_key.is_none())
         {
@@ -617,6 +642,8 @@ fn resolve_evidence_verifier_bindings(
                 } else {
                     "The Jira verifier is bound to one live read tool, exact immutable issue key, and Rules-defined expected status."
                 }
+            } else if verifier.provider == "confluence" {
+                "The Confluence verifier is bound to one live read tool and exact immutable page ID."
             } else {
                 "The Git terminal-state verifier is bound to the resolved trusted repository."
             };
@@ -632,24 +659,26 @@ fn resolve_evidence_verifier_bindings(
             status: status.to_string(),
             matched_labels,
             required_states: verifier.required_states.clone(),
-            connector_id: matches!(verifier.provider.as_str(), "bamboo" | "jira")
+            connector_id: matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
                 .then(|| verifier.connector_id.clone())
                 .flatten(),
-            read_tool: matches!(verifier.provider.as_str(), "bamboo" | "jira")
+            read_tool: matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
                 .then(|| external_read_tool.clone())
                 .flatten(),
-            read_argument: matches!(verifier.provider.as_str(), "bamboo" | "jira")
+            read_argument: matches!(verifier.provider.as_str(), "bamboo" | "confluence" | "jira")
                 .then(|| external_read_argument.clone())
                 .flatten(),
             resource_kind: match verifier.provider.as_str() {
                 "kubernetes" => Some("deployment".to_string()),
                 "bamboo" => Some("build".to_string()),
+                "confluence" => Some("page".to_string()),
                 "jira" => Some("issue".to_string()),
                 _ => None,
             },
             resource_name: match verifier.provider.as_str() {
                 "kubernetes" => workload.map(str::to_string),
                 "bamboo" => build_result_key.map(|value| value.to_ascii_uppercase()),
+                "confluence" => confluence_page_id.map(str::to_string),
                 "jira" => jira_issue_key,
                 _ => None,
             },
@@ -3124,7 +3153,8 @@ impl TaskExecutor for AgentTaskExecutor {
         let external_evidence_connector_ids = bound_evidence_verifiers
             .iter()
             .filter(|binding| {
-                matches!(binding.provider.as_str(), "bamboo" | "jira") && binding.status == "ready"
+                matches!(binding.provider.as_str(), "bamboo" | "confluence" | "jira")
+                    && binding.status == "ready"
             })
             .filter_map(|binding| binding.connector_id.clone())
             .collect::<HashSet<_>>();
@@ -3761,6 +3791,73 @@ impl TaskExecutor for AgentTaskExecutor {
                             "Jira issue-status verification blocked completion.",
                         ));
                     }
+                }
+            }
+            for binding in bound_evidence_verifiers
+                .iter()
+                .filter(|binding| binding.provider == "confluence")
+            {
+                let connector_id = binding.connector_id.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Confluence evidence connector is missing.")
+                })?;
+                let tool = binding.read_tool.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Confluence evidence read tool is missing.")
+                })?;
+                let argument = binding.read_argument.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Confluence evidence read argument is missing.")
+                })?;
+                let page_id = binding.resource_name.as_deref().ok_or_else(|| {
+                    TaskExecutionError::blocked("Confluence evidence page identity is missing.")
+                })?;
+                context.authorize_capability(&format!("external_tools:{connector_id}"))?;
+                let (command, environment) =
+                    evidence_mcp_connectors.get(connector_id).ok_or_else(|| {
+                        TaskExecutionError::blocked(
+                            "Confluence evidence verifier lost its trusted connector configuration.",
+                        )
+                    })?;
+                context.ensure_current()?;
+                let arguments = Value::Object(serde_json::Map::from_iter([(
+                    argument.to_string(),
+                    json!(page_id),
+                )]));
+                let response = crate::infrastructure::mcp::call_mcp_read_tool(
+                    connector_id,
+                    command,
+                    environment,
+                    tool,
+                    arguments,
+                    Duration::from_secs(45),
+                );
+                context.ensure_current()?;
+                let (state, satisfied) = match response {
+                    Ok(response) => match parse_confluence_page_evidence(&response, page_id) {
+                        Ok(_) => ("satisfied", true),
+                        Err(ConfluenceEvidenceError::Conflict) => ("conflict", false),
+                        Err(ConfluenceEvidenceError::Unavailable) => ("unavailable", false),
+                    },
+                    Err(_) => ("unavailable", false),
+                };
+                context.emit_event(
+                    TaskSessionEventKind::Runtime,
+                    json!({
+                        "type": "evidence_verifier_result",
+                        "schema_version": 1,
+                        "provider": "confluence",
+                        "status": if satisfied { "satisfied" } else { "blocked" },
+                        "connector_id": connector_id,
+                        "resource_kind": "page",
+                        "resource_name": page_id,
+                        "evidence": [{
+                            "state": "page_exists",
+                            "status": state,
+                        }],
+                    }),
+                )?;
+                if !satisfied {
+                    return Err(TaskExecutionError::blocked(
+                        "Confluence exact-page verification blocked completion.",
+                    ));
                 }
             }
         }
@@ -7020,6 +7117,105 @@ mod tests {
         );
         assert_eq!(invalid_records[0].status, "invalid_rule");
         assert_eq!(blockers.len(), 1);
+    }
+
+    #[test]
+    fn confluence_evidence_verifier_binds_exact_page_read() {
+        let rule = crate::domain::governance::EvidenceVerifierRuleFact {
+            id: "confluence-page".to_string(),
+            provider: "confluence".to_string(),
+            connector_id: Some("corporate-confluence".to_string()),
+            read_operation: Some("get_page".to_string()),
+            required_states: vec!["page_exists".to_string()],
+            source: "global.agent_rules".to_string(),
+            source_line: 70,
+            ..Default::default()
+        };
+        let facts = RuleFactsRecord {
+            connectors: vec![ConnectorRuleFact {
+                id: "corporate-confluence".to_string(),
+                connector_type: "confluence".to_string(),
+                ..Default::default()
+            }],
+            evidence_verifiers: vec![rule],
+            ..Default::default()
+        };
+        let capability = crate::domain::task_examination::ConnectorCapabilitySnapshot {
+            connector_id: "corporate-confluence".to_string(),
+            status: ConnectorDiscoveryStatus::Available,
+            tools: vec![crate::domain::task_examination::DiscoveredToolCapability {
+                name: "confluence_get_page".to_string(),
+                risk: "read".to_string(),
+                argument_names: vec!["page_id".to_string()],
+            }],
+            error: None,
+            warnings: Vec::new(),
+        };
+        let contract = json!({
+            "document": {"provider": "confluence", "page_id": "123456"}
+        });
+        let context = |contract: &Value| {
+            resolve_evidence_verifier_bindings(
+                contract,
+                EvidenceVerifierResolutionContext {
+                    requested_capabilities: &["external_tools:corporate-confluence".to_string()],
+                    connector_ids: &["corporate-confluence".to_string()],
+                    rule_facts: &facts,
+                    repository_root: None,
+                    deployment_target: None,
+                    trusted_kubernetes_connector: false,
+                    capabilities: std::slice::from_ref(&capability),
+                },
+            )
+        };
+        let (records, blockers) = context(&contract);
+        assert!(blockers.is_empty());
+        assert_eq!(records[0].status, "ready");
+        assert_eq!(records[0].read_tool.as_deref(), Some("confluence_get_page"));
+        assert_eq!(records[0].read_argument.as_deref(), Some("page_id"));
+        assert_eq!(records[0].resource_kind.as_deref(), Some("page"));
+        assert_eq!(records[0].resource_name.as_deref(), Some("123456"));
+
+        let invalid = json!({
+            "document": {"provider": "confluence", "page_id": "not-an-id"}
+        });
+        let (missing, blockers) = context(&invalid);
+        assert_eq!(missing[0].status, "missing_resource");
+        assert_eq!(blockers.len(), 1);
+
+        let unavailable_capability = crate::domain::task_examination::ConnectorCapabilitySnapshot {
+            tools: Vec::new(),
+            ..capability.clone()
+        };
+        let (missing_operation, blockers) = resolve_evidence_verifier_bindings(
+            &contract,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:corporate-confluence".to_string()],
+                connector_ids: &["corporate-confluence".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: std::slice::from_ref(&unavailable_capability),
+            },
+        );
+        assert_eq!(missing_operation[0].status, "missing_operation");
+        assert_eq!(blockers.len(), 1);
+
+        let (not_selected, blockers) = resolve_evidence_verifier_bindings(
+            &contract,
+            EvidenceVerifierResolutionContext {
+                requested_capabilities: &["external_tools:other-confluence".to_string()],
+                connector_ids: &["other-confluence".to_string()],
+                rule_facts: &facts,
+                repository_root: None,
+                deployment_target: None,
+                trusted_kubernetes_connector: false,
+                capabilities: &[],
+            },
+        );
+        assert!(not_selected.is_empty());
+        assert!(blockers.is_empty());
     }
 
     #[test]

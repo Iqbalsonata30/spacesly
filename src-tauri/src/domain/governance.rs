@@ -1664,6 +1664,27 @@ mod tests {
     }
 
     #[test]
+    fn rule_compiler_extracts_confluence_page_verifier() {
+        let facts = compile_rule_facts(
+            r#"
+## Evidence Verifier: confluence-page
+- Provider: confluence
+- Connector: corporate-confluence
+- Read operation: get_page
+- Required states: page_exists
+"#,
+        );
+        let verifier = &facts.evidence_verifiers[0];
+        assert_eq!(verifier.provider, "confluence");
+        assert_eq!(
+            verifier.connector_id.as_deref(),
+            Some("corporate-confluence")
+        );
+        assert_eq!(verifier.read_operation.as_deref(), Some("get_page"));
+        assert_eq!(verifier.required_states, vec!["page_exists"]);
+    }
+
+    #[test]
     fn retained_resolution_is_self_consistent_and_catalog_independent() {
         let initial = profile(vec![skill("kubernetes", "infrastructure", "automatic", 90)]);
         let resolution = resolve_governance(5, &initial, &contract("Run diagnostics"))

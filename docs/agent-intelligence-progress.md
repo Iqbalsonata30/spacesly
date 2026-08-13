@@ -11,7 +11,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
 - Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
-- Phase 11 now also includes Rules-bound exact Jira issue-status and dynamic Jira comment-state verifiers.
+- Phase 11 now also includes Rules-bound exact Jira issue/comment-state and Confluence page-existence verifiers.
 - Phase 12 is in progress with a replayable, headless production-policy corpus and deterministic scorecard across all four initial categories.
 
 ## Phase 12 In Progress
@@ -35,7 +35,7 @@ Phase 12 regression evidence:
 
 - Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, containment, and report-redaction tests: 9 passed.
 - Headless embedded corpus: 47 passed, 0 failed; planning, safe execution, recovery, and evidence quality 100%.
-- Full Rust suite: 501 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Full Rust suite: 504 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
@@ -73,7 +73,6 @@ Implemented Git evidence-verifier vertical slice:
 Known limitation of this slice:
 
 - `new_commit` proves that repository `HEAD` changed from the immutable task baseline, but does not yet attribute the commit contents to a specific semantic objective.
-- Exact Jira issue/comment state still requires a provider-specific response adapter.
 
 Implemented Kubernetes Deployment availability vertical slice:
 
@@ -187,6 +186,33 @@ Implemented Jira exact comment-state vertical slice:
 - Comment text, raw arguments, raw connector/REST responses, connector environments, and credentials are absent from both ledgers. Only canonical identity, fingerprints, state, and confirmed comment IDs persist.
 - Known limitation: Jira does not receive a provider-native idempotency key in these supported calls. A crash after Jira accepts a comment but before Spacesly durably confirms its response can no longer create a duplicate automatically, but it remains an `uncertain` operator-reconciliation case rather than being automatically adopted from Jira. Connector-side pagination must still expose the exact comment to the terminal verifier.
 
+Implemented Confluence exact page-existence vertical slice:
+
+```markdown
+## Evidence Verifier: confluence-page
+
+- Provider: confluence
+- Connector: corporate-confluence
+- Read operation: get_page
+- Required states: page_exists
+```
+
+```json
+{
+  "document": {
+    "provider": "confluence",
+    "page_id": "1997894022"
+  }
+}
+```
+
+- The immutable contract owns one canonical numeric page ID; page authority is never extracted from a URL, title, or free-form task prose during verification.
+- Rules bind one selected Confluence connector and one live-discovered read-only tool with exactly one supported `page_id`, `pageId`, or `id` argument.
+- After worker execution, Spacesly independently reads the exact page and accepts completion only when structured connector output returns the same page ID and a bounded non-empty title.
+- Mismatched identities, prose-only output, nested unrelated references, multiple decoded objects, missing titles, connector errors, missing tools, and invalid contract IDs block safely.
+- Durable evidence contains only connector ID, page ID, `page_exists`, and satisfied/conflict/unavailable state. Page title, body, raw connector output, diagnostics, environment, credentials, and tokens are discarded.
+- Known limitation: this slice proves that the exact page exists, not that its body matches a desired revision or contains task-specific deployment environments. Content fingerprint and structured requirement verification remain future provider adapters.
+
 Phase 11 regression evidence:
 
 - Focused Rules parser, label binding, missing-baseline, and unsupported-provider tests: 2 passed.
@@ -194,10 +220,11 @@ Phase 11 regression evidence:
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
 - Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
-- Full Rust suite: 492 passed, 3 ignored, 0 failed in serial mode.
+- Full Rust suite: 504 passed, 3 ignored, 0 failed in serial mode.
 - Focused Jira Rules compilation/binding, strict identity/status parsing, mismatch/conflict handling, schema compatibility, and diagnostic redaction tests: 7 passed.
 - Focused Jira comment capture, ambiguity, content drift, ADF normalization, checkpoint replay, continuation resolution, and redaction tests: 6 passed.
 - Focused Jira identity, mutation-ledger replay/uncertainty, proxy response enrichment, final-writeback durability, recovery, and redaction tests: 12 passed.
+- Focused Confluence Rules binding, exact structured-page parsing, mismatch/ambiguity rejection, and body-redaction tests: 3 passed.
 - `cargo check` and formatting: passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy: 0 errors; the same 3 pre-existing warnings remain.

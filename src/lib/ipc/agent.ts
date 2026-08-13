@@ -97,6 +97,11 @@ export interface ExecutionContract {
     provider: "bamboo";
     result_key?: string;
   };
+  /** Optional exact external document identity used by deterministic page evidence policies. */
+  document?: {
+    provider: "confluence";
+    page_id: string;
+  };
   capability_plan: {
     schema_version: 1;
     planner_version: "agent-capability-plan-v1";

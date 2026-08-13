@@ -586,6 +586,17 @@ impl TaskExaminationRecord {
                             }))
                         || (record.required_states == ["comment_matches"]
                             && record.expected_status.is_some())))
+                || (record.provider == "confluence"
+                    && record.status == "ready"
+                    && (record.connector_id.is_none()
+                        || record.read_tool.is_none()
+                        || record.read_argument.is_none()
+                        || record.resource_kind.as_deref() != Some("page")
+                        || record.resource_name.as_deref().is_none_or(|value| {
+                            !crate::infrastructure::confluence::canonical_confluence_page_id(value)
+                        })
+                        || record.required_states != ["page_exists"]
+                        || record.expected_status.is_some()))
                 || record.source.trim().is_empty()
                 || record.source.len() > 128
                 || record.reason.trim().is_empty()

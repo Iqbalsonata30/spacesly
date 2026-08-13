@@ -367,7 +367,7 @@ Trade-offs:
 
 Exit criteria:
 
-- Git, Kubernetes Deployment, Bamboo build, Jira issue-status, and Jira comment-state slices have authoritative verifiers; broader connector coverage remains incremental.
+- Git, Kubernetes Deployment, Bamboo build, Jira issue-status, Jira comment-state, and Confluence page-existence slices have authoritative verifiers; broader connector coverage remains incremental.
 - Verification failures retain the mutation receipt and block safely.
 
 ### Phase 12 — Evaluation and Regression Harness
