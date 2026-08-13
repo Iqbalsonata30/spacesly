@@ -16,9 +16,9 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 ## Phase 12 In Progress
 
-Implemented recovery, result-evidence, planning-proposal, Rules-compilation, deployment/repository preflight, and task-tool containment corpus slices:
+Implemented recovery, result-evidence, planning-proposal, Rules-compilation, deployment/repository/connector preflight, and task-tool containment corpus slices:
 
-- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its forty-seven cases cover bounded recovery policy, production model-result evidence enforcement, semantic-planning proposal validation, dynamic Rules compilation, Rules-bound deployment/repository preflight, and task-tool containment.
+- `src-tauri/evaluation-fixtures/runtime-recovery-v1.json` is the first versioned, provider-neutral corpus. Its fifty-four cases cover bounded recovery policy, production model-result evidence enforcement, semantic-planning proposal validation, dynamic Rules compilation, Rules-bound deployment/repository/connector preflight, and task-tool containment.
 - The evaluator invokes the production recovery decision function directly and compares its failure class, recovery action, and retryability with each fixture's expected terminal policy.
 - Reports contain stable corpus/fixture identities, mismatch field names, exact totals, and basis-point pass rates. They never reproduce fixture errors, task text, diagnostics, or secrets.
 - Model-result fixtures invoke the production structured-response and objective-coverage validator. Valid complete evidence succeeds, while malformed JSON, omitted objectives, duplicate objectives, evidence-free objectives, and sensitive completion without approval block.
@@ -26,25 +26,27 @@ Implemented recovery, result-evidence, planning-proposal, Rules-compilation, dep
 - Rules fixtures invoke the production domain compiler with generic user-defined repositories and environments. They verify repository identity, missing-local-checkout warnings, protected-branch approval policy, deployment targets, connector/verifier policy identities, and preservation of conflicting target rows for later preflight diagnostics.
 - Deployment-preflight fixtures invoke the production resolver after compiling user Rules. Exact labels, explicit targets, and agreeing combined selectors resolve to their bound branch and namespace; conflicts, unknown targets, ambiguous labels, and invalid Rules targets block with retained selector status.
 - Repository fixtures create isolated temporary Git layouts, compile generic user Rules, and invoke the production repository resolver. Exact Rules paths and unique bounded discovery resolve; ambiguous checkouts, outside-workspace paths, contract/Rules conflicts, missing checkouts, and unselected multiple Rules block. Reports retain normalized status only and temporary layouts are removed after each fixture.
+- Connector-preflight fixtures compile generic Connector Rules and invoke the production configuration/capability resolver with sanitized connector configuration and live inventory snapshots. They cover matching URL and operations, missing Rules/configuration, URL mismatch, unavailable discovery, missing operations, and ambiguous operation names.
+- Connector-preflight reports retain only fixture identity and mismatched normalized field names. Rules text, configured URLs, inventory names, connector environment, diagnostics, and credentials are never copied into a failure report.
 - Task-tool fixtures invoke production workspace-read, shell-workdir, and Git-file path resolution inside isolated temporary layouts. Contained relative/absolute paths succeed while parent traversal, absolute escape, and symlink escape are rejected. Non-Unix evaluation uses an equivalent absolute outside path because symlink creation is not portable.
-- All roadmap score categories are represented. The current run reports planning 4/4, safe execution 35/35, recovery 3/3, and evidence quality 5/5.
+- All roadmap score categories are represented. The current run reports planning 4/4, safe execution 42/42, recovery 3/3, and evidence quality 5/5.
 - Run the release-safe headless command with `spacesly --spacesly-evaluate-agent`; it prints JSON and returns a non-zero exit code if parsing, validation, or any fixture fails.
 - Duplicate or malformed fixture IDs, unsupported schema versions, empty/oversized errors, excessive retry policy, and empty/oversized corpora fail closed.
 
 Phase 12 regression evidence:
 
-- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, containment, and report-redaction tests: 9 passed.
-- Headless embedded corpus: 47 passed, 0 failed; planning, safe execution, recovery, and evidence quality 100%.
-- Full Rust suite: 504 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
+- Focused corpus parsing, scoring, uncovered-category, tampered-expectation, duplicate-fixture, production-validator, containment, connector-preflight, and report-redaction tests: 10 passed.
+- Headless embedded corpus: 54 passed, 0 failed; planning, safe execution, recovery, and evidence quality 100%.
+- Full Rust suite: 505 passed, 3 ignored, 0 failed in serial mode; `cargo check` and formatting passed.
 - Frontend unit tests: 7 passed, 0 failed; `svelte-check`: 0 errors and 0 warnings.
 - Clippy introduced no finding; the same three pre-existing warnings remain.
 
 Remaining Phase 12 scope:
 
 - Planning coverage currently measures deterministic proposal-schema enforcement, not whether a live model semantically decomposes an arbitrary task correctly; curated task-to-plan model fixtures remain future work.
-- Rules compilation, deployment-target resolution, and repository checkout containment are covered, but live connector configuration/capability preflight is not yet replayed by this corpus.
+- Rules compilation, deployment-target resolution, repository checkout containment, and deterministic connector configuration/capability preflight are covered. The corpus uses sanitized snapshots and does not spawn real connector processes or exercise discovery transport failures.
 - Task-tool read/workdir/Git-file containment is covered; mutation-time directory replacement races remain covered by focused file-service tests rather than the headless corpus.
-- Add real production-path fixtures for connector preflight, approval continuation, mutation-ledger recovery, and provider evidence adapters.
+- Add real production-path fixtures for approval continuation, mutation-ledger recovery, and provider evidence adapters.
 - Add connector simulators and a CI release gate only after each score category has representative coverage.
 
 ## Phase 11 In Progress
@@ -220,7 +222,7 @@ Phase 11 regression evidence:
 - Focused Deployment predicate, namespace/identity fencing, Rules parsing, and workload/namespace binding tests: 4 passed.
 - Focused polling success, timeout, cancellation, unavailable-read, request-budget, invalid-policy, and compiler compatibility tests: 7 passed.
 - Focused Bamboo identity capture, receipt persistence/replay, Rules/binding, strict response parsing, bounded polling, cancellation, MCP read-only boundary/deadline, and redaction tests: 16 passed.
-- Full Rust suite: 504 passed, 3 ignored, 0 failed in serial mode.
+- Full Rust suite: 505 passed, 3 ignored, 0 failed in serial mode.
 - Focused Jira Rules compilation/binding, strict identity/status parsing, mismatch/conflict handling, schema compatibility, and diagnostic redaction tests: 7 passed.
 - Focused Jira comment capture, ambiguity, content drift, ADF normalization, checkpoint replay, continuation resolution, and redaction tests: 6 passed.
 - Focused Jira identity, mutation-ledger replay/uncertainty, proxy response enrichment, final-writeback durability, recovery, and redaction tests: 12 passed.

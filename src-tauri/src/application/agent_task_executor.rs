@@ -1304,6 +1304,64 @@ fn resolve_connector_configuration_preflights(
     (records, blockers)
 }
 
+pub(crate) fn evaluate_connector_preflight_fixture(
+    rules: &str,
+    connector_id: &str,
+    configured_base_url: Option<&str>,
+    capability_status: ConnectorDiscoveryStatus,
+    live_tools: &[String],
+) -> crate::domain::agent_evaluation::ConnectorPreflightObservation {
+    let facts = compile_rule_facts(rules);
+    let servers = configured_base_url
+        .map(|base_url| AiWorkerMcpServer {
+            name: connector_id.to_string(),
+            secret_id: connector_id.to_string(),
+            command: vec!["fixture-connector".to_string()],
+            environment: HashMap::from([("CONNECTOR_BASE_URL".to_string(), base_url.to_string())]),
+            proxy_authority: None,
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let capabilities = [
+        crate::domain::task_examination::ConnectorCapabilitySnapshot {
+            connector_id: connector_id.to_string(),
+            status: capability_status,
+            tools: live_tools
+                .iter()
+                .map(
+                    |name| crate::domain::task_examination::DiscoveredToolCapability {
+                        name: name.clone(),
+                        risk: "read".to_string(),
+                        argument_names: Vec::new(),
+                    },
+                )
+                .collect(),
+            error: None,
+            warnings: Vec::new(),
+        },
+    ];
+    let (records, blockers) = resolve_connector_configuration_preflights(
+        &[connector_id.to_string()],
+        &facts,
+        &servers,
+        &capabilities,
+    );
+    let record = records.into_iter().next();
+    crate::domain::agent_evaluation::ConnectorPreflightObservation {
+        status: record
+            .as_ref()
+            .map(|record| record.status.clone())
+            .unwrap_or_else(|| "missing_rule".to_string()),
+        connector_type: record
+            .as_ref()
+            .and_then(|record| record.connector_type.clone()),
+        verified_tools: record
+            .map(|record| record.verified_tools)
+            .unwrap_or_default(),
+        blocked: !blockers.is_empty(),
+    }
+}
+
 fn resolve_connector_rule(
     rule: &ConnectorRuleFact,
     servers: &[AiWorkerMcpServer],

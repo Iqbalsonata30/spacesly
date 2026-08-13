@@ -4503,11 +4503,12 @@ mod tests {
             evaluate_planning_proposal_fixture,
             crate::application::agent_task_executor::evaluate_deployment_target_preflight_fixture,
             crate::application::agent_task_executor::evaluate_repository_preflight_fixture,
+            crate::application::agent_task_executor::evaluate_connector_preflight_fixture,
             crate::infrastructure::task_tools::evaluate_task_tool_containment_fixture,
         )
         .expect("production evaluation completes");
-        assert_eq!(report.total, 47);
-        assert_eq!(report.passed, 47);
+        assert_eq!(report.total, 54);
+        assert_eq!(report.passed, 54);
         assert_eq!(report.failed, 0);
         assert_eq!(
             report.categories

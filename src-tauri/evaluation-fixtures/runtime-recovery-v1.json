@@ -544,6 +544,88 @@
       }
     },
     {
+      "fixture_id": "connector-preflight-verifies-config-and-capabilities",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search\n  - get_page",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://confluence.example/",
+      "capability_status": "available",
+      "live_tools": ["confluence_search", "confluence_get_page"],
+      "expected": {
+        "status": "ready",
+        "connector_type": "confluence",
+        "verified_tools": ["confluence_get_page", "confluence_search"],
+        "blocked": false
+      }
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-missing-rule",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: other-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://confluence.example",
+      "capability_status": "available",
+      "live_tools": ["confluence_search"],
+      "expected": {"status":"missing_rule","connector_type":null,"verified_tools":[],"blocked":true}
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-missing-configuration",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search",
+      "connector_id": "team-confluence",
+      "configured_base_url": null,
+      "capability_status": "available",
+      "live_tools": ["confluence_search"],
+      "expected": {"status":"missing_configuration","connector_type":"confluence","verified_tools":[],"blocked":true}
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-url-mismatch",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://wrong.example",
+      "capability_status": "available",
+      "live_tools": ["confluence_search"],
+      "expected": {"status":"url_mismatch","connector_type":"confluence","verified_tools":[],"blocked":true}
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-unavailable-inventory",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://confluence.example",
+      "capability_status": "unavailable",
+      "live_tools": [],
+      "expected": {"status":"connector_unavailable","connector_type":"confluence","verified_tools":[],"blocked":true}
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-missing-operation",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search\n  - get_page",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://confluence.example",
+      "capability_status": "available",
+      "live_tools": ["confluence_search"],
+      "expected": {"status":"missing_operations","connector_type":"confluence","verified_tools":[],"blocked":true}
+    },
+    {
+      "fixture_id": "connector-preflight-blocks-ambiguous-operation",
+      "category": "safe_execution",
+      "scenario": "connector_preflight",
+      "rules": "## Connector: team-confluence\n- Type: confluence\n- Base URL: https://confluence.example\n- Required operations:\n  - search",
+      "connector_id": "team-confluence",
+      "configured_base_url": "https://confluence.example",
+      "capability_status": "available",
+      "live_tools": ["legacy_search", "alternate_search"],
+      "expected": {"status":"ambiguous_operation","connector_type":"confluence","verified_tools":[],"blocked":true}
+    },
+    {
       "fixture_id": "task-tool-read-allows-contained-relative-file",
       "category": "safe_execution",
       "scenario": "task_tool_containment",

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::governance::compile_rule_facts;
+use crate::domain::task_examination::ConnectorDiscoveryStatus;
 use crate::domain::task_recovery::{
     decide_runtime_recovery, RuntimeFailureClass, RuntimeRecoveryAction, RuntimeRecoveryContext,
 };
@@ -89,6 +90,14 @@ pub enum AgentEvaluationScenario {
         workspace_repositories: Vec<String>,
         outside_repository: Option<String>,
         expected: RepositoryPreflightExpectation,
+    },
+    ConnectorPreflight {
+        rules: String,
+        connector_id: String,
+        configured_base_url: Option<String>,
+        capability_status: ConnectorDiscoveryStatus,
+        live_tools: Vec<String>,
+        expected: ConnectorPreflightExpectation,
     },
     TaskToolContainment {
         operation: TaskToolContainmentOperation,
@@ -182,6 +191,16 @@ pub struct RepositoryPreflightExpectation {
 
 pub type RepositoryPreflightObservation = RepositoryPreflightExpectation;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConnectorPreflightExpectation {
+    pub status: String,
+    pub connector_type: Option<String>,
+    pub verified_tools: Vec<String>,
+    pub blocked: bool,
+}
+
+pub type ConnectorPreflightObservation = ConnectorPreflightExpectation;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskToolContainmentOperation {
@@ -253,6 +272,13 @@ pub fn evaluate_agent_corpus(
         &[String],
         Option<&str>,
     ) -> RepositoryPreflightObservation,
+    connector_preflight_validator: impl Fn(
+        &str,
+        &str,
+        Option<&str>,
+        ConnectorDiscoveryStatus,
+        &[String],
+    ) -> ConnectorPreflightObservation,
     task_tool_containment_validator: impl Fn(
         TaskToolContainmentOperation,
         &str,
@@ -269,6 +295,7 @@ pub fn evaluate_agent_corpus(
             &planning_proposal_validator,
             &deployment_target_validator,
             &repository_validator,
+            &connector_preflight_validator,
             &task_tool_containment_validator,
         );
         let counts = category_counts.entry(fixture.category).or_default();
@@ -331,6 +358,13 @@ fn evaluate_fixture(
         &[String],
         Option<&str>,
     ) -> RepositoryPreflightObservation,
+    connector_preflight_validator: &impl Fn(
+        &str,
+        &str,
+        Option<&str>,
+        ConnectorDiscoveryStatus,
+        &[String],
+    ) -> ConnectorPreflightObservation,
     task_tool_containment_validator: &impl Fn(
         TaskToolContainmentOperation,
         &str,
@@ -505,6 +539,23 @@ fn evaluate_fixture(
                 outside_repository.as_deref(),
             );
             repository_preflight_mismatches(&observed, expected)
+        }
+        AgentEvaluationScenario::ConnectorPreflight {
+            rules,
+            connector_id,
+            configured_base_url,
+            capability_status,
+            live_tools,
+            expected,
+        } => {
+            let observed = connector_preflight_validator(
+                rules,
+                connector_id,
+                configured_base_url.as_deref(),
+                capability_status.clone(),
+                live_tools,
+            );
+            connector_preflight_mismatches(&observed, expected)
         }
         AgentEvaluationScenario::TaskToolContainment {
             operation,
@@ -728,6 +779,52 @@ fn validate_corpus(corpus: &AgentEvaluationCorpus) -> Result<(), String> {
                     return Err("Agent repository preflight fixture is invalid.".to_string());
                 }
             }
+            AgentEvaluationScenario::ConnectorPreflight {
+                rules,
+                connector_id,
+                configured_base_url,
+                live_tools,
+                expected,
+                ..
+            } => {
+                let valid_status = matches!(
+                    expected.status.as_str(),
+                    "ready"
+                        | "missing_rule"
+                        | "invalid_rule"
+                        | "missing_configuration"
+                        | "url_mismatch"
+                        | "connector_unavailable"
+                        | "missing_operations"
+                        | "ambiguous_operation"
+                );
+                if rules.trim().is_empty()
+                    || rules.len() > 32 * 1024
+                    || rules.contains('\0')
+                    || !valid_identifier(connector_id)
+                    || configured_base_url.as_deref().is_some_and(|url| {
+                        url.trim().is_empty()
+                            || url.len() > 2_048
+                            || url.chars().any(char::is_control)
+                    })
+                    || live_tools.len() > 128
+                    || live_tools.iter().any(|tool| !valid_identifier(tool))
+                    || !valid_status
+                    || expected
+                        .connector_type
+                        .as_deref()
+                        .is_some_and(|value| !valid_identifier(value))
+                    || expected.verified_tools.len() > 128
+                    || expected
+                        .verified_tools
+                        .iter()
+                        .any(|tool| !valid_identifier(tool))
+                    || expected.blocked == (expected.status == "ready")
+                    || (expected.status != "ready" && !expected.verified_tools.is_empty())
+                {
+                    return Err("Agent connector preflight fixture is invalid.".to_string());
+                }
+            }
             AgentEvaluationScenario::TaskToolContainment { path, expected, .. } => {
                 if path.trim().is_empty()
                     || path.len() > 512
@@ -819,6 +916,26 @@ fn repository_preflight_mismatches(
     }
     if observed.fixture_error != expected.fixture_error {
         mismatches.push("fixture_error".to_string());
+    }
+    mismatches
+}
+
+fn connector_preflight_mismatches(
+    observed: &ConnectorPreflightObservation,
+    expected: &ConnectorPreflightExpectation,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if observed.status != expected.status {
+        mismatches.push("status".to_string());
+    }
+    if observed.connector_type != expected.connector_type {
+        mismatches.push("connector_type".to_string());
+    }
+    if observed.verified_tools != expected.verified_tools {
+        mismatches.push("verified_tools".to_string());
+    }
+    if observed.blocked != expected.blocked {
+        mismatches.push("blocked".to_string());
     }
     mismatches
 }
@@ -1032,6 +1149,22 @@ mod tests {
         )
     }
 
+    fn fixture_connector_preflight_validator(
+        rules: &str,
+        connector_id: &str,
+        configured_base_url: Option<&str>,
+        capability_status: ConnectorDiscoveryStatus,
+        live_tools: &[String],
+    ) -> ConnectorPreflightObservation {
+        crate::application::agent_task_executor::evaluate_connector_preflight_fixture(
+            rules,
+            connector_id,
+            configured_base_url,
+            capability_status,
+            live_tools,
+        )
+    }
+
     fn fixture_task_tool_containment_validator(
         operation: TaskToolContainmentOperation,
         path: &str,
@@ -1053,18 +1186,19 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
-        assert_eq!(report.total, 47);
-        assert_eq!(report.passed, 47);
+        assert_eq!(report.total, 54);
+        assert_eq!(report.passed, 54);
         assert_eq!(report.failed, 0);
         assert_eq!(report.pass_rate_basis_points, 10_000);
         assert!(report.categories[&AgentEvaluationCategory::Recovery].evaluated);
         assert!(report.categories[&AgentEvaluationCategory::SafeExecution].evaluated);
         assert_eq!(
             report.categories[&AgentEvaluationCategory::SafeExecution].passed,
-            35
+            42
         );
         assert!(report.categories[&AgentEvaluationCategory::Planning].evaluated);
         assert_eq!(
@@ -1083,6 +1217,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("partial corpus evaluates");
@@ -1110,6 +1245,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1151,6 +1287,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1187,6 +1324,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1225,6 +1363,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1264,6 +1403,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1274,6 +1414,51 @@ mod tests {
         assert!(!encoded.contains("unexpected-repository"));
         assert!(!encoded.contains("token="));
         assert!(!encoded.contains("spacesly-agent-repository-evaluation"));
+    }
+
+    #[test]
+    fn connector_preflight_failure_report_never_echoes_configuration_or_inventory() {
+        let mut corpus = embedded_agent_evaluation_corpus().expect("embedded corpus parses");
+        let fixture = corpus
+            .fixtures
+            .iter_mut()
+            .find(|fixture| {
+                matches!(
+                    fixture.scenario,
+                    AgentEvaluationScenario::ConnectorPreflight { .. }
+                )
+            })
+            .expect("connector preflight fixture exists");
+        let AgentEvaluationScenario::ConnectorPreflight {
+            rules,
+            configured_base_url,
+            live_tools,
+            ..
+        } = &mut fixture.scenario
+        else {
+            unreachable!("selected fixture is connector preflight");
+        };
+        rules.push_str("\nOperator token=connector-private-value");
+        *configured_base_url =
+            Some("https://confluence.example/connector-private-value".to_string());
+        live_tools.push("connector_private_tool".to_string());
+
+        let report = evaluate_agent_corpus(
+            &corpus,
+            fixture_model_validator,
+            fixture_planning_validator,
+            fixture_deployment_target_validator,
+            fixture_repository_validator,
+            fixture_connector_preflight_validator,
+            fixture_task_tool_containment_validator,
+        )
+        .expect("corpus evaluates");
+        assert_eq!(report.failed, 1);
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(!encoded.contains("connector-private-value"));
+        assert!(!encoded.contains("connector_private_tool"));
+        assert!(!encoded.contains("token="));
+        assert!(!encoded.contains("confluence.example"));
     }
 
     #[test]
@@ -1303,6 +1488,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect("corpus evaluates");
@@ -1324,6 +1510,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect_err("duplicate fixture rejected")
@@ -1346,6 +1533,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect_err("NUL in Rules fixture rejected")
@@ -1370,6 +1558,7 @@ mod tests {
             fixture_planning_validator,
             fixture_deployment_target_validator,
             fixture_repository_validator,
+            fixture_connector_preflight_validator,
             fixture_task_tool_containment_validator,
         )
         .expect_err("repository fixture traversal rejected")

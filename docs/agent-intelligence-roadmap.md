@@ -389,6 +389,7 @@ Implemented recovery-policy corpus increment:
 - Deployment-target fixtures execute the production Rules-bound preflight resolver. They cover ticket labels, explicit targets, agreeing combined selectors, conflicts, unresolved targets, ambiguous labels, invalid branch/namespace Rules, and secret-free diagnostics.
 - Repository fixtures create isolated Git layouts and execute the production Rules-bound repository resolver. They cover exact contained checkouts, bounded discovery, ambiguity, missing checkouts, contract/Rules conflicts, outside-workspace paths, multiple unselected Rules, cleanup, and secret-free normalized reports.
 - Task-tool fixtures execute production workspace-read, shell-workdir, and Git-file path resolution in isolated layouts. They cover contained paths, parent traversal, absolute escapes, Unix symlink escapes, portable non-Unix outside-path equivalents, cleanup, and path-free reports.
+- Connector-preflight fixtures execute the production Rules-bound configuration and capability resolver against sanitized MCP server configuration and live inventory snapshots. They cover matching configuration, missing Rules/configuration, URL mismatch, unavailable discovery, and missing or ambiguous operations without exposing URLs or inventory data in reports.
 
 Current limitations:
 
