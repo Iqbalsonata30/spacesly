@@ -5572,7 +5572,7 @@ mod tests {
         )
         .expect("execution store opens");
         let workspace_id = "workspace-personal";
-        let conversation_id = "conversation-1";
+        let conversation_id = "agent-card-conversation-1";
         let run_id = "run-1";
         executions
             .save(&ExecutionRun {
@@ -5605,7 +5605,7 @@ mod tests {
             })
             .expect("execution run saved");
         executions
-            .append_conversation_message(
+            .append_agent_task_context_message(
                 workspace_id,
                 conversation_id,
                 "Agent card",
@@ -5635,7 +5635,11 @@ mod tests {
         )
         .expect("engine starts");
 
-        let envelope = test_envelope();
+        let mut envelope = test_envelope();
+        let TaskSessionEnvelope::V1(session_envelope) = &mut envelope else {
+            unreachable!("test envelope is V1")
+        };
+        session_envelope.conversation_id = Some(conversation_id.to_string());
         let session = engine
             .submit_envelope_with_grants(
                 "blocked-agent",

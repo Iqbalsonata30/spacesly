@@ -242,9 +242,11 @@ impl AgentRuntimeResolver for StoredAgentRuntimeResolver {
             .ok_or_else(|| "Agent conversation ID is required.".to_string())?;
         if !self
             .executions
-            .conversation_exists(&envelope.workspace_id, conversation_id)?
+            .agent_task_context_exists(&envelope.workspace_id, conversation_id)?
         {
-            return Err("Agent conversation does not belong to this workspace.".to_string());
+            return Err(
+                "Agent context does not belong to this workspace and task scope.".to_string(),
+            );
         }
         let run = self
             .executions

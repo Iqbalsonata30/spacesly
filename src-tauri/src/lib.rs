@@ -1026,6 +1026,23 @@ async fn append_conversation_message(
     .map_err(|error| format!("Conversation append task failed: {error}"))?
 }
 
+#[tauri::command]
+async fn append_agent_task_context_message(
+    workspace_id: String,
+    conversation_id: String,
+    title: String,
+    message: ConversationMessageInput,
+    execution_store: State<'_, ExecutionStore>,
+) -> Result<infrastructure::execution_store::ConversationMessageRecord, String> {
+    validate_renderer_conversation_role(&message)?;
+    let store = execution_store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.append_agent_task_context_message(&workspace_id, &conversation_id, &title, &message)
+    })
+    .await
+    .map_err(|error| format!("Agent task context append failed: {error}"))?
+}
+
 fn validate_renderer_conversation_role(message: &ConversationMessageInput) -> Result<(), String> {
     match message.role.as_str() {
         "user" | "system" => Ok(()),
@@ -3459,6 +3476,7 @@ pub fn run() {
             load_conversation_history,
             load_conversation_messages,
             append_conversation_message,
+            append_agent_task_context_message,
             import_conversations,
             prune_conversations,
             chat_ai_worker,

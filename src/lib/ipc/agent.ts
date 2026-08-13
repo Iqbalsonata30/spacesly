@@ -392,6 +392,20 @@ export async function appendConversationMessage(
   );
 }
 
+/** Stores scheduler Agent context without exposing it as a user Spacesly Chat conversation. */
+export async function appendAgentTaskContextMessage(
+  workspaceId: string,
+  conversationId: string,
+  title: string,
+  message: Pick<ConversationMessageRecord, "id" | "text"> & { role: "user" | "system" },
+): Promise<ConversationMessageRecord> {
+  return invokeWithPolicy<ConversationMessageRecord>(
+    "append_agent_task_context_message",
+    { workspaceId, conversationId, title, message },
+    IPC_POLICIES.fileWrite,
+  );
+}
+
 export async function importConversations(
   workspaceId: string,
   conversations: Array<{

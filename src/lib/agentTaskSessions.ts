@@ -1,5 +1,5 @@
 import type { AiWorkerConfig, AiWorkerTaskResult, ExecutionContract } from "$lib/ipc/agent";
-import { appendConversationMessage } from "$lib/ipc/agent";
+import { appendAgentTaskContextMessage } from "$lib/ipc/agent";
 import type { GitWorkspaceInfo } from "$lib/ipc/git";
 import {
   cancelTaskSession,
@@ -105,7 +105,7 @@ export type AgentTaskSessionExecution = {
 
 /** Injectable IPC boundary used by the Task Session orchestration and pure tests. */
 export type AgentTaskSessionDependencies = {
-  appendMessage: typeof appendConversationMessage;
+  appendMessage: typeof appendAgentTaskContextMessage;
   cancel: typeof cancelTaskSession;
   digestContract: typeof digestAgentExecutionContract;
   getResult: typeof getTaskSessionResult;
@@ -166,7 +166,7 @@ export class AgentTaskSessionApprovalRequiredError extends Error {
 }
 
 const defaultDependencies: AgentTaskSessionDependencies = {
-  appendMessage: appendConversationMessage,
+  appendMessage: appendAgentTaskContextMessage,
   cancel: cancelTaskSession,
   digestContract: digestAgentExecutionContract,
   getResult: getTaskSessionResult,

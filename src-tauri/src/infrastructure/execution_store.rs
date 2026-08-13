@@ -19,6 +19,7 @@ const SLOW_CONVERSATION_LIST: Duration = Duration::from_millis(250);
 const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
        conversation_id TEXT PRIMARY KEY,
        workspace_id TEXT NOT NULL,
+       kind TEXT NOT NULL DEFAULT 'chat',
        title TEXT NOT NULL,
        created_at INTEGER NOT NULL,
        updated_at INTEGER NOT NULL
@@ -42,6 +43,9 @@ const CONVERSATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS conversations (
 
 const MESSAGE_AUTHORITY_RENDERER: &str = "renderer";
 const MESSAGE_AUTHORITY_BACKEND: &str = "backend";
+const CONVERSATION_KIND_CHAT: &str = "chat";
+const CONVERSATION_KIND_AGENT_TASK: &str = "agent_task";
+const LEGACY_AGENT_TASK_CONVERSATION_PREFIX: &str = "agent-card-";
 
 /// Returns the `task-session:<instance>:<session>` origin of a scheduler projection ID, or `None`
 /// when the ID is not a well-formed scheduler projection. Every attempt of one Task Session shares
@@ -267,6 +271,7 @@ impl ExecutionStore {
         connection
             .execute_batch(CONVERSATION_SCHEMA)
             .map_err(|error| format!("Failed to initialize conversation database: {error}"))?;
+        migrate_conversation_kind(&connection)?;
         migrate_conversation_authority(&connection)?;
         // Keep databases created by earlier builds usable without destructive migrations.
         let _ = connection.execute(
@@ -1012,11 +1017,12 @@ impl ExecutionStore {
         let mut statement = connection
             .prepare(
                 "SELECT conversation_id, workspace_id, title, created_at, updated_at
-                 FROM conversations WHERE workspace_id = ?1 ORDER BY updated_at DESC",
+                 FROM conversations WHERE workspace_id = ?1 AND kind = ?2
+                 ORDER BY updated_at DESC",
             )
             .map_err(|error| format!("Failed to prepare conversation query: {error}"))?;
         let conversations = statement
-            .query_map(params![workspace_id], |row| {
+            .query_map(params![workspace_id, CONVERSATION_KIND_CHAT], |row| {
                 Ok(ConversationRecord {
                     id: row.get(0)?,
                     workspace_id: row.get(1)?,
@@ -1054,20 +1060,23 @@ impl ExecutionStore {
         let mut statement = connection
             .prepare(
                 "SELECT conversation_id, workspace_id, title, created_at, updated_at
-                 FROM conversations WHERE workspace_id = ?1
-                 ORDER BY updated_at DESC LIMIT ?2",
+                 FROM conversations WHERE workspace_id = ?1 AND kind = ?2
+                 ORDER BY updated_at DESC LIMIT ?3",
             )
             .map_err(|error| format!("Failed to prepare conversation history query: {error}"))?;
         let conversations = statement
-            .query_map(params![workspace_id, limit.max(1) as u64], |row| {
-                Ok(ConversationRecord {
-                    id: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    title: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            })
+            .query_map(
+                params![workspace_id, CONVERSATION_KIND_CHAT, limit.max(1) as u64],
+                |row| {
+                    Ok(ConversationRecord {
+                        id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        title: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
             .map_err(|error| format!("Failed to query conversation history: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Failed to decode conversation history: {error}"))?;
@@ -1150,7 +1159,8 @@ impl ExecutionStore {
     }
 
     /// Returns whether a durable conversation belongs to the requested workspace.
-    pub fn conversation_exists(
+    #[cfg(test)]
+    pub(crate) fn conversation_exists(
         &self,
         workspace_id: &str,
         conversation_id: &str,
@@ -1160,6 +1170,24 @@ impl ExecutionStore {
         crate::infrastructure::performance::increment("sqlite_reads_total", "sqlite", 1);
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         conversation_exists_in(&connection, workspace_id, conversation_id)
+    }
+
+    pub fn agent_task_context_exists(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM conversations
+                 WHERE conversation_id = ?1 AND workspace_id = ?2 AND kind = ?3",
+                params![conversation_id, workspace_id, CONVERSATION_KIND_AGENT_TASK],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to verify Agent task context scope: {error}"))?;
+        Ok(exists.is_some())
     }
 
     /// Resolves the authoritative model context for an exact durable Chat user message.
@@ -1367,6 +1395,11 @@ impl ExecutionStore {
         title: &str,
         input: &ConversationMessageInput,
     ) -> Result<ConversationMessageRecord, String> {
+        if conversation_id.starts_with(LEGACY_AGENT_TASK_CONVERSATION_PREFIX) {
+            return Err(
+                "Agent task conversation IDs are reserved for internal context.".to_string(),
+            );
+        }
         let _metric = crate::infrastructure::performance::span(
             "conversation_message_append",
             "sqlite_write_transaction",
@@ -1377,6 +1410,28 @@ impl ExecutionStore {
             conversation_id,
             title,
             input,
+            CONVERSATION_KIND_CHAT,
+            MESSAGE_AUTHORITY_RENDERER,
+        )
+    }
+
+    /// Persists internal Agent execution context without projecting it into Spacesly Chat history.
+    pub fn append_agent_task_context_message(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        title: &str,
+        input: &ConversationMessageInput,
+    ) -> Result<ConversationMessageRecord, String> {
+        if !conversation_id.starts_with(LEGACY_AGENT_TASK_CONVERSATION_PREFIX) {
+            return Err("Agent task context requires its reserved conversation ID.".to_string());
+        }
+        self.append_conversation_message_with_authority(
+            workspace_id,
+            conversation_id,
+            title,
+            input,
+            CONVERSATION_KIND_AGENT_TASK,
             MESSAGE_AUTHORITY_RENDERER,
         )
     }
@@ -1387,6 +1442,7 @@ impl ExecutionStore {
         conversation_id: &str,
         title: &str,
         input: &ConversationMessageInput,
+        conversation_kind: &str,
         authority: &str,
     ) -> Result<ConversationMessageRecord, String> {
         validate_conversation_message(input)?;
@@ -1397,23 +1453,31 @@ impl ExecutionStore {
             .map_err(|error| format!("Failed to start conversation transaction: {error}"))?;
         transaction
             .execute(
-                "INSERT INTO conversations (conversation_id, workspace_id, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)
+                "INSERT INTO conversations
+                   (conversation_id, workspace_id, kind, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                  ON CONFLICT(conversation_id) DO UPDATE SET
                    title = excluded.title, updated_at = excluded.updated_at
-                 WHERE conversations.workspace_id = excluded.workspace_id",
-                params![conversation_id, workspace_id, title.trim(), now],
+                 WHERE conversations.workspace_id = excluded.workspace_id
+                   AND conversations.kind = excluded.kind",
+                params![
+                    conversation_id,
+                    workspace_id,
+                    conversation_kind,
+                    title.trim(),
+                    now
+                ],
             )
             .map_err(|error| format!("Failed to save conversation: {error}"))?;
         let conversation_scope = transaction
             .query_row(
-                "SELECT workspace_id FROM conversations WHERE conversation_id = ?1",
+                "SELECT workspace_id, kind FROM conversations WHERE conversation_id = ?1",
                 params![conversation_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .map_err(|error| format!("Failed to verify conversation ownership: {error}"))?;
-        if conversation_scope != workspace_id {
-            return Err("Conversation does not belong to this workspace.".to_string());
+        if conversation_scope.0 != workspace_id || conversation_scope.1 != conversation_kind {
+            return Err("Conversation does not belong to this workspace and purpose.".to_string());
         }
         let existing = transaction
             .query_row(
@@ -1521,10 +1585,15 @@ impl ExecutionStore {
     ) -> Result<usize, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
-            .prepare("SELECT conversation_id FROM conversations WHERE workspace_id = ?1")
+            .prepare(
+                "SELECT conversation_id FROM conversations
+                 WHERE workspace_id = ?1 AND kind = ?2",
+            )
             .map_err(|error| format!("Failed to prepare conversation retention query: {error}"))?;
         let ids = statement
-            .query_map(params![workspace_id], |row| row.get::<_, String>(0))
+            .query_map(params![workspace_id, CONVERSATION_KIND_CHAT], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|error| format!("Failed to query conversations for retention: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Failed to decode conversation retention IDs: {error}"))?;
@@ -1783,6 +1852,39 @@ fn migrate_conversation_authority(connection: &Connection) -> Result<(), String>
     Ok(())
 }
 
+fn migrate_conversation_kind(connection: &Connection) -> Result<(), String> {
+    let has_kind = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'kind'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to inspect conversation schema: {error}"))?
+        .is_some();
+    if !has_kind {
+        connection
+            .execute(
+                "ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'",
+                [],
+            )
+            .map_err(|error| format!("Failed to migrate conversation purpose: {error}"))?;
+    }
+    // Agent task contexts used this stable prefix before conversation purposes were persisted.
+    connection
+        .execute(
+            "UPDATE conversations SET kind = ?1
+             WHERE kind = ?2 AND conversation_id LIKE ?3",
+            params![
+                CONVERSATION_KIND_AGENT_TASK,
+                CONVERSATION_KIND_CHAT,
+                format!("{LEGACY_AGENT_TASK_CONVERSATION_PREFIX}%")
+            ],
+        )
+        .map_err(|error| format!("Failed to classify legacy Agent task conversations: {error}"))?;
+    Ok(())
+}
+
 fn resolve_chat_snapshot_in(
     connection: &Connection,
     workspace_id: &str,
@@ -1791,8 +1893,18 @@ fn resolve_chat_snapshot_in(
     message_sequence: u64,
     message_text: &str,
 ) -> Result<ChatConversationSnapshot, String> {
-    if !conversation_exists_in(connection, workspace_id, conversation_id)? {
-        return Err("Conversation does not belong to this workspace.".to_string());
+    let is_chat = connection
+        .query_row(
+            "SELECT 1 FROM conversations
+             WHERE conversation_id = ?1 AND workspace_id = ?2 AND kind = ?3",
+            params![conversation_id, workspace_id, CONVERSATION_KIND_CHAT],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to verify Chat conversation scope: {error}"))?
+        .is_some();
+    if !is_chat {
+        return Err("Conversation does not belong to this workspace Chat scope.".to_string());
     }
     let head = connection
         .query_row(
@@ -2473,6 +2585,69 @@ mod tests {
     }
 
     #[test]
+    fn agent_task_context_is_durable_but_hidden_from_chat_history() {
+        let store = test_store();
+        append(&store, "chat-conversation", "chat-user", "user", "Hello");
+        store
+            .append_agent_task_context_message(
+                "workspace-a",
+                "agent-card-context",
+                "Internal Agent context",
+                &ConversationMessageInput {
+                    id: "agent-context-message".to_string(),
+                    role: "user".to_string(),
+                    text: "Execute the immutable contract".to_string(),
+                },
+            )
+            .unwrap();
+
+        let history = store.load_conversation_history("workspace-a", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "chat-conversation");
+        assert_eq!(store.list_conversations("workspace-a").unwrap().len(), 1);
+        assert!(store
+            .resolve_chat_snapshot(
+                "workspace-a",
+                "agent-card-context",
+                "agent-context-message",
+                1,
+                "Execute the immutable contract",
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .load_conversation_messages("workspace-a", "agent-card-context")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .append_conversation_message(
+                "workspace-a",
+                "agent-card-user-chat",
+                "Forged chat",
+                &ConversationMessageInput {
+                    id: "forged-chat".to_string(),
+                    role: "user".to_string(),
+                    text: "Hidden user chat".to_string(),
+                },
+            )
+            .is_err());
+        assert!(store
+            .append_agent_task_context_message(
+                "workspace-a",
+                "ordinary-chat-id",
+                "Forged Agent context",
+                &ConversationMessageInput {
+                    id: "forged-context".to_string(),
+                    role: "user".to_string(),
+                    text: "Wrong scope".to_string(),
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
     fn chat_snapshot_digest_is_deterministic_and_ignores_presentation_metadata() {
         let store = test_store();
         append(&store, "conversation-a", "user-1", "user", "Hello");
@@ -2646,6 +2821,7 @@ mod tests {
                    ('user-1', 'conversation-a', 2, 'user', 'Continue', 2);",
             )
             .unwrap();
+        migrate_conversation_kind(&connection).unwrap();
         migrate_conversation_authority(&connection).unwrap();
         let store = ExecutionStore {
             connection: Arc::new(Mutex::new(connection)),
@@ -2668,6 +2844,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(authority, "legacy_renderer");
+    }
+
+    #[test]
+    fn migration_hides_legacy_agent_task_context_from_chat_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversations (
+                   conversation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE conversation_messages (
+                   message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL,
+                   created_at INTEGER NOT NULL, authority TEXT NOT NULL DEFAULT 'renderer',
+                   UNIQUE(conversation_id, sequence)
+                 );
+                 INSERT INTO conversations VALUES
+                   ('chat-1', 'workspace-a', 'User chat', 1, 1),
+                   ('agent-card-legacy', 'workspace-a', 'Internal task', 2, 2);
+                 INSERT INTO conversation_messages VALUES
+                   ('chat-message', 'chat-1', 1, 'user', 'Hello', 1, 'renderer'),
+                   ('agent-context', 'agent-card-legacy', 1, 'user', 'Execute', 2, 'renderer');",
+            )
+            .unwrap();
+        migrate_conversation_kind(&connection).unwrap();
+        let store = ExecutionStore {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+
+        let history = store.load_conversation_history("workspace-a", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "chat-1");
+        assert_eq!(
+            store
+                .load_conversation_messages("workspace-a", "agent-card-legacy")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2862,6 +3078,18 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .append_agent_task_context_message(
+                "workspace-a",
+                "agent-card-retained",
+                "Internal Agent context",
+                &ConversationMessageInput {
+                    id: "agent-context".to_string(),
+                    role: "user".to_string(),
+                    text: "Do not prune".to_string(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(
             store
@@ -2871,6 +3099,13 @@ mod tests {
         );
         assert_eq!(store.list_conversations("workspace-a").unwrap().len(), 1);
         assert_eq!(store.list_conversations("workspace-b").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load_conversation_messages("workspace-a", "agent-card-retained")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

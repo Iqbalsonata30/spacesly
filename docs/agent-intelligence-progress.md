@@ -17,6 +17,15 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 ## Phase 14 In Progress
 
+Operational Chat/Agent session-boundary bug fix after the tenth vertical slice:
+
+- Root cause: Agent execution contexts and user Chat messages were stored in the same durable `conversations` table without a persisted purpose. Chat history hydration therefore projected internal `agent-card-*` rows as Spacesly Chat sessions, and Chat retention could count or delete those task-owned rows.
+- Conversations now carry a backend-owned `chat` or `agent_task` purpose. Agent Task Session preparation uses a dedicated IPC mutation for internal context; Chat append and Agent-context append reject the other purpose's reserved identity.
+- Chat list/history queries, snapshot resolution, and retention operate only on `chat` rows. Agent runtime resolution requires the exact workspace-owned `agent_task` row, so Chat and Agent contexts cannot be substituted for one another.
+- Existing databases migrate non-destructively. Historical `agent-card-*` rows are classified as Agent task context, remain available for continuation/resume, and disappear from the Spacesly Chat session list.
+- OpenCode runtime ownership remains independently isolated: Chat runs use Chat Task Session runtime attempts, while Agent runs use `task-session:<id>` and retain only their Task Session-owned OpenCode session on continuation.
+- Regression evidence: focused purpose, migration, retention, and blocked-continuation tests passed; full Rust suite 537 passed with 3 ignored; frontend unit suite 7 passed; Svelte diagnostics reported 0 errors and 0 warnings; full rendered browser suite 12 passed.
+
 Operational repository-contract bug fix after the tenth vertical slice:
 
 - New Agent tasks no longer copy the general OpenCode working directory or trusted workspace root into `repository.root_path`. That field now contains only a Git repository root actually observed by workspace Git inspection; otherwise it stays `null` so authoritative Repository Rules can resolve the checkout.
