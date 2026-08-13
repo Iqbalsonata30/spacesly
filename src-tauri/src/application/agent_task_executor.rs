@@ -7686,6 +7686,49 @@ mod tests {
     }
 
     #[test]
+    fn repository_preflight_lets_rules_resolve_named_task_with_explicit_branch() {
+        let directory = tempdir().expect("workspace");
+        let repository = directory.path().join("BRI").join("qcash-deployment");
+        initialize_repository(&repository);
+        let facts = RuleFactsRecord {
+            repositories: vec![repository_fact(Some(
+                repository.to_string_lossy().to_string(),
+            ))],
+            ..Default::default()
+        };
+
+        let preflight = resolve_repository_preflight(
+            &json!({
+                "objective": {
+                    "summary": "Create a simple helm chart copy from a backend service in qcash-deployment branch dev"
+                },
+                "repository": {
+                    "root_path": null,
+                    "branch": "dev",
+                    "head_commit": null
+                }
+            }),
+            &facts,
+            directory.path(),
+        );
+
+        assert!(preflight.blocker.is_none());
+        assert_eq!(
+            preflight.repository_root.as_deref(),
+            Some(
+                repository
+                    .canonicalize()
+                    .expect("repository resolves")
+                    .as_path()
+            )
+        );
+        let record = preflight.record.expect("resolution record");
+        assert_eq!(record.status, "resolved");
+        assert_eq!(record.repository_id.as_deref(), Some("qcash-deployment"));
+        assert_eq!(record.backend_path.as_deref(), Some("service"));
+    }
+
+    #[test]
     fn repository_preflight_blocks_ambiguous_and_escaping_checkouts() {
         let directory = tempdir().expect("workspace");
         for parent in ["one", "two"] {

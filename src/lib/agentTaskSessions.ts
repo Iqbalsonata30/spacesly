@@ -28,17 +28,42 @@ const RECONCILIATION_INTERVAL_MS = 5_000;
 const BUILTIN_CAPABILITIES = ["workspace_read", "workspace_write", "shell", "git"];
 
 export function executionRepositoryContext(
-  config: AiWorkerConfig,
   gitInfo: GitWorkspaceInfo | null,
-  workspaceRoot: string | null,
+  requestedBranch: string | null = null,
 ): ExecutionContract["repository"] {
-  const configuredRoot =
-    config.runtime === "opencode" ? config.opencode_workdir?.trim() || null : null;
+  const observedRepositoryRoot =
+    gitInfo?.is_git_repo === true ? gitInfo.repo_root?.trim() || null : null;
+  const observedBranch = observedRepositoryRoot ? (gitInfo?.current_branch ?? null) : null;
   return {
-    root_path: configuredRoot ?? gitInfo?.repo_root ?? workspaceRoot,
-    branch: gitInfo?.current_branch ?? null,
-    head_commit: gitInfo?.head_commit ?? null,
+    root_path: observedRepositoryRoot,
+    branch: requestedBranch ?? observedBranch,
+    head_commit:
+      observedRepositoryRoot && (!requestedBranch || requestedBranch === observedBranch)
+        ? (gitInfo?.head_commit ?? null)
+        : null,
   };
+}
+
+/** Extracts an explicitly requested Git branch without guessing a repository checkout path. */
+export function requestedRepositoryBranch(
+  ...taskText: Array<string | null | undefined>
+): string | null {
+  const text = taskText.filter((value): value is string => Boolean(value?.trim())).join("\n");
+  const match = text.match(/\bbranch\s+(?:(?:is|named)\s+)?([A-Za-z0-9][A-Za-z0-9._/-]{0,254})/i);
+  const branch = match?.[1]?.replace(/[.,;!?]+$/, "") || null;
+  if (
+    !branch ||
+    branch.startsWith("-") ||
+    branch.endsWith(".") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".lock") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.includes("@{")
+  ) {
+    return null;
+  }
+  return branch;
 }
 
 /** Immutable profile identity and authority requested by one Agent submission. */

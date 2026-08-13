@@ -17,6 +17,14 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 ## Phase 14 In Progress
 
+Operational repository-contract bug fix after the tenth vertical slice:
+
+- New Agent tasks no longer copy the general OpenCode working directory or trusted workspace root into `repository.root_path`. That field now contains only a Git repository root actually observed by workspace Git inspection; otherwise it stays `null` so authoritative Repository Rules can resolve the checkout.
+- Explicit natural-language branch requests such as `branch dev`, `branch named release/1.2`, and slash-delimited feature branches are normalized into `repository.branch`. Malformed traversal-like refs fail closed.
+- When a requested branch differs from the currently observed branch, the contract does not retain the current branch's unrelated HEAD commit.
+- The reported qcash-style task now produces an unassigned root plus branch `dev`; repository preflight resolves the Rules checkout and backend template path. A genuinely different explicit contract checkout still produces the original conflict blocker.
+- Regression evidence: four focused repository-preflight tests passed; full Rust suite 535 passed with 3 ignored; frontend unit suite 7 passed; Svelte diagnostics reported 0 errors and 0 warnings; full rendered browser suite 12 passed.
+
 Completed tenth vertical slice: independent subtask evidence attestations and parent aggregation.
 
 - The scheduler now owns a separate immutable evidence-attestation ledger keyed by the prepared subtask and its exact active authority. A subtask Worker cannot construct the module-private evidence permit, so model text and Worker-authored objective checkpoints cannot satisfy this gate.

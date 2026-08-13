@@ -16,6 +16,7 @@ import {
   agentTaskCapabilities,
   ensureOpenCodeAgentProfile,
   executionRepositoryContext,
+  requestedRepositoryBranch,
   continueAgentTaskSession,
   executeAgentTaskSession,
   planAgentTaskConnectors,
@@ -237,23 +238,60 @@ const config: AiWorkerConfig = {
 };
 
 assertEqual(
-  executionRepositoryContext(
-    { ...config, opencode_workdir: "/home/iqbalsonata" },
-    {
-      is_git_repo: true,
-      repo_root: "/home/iqbalsonata/BRI",
-      current_branch: "main",
-      branches: ["main"],
-      head_commit: "abc",
-      upstream_branch: null,
-      dirty_worktree: false,
-      ahead_count: 0,
-      behind_count: 0,
-    },
-    "/home/iqbalsonata/BRI",
-  ).root_path,
-  "/home/iqbalsonata",
-  "configured Agent workdir should override the open Git workspace in execution contracts",
+  executionRepositoryContext({
+    is_git_repo: true,
+    repo_root: "/home/iqbalsonata/BRI",
+    current_branch: "main",
+    branches: ["main"],
+    head_commit: "abc",
+    upstream_branch: null,
+    dirty_worktree: false,
+    ahead_count: 0,
+    behind_count: 0,
+  }).root_path,
+  "/home/iqbalsonata/BRI",
+  "only an observed Git root should enter the execution contract",
+);
+const rulesResolvedRepository = executionRepositoryContext(
+  {
+    is_git_repo: false,
+    repo_root: null,
+    current_branch: null,
+    branches: [],
+    head_commit: null,
+    upstream_branch: null,
+    dirty_worktree: false,
+    ahead_count: 0,
+    behind_count: 0,
+  },
+  requestedRepositoryBranch(
+    "Create a simple helm chart copy from a backend service in qcash-deployment branch dev",
+  ),
+);
+assertEqual(
+  rulesResolvedRepository.root_path,
+  null,
+  "a general OpenCode workdir must not masquerade as a repository root",
+);
+assertEqual(
+  rulesResolvedRepository.branch,
+  "dev",
+  "an explicitly requested branch should be retained while Rules resolve the checkout",
+);
+assertEqual(
+  rulesResolvedRepository.head_commit,
+  null,
+  "a branch not observed in a repository must not inherit an unrelated HEAD",
+);
+assertEqual(
+  requestedRepositoryBranch("Deploy from branch feature/NQLA-63148."),
+  "feature/NQLA-63148",
+  "slash-delimited branches should be accepted",
+);
+assertEqual(
+  requestedRepositoryBranch("Use branch ../escape"),
+  null,
+  "malformed branch references should fail closed",
 );
 const contract = {
   contract_id: "contract-1",
