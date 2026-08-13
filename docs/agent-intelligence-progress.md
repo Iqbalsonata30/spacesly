@@ -10,8 +10,7 @@ This file is the operational ledger for the roadmap in [agent-intelligence-roadm
 
 - Completed through Phase 9: resource-level idempotency foundation.
 - Completed through Phase 10: structured Rules, deterministic scope resolution, connector preflight, verification receipts, and contradiction detection.
-- Phase 11 is in progress with independent Git terminal-state, Kubernetes Deployment-availability, and exact Bamboo build-result verifiers.
-- Phase 11 now also includes Rules-bound exact Jira issue/comment-state and Confluence page-existence verifiers.
+- Phase 11 is complete with independent Git terminal-state, Kubernetes Deployment-availability, exact Bamboo build-result, Rules-bound Jira issue/comment-state, and Confluence page-existence verifiers.
 - Phase 12 is in progress with a replayable, headless production-policy corpus and deterministic scorecard across all four initial categories.
 
 ## Phase 12 In Progress
@@ -49,7 +48,7 @@ Remaining Phase 12 scope:
 - Add real production-path fixtures for approval continuation, mutation-ledger recovery, and provider evidence adapters.
 - Add connector simulators and a CI release gate only after each score category has representative coverage.
 
-## Phase 11 In Progress
+## Phase 11 Completed
 
 Implemented Git evidence-verifier vertical slice:
 

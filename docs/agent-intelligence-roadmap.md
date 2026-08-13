@@ -299,7 +299,7 @@ Exit criteria:
 
 ### Phase 11 — Evidence Verifiers
 
-Status: in progress.
+Status: completed.
 
 Add connector-aware verification policies: build state from Bamboo, deployment health from Kubernetes, commit/upstream state from Git, and exact issue/comment state from Jira.
 
