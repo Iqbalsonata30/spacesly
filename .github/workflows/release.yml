@@ -43,7 +43,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "::notice title=Release Tag::Releasing $TAG"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ steps.tag.outputs.tag }}
@@ -60,7 +60,7 @@ jobs:
           OUTPUT: CHANGELOG.md
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-artifacts
           pattern: spacesly-*
@@ -85,7 +85,7 @@ jobs:
           gpg --batch --yes --passphrase "$GPG_PASSPHRASE" --detach-sign --armor SHA256SUMS
 
       - name: Generate SLSA provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: release-artifacts/*
 
